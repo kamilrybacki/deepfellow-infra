@@ -47,6 +47,18 @@ ui-rebuild:
 test-webui:
    (cd $(git rev-parse --show-toplevel)/webui && npm test)
 
+ts-check *FLAGS:
+   (cd $(git rev-parse --show-toplevel)/webui && npx biome check src {{FLAGS}})
+
+ts-lint *FLAGS:
+   (cd $(git rev-parse --show-toplevel)/webui && npx biome lint src {{FLAGS}})
+
+ts-format *FLAGS:
+   (cd $(git rev-parse --show-toplevel)/webui && npx biome format src {{FLAGS}})
+
+ts-fix *FLAGS:
+   (cd $(git rev-parse --show-toplevel)/webui && npx biome check --write src {{FLAGS}})
+
 env-copy:
     uv run python ./scripts/copy_envs.py
 
