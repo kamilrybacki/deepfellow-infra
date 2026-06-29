@@ -1,3 +1,51 @@
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Switch } from "@/components/ui/switch";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { apiClient } from "@/deepfellow/client";
+import type { InstallProgress, Service } from "@/deepfellow/types";
+import { InstallationWarningsError } from "@/deepfellow/types";
+import { useModal } from "@/hooks/use-modal";
+import {
+  clearServiceInstallProgress,
+  getSnapshot,
+  setServiceInstallProgress,
+  useInstallProgressSnapshot,
+} from "@/state/install-progress-store";
+import {
+  COMPLETION_SMOOTH_MIN_MS,
+  COMPLETION_SMOOTH_MS,
+  getStepPerTick,
+  startProgressSimulation,
+} from "@/utils/progress-simulation";
+import type { SimulationHandle } from "@/utils/progress-simulation";
+import type { ProgressEvent } from "@/utils/sse-stream";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link, useNavigate } from "@tanstack/react-router";
+import { MoreVertical } from "lucide-react";
 /*
 DeepFellow Software Framework.
 Copyright © 2025 Simplito sp. z o.o.
@@ -8,55 +56,31 @@ This software is Licensed under the DeepFellow Free License.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-import { useState, useMemo, useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent } from "react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Link, useNavigate } from "@tanstack/react-router";
-import { apiClient } from "@/deepfellow/client";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Input } from "@/components/ui/input";
-import { Switch } from "@/components/ui/switch";
-import { Label } from "@/components/ui/label";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { Skeleton } from "@/components/ui/skeleton";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import {
-  DropdownMenu,
-  DropdownMenuTrigger,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-} from "@/components/ui/dropdown-menu";
-import { MoreVertical } from "lucide-react";
-import { DynamicFormModal } from "./DynamicFormModal";
-import { ConfirmModal } from "./ConfirmModal";
-import { UninstallWithPurgeModal } from "./UninstallWithPurgeModal";
-import { ProgressBadge } from "./ProgressBadge";
-import { ContentModal } from "./ContentModal";
-import { WarningsModal } from "./WarningsModal";
-import { MeshInfoModal } from "./MeshInfoModal";
-import { ServiceSettingsModal } from "./ServiceSettingsModal";
-import { useModal } from "@/hooks/use-modal";
-import type { Service, InstallProgress } from "@/deepfellow/types";
-import { InstallationWarningsError } from "@/deepfellow/types";
-import type { ProgressEvent } from "@/utils/sse-stream";
-import {
-  clearServiceInstallProgress,
-  getSnapshot,
-  setServiceInstallProgress,
-  useInstallProgressSnapshot,
-} from "@/state/install-progress-store";
-import { startProgressSimulation, getStepPerTick, COMPLETION_SMOOTH_MS, COMPLETION_SMOOTH_MIN_MS } from "@/utils/progress-simulation";
-import type { SimulationHandle } from "@/utils/progress-simulation";
 import { toast } from "sonner";
+import { ConfirmModal } from "./ConfirmModal";
+import { ContentModal } from "./ContentModal";
+import { DynamicFormModal } from "./DynamicFormModal";
+import { MeshInfoModal } from "./MeshInfoModal";
+import { ProgressBadge } from "./ProgressBadge";
+import { ServiceSettingsModal } from "./ServiceSettingsModal";
+import { UninstallWithPurgeModal } from "./UninstallWithPurgeModal";
+import { WarningsModal } from "./WarningsModal";
 
 export function ServicesList() {
   const modal = useModal();
   const navigate = useNavigate();
   const [searchQuery, setSearchQuery] = useState("");
-  const [installingServiceId, setInstallingServiceId] = useState<string | null>(null);
-  const pendingInstallationRef = useRef<{ serviceId: string; spec: Record<string, unknown>; size?: string | Record<string, string>; update?: boolean } | null>(null);
+  const [installingServiceId, setInstallingServiceId] = useState<string | null>(
+    null,
+  );
+  const pendingInstallationRef = useRef<{
+    serviceId: string;
+    spec: Record<string, unknown>;
+    size?: string | Record<string, string>;
+    update?: boolean;
+  } | null>(null);
   const hasWarningsRef = useRef(false);
   const simulationStopFnsRef = useRef<Record<string, SimulationHandle>>({});
   const hasRealProgressRef = useRef<Record<string, boolean>>({});
@@ -78,7 +102,8 @@ export function ServicesList() {
   const cloudEnabled = settingsData?.cloud_enabled ?? true;
 
   const cloudToggleMutation = useMutation({
-    mutationFn: (enabled: boolean) => apiClient.updateSettings({ cloud_enabled: enabled }),
+    mutationFn: (enabled: boolean) =>
+      apiClient.updateSettings({ cloud_enabled: enabled }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["admin", "settings"] });
     },
@@ -88,7 +113,10 @@ export function ServicesList() {
   });
   const [anotherInstances, setAnotherInstances] = useState([] as Service[]);
   const servicesList = useMemo(() => {
-    const newList = [...(servicesData ? servicesData.list : []), ...anotherInstances];
+    const newList = [
+      ...(servicesData ? servicesData.list : []),
+      ...anotherInstances,
+    ];
     newList.sort((a, b) => {
       if (!cloudEnabled) {
         const aCloud = a.is_cloud ? 1 : 0;
@@ -98,7 +126,7 @@ export function ServicesList() {
       return a.type.localeCompare(b.type) || a.id.localeCompare(b.id);
     });
     return newList;
-  }, [servicesData, anotherInstances, cloudEnabled])
+  }, [servicesData, anotherInstances, cloudEnabled]);
 
   // Clean up any running simulations on unmount
   useEffect(() => {
@@ -119,7 +147,11 @@ export function ServicesList() {
       if (!inst || typeof inst !== "object") continue;
       const s = (inst as { stage?: unknown }).stage;
       const v = (inst as { value?: unknown }).value;
-      if ((s === "install" || s === "download") && typeof v === "number" && Number.isFinite(v)) {
+      if (
+        (s === "install" || s === "download") &&
+        typeof v === "number" &&
+        Number.isFinite(v)
+      ) {
         inProgressIds.add(service.id);
       }
     }
@@ -147,7 +179,9 @@ export function ServicesList() {
       // and orphaned simulation timers when the 10 s refetch fires mid-install.
       if (simulationStopFnsRef.current[serviceId]) continue;
 
-      let currentStage: "install" | "download" = installedStage as "install" | "download";
+      let currentStage: "install" | "download" = installedStage as
+        | "install"
+        | "download";
       const abortController = new AbortController();
       let isCancelled = false;
 
@@ -156,7 +190,10 @@ export function ServicesList() {
       const existingProgress = getSnapshot().services[serviceId];
       const startValue = existingProgress?.value ?? (installedValue as number);
       if (!existingProgress) {
-        setServiceInstallProgress(serviceId, { stage: currentStage, value: installedValue as number });
+        setServiceInstallProgress(serviceId, {
+          stage: currentStage,
+          value: installedValue as number,
+        });
       }
 
       const installStartTime = Date.now();
@@ -189,22 +226,32 @@ export function ServicesList() {
             if (event.type === "finish") {
               if (event.status === "ok") {
                 sim.smoothComplete(
-                  Math.max(COMPLETION_SMOOTH_MIN_MS, Math.min(Date.now() - installStartTime, COMPLETION_SMOOTH_MS)),
+                  Math.max(
+                    COMPLETION_SMOOTH_MIN_MS,
+                    Math.min(
+                      Date.now() - installStartTime,
+                      COMPLETION_SMOOTH_MS,
+                    ),
+                  ),
                   () => {
                     delete simulationStopFnsRef.current[serviceId];
-                    queryClient.invalidateQueries({ queryKey: ["admin", "services"] });
+                    queryClient.invalidateQueries({
+                      queryKey: ["admin", "services"],
+                    });
                   },
-                  getSnapshot().services[serviceId]?.value
+                  getSnapshot().services[serviceId]?.value,
                 );
               } else {
                 sim.stop();
                 delete simulationStopFnsRef.current[serviceId];
                 clearServiceInstallProgress(serviceId);
-                toast.error(`Installation failed for ${serviceId}: ${event.details || "Unknown error"}`);
+                toast.error(
+                  `Installation failed for ${serviceId}: ${event.details || "Unknown error"}`,
+                );
               }
             }
           },
-          abortController.signal
+          abortController.signal,
         )
         .catch((error) => {
           if (isCancelled) return;
@@ -231,55 +278,80 @@ export function ServicesList() {
   }, [servicesList, queryClient]);
 
   const installMutation = useMutation({
-    mutationFn: ({ serviceId, spec, size, ignoreWarnings = false, update = false }: { serviceId: string; spec: Record<string, unknown>; size?: string | Record<string, string>; ignoreWarnings?: boolean; update?: boolean }) => {
+    mutationFn: ({
+      serviceId,
+      spec,
+      size,
+      ignoreWarnings = false,
+      update = false,
+    }: {
+      serviceId: string;
+      spec: Record<string, unknown>;
+      size?: string | Record<string, string>;
+      ignoreWarnings?: boolean;
+      update?: boolean;
+    }) => {
       return new Promise<void>((resolve, reject) => {
         let currentStage: "install" | "download" = "download";
         const installStartTime = Date.now();
         const sim = startProgressSimulation({
           stepPerTick: getStepPerTick(size ?? "", 10),
           onTick: (value) => {
-            setServiceInstallProgress(serviceId, { stage: currentStage, value });
+            setServiceInstallProgress(serviceId, {
+              stage: currentStage,
+              value,
+            });
           },
         });
         simulationStopFnsRef.current[serviceId] = sim;
 
-        const stream = update ? apiClient.updateAdminServiceStreaming : apiClient.installAdminServiceStreaming;
-        stream.call(
-          apiClient,
-          serviceId,
-          spec,
-          (event: ProgressEvent) => {
-            const stage = event.stage;
-            const value = event.value;
+        const stream = update
+          ? apiClient.updateAdminServiceStreaming
+          : apiClient.installAdminServiceStreaming;
+        stream
+          .call(
+            apiClient,
+            serviceId,
+            spec,
+            (event: ProgressEvent) => {
+              const stage = event.stage;
+              const value = event.value;
 
-            if (event.type === "progress" && stage && value !== undefined) {
-              currentStage = stage;
-              hasRealProgressRef.current[serviceId] = true;
-              setServiceInstallProgress(serviceId, { stage, value });
-            } else if (event.type === "finish") {
-              if (event.status === "ok") {
-                sim.smoothComplete(
-                  Math.max(COMPLETION_SMOOTH_MIN_MS, Math.min(Date.now() - installStartTime, COMPLETION_SMOOTH_MS)),
-                  () => {
-                    delete simulationStopFnsRef.current[serviceId];
-                    // Do NOT clear progress here — if the backend still reports the service
-                    // as in-progress on the next refetch, clearing now would cause the bar
-                    // to jump back to the stale backend value. Reconciliation clears it once
-                    // the backend confirms the service is no longer in-progress.
-                    resolve();
-                  },
-                  getSnapshot().services[serviceId]?.value
-                );
-              } else {
-                sim.stop();
-                delete simulationStopFnsRef.current[serviceId];
-                clearServiceInstallProgress(serviceId);
-                reject(new Error(event.details || "Installation failed"));
+              if (event.type === "progress" && stage && value !== undefined) {
+                currentStage = stage;
+                hasRealProgressRef.current[serviceId] = true;
+                setServiceInstallProgress(serviceId, { stage, value });
+              } else if (event.type === "finish") {
+                if (event.status === "ok") {
+                  sim.smoothComplete(
+                    Math.max(
+                      COMPLETION_SMOOTH_MIN_MS,
+                      Math.min(
+                        Date.now() - installStartTime,
+                        COMPLETION_SMOOTH_MS,
+                      ),
+                    ),
+                    () => {
+                      delete simulationStopFnsRef.current[serviceId];
+                      // Do NOT clear progress here — if the backend still reports the service
+                      // as in-progress on the next refetch, clearing now would cause the bar
+                      // to jump back to the stale backend value. Reconciliation clears it once
+                      // the backend confirms the service is no longer in-progress.
+                      resolve();
+                    },
+                    getSnapshot().services[serviceId]?.value,
+                  );
+                } else {
+                  sim.stop();
+                  delete simulationStopFnsRef.current[serviceId];
+                  clearServiceInstallProgress(serviceId);
+                  reject(new Error(event.details || "Installation failed"));
+                }
               }
-            }
-          },
-          ignoreWarnings
-        ).catch(reject);
+            },
+            ignoreWarnings,
+          )
+          .catch(reject);
         modal.close();
       });
     },
@@ -291,7 +363,11 @@ export function ServicesList() {
       delete hasRealProgressRef.current[variables.serviceId];
       queryClient.invalidateQueries({ queryKey: ["admin", "services"] });
       pendingInstallationRef.current = null;
-      toast.success(variables.update ? "Service updated successfully" : "Service installed successfully");
+      toast.success(
+        variables.update
+          ? "Service updated successfully"
+          : "Service installed successfully",
+      );
     },
     onError: (error, variables) => {
       const simStop = simulationStopFnsRef.current[variables.serviceId];
@@ -314,7 +390,9 @@ export function ServicesList() {
 
       hasWarningsRef.current = false;
       clearServiceInstallProgress(variables.serviceId);
-      toast.error(`Failed to ${variables.update ? "update" : "install"} service: ${error.message}`);
+      toast.error(
+        `Failed to ${variables.update ? "update" : "install"} service: ${error.message}`,
+      );
     },
     onSettled: () => {
       // Only reset if not showing warnings modal
@@ -326,7 +404,8 @@ export function ServicesList() {
   });
 
   const uninstallMutation = useMutation({
-    mutationFn: (serviceId: string) => apiClient.uninstallAdminService(serviceId, false),
+    mutationFn: (serviceId: string) =>
+      apiClient.uninstallAdminService(serviceId, false),
     onMutate: () => {
       const toastId = toast.loading("Uninstalling...");
       uninstallToastIdRef.current = toastId;
@@ -334,7 +413,9 @@ export function ServicesList() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["admin", "services"] });
       if (uninstallToastIdRef.current) {
-        toast.success("Service uninstalled successfully", { id: uninstallToastIdRef.current });
+        toast.success("Service uninstalled successfully", {
+          id: uninstallToastIdRef.current,
+        });
         uninstallToastIdRef.current = null;
       } else {
         toast.success("Service uninstalled successfully");
@@ -342,7 +423,9 @@ export function ServicesList() {
     },
     onError: (error) => {
       if (uninstallToastIdRef.current) {
-        toast.error(`Failed to uninstall service: ${error.message}`, { id: uninstallToastIdRef.current });
+        toast.error(`Failed to uninstall service: ${error.message}`, {
+          id: uninstallToastIdRef.current,
+        });
         uninstallToastIdRef.current = null;
       } else {
         toast.error(`Failed to uninstall service: ${error.message}`);
@@ -351,7 +434,8 @@ export function ServicesList() {
   });
 
   const purgeMutation = useMutation({
-    mutationFn: (serviceId: string) => apiClient.uninstallAdminService(serviceId, true),
+    mutationFn: (serviceId: string) =>
+      apiClient.uninstallAdminService(serviceId, true),
     onMutate: () => {
       toast.loading("Purging...", { id: "purge-service" });
     },
@@ -360,7 +444,9 @@ export function ServicesList() {
       toast.success("Service purged successfully", { id: "purge-service" });
     },
     onError: (error) => {
-      toast.error(`Failed to purge service: ${error.message}`, { id: "purge-service" });
+      toast.error(`Failed to purge service: ${error.message}`, {
+        id: "purge-service",
+      });
     },
   });
 
@@ -372,7 +458,9 @@ export function ServicesList() {
     },
     onSuccess: () => {
       if (restartDockerToastIdRef.current) {
-        toast.success("Docker restarted successfully", { id: restartDockerToastIdRef.current });
+        toast.success("Docker restarted successfully", {
+          id: restartDockerToastIdRef.current,
+        });
         restartDockerToastIdRef.current = null;
       } else {
         toast.success("Docker restarted successfully");
@@ -380,7 +468,9 @@ export function ServicesList() {
     },
     onError: (error) => {
       if (restartDockerToastIdRef.current) {
-        toast.error(`Failed to restart Docker: ${error.message}`, { id: restartDockerToastIdRef.current });
+        toast.error(`Failed to restart Docker: ${error.message}`, {
+          id: restartDockerToastIdRef.current,
+        });
         restartDockerToastIdRef.current = null;
       } else {
         toast.error(`Failed to restart Docker: ${error.message}`);
@@ -413,7 +503,9 @@ export function ServicesList() {
       });
     } catch (error) {
       modal.close();
-      toast.error(`Failed to fetch Docker logs: ${error instanceof Error ? error.message : "Unknown error"}`);
+      toast.error(
+        `Failed to fetch Docker logs: ${error instanceof Error ? error.message : "Unknown error"}`,
+      );
     }
   };
 
@@ -442,7 +534,9 @@ export function ServicesList() {
       });
     } catch (error) {
       modal.close();
-      toast.error(`Failed to fetch Docker compose file: ${error instanceof Error ? error.message : "Unknown error"}`);
+      toast.error(
+        `Failed to fetch Docker compose file: ${error instanceof Error ? error.message : "Unknown error"}`,
+      );
     }
   };
 
@@ -465,7 +559,10 @@ export function ServicesList() {
     modal.open(MeshInfoModal, {});
   };
 
-  const handleInstallClick = async (service: Service, installAnotherInstance: boolean) => {
+  const handleInstallClick = async (
+    service: Service,
+    installAnotherInstance: boolean,
+  ) => {
     modal.open(DynamicFormModal, {
       title: `Install ${service.id}`,
       fields: [],
@@ -481,38 +578,66 @@ export function ServicesList() {
       if (installAnotherInstance) {
         let i = 0;
         while (true) {
-          instanceDefaulValue = "new" + (i === 0 ? "" : "-" + i);
-          const id = serviceDetail.type + "|" + instanceDefaulValue;
-          if (servicesList.find(x => x.id === id)) {
+          instanceDefaulValue = `new${i === 0 ? "" : `-${i}`}`;
+          const id = `${serviceDetail.type}|${instanceDefaulValue}`;
+          if (servicesList.find((x) => x.id === id)) {
             i++;
-          }
-          else {
+          } else {
             break;
           }
         }
       }
       modal.open(DynamicFormModal, {
         title: `Install ${serviceDetail.id}`,
-        fields: installAnotherInstance ? [{
-          name: "instance",
-          description: "Instance ID",
-          type: "text",
-          required: true,
-          default: instanceDefaulValue,
-          placeholder: "default",
-        }, ...serviceDetail.spec.fields] : serviceDetail.spec.fields,
+        fields: installAnotherInstance
+          ? [
+              {
+                name: "instance",
+                description: "Instance ID",
+                type: "text",
+                required: true,
+                default: instanceDefaulValue,
+                placeholder: "default",
+              },
+              ...serviceDetail.spec.fields,
+            ]
+          : serviceDetail.spec.fields,
         onSubmit: (spec: Record<string, unknown>) => {
-          const instance = installAnotherInstance ? spec.instance as string : orgInstance;
-          const serviceId = installAnotherInstance ? serviceDetail.type + (instance && instance !== "default" ? "|" + instance : "") : service.id;
-          if (installAnotherInstance && servicesList.find(x => x.id === serviceId)) {
+          const instance = installAnotherInstance
+            ? (spec.instance as string)
+            : orgInstance;
+          const serviceId = installAnotherInstance
+            ? serviceDetail.type +
+              (instance && instance !== "default" ? `|${instance}` : "")
+            : service.id;
+          if (
+            installAnotherInstance &&
+            servicesList.find((x) => x.id === serviceId)
+          ) {
             toast.error("Given Instance ID already in use");
             return;
           }
-          pendingInstallationRef.current = { serviceId: serviceId, spec, size: serviceDetail.size };
+          pendingInstallationRef.current = {
+            serviceId: serviceId,
+            spec,
+            size: serviceDetail.size,
+          };
           if (installAnotherInstance) {
-            setAnotherInstances([...anotherInstances, {...serviceDetail, id: serviceId, instance: instance, installed: false}]);
+            setAnotherInstances([
+              ...anotherInstances,
+              {
+                ...serviceDetail,
+                id: serviceId,
+                instance: instance,
+                installed: false,
+              },
+            ]);
           }
-          installMutation.mutate({ serviceId: serviceId, spec, size: serviceDetail.size });
+          installMutation.mutate({
+            serviceId: serviceId,
+            spec,
+            size: serviceDetail.size,
+          });
         },
         // Keep modal interactive; don't disable because another install is running.
         isSubmitting: false,
@@ -526,7 +651,9 @@ export function ServicesList() {
   const handleEditClick = (service: Service) => {
     const installed = service.installed;
     const currentValues =
-      installed && typeof installed === "object" && !("stage" in (installed as Record<string, unknown>))
+      installed &&
+      typeof installed === "object" &&
+      !("stage" in (installed as Record<string, unknown>))
         ? (installed as Record<string, unknown>)
         : {};
     modal.open(DynamicFormModal, {
@@ -536,8 +663,18 @@ export function ServicesList() {
       submitLabel: "Save",
       submittingLabel: "Saving...",
       onSubmit: (spec: Record<string, unknown>) => {
-        pendingInstallationRef.current = { serviceId: service.id, spec, size: service.size, update: true };
-        installMutation.mutate({ serviceId: service.id, spec, size: service.size, update: true });
+        pendingInstallationRef.current = {
+          serviceId: service.id,
+          spec,
+          size: service.size,
+          update: true,
+        };
+        installMutation.mutate({
+          serviceId: service.id,
+          spec,
+          size: service.size,
+          update: true,
+        });
       },
       isSubmitting: false,
     });
@@ -551,7 +688,7 @@ export function ServicesList() {
         spec: pendingInstallationRef.current.spec,
         size: pendingInstallationRef.current.size,
         update: pendingInstallationRef.current.update,
-        ignoreWarnings: true
+        ignoreWarnings: true,
       });
     }
   };
@@ -561,15 +698,17 @@ export function ServicesList() {
     let customModelsCount = 0;
     try {
       const modelsData = await apiClient.listAdminServiceModels(serviceId);
-      customModelsCount = modelsData.list?.filter((model) => model.custom).length || 0;
+      customModelsCount =
+        modelsData.list?.filter((model) => model.custom).length || 0;
     } catch (error) {
       // If we can't fetch models, proceed anyway but log the error
       console.warn("Failed to fetch models for service:", error);
     }
 
-    const description = customModelsCount > 0
-      ? `Are you sure you want to uninstall ${serviceId}? This will also remove ${customModelsCount} custom model${customModelsCount > 1 ? "s" : ""} associated with this service. This action cannot be undone.`
-      : `Are you sure you want to uninstall ${serviceId}? This action cannot be undone.`;
+    const description =
+      customModelsCount > 0
+        ? `Are you sure you want to uninstall ${serviceId}? This will also remove ${customModelsCount} custom model${customModelsCount > 1 ? "s" : ""} associated with this service. This action cannot be undone.`
+        : `Are you sure you want to uninstall ${serviceId}? This action cannot be undone.`;
 
     modal.open(UninstallWithPurgeModal, {
       title: "Uninstall Service",
@@ -577,7 +716,8 @@ export function ServicesList() {
       confirmText: "Uninstall",
       cancelText: "Cancel",
       purgeLabel: "Purge",
-      purgeDescription: "Also remove downloaded service files and local data to free disk space. This cannot be undone.",
+      purgeDescription:
+        "Also remove downloaded service files and local data to free disk space. This cannot be undone.",
       onConfirm: (purge) => {
         modal.close();
         if (purge) {
@@ -594,7 +734,8 @@ export function ServicesList() {
   const handlePurgeClick = (serviceId: string) => {
     modal.open(ConfirmModal, {
       title: "Purge Service",
-      description: "This will remove all downloaded files for the service. This action cannot be undone.",
+      description:
+        "This will remove all downloaded files for the service. This action cannot be undone.",
       confirmText: "Purge",
       cancelText: "Cancel",
       onConfirm: () => {
@@ -612,7 +753,7 @@ export function ServicesList() {
     if (!target) return;
 
     const interactive = target.closest(
-      "a,button,[role='button'],[role='menuitem'],input,select,textarea,label,[data-prevent-row-click]"
+      "a,button,[role='button'],[role='menuitem'],input,select,textarea,label,[data-prevent-row-click]",
     );
     if (interactive) return;
 
@@ -637,22 +778,29 @@ export function ServicesList() {
         installedIsObject && "stage" in installed && "value" in installed;
 
       if (installedIsObject && !installedLooksLikeProgress) {
-        const installedValues = Object.entries(installed).some(([key, value]) => {
-          const field = service.spec.fields.find((f) => f.name === key);
-          if (field?.type === "password") return false;
+        const installedValues = Object.entries(installed).some(
+          ([key, value]) => {
+            const field = service.spec.fields.find((f) => f.name === key);
+            if (field?.type === "password") return false;
 
-          return (
-            key.toLowerCase().includes(query) ||
-            String(value ?? "").toLowerCase().includes(query)
-          );
-        });
+            return (
+              key.toLowerCase().includes(query) ||
+              String(value ?? "")
+                .toLowerCase()
+                .includes(query)
+            );
+          },
+        );
         if (installedValues) return true;
       }
 
       // Search in size
-      const sizeStr = typeof service.size === "string"
-        ? service.size
-        : Object.entries(service.size).map(([k, v]) => `${k}:${v}`).join(" ");
+      const sizeStr =
+        typeof service.size === "string"
+          ? service.size
+          : Object.entries(service.size)
+              .map(([k, v]) => `${k}:${v}`)
+              .join(" ");
       if (sizeStr.toLowerCase().includes(query)) return true;
 
       return false;
@@ -673,15 +821,14 @@ export function ServicesList() {
               <Switch
                 id="cloud-enabled"
                 checked={cloudEnabled}
-                onCheckedChange={(checked) => cloudToggleMutation.mutate(checked)}
+                onCheckedChange={(checked) =>
+                  cloudToggleMutation.mutate(checked)
+                }
                 disabled={cloudToggleMutation.isPending}
               />
               <Label htmlFor="cloud-enabled">Cloud services</Label>
             </div>
-            <Button
-              onClick={handleShowMeshInfo}
-              variant="outline"
-            >
+            <Button onClick={handleShowMeshInfo} variant="outline">
               Show mesh info
             </Button>
           </div>
@@ -701,44 +848,73 @@ export function ServicesList() {
               <TableHead>Service ID</TableHead>
               <TableHead className="min-w-[150px]">Status</TableHead>
               <TableHead>Resources</TableHead>
-              <TableHead className="text-right min-w-[165px]">Actions</TableHead>
+              <TableHead className="text-right min-w-[165px]">
+                Actions
+              </TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {filteredServices.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={4} className="text-center text-muted-foreground">
-                  {searchQuery ? "No services found matching your search" : "No services available"}
+                <TableCell
+                  colSpan={4}
+                  className="text-center text-muted-foreground"
+                >
+                  {searchQuery
+                    ? "No services found matching your search"
+                    : "No services available"}
                 </TableCell>
               </TableRow>
             ) : (
               filteredServices.map((service) => {
                 const isInstalled = !!service.installed;
                 const isDownloaded = !!service.downloaded;
-                const sizeInfo = typeof service.size === "string"
-                  ? service.size
-                  : Object.entries(service.size).map(([key, val]) => `${key.toUpperCase()}: ${val}`).join(", ");
+                const sizeInfo =
+                  typeof service.size === "string"
+                    ? service.size
+                    : Object.entries(service.size)
+                        .map(([key, val]) => `${key.toUpperCase()}: ${val}`)
+                        .join(", ");
 
-                const isInstallingCurrent = installMutation.isPending && installingServiceId === service.id;
+                const isInstallingCurrent =
+                  installMutation.isPending &&
+                  installingServiceId === service.id;
                 const currentProgress = installProgress[service.id];
                 const isInProgress = !!currentProgress;
                 // Check if installed is InstallProgress type (has stage and value)
-                const installedIsProgress = service.installed && typeof service.installed === "object" && "stage" in service.installed && "value" in service.installed;
+                const installedIsProgress =
+                  service.installed &&
+                  typeof service.installed === "object" &&
+                  "stage" in service.installed &&
+                  "value" in service.installed;
                 const isCloudDisabled = service.is_cloud && !cloudEnabled;
 
                 return (
                   <TableRow
                     key={service.id}
                     onClick={(e) => {
-                      if (!isInstalled || installedIsProgress || isInProgress || isCloudDisabled) return;
+                      if (
+                        !isInstalled ||
+                        installedIsProgress ||
+                        isInProgress ||
+                        isCloudDisabled
+                      )
+                        return;
                       handleRowNavigate(e, service.id);
                     }}
-                    className={[
-                      isInstalled && !installedIsProgress && !isInProgress && !isCloudDisabled
-                        ? "cursor-pointer hover:bg-muted/50"
-                        : undefined,
-                      isCloudDisabled ? "opacity-50" : undefined,
-                    ].filter(Boolean).join(" ") || undefined}
+                    className={
+                      [
+                        isInstalled &&
+                        !installedIsProgress &&
+                        !isInProgress &&
+                        !isCloudDisabled
+                          ? "cursor-pointer hover:bg-muted/50"
+                          : undefined,
+                        isCloudDisabled ? "opacity-50" : undefined,
+                      ]
+                        .filter(Boolean)
+                        .join(" ") || undefined
+                    }
                   >
                     <TableCell className="font-semibold">
                       <div>
@@ -753,22 +929,33 @@ export function ServicesList() {
                         ) : (
                           <div>{service.id}</div>
                         )}
-                        {service.description && service.description.length > 0 && (
-                          <div className="text-sm text-muted-foreground mt-1">{service.description}</div>
-                        )}
+                        {service.description &&
+                          service.description.length > 0 && (
+                            <div className="text-sm text-muted-foreground mt-1">
+                              {service.description}
+                            </div>
+                          )}
                       </div>
                     </TableCell>
                     <TableCell>
                       {isInProgress || installedIsProgress ? (
                         <ProgressBadge
-                          stage={currentProgress?.stage || (service.installed as InstallProgress).stage}
-                          value={currentProgress?.value ?? (service.installed as InstallProgress).value}
+                          stage={
+                            currentProgress?.stage ||
+                            (service.installed as InstallProgress).stage
+                          }
+                          value={
+                            currentProgress?.value ??
+                            (service.installed as InstallProgress).value
+                          }
                           variant="default"
                           simulated={!hasRealProgressRef.current[service.id]}
                         />
                       ) : (
                         <div className="flex flex-wrap items-center gap-2">
-                          <Badge variant={isInstalled ? "default" : "secondary"}>
+                          <Badge
+                            variant={isInstalled ? "default" : "secondary"}
+                          >
                             {isInstalled ? "Installed" : "Not installed"}
                           </Badge>
                           {!isInstalled && isDownloaded && (
@@ -777,27 +964,40 @@ export function ServicesList() {
                         </div>
                       )}
                     </TableCell>
-                    <TableCell className="font-mono text-sm">{sizeInfo || "N/A"}</TableCell>
+                    <TableCell className="font-mono text-sm">
+                      {sizeInfo || "N/A"}
+                    </TableCell>
                     <TableCell className="text-right">
-                      <div className="flex justify-end gap-2" data-prevent-row-click>
-                        {isInProgress || installedIsProgress ? null : !isInstalled ? (
+                      <div
+                        className="flex justify-end gap-2"
+                        data-prevent-row-click
+                      >
+                        {isInProgress ||
+                        installedIsProgress ? null : !isInstalled ? (
                           <>
                             <TooltipProvider>
                               <Tooltip>
                                 <TooltipTrigger asChild>
                                   <span>
                                     <Button
-                                      onClick={() => handleInstallClick(service, false)}
+                                      onClick={() =>
+                                        handleInstallClick(service, false)
+                                      }
                                       size="sm"
-                                      disabled={isInstallingCurrent || isCloudDisabled}
+                                      disabled={
+                                        isInstallingCurrent || isCloudDisabled
+                                      }
                                     >
-                                      {isInstallingCurrent ? "Installing..." : "Install"}
+                                      {isInstallingCurrent
+                                        ? "Installing..."
+                                        : "Install"}
                                     </Button>
                                   </span>
                                 </TooltipTrigger>
                                 {isCloudDisabled && (
                                   <TooltipContent>
-                                    Cloud services are disabled. Enable cloud to install this service.
+                                    Cloud services are disabled. Enable cloud to
+                                    install this service.
                                   </TooltipContent>
                                 )}
                               </Tooltip>
@@ -815,7 +1015,9 @@ export function ServicesList() {
                               <DropdownMenuContent align="end">
                                 <DropdownMenuItem
                                   onClick={() => handlePurgeClick(service.id)}
-                                  disabled={!isDownloaded || purgeMutation.isPending}
+                                  disabled={
+                                    !isDownloaded || purgeMutation.isPending
+                                  }
                                   variant="destructive"
                                 >
                                   Purge
@@ -829,51 +1031,64 @@ export function ServicesList() {
                               variant="outline"
                               size="sm"
                               onClick={() =>
-                                modal.open(ServiceSettingsModal, { service, onEdit: handleEditClick })
+                                modal.open(ServiceSettingsModal, {
+                                  service,
+                                  onEdit: handleEditClick,
+                                })
                               }
                             >
                               Settings
                             </Button>
                             <DropdownMenu>
-                            <DropdownMenuTrigger asChild>
-                              <Button variant="outline" size="sm">
-                                <MoreVertical className="h-4 w-4" />
-                              </Button>
-                            </DropdownMenuTrigger>
-                            <DropdownMenuContent align="end">
-                              <DropdownMenuItem
-                                onClick={() => handleInstallClick(service, true)}
-                              >
-                                Install another instance
-                              </DropdownMenuItem>
-                              {service.has_docker && (
-                                <>
-                                  <DropdownMenuItem
-                                    onClick={() => handleShowDockerLogs(service.id)}
-                                  >
-                                    Docker Logs
-                                  </DropdownMenuItem>
-                                  <DropdownMenuItem
-                                    onClick={() => handleShowDockerCompose(service.id)}
-                                  >
-                                    Docker Compose
-                                  </DropdownMenuItem>
-                                  <DropdownMenuItem
-                                    onClick={() => handleRestartDocker(service.id)}
-                                  >
-                                    Restart Docker
-                                  </DropdownMenuItem>
-                                  <DropdownMenuSeparator />
-                                </>
-                              )}
-                              <DropdownMenuItem
-                                onClick={() => handleUninstallClick(service.id)}
-                                variant="destructive"
-                              >
-                                Uninstall
-                              </DropdownMenuItem>
-                            </DropdownMenuContent>
-                          </DropdownMenu>
+                              <DropdownMenuTrigger asChild>
+                                <Button variant="outline" size="sm">
+                                  <MoreVertical className="h-4 w-4" />
+                                </Button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent align="end">
+                                <DropdownMenuItem
+                                  onClick={() =>
+                                    handleInstallClick(service, true)
+                                  }
+                                >
+                                  Install another instance
+                                </DropdownMenuItem>
+                                {service.has_docker && (
+                                  <>
+                                    <DropdownMenuItem
+                                      onClick={() =>
+                                        handleShowDockerLogs(service.id)
+                                      }
+                                    >
+                                      Docker Logs
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem
+                                      onClick={() =>
+                                        handleShowDockerCompose(service.id)
+                                      }
+                                    >
+                                      Docker Compose
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem
+                                      onClick={() =>
+                                        handleRestartDocker(service.id)
+                                      }
+                                    >
+                                      Restart Docker
+                                    </DropdownMenuItem>
+                                    <DropdownMenuSeparator />
+                                  </>
+                                )}
+                                <DropdownMenuItem
+                                  onClick={() =>
+                                    handleUninstallClick(service.id)
+                                  }
+                                  variant="destructive"
+                                >
+                                  Uninstall
+                                </DropdownMenuItem>
+                              </DropdownMenuContent>
+                            </DropdownMenu>
                           </>
                         )}
                       </div>

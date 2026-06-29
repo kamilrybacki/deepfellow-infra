@@ -1,3 +1,4 @@
+import { Button } from "@/components/ui/button";
 /*
 DeepFellow Software Framework.
 Copyright © 2025 Simplito sp. z o.o.
@@ -9,7 +10,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 import { Input } from "@/components/ui/input";
-import { Button } from "@/components/ui/button";
 import { Plus, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
@@ -55,7 +55,9 @@ export function MapInput({ value, onChange, placeholder }: MapInputProps) {
 
   const handleKeyChange = (rowId: string, newKey: string) => {
     setRows((prev) => {
-      const next = prev.map((r) => (r.id === rowId ? { ...r, keyText: newKey } : r));
+      const next = prev.map((r) =>
+        r.id === rowId ? { ...r, keyText: newKey } : r,
+      );
       emitChange(next);
       return next;
     });
@@ -63,7 +65,9 @@ export function MapInput({ value, onChange, placeholder }: MapInputProps) {
 
   const handleValueChange = (rowId: string, newValue: string) => {
     setRows((prev) => {
-      const next = prev.map((r) => (r.id === rowId ? { ...r, valueText: newValue } : r));
+      const next = prev.map((r) =>
+        r.id === rowId ? { ...r, valueText: newValue } : r,
+      );
       emitChange(next);
       return next;
     });
@@ -72,7 +76,9 @@ export function MapInput({ value, onChange, placeholder }: MapInputProps) {
   const handleRemove = (rowId: string) => {
     setRows((prev) => {
       const filtered = prev.filter((r) => r.id !== rowId);
-      const next = filtered.length ? filtered : [{ id: newRowId(), keyText: "", valueText: "" }];
+      const next = filtered.length
+        ? filtered
+        : [{ id: newRowId(), keyText: "", valueText: "" }];
       emitChange(next);
       return next;
     });
@@ -99,7 +105,11 @@ export function MapInput({ value, onChange, placeholder }: MapInputProps) {
             variant="ghost"
             size="icon"
             onClick={() => handleRemove(row.id)}
-            disabled={rows.length === 1 && row.keyText.trim() === "" && row.valueText.trim() === ""}
+            disabled={
+              rows.length === 1 &&
+              row.keyText.trim() === "" &&
+              row.valueText.trim() === ""
+            }
           >
             <X className="h-4 w-4" />
           </Button>
@@ -124,12 +134,14 @@ function serializeMap(map: Record<string, string>): string {
   return JSON.stringify(sorted);
 }
 
-function mapToRows<RowType extends { id: string; keyText: string; valueText: string }>(
-  value: Record<string, string>
-): RowType[] {
+function mapToRows<
+  RowType extends { id: string; keyText: string; valueText: string },
+>(value: Record<string, string>): RowType[] {
   const entries = Object.entries(value);
   if (entries.length === 0) {
     return [{ id: newRowId(), keyText: "", valueText: "" } as RowType];
   }
-  return entries.map(([k, v]) => ({ id: newRowId(), keyText: k, valueText: v } as RowType));
+  return entries.map(
+    ([k, v]) => ({ id: newRowId(), keyText: k, valueText: v }) as RowType,
+  );
 }

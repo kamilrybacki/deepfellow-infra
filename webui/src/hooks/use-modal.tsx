@@ -9,14 +9,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 import {
+  type ComponentType,
+  type ReactNode,
   createContext,
   memo,
   useCallback,
   useContext,
   useMemo,
   useState,
-  type ComponentType,
-  type ReactNode,
 } from "react";
 
 /**
@@ -47,7 +47,7 @@ interface ModalContextValue {
   /**
    * Open a modal with a component and its props.
    * The `open` and `onOpenChange` props are injected automatically.
-   * 
+   *
    * @example
    * modal.open(ConfirmModal, {
    *   title: "Delete item?",
@@ -56,9 +56,9 @@ interface ModalContextValue {
    */
   open<P extends ModalProps>(
     Component: ComponentType<P>,
-    props: Omit<P, keyof ModalProps>
+    props: Omit<P, keyof ModalProps>,
   ): { close: () => void };
-  
+
   /**
    * Close the currently open modal.
    */
@@ -78,24 +78,33 @@ export function ModalProvider({ children }: ModalProviderProps) {
     setModalState(null);
   }, []);
 
-  const open = useCallback(<P extends ModalProps>(
-    Component: ComponentType<P>,
-    props: Omit<P, keyof ModalProps>
-  ) => {
-    setModalState({
-      Component: Component as unknown as AnyModalComponent,
-      props: props as unknown as Record<string, unknown>,
-    });
-    return { close };
-  }, [close]);
+  const open = useCallback(
+    <P extends ModalProps>(
+      Component: ComponentType<P>,
+      props: Omit<P, keyof ModalProps>,
+    ) => {
+      setModalState({
+        Component: Component as unknown as AnyModalComponent,
+        props: props as unknown as Record<string, unknown>,
+      });
+      return { close };
+    },
+    [close],
+  );
 
-  const handleOpenChange = useCallback((isOpen: boolean) => {
-    if (!isOpen) {
-      close();
-    }
-  }, [close]);
+  const handleOpenChange = useCallback(
+    (isOpen: boolean) => {
+      if (!isOpen) {
+        close();
+      }
+    },
+    [close],
+  );
 
-  const contextValue = useMemo<ModalContextValue>(() => ({ open, close }), [open, close]);
+  const contextValue = useMemo<ModalContextValue>(
+    () => ({ open, close }),
+    [open, close],
+  );
 
   return (
     <ModalContext.Provider value={contextValue}>
@@ -113,17 +122,17 @@ export function ModalProvider({ children }: ModalProviderProps) {
 
 /**
  * Hook to access the modal system.
- * 
+ *
  * @example
  * const modal = useModal();
- * 
+ *
  * // Open a confirm modal
  * modal.open(ConfirmModal, {
  *   title: "Delete?",
  *   description: "This cannot be undone.",
  *   onConfirm: () => deleteMutation.mutate(),
  * });
- * 
+ *
  * // Open a content modal
  * modal.open(ContentModal, {
  *   title: "Logs",

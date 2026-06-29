@@ -1,3 +1,4 @@
+import { Button } from "@/components/ui/button";
 /*
 DeepFellow Software Framework.
 Copyright © 2025 Simplito sp. z o.o.
@@ -14,9 +15,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Button } from "@/components/ui/button";
-import { CheckCircle2, XCircle, Loader2 } from "lucide-react";
 import type { TestResult } from "@/deepfellow/types";
+import { CheckCircle2, Loader2, XCircle } from "lucide-react";
 
 interface TestResultModalProps {
   open: boolean;
@@ -26,7 +26,13 @@ interface TestResultModalProps {
   onCancel?: () => void;
 }
 
-export function TestResultModal({ open, onOpenChange, result, isLoading = false, onCancel }: TestResultModalProps) {
+export function TestResultModal({
+  open,
+  onOpenChange,
+  result,
+  isLoading = false,
+  onCancel,
+}: TestResultModalProps) {
   const renderOutput = () => {
     if (!result.output) return null;
 
@@ -34,13 +40,21 @@ export function TestResultModal({ open, onOpenChange, result, isLoading = false,
       return <div className="mt-4 p-4 bg-muted rounded">{result.output}</div>;
     }
 
-    const { content_type, data } = result.output as { content_type?: string; data?: string };
+    const { content_type, data } = result.output as {
+      content_type?: string;
+      data?: string;
+    };
 
     if (content_type?.startsWith("audio/")) {
       return (
         <div className="mt-4">
           <audio controls className="w-full">
-            <source src={`data:${content_type};base64,${data}`} type={content_type} />
+            <source
+              src={`data:${content_type};base64,${data}`}
+              type={content_type}
+            />
+            {/* Generated audio output has no captions track available. */}
+            <track kind="captions" />
           </audio>
         </div>
       );
@@ -60,7 +74,10 @@ export function TestResultModal({ open, onOpenChange, result, isLoading = false,
 
     return (
       <div className="mt-4 p-4 bg-muted rounded">
-        <pre className="text-sm overflow-auto max-h-64 whitespace-pre-wrap" style={{ lineBreak: "anywhere" }}>
+        <pre
+          className="text-sm overflow-auto max-h-64 whitespace-pre-wrap"
+          style={{ lineBreak: "anywhere" }}
+        >
           {JSON.stringify(result.output, null, 2)}
         </pre>
       </div>
@@ -113,7 +130,10 @@ export function TestResultModal({ open, onOpenChange, result, isLoading = false,
             {result.details && (
               <div>
                 <h3 className="font-semibold mb-2">Details:</h3>
-                <pre className="p-4 bg-muted rounded text-sm overflow-auto max-h-48 whitespace-pre-wrap" style={({lineBreak: "anywhere"})}>
+                <pre
+                  className="p-4 bg-muted rounded text-sm overflow-auto max-h-48 whitespace-pre-wrap"
+                  style={{ lineBreak: "anywhere" }}
+                >
                   {JSON.stringify(result.details, null, 2)}
                 </pre>
               </div>
@@ -123,16 +143,14 @@ export function TestResultModal({ open, onOpenChange, result, isLoading = false,
 
         <div className="flex justify-end mt-4">
           {isLoading ? (
-            <Button 
-              onClick={onCancel || (() => onOpenChange(false))} 
+            <Button
+              onClick={onCancel || (() => onOpenChange(false))}
               variant="outline"
             >
               Cancel
             </Button>
           ) : (
-            <Button onClick={() => onOpenChange(false)}>
-              OK
-            </Button>
+            <Button onClick={() => onOpenChange(false)}>OK</Button>
           )}
         </div>
       </DialogContent>

@@ -1,3 +1,5 @@
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
 /*
 DeepFellow Software Framework.
 Copyright © 2025 Simplito sp. z o.o.
@@ -16,9 +18,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Button } from "@/components/ui/button";
 import { AlertTriangle } from "lucide-react";
-import { Alert, AlertDescription } from "@/components/ui/alert";
 
 interface WarningsModalProps {
   open: boolean;
@@ -52,12 +52,17 @@ export function WarningsModal({
             Installation Warnings
           </DialogTitle>
           <DialogDescription>
-            The following warnings were detected during installation. Do you want to continue?
+            The following warnings were detected during installation. Do you
+            want to continue?
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-2 max-h-[400px] overflow-y-auto">
-          {warnings.map((warning, index) => (
-            <Alert key={index} variant="default" className="border-yellow-500">
+          {warnings.map((warning) => (
+            <Alert
+              key={warning}
+              variant="default"
+              className="border-yellow-500"
+            >
               <AlertTriangle className="h-4 w-4 text-yellow-500" />
               <AlertDescription className="text-sm">{warning}</AlertDescription>
             </Alert>

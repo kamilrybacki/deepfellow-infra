@@ -23,12 +23,21 @@ export interface SimulationConfig {
 
 export interface SimulationHandle {
   stop: () => void;
-  smoothComplete: (durationMs?: number, onDone?: () => void, currentValue?: number) => void;
+  smoothComplete: (
+    durationMs?: number,
+    onDone?: () => void,
+    currentValue?: number,
+  ) => void;
 }
 
-export function startProgressSimulation(config: SimulationConfig): SimulationHandle {
+export function startProgressSimulation(
+  config: SimulationConfig,
+): SimulationHandle {
   let stopped = false;
-  let simulated = Math.min(MAX_SIMULATED, Math.max(0, config.initialValue ?? 0));
+  let simulated = Math.min(
+    MAX_SIMULATED,
+    Math.max(0, config.initialValue ?? 0),
+  );
   let smoothing = false;
   let smoothStep = 0;
   let onSmoothDone: (() => void) | undefined;
@@ -55,11 +64,16 @@ export function startProgressSimulation(config: SimulationConfig): SimulationHan
       stopped = true;
       clearInterval(id);
     },
-    smoothComplete: (durationMs = COMPLETION_SMOOTH_MS, onDone?: () => void, currentValue?: number) => {
+    smoothComplete: (
+      durationMs = COMPLETION_SMOOTH_MS,
+      onDone?: () => void,
+      currentValue?: number,
+    ) => {
       // Sync with the store's current value — real SSE data may have advanced past the
       // simulation's internal position (whose updates were ignored by monotonicity rules),
       // so without this the animation would waste time replaying already-visible values.
-      if (currentValue !== undefined && currentValue > simulated) simulated = currentValue;
+      if (currentValue !== undefined && currentValue > simulated)
+        simulated = currentValue;
       const remaining = 1 - simulated;
       if (remaining <= 0) {
         stopped = true;
@@ -79,7 +93,7 @@ function parseSizeGb(sizeStr: string): number | null {
   const match = sizeStr.match(/([0-9.]+)\s*(MB|GB|TB)/i);
   if (!match) return null;
 
-  const value = parseFloat(match[1]);
+  const value = Number.parseFloat(match[1]);
   const unit = match[2].toUpperCase();
 
   if (unit === "MB") return value / 1024;
@@ -87,7 +101,10 @@ function parseSizeGb(sizeStr: string): number | null {
   return value;
 }
 
-export function getStepPerTick(size: string | Record<string, string>, multiplier: number = 1): number {
+export function getStepPerTick(
+  size: string | Record<string, string>,
+  multiplier = 1,
+): number {
   const candidates = typeof size === "string" ? [size] : Object.values(size);
   let maxGb: number | null = null;
 
@@ -99,5 +116,5 @@ export function getStepPerTick(size: string | Record<string, string>, multiplier
   }
 
   if (maxGb === null) return 0.0001;
-  return multiplier * 0.001 / maxGb
+  return (multiplier * 0.001) / maxGb;
 }

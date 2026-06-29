@@ -145,7 +145,6 @@ export interface UninstallRequest {
   purge: boolean;
 }
 
-
 export class InstallationWarningsError extends Error {
   warnings: string[];
 

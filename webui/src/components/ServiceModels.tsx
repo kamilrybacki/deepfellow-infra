@@ -139,7 +139,7 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
     spec: AddMcpServerSpec | ProxyMcpServerSpec;
   } | null>(null);
   const [mcpApiError, setMcpApiError] = useState<string | null>(null);
-const [showEntrySkeleton, setShowEntrySkeleton] = useState(true);
+  const [showEntrySkeleton, setShowEntrySkeleton] = useState(true);
   const [installingModelId, setInstallingModelId] = useState<string | null>(
     null,
   );
@@ -155,7 +155,9 @@ const [showEntrySkeleton, setShowEntrySkeleton] = useState(true);
   const toastIdsRef = useRef<Record<string, string | number>>({});
   const restartDockerToastIdRef = useRef<string | number | null>(null);
   const testAbortControllerRef = useRef<AbortController | null>(null);
-  const installAbortControllersRef = useRef<Record<string, AbortController>>({});
+  const installAbortControllersRef = useRef<Record<string, AbortController>>(
+    {},
+  );
   const cancelledInstallsRef = useRef<Set<string>>(new Set());
   const queryClient = useQueryClient();
 
@@ -393,7 +395,9 @@ const [showEntrySkeleton, setShowEntrySkeleton] = useState(true);
         toast.dismiss(toastId);
         delete toastIdsRef.current[modelId];
       }
-      toast.success(`Installation cancelled for ${modelId}`, { duration: 8000 });
+      toast.success(`Installation cancelled for ${modelId}`, {
+        duration: 8000,
+      });
 
       setInstallingModelId(null);
 
@@ -402,17 +406,22 @@ const [showEntrySkeleton, setShowEntrySkeleton] = useState(true);
         await apiClient.cancelAdminServiceModelInstall(serviceId, modelId);
       } catch (error) {
         // A 404 just means the install already finished/cleared on the backend — safe to ignore.
-        const isAlreadyGone = error instanceof Error && error.message.includes("HTTP 404");
+        const isAlreadyGone =
+          error instanceof Error && error.message.includes("HTTP 404");
         if (!isAlreadyGone) {
-          toast.error(`Failed to cancel installation for ${modelId} — please try again`);
+          toast.error(
+            `Failed to cancel installation for ${modelId} — please try again`,
+          );
         }
         console.error(`Failed to cancel install for ${modelId}:`, error);
       }
 
       // Let reconciliation confirm the reset.
-      queryClient.invalidateQueries({ queryKey: ["admin", "services", serviceId, "models"] });
+      queryClient.invalidateQueries({
+        queryKey: ["admin", "services", serviceId, "models"],
+      });
     },
-    [serviceId, queryClient]
+    [serviceId, queryClient],
   );
 
   // Shared sonner options for an installing model's progress toast, including the Cancel action.
@@ -421,7 +430,7 @@ const [showEntrySkeleton, setShowEntrySkeleton] = useState(true);
       id: toastId,
       action: { label: "Cancel", onClick: () => handleCancelInstall(modelId) },
     }),
-    [handleCancelInstall]
+    [handleCancelInstall],
   );
 
   // Render the progress toast from the store, so its % matches the table row.
@@ -431,13 +440,26 @@ const [showEntrySkeleton, setShowEntrySkeleton] = useState(true);
       if (!toastId) return;
       const progress = getSnapshot().models[`${serviceId}::${modelId}`];
       if (!progress) return;
-      toast.loading(`${getStageLabel(progress.stage)} ${modelId}: ${(progress.value * 100).toFixed(1)}%`, progressToastOptions(modelId, toastId));
+      toast.loading(
+        `${getStageLabel(progress.stage)} ${modelId}: ${(progress.value * 100).toFixed(1)}%`,
+        progressToastOptions(modelId, toastId),
+      );
     },
-    [serviceId, progressToastOptions]
+    [serviceId, progressToastOptions],
   );
 
   const installMutation = useMutation({
-    mutationFn: async ({ modelId, spec, size, ignoreWarnings = false }: { modelId: string; spec: Record<string, unknown>; size?: string; ignoreWarnings?: boolean }) => {
+    mutationFn: async ({
+      modelId,
+      spec,
+      size,
+      ignoreWarnings = false,
+    }: {
+      modelId: string;
+      spec: Record<string, unknown>;
+      size?: string;
+      ignoreWarnings?: boolean;
+    }) => {
       const abortController = new AbortController();
       installAbortControllersRef.current[modelId] = abortController;
       try {
@@ -466,43 +488,52 @@ const [showEntrySkeleton, setShowEntrySkeleton] = useState(true);
                 const stage = event.stage;
                 const value = event.value;
 
-              if (event.type === "progress" && stage && value !== undefined) {
-                currentStage = stage;
-                hasRealProgressByModelRef.current[modelId] = true;
-                setModelInstallProgress(serviceId, modelId, { stage, value });
-                syncProgressToast(modelId);
-              } else if (event.type === "finish") {
-                if (event.status === "ok") {
-                  sim.smoothComplete(
-                    Math.max(COMPLETION_SMOOTH_MIN_MS, Math.min(Date.now() - installStartTime, COMPLETION_SMOOTH_MS)),
-                    () => {
-                      delete simulationStopFnsRef.current[simKey];
-                      // Do NOT clear progress here — reconciliation clears it once the
-                      // backend confirms the model is no longer in-progress. Clearing early
-                      // would cause the bar to jump back to the stale backend value.
-                      const toastId = toastIdsRef.current[modelId];
-                      if (toastId) {
-                        // action: undefined removes the Cancel button — the install is done.
-                        toast.success(`Model ${modelId} installed successfully`, { id: toastId, action: undefined });
-                        delete toastIdsRef.current[modelId];
-                      }
-                      resolve();
-                    },
-                    getSnapshot().models[simKey]?.value
-                  );
-                } else {
-                  sim.stop();
-                  delete simulationStopFnsRef.current[simKey];
-                  reject(new Error(event.details || "Installation failed"));
+                if (event.type === "progress" && stage && value !== undefined) {
+                  currentStage = stage;
+                  hasRealProgressByModelRef.current[modelId] = true;
+                  setModelInstallProgress(serviceId, modelId, { stage, value });
+                  syncProgressToast(modelId);
+                } else if (event.type === "finish") {
+                  if (event.status === "ok") {
+                    sim.smoothComplete(
+                      Math.max(
+                        COMPLETION_SMOOTH_MIN_MS,
+                        Math.min(
+                          Date.now() - installStartTime,
+                          COMPLETION_SMOOTH_MS,
+                        ),
+                      ),
+                      () => {
+                        delete simulationStopFnsRef.current[simKey];
+                        // Do NOT clear progress here — reconciliation clears it once the
+                        // backend confirms the model is no longer in-progress. Clearing early
+                        // would cause the bar to jump back to the stale backend value.
+                        const toastId = toastIdsRef.current[modelId];
+                        if (toastId) {
+                          // action: undefined removes the Cancel button — the install is done.
+                          toast.success(
+                            `Model ${modelId} installed successfully`,
+                            { id: toastId, action: undefined },
+                          );
+                          delete toastIdsRef.current[modelId];
+                        }
+                        resolve();
+                      },
+                      getSnapshot().models[simKey]?.value,
+                    );
+                  } else {
+                    sim.stop();
+                    delete simulationStopFnsRef.current[simKey];
+                    reject(new Error(event.details || "Installation failed"));
+                  }
                 }
-              }
-            },
-            ignoreWarnings,
-            abortController.signal
-          ).catch(reject);
+              },
+              ignoreWarnings,
+              abortController.signal,
+            )
+            .catch(reject);
         });
-      }
-      catch (e) {
+      } catch (e) {
         // Intentional cancel: the UI was already reset by handleCancelInstall — swallow the AbortError.
         if (cancelledInstallsRef.current.has(modelId)) {
           cancelledInstallsRef.current.delete(modelId);
@@ -512,11 +543,13 @@ const [showEntrySkeleton, setShowEntrySkeleton] = useState(true);
         const toastId = toastIdsRef.current[modelId];
         if (toastId) {
           // action: undefined removes the Cancel button — there is nothing left to cancel.
-          toast.error(`Failed to install model ${modelId}: ${(e instanceof Error ? e.message : "") || "Installation failed"}`, { id: toastId, action: undefined });
+          toast.error(
+            `Failed to install model ${modelId}: ${(e instanceof Error ? e.message : "") || "Installation failed"}`,
+            { id: toastId, action: undefined },
+          );
           delete toastIdsRef.current[modelId];
         }
-      }
-      finally {
+      } finally {
         delete installAbortControllersRef.current[modelId];
       }
     },
@@ -733,8 +766,12 @@ const [showEntrySkeleton, setShowEntrySkeleton] = useState(true);
         payload.kind === "docker"
           ? {
               ...payload.data,
-              ...(payload.repository_url ? { repository_url: payload.repository_url } : {}),
-              ...(payload.description ? { description: payload.description } : {}),
+              ...(payload.repository_url
+                ? { repository_url: payload.repository_url }
+                : {}),
+              ...(payload.description
+                ? { description: payload.description }
+                : {}),
             }
           : (payload as unknown as Record<string, unknown>);
       return apiClient.addCustomModel(serviceId, spec);
@@ -787,10 +824,16 @@ const [showEntrySkeleton, setShowEntrySkeleton] = useState(true);
       queryClient.invalidateQueries({
         queryKey: ["admin", "services", serviceId, "models"],
       });
-      toast.success(isOllamaExternal ? "Models synced successfully" : "Models refreshed successfully");
+      toast.success(
+        isOllamaExternal
+          ? "Models synced successfully"
+          : "Models refreshed successfully",
+      );
     },
     onError: (error) => {
-      toast.error(`Failed to ${isOllamaExternal ? "sync" : "refresh"} models: ${error.message}`);
+      toast.error(
+        `Failed to ${isOllamaExternal ? "sync" : "refresh"} models: ${error.message}`,
+      );
     },
   });
 
@@ -1618,7 +1661,10 @@ const ModelRow = memo(function ModelRow({
           )}
         </div>
         {model.description && (
-          <div className="text-xs text-muted-foreground font-normal mt-0.5" title={stripMarkdownLinks(model.description)}>
+          <div
+            className="text-xs text-muted-foreground font-normal mt-0.5"
+            title={stripMarkdownLinks(model.description)}
+          >
             {renderMarkdownLinks(model.description)}
           </div>
         )}

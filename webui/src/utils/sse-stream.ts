@@ -54,7 +54,7 @@ class SSEStream {
 
 export async function readSSEStream(
   response: Response,
-  onProgress: (data: ProgressEvent) => void
+  onProgress: (data: ProgressEvent) => void,
 ): Promise<void> {
   const reader = response.body?.getReader();
   if (!reader) {

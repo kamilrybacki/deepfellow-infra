@@ -8,7 +8,7 @@ This software is Licensed under the DeepFellow Free License.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   clearModelInstallProgress,
   clearServiceInstallProgress,
@@ -30,7 +30,10 @@ describe("setServiceInstallProgress", () => {
   it("stores the given progress", () => {
     const id = uid();
     setServiceInstallProgress(id, { stage: "download", value: 0.4 });
-    expect(getSnapshot().services[id]).toEqual({ stage: "download", value: 0.4 });
+    expect(getSnapshot().services[id]).toEqual({
+      stage: "download",
+      value: 0.4,
+    });
   });
 
   // ── Bug 2 / monotonicity — value regression ───────────────────────────────
@@ -82,7 +85,10 @@ describe("setServiceInstallProgress", () => {
       setServiceInstallProgress(id, { stage: "download", value: 1.0 });
       setServiceInstallProgress(id, { stage: "install", value: 0.5 });
       setServiceInstallProgress(id, { stage: "install", value: 0.8 });
-      expect(getSnapshot().services[id]).toEqual({ stage: "install", value: 0.8 });
+      expect(getSnapshot().services[id]).toEqual({
+        stage: "install",
+        value: 0.8,
+      });
     });
   });
 
@@ -140,7 +146,10 @@ describe("clearServiceInstallProgress", () => {
     setServiceInstallProgress(id, { stage: "install", value: 0.9 });
     clearServiceInstallProgress(id);
     setServiceInstallProgress(id, { stage: "download", value: 0.4 }); // backend reported 40%
-    expect(getSnapshot().services[id]).toEqual({ stage: "download", value: 0.4 });
+    expect(getSnapshot().services[id]).toEqual({
+      stage: "download",
+      value: 0.4,
+    });
   });
 
   it("is a no-op when the entry does not exist", () => {
@@ -157,7 +166,10 @@ describe("setModelInstallProgress", () => {
     const svc = uid();
     const mdl = uid();
     setModelInstallProgress(svc, mdl, { stage: "download", value: 0.35 });
-    expect(getSnapshot().models[`${svc}::${mdl}`]).toEqual({ stage: "download", value: 0.35 });
+    expect(getSnapshot().models[`${svc}::${mdl}`]).toEqual({
+      stage: "download",
+      value: 0.35,
+    });
   });
 
   it("tracks multiple models independently", () => {
@@ -197,7 +209,10 @@ describe("clearModelInstallProgress", () => {
     setModelInstallProgress(svc, mdl, { stage: "install", value: 0.95 });
     clearModelInstallProgress(svc, mdl);
     setModelInstallProgress(svc, mdl, { stage: "download", value: 0.5 });
-    expect(getSnapshot().models[`${svc}::${mdl}`]).toEqual({ stage: "download", value: 0.5 });
+    expect(getSnapshot().models[`${svc}::${mdl}`]).toEqual({
+      stage: "download",
+      value: 0.5,
+    });
   });
 });
 

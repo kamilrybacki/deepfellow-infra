@@ -1,3 +1,15 @@
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
+import { cn } from "@/lib/utils";
 /*
 DeepFellow Software Framework.
 Copyright © 2025 Simplito sp. z o.o.
@@ -9,18 +21,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 import { useId, useState } from "react";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Label } from "@/components/ui/label";
-import { cn } from "@/lib/utils";
 
 interface UninstallWithPurgeModalProps {
   open: boolean;
@@ -70,7 +70,10 @@ export function UninstallWithPurgeModal({
         </DialogHeader>
 
         <div className="rounded-md border bg-muted/30 p-3">
-          <label htmlFor={checkboxId} className="flex items-start gap-3 cursor-pointer">
+          <label
+            htmlFor={checkboxId}
+            className="flex items-start gap-3 cursor-pointer"
+          >
             <Checkbox
               id={checkboxId}
               checked={purgeChecked}
@@ -78,10 +81,15 @@ export function UninstallWithPurgeModal({
               onCheckedChange={(checked) => setPurgeChecked(checked === true)}
             />
             <div className="grid gap-1">
-              <Label htmlFor={checkboxId} className="leading-none cursor-pointer select-none">
+              <Label
+                htmlFor={checkboxId}
+                className="leading-none cursor-pointer select-none"
+              >
                 {purgeLabel}
               </Label>
-              <p className="text-sm text-muted-foreground">{purgeDescription}</p>
+              <p className="text-sm text-muted-foreground">
+                {purgeDescription}
+              </p>
             </div>
           </label>
         </div>
@@ -102,7 +110,7 @@ export function UninstallWithPurgeModal({
             variant={variant === "destructive" ? "destructive" : "default"}
             className={cn(
               variant === "warning" &&
-                "bg-yellow-500 hover:bg-yellow-600 text-white focus-visible:ring-yellow-500/20 dark:bg-yellow-600 dark:hover:bg-yellow-700"
+                "bg-yellow-500 hover:bg-yellow-600 text-white focus-visible:ring-yellow-500/20 dark:bg-yellow-600 dark:hover:bg-yellow-700",
             )}
           >
             {isLoading ? "Processing..." : confirmText}

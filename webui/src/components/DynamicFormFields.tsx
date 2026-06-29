@@ -78,7 +78,11 @@ export function DynamicFormFields({
             </div>
           ) : field.type === "oneof" ? (
             <Select
-              value={(formData[field.name] as string | undefined) || (field.default as string | undefined) || "__none__"}
+              value={
+                (formData[field.name] as string | undefined) ||
+                (field.default as string | undefined) ||
+                "__none__"
+              }
               onValueChange={(value) =>
                 onChange(field.name, value === "__none__" ? "" : value)
               }

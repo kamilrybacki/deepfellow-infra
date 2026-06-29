@@ -104,7 +104,12 @@ export interface AddMcpServerSpec {
 
 export type AddMcpServerPayload =
   | AddMcpServerSpec
-  | { kind: "docker"; data: Record<string, unknown>; repository_url?: string; description?: string }
+  | {
+      kind: "docker";
+      data: Record<string, unknown>;
+      repository_url?: string;
+      description?: string;
+    }
   | {
       kind: "proxy";
       id: string;

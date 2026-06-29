@@ -29,7 +29,9 @@ function normalizeType(type: string): string {
   return type;
 }
 
-function groupModels(models: MeshTopologyModel[]): [string, MeshTopologyModel[]][] {
+function groupModels(
+  models: MeshTopologyModel[],
+): [string, MeshTopologyModel[]][] {
   const groups = new Map<string, MeshTopologyModel[]>();
   for (const m of models) {
     const key = normalizeType(m.type);
@@ -82,7 +84,8 @@ export function MeshModelGroups({
     <div className={className}>
       {groups.map(([key, items]) => {
         const isCollapsed = collapsed.has(key);
-        const label = TYPE_LABELS[key] ?? (key.charAt(0).toUpperCase() + key.slice(1));
+        const label =
+          TYPE_LABELS[key] ?? key.charAt(0).toUpperCase() + key.slice(1);
         return (
           <div key={key}>
             <button
