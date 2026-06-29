@@ -8,7 +8,7 @@ This software is Licensed under the DeepFellow Free License.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { startProgressSimulation } from "./progress-simulation";
 
 const TICK_MS = 50;
@@ -139,7 +139,13 @@ describe("startProgressSimulation", () => {
         onTick: () => {},
       });
       // Pass currentValue near 1 so smoothComplete completes quickly
-      sim.smoothComplete(TICK_MS * 2, () => { done = true; }, 0.999);
+      sim.smoothComplete(
+        TICK_MS * 2,
+        () => {
+          done = true;
+        },
+        0.999,
+      );
       vi.advanceTimersByTime(TICK_MS * 10);
 
       expect(done).toBe(true);
@@ -152,7 +158,13 @@ describe("startProgressSimulation", () => {
         initialValue: 1,
         onTick: () => {},
       });
-      sim.smoothComplete(5000, () => { done = true; }, 1);
+      sim.smoothComplete(
+        5000,
+        () => {
+          done = true;
+        },
+        1,
+      );
       vi.advanceTimersByTime(0); // synchronous completion
 
       expect(done).toBe(true);
@@ -162,7 +174,10 @@ describe("startProgressSimulation", () => {
   // ── General behaviour ─────────────────────────────────────────────────────
   it("stop() halts all ticks immediately", () => {
     const ticks: number[] = [];
-    const sim = startProgressSimulation({ stepPerTick: 0.1, onTick: (v) => ticks.push(v) });
+    const sim = startProgressSimulation({
+      stepPerTick: 0.1,
+      onTick: (v) => ticks.push(v),
+    });
     vi.advanceTimersByTime(TICK_MS * 4);
     const countBefore = ticks.length;
     sim.stop();
@@ -173,7 +188,10 @@ describe("startProgressSimulation", () => {
 
   it("value never exceeds 1.0 during normal progression", () => {
     const ticks: number[] = [];
-    const sim = startProgressSimulation({ stepPerTick: 0.5, onTick: (v) => ticks.push(v) });
+    const sim = startProgressSimulation({
+      stepPerTick: 0.5,
+      onTick: (v) => ticks.push(v),
+    });
     vi.advanceTimersByTime(TICK_MS * 100);
     sim.stop();
 

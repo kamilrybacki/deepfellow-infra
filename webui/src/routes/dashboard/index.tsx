@@ -1,3 +1,6 @@
+import { ServicesList } from "@/components/ServicesList";
+import { SiteHeader } from "@/components/dashboard/site-header";
+import { useRequireAuth } from "@/hooks/use-auth";
 /*
 DeepFellow Software Framework.
 Copyright © 2025 Simplito sp. z o.o.
@@ -9,9 +12,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 import { createFileRoute } from "@tanstack/react-router";
-import { ServicesList } from "@/components/ServicesList";
-import { SiteHeader } from "@/components/dashboard/site-header";
-import { useRequireAuth } from "@/hooks/use-auth";
 
 export const Route = createFileRoute("/dashboard/")({
   component: DashboardPage,

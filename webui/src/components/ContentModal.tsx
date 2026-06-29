@@ -1,3 +1,4 @@
+import { Button } from "@/components/ui/button";
 /*
 DeepFellow Software Framework.
 Copyright © 2025 Simplito sp. z o.o.
@@ -14,7 +15,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Button } from "@/components/ui/button";
 import { Loader2 } from "lucide-react";
 
 interface ContentModalProps {
@@ -44,7 +44,7 @@ export function ContentModal({
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
         </DialogHeader>
-        
+
         {isLoading ? (
           <div className="flex flex-col items-center justify-center py-8 space-y-4">
             <Loader2 className="h-8 w-8 animate-spin text-primary" />
@@ -61,11 +61,11 @@ export function ContentModal({
             )}
           </div>
         )}
-        
+
         <div className="flex justify-end">
           {isLoading ? (
-            <Button 
-              onClick={onCancel || (() => onOpenChange(false))} 
+            <Button
+              onClick={onCancel || (() => onOpenChange(false))}
               variant="outline"
             >
               Cancel
@@ -78,5 +78,3 @@ export function ContentModal({
     </Dialog>
   );
 }
-
-

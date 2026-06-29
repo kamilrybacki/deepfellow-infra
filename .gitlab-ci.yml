@@ -65,6 +65,16 @@ check-auth:
   except:
     - tags
 
+biome:
+  stage: analysis
+  image: node:24-alpine
+  script:
+    - cd webui
+    - npm ci
+    - npx biome check src
+  except:
+    - tags
+
 pytest:
   <<: *uv
   stage: test

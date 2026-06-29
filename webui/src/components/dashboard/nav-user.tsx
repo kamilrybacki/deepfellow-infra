@@ -1,3 +1,6 @@
+import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Button } from "@/components/ui/button";
+import { SidebarMenu, SidebarMenuItem } from "@/components/ui/sidebar";
 /*
 DeepFellow Software Framework.
 Copyright © 2025 Simplito sp. z o.o.
@@ -9,12 +12,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 import { LogOut, User } from "lucide-react";
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { Button } from "@/components/ui/button";
-import {
-  SidebarMenu,
-  SidebarMenuItem,
-} from "@/components/ui/sidebar";
 
 interface NavUserProps {
   user: {

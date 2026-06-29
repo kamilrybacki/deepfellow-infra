@@ -17,7 +17,6 @@ import type { ModalProps } from "@/hooks/use-modal";
 import { useQuery } from "@tanstack/react-query";
 import type { Node } from "@xyflow/react";
 import { AlertCircle, Loader2, Server } from "lucide-react";
-import { MeshModelGroups } from "./MeshModelGroups";
 /*
 DeepFellow Software Framework.
 Copyright © 2025 Simplito sp. z o.o.
@@ -34,6 +33,7 @@ import {
   MeshGraph,
   type ServiceNodeData,
 } from "./MeshGraph";
+import { MeshModelGroups } from "./MeshModelGroups";
 
 interface MeshInfoModalProps extends ModalProps {}
 

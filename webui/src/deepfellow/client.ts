@@ -510,7 +510,9 @@ export class DeepFellowClient {
   }
 
   async getSystemStats(): Promise<SystemStats> {
-    return this.makeRequest<SystemStats>("/admin/settings/hardware/system-stats");
+    return this.makeRequest<SystemStats>(
+      "/admin/settings/hardware/system-stats",
+    );
   }
 
   async getMeshInfo(): Promise<ShowMeshInfoOut> {

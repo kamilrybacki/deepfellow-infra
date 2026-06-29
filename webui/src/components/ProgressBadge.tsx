@@ -18,13 +18,17 @@ interface ProgressBadgeProps {
   simulated?: boolean;
 }
 
-export function ProgressBadge({ stage, value, variant = "default" }: ProgressBadgeProps) {
+export function ProgressBadge({
+  stage,
+  value,
+  variant = "default",
+}: ProgressBadgeProps) {
   const percentage = (value * 100).toFixed(1);
   const label = getStageLabel(stage);
 
   return (
     <Badge variant={variant}>
-        {label} {percentage}%
+      {label} {percentage}%
     </Badge>
   );
 }

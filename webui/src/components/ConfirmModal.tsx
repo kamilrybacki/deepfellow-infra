@@ -1,3 +1,4 @@
+import { Button } from "@/components/ui/button";
 /*
 DeepFellow Software Framework.
 Copyright © 2025 Simplito sp. z o.o.
@@ -16,7 +17,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 interface ConfirmModalProps {
@@ -71,7 +71,8 @@ export function ConfirmModal({
             disabled={isLoading}
             variant={variant === "destructive" ? "destructive" : "default"}
             className={cn(
-              variant === "warning" && "bg-yellow-500 hover:bg-yellow-600 text-white focus-visible:ring-yellow-500/20 dark:bg-yellow-600 dark:hover:bg-yellow-700"
+              variant === "warning" &&
+                "bg-yellow-500 hover:bg-yellow-600 text-white focus-visible:ring-yellow-500/20 dark:bg-yellow-600 dark:hover:bg-yellow-700",
             )}
           >
             {isLoading ? "Processing..." : confirmText}

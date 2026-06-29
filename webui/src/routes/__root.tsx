@@ -15,8 +15,8 @@ import {
 } from "@tanstack/react-router";
 import { useEffect } from "react";
 
-import { useAuth } from "../hooks/use-auth";
 import { Toaster } from "../components/ui/sonner";
+import { useAuth } from "../hooks/use-auth";
 import { ModalProvider } from "../hooks/use-modal";
 
 import type { QueryClient } from "@tanstack/react-query";

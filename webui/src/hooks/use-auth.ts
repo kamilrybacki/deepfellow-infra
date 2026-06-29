@@ -1,3 +1,5 @@
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { useRouter } from "@tanstack/react-router";
 /*
 DeepFellow Software Framework.
 Copyright © 2025 Simplito sp. z o.o.
@@ -8,12 +10,10 @@ This software is Licensed under the DeepFellow Free License.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-import { useState, useEffect } from "react";
-import { useRouter } from "@tanstack/react-router";
-import { useQuery, useMutation } from "@tanstack/react-query";
-import { AdminApiKeyStorage } from "../lib/auth";
-import { apiClient } from "../deepfellow/client";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
+import { apiClient } from "../deepfellow/client";
+import { AdminApiKeyStorage } from "../lib/auth";
 
 export const useAuth = () => {
   const [apiKey, setApiKey] = useState<string | null>(AdminApiKeyStorage.get());
@@ -37,7 +37,8 @@ export const useAuth = () => {
       AdminApiKeyStorage.clear();
       setApiKey(null);
 
-      const errorMessage = error instanceof Error ? error.message : "Invalid API key";
+      const errorMessage =
+        error instanceof Error ? error.message : "Invalid API key";
       toast.error(`Authentication failed: ${errorMessage}`);
     },
   });

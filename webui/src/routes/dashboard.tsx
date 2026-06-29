@@ -1,3 +1,6 @@
+import { AppSidebar } from "@/components/dashboard/app-sidebar";
+import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
+import { AdminApiKeyStorage } from "@/deepfellow/client";
 /*
 DeepFellow Software Framework.
 Copyright © 2025 Simplito sp. z o.o.
@@ -9,9 +12,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 import { Outlet, createFileRoute, useNavigate } from "@tanstack/react-router";
-import { AppSidebar } from "@/components/dashboard/app-sidebar";
-import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
-import { AdminApiKeyStorage } from "@/deepfellow/client";
 
 export const Route = createFileRoute("/dashboard")({
   component: RouteComponent,

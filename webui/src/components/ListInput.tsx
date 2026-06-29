@@ -1,3 +1,4 @@
+import { Button } from "@/components/ui/button";
 /*
 DeepFellow Software Framework.
 Copyright © 2025 Simplito sp. z o.o.
@@ -9,7 +10,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 import { Input } from "@/components/ui/input";
-import { Button } from "@/components/ui/button";
 import { Plus, X } from "lucide-react";
 
 interface ListInputProps {
@@ -23,7 +23,6 @@ export function ListInput({ value, onChange, placeholder }: ListInputProps) {
     onChange([...value, ""]);
   };
 
-
   const handleRemove = (index: number) => {
     const newList = value.filter((_, i) => i !== index);
     onChange(newList);
@@ -35,6 +34,7 @@ export function ListInput({ value, onChange, placeholder }: ListInputProps) {
   return (
     <div className="space-y-2">
       {displayValue.map((item, index) => (
+        // biome-ignore lint/suspicious/noArrayIndexKey: list items are edited by position and have no stable id; a value-based key would lose input focus on every keystroke
         <div key={index} className="flex gap-2">
           <Input
             value={item}
@@ -66,5 +66,3 @@ export function ListInput({ value, onChange, placeholder }: ListInputProps) {
     </div>
   );
 }
-
-
