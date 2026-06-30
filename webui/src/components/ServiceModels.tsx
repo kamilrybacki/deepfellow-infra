@@ -1397,6 +1397,7 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
         isTestPending={testMutation.isPending}
         hasRealProgressByModelRef={hasRealProgressByModelRef}
         onInstallClick={handleInstallClick}
+        onCancelInstall={handleCancelInstall}
         onRemoveCustomModelClick={handleRemoveCustomModelClick}
         onEditMcpServerClick={handleEditMcpServerClick}
         onPurgeClick={handlePurgeClick}
@@ -1458,6 +1459,7 @@ type ModelsTableProps = {
   isTestPending: boolean;
   hasRealProgressByModelRef: RefObject<Record<string, boolean>>;
   onInstallClick: (model: ServiceModel) => void | Promise<void>;
+  onCancelInstall: (modelId: string) => void | Promise<void>;
   onRemoveCustomModelClick: (model: ServiceModel) => void;
   onEditMcpServerClick: (model: ServiceModel) => void;
   onPurgeClick: (modelId: string) => void;
@@ -1479,6 +1481,7 @@ const ModelsTable = memo(function ModelsTable({
   isTestPending,
   hasRealProgressByModelRef,
   onInstallClick,
+  onCancelInstall,
   onRemoveCustomModelClick,
   onEditMcpServerClick,
   onPurgeClick,
@@ -1542,6 +1545,7 @@ const ModelsTable = memo(function ModelsTable({
                 isTestPending={isTestPending}
                 hasRealProgressByModelRef={hasRealProgressByModelRef}
                 onInstallClick={onInstallClick}
+                onCancelInstall={onCancelInstall}
                 onRemoveCustomModelClick={onRemoveCustomModelClick}
                 onEditMcpServerClick={onEditMcpServerClick}
                 onPurgeClick={onPurgeClick}
@@ -1570,6 +1574,7 @@ type ModelRowProps = {
   isTestPending: boolean;
   hasRealProgressByModelRef: RefObject<Record<string, boolean>>;
   onInstallClick: (model: ServiceModel) => void | Promise<void>;
+  onCancelInstall: (modelId: string) => void | Promise<void>;
   onRemoveCustomModelClick: (model: ServiceModel) => void;
   onEditMcpServerClick: (model: ServiceModel) => void;
   onPurgeClick: (modelId: string) => void;
@@ -1591,6 +1596,7 @@ const ModelRow = memo(function ModelRow({
   isTestPending,
   hasRealProgressByModelRef,
   onInstallClick,
+  onCancelInstall,
   onRemoveCustomModelClick,
   onEditMcpServerClick,
   onPurgeClick,
@@ -1723,7 +1729,17 @@ const ModelRow = memo(function ModelRow({
         )}
       </TableCell>
       <TableCell className="text-right" style={{ height: "49px" }}>
-        {isInProgress || hasProgressStage ? null : !isInstalled ? (
+        {isInProgress || hasProgressStage ? (
+          <div className="flex justify-end gap-2">
+            <Button
+              onClick={() => onCancelInstall(model.id)}
+              variant="destructive"
+              size="sm"
+            >
+              Cancel
+            </Button>
+          </div>
+        ) : !isInstalled ? (
           <div className="flex justify-end gap-2">
             <Button
               onClick={() => onInstallClick(model)}
