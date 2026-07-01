@@ -534,11 +534,20 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
             .catch(reject);
         });
       } catch (e) {
+        const simKey = `${serviceId}::${modelId}`;
+        simulationStopFnsRef.current[simKey]?.stop();
+        delete simulationStopFnsRef.current[simKey];
+
         // Intentional cancel: the UI was already reset by handleCancelInstall — swallow the AbortError.
         if (cancelledInstallsRef.current.has(modelId)) {
           cancelledInstallsRef.current.delete(modelId);
           return;
         }
+
+        if (e instanceof InstallationWarningsError) {
+          throw e;
+        }
+
         clearModelInstallProgress(serviceId, modelId);
         const toastId = toastIdsRef.current[modelId];
         if (toastId) {

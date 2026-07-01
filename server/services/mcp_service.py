@@ -550,6 +550,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                         if required_envs
                         else ""
                     ),
+                    required_keys=list(required_envs) if required_envs else None,
                 ),
                 ModelField(
                     type="map",
@@ -564,6 +565,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                         if required_headers
                         else ""
                     ),
+                    required_keys=list(required_headers) if required_headers else None,
                 ),
             ]
         )
@@ -1124,29 +1126,33 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
 
     def check_envs(self, required_envs: list[str] | None, envs: dict[str, str]) -> None:
         """Check enviromental variables."""
-        if required_envs and envs:
-            missing_keys = [key for key in required_envs if key not in envs]
-            if missing_keys:
-                raise HTTPException(
-                    status_code=422, detail=f"The following required environment variables are missing: {', '.join(missing_keys)}"
-                )
+        if not required_envs:
+            return
 
-            empty_keys = [key for key in required_envs if not envs.get(key)]
-            if empty_keys:
-                raise HTTPException(
-                    status_code=422, detail=f"The following environment variables are present but have no value: {', '.join(empty_keys)}"
-                )
+        missing_keys = [key for key in required_envs if key not in envs]
+        if missing_keys:
+            raise HTTPException(
+                status_code=422, detail=f"The following required environment variables are missing: {', '.join(missing_keys)}"
+            )
+
+        empty_keys = [key for key in required_envs if not envs.get(key)]
+        if empty_keys:
+            raise HTTPException(
+                status_code=422, detail=f"The following environment variables are present but have no value: {', '.join(empty_keys)}"
+            )
 
     def check_headers(self, required_headers: list[str] | None, headers: dict[str, str]) -> None:
         """Check headers."""
-        if required_headers and headers:
-            missing_keys = [key for key in required_headers if key not in headers]
-            if missing_keys:
-                raise HTTPException(status_code=422, detail=f"The following required headers are missing: {', '.join(missing_keys)}")
+        if not required_headers:
+            return
 
-            empty_keys = [key for key in required_headers if not headers.get(key)]
-            if empty_keys:
-                raise HTTPException(status_code=422, detail=f"The following headers are present but have no value: {', '.join(empty_keys)}")
+        missing_keys = [key for key in required_headers if key not in headers]
+        if missing_keys:
+            raise HTTPException(status_code=422, detail=f"The following required headers are missing: {', '.join(missing_keys)}")
+
+        empty_keys = [key for key in required_headers if not headers.get(key)]
+        if empty_keys:
+            raise HTTPException(status_code=422, detail=f"The following headers are present but have no value: {', '.join(empty_keys)}")
 
     def _register_proxy_model(self, model: SrvMcpModel, parsed_options: McpModelOptions) -> RegistrationId:
         """Register a proxy model endpoint, choosing SSE or Streamable HTTP transport."""

@@ -44,6 +44,7 @@ export interface SpecField {
   placeholder?: string;
   values?: (string | { label: string; value: string })[]; // For oneof type
   display?: string; // Conditional display: "fieldName=value"
+  required_keys?: string[]; // For map type: keys that must be present with a non-empty value
 }
 
 export interface ServiceSpec {
