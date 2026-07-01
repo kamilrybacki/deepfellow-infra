@@ -226,6 +226,20 @@ export function validateFields(
 ): Record<string, string> {
   const errors: Record<string, string> = {};
   for (const field of fields) {
+    if (field.type === "map" && field.required_keys?.length) {
+      const map =
+        formData[field.name] && typeof formData[field.name] === "object"
+          ? (formData[field.name] as Record<string, unknown>)
+          : {};
+      const missing = field.required_keys.filter((key) => {
+        const v = map[key];
+        return v === null || v === undefined || String(v).trim() === "";
+      });
+      if (missing.length > 0) {
+        errors[field.name] = `Required: ${missing.join(", ")}`;
+        continue;
+      }
+    }
     if (!field.required) continue;
     const value = formData[field.name];
     switch (field.type) {

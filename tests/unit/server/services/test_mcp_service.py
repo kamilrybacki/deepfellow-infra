@@ -667,6 +667,14 @@ def test_check_envs_empty_value_raises_422(svc: McpService) -> None:
     assert "API_KEY" in exc_info.value.detail
 
 
+def test_check_envs_empty_dict_raises_422(svc: McpService) -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        svc.check_envs(["API_KEY"], {})
+
+    assert exc_info.value.status_code == 422
+    assert "API_KEY" in exc_info.value.detail
+
+
 def test_check_envs_all_present_and_non_empty_passes(svc: McpService) -> None:
     svc.check_envs(["API_KEY"], {"API_KEY": "secret"})
 
@@ -691,12 +699,40 @@ def test_check_headers_empty_value_raises_422(svc: McpService) -> None:
     assert "Authorization" in exc_info.value.detail
 
 
+def test_check_headers_empty_dict_raises_422(svc: McpService) -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        svc.check_headers(["Authorization"], {})
+
+    assert exc_info.value.status_code == 422
+    assert "Authorization" in exc_info.value.detail
+
+
 def test_check_headers_all_present_passes(svc: McpService) -> None:
     svc.check_headers(["Authorization"], {"Authorization": "Bearer token"})
 
 
 def test_check_headers_no_required_headers_passes(svc: McpService) -> None:
     svc.check_headers(None, {})
+
+
+def test_default_model_spec_exposes_required_env_keys(svc: McpService) -> None:
+    spec = svc.get_default_model_spec("brave-search", required_envs=["BRAVE_API_KEY"])
+    envs_field = next(f for f in spec.fields if f.name == "envs")
+    assert envs_field.required_keys == ["BRAVE_API_KEY"]
+
+
+def test_default_model_spec_exposes_required_header_keys(svc: McpService) -> None:
+    spec = svc.get_default_model_spec("serpapi", required_headers={"Authorization": "Bearer "})
+    headers_field = next(f for f in spec.fields if f.name == "headers")
+    assert headers_field.required_keys == ["Authorization"]
+
+
+def test_default_model_spec_no_required_keys_when_none(svc: McpService) -> None:
+    spec = svc.get_default_model_spec("open-websearch")
+    envs_field = next(f for f in spec.fields if f.name == "envs")
+    headers_field = next(f for f in spec.fields if f.name == "headers")
+    assert envs_field.required_keys is None
+    assert headers_field.required_keys is None
 
 
 @pytest.mark.asyncio

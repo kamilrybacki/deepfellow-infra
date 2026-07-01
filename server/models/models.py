@@ -37,6 +37,7 @@ class ModelField(BaseModel):
     placeholder: str | None = None
     required: bool = True
     values: list[OneOfOption | str] | None = None
+    required_keys: list[str] | None = None
 
 
 class ModelSpecification(BaseModel):
