@@ -168,9 +168,11 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
     api_version: str = "v1/"
     models: dict[str, dict[str, RemoteModel]]
     options_class: type[T_Options]  # set by each subclass to parse frontend input
+    _installing: set[tuple[str, str]]
 
     def _after_init(self) -> None:
         self.models = {}
+        self._installing = set()
         self.load_default_models("default")
 
     def load_default_models(self, instance: str) -> None:
@@ -413,7 +415,7 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
             has_docker=False,
         )
 
-    async def _install_model(
+    async def _install_model(  # noqa: C901
         self, instance: str, model_id: str, options: InstallModelIn
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_model_options = try_parse_pydantic(RemoteModelOptions, options.spec) if options.spec else RemoteModelOptions()
@@ -422,7 +424,8 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
         if not self.models.get(instance):
             self.models[instance] = {}
 
-        if model_id in info.models:
+        key = (instance, model_id)
+        if model_id in info.models or key in self._installing:
             return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed"))
 
         if model_id not in self.models[instance]:
@@ -430,108 +433,117 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
 
         model = self.models[instance][model_id]
         headers = info.parsed_options.headers
+        self._installing.add(key)
 
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
-            registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
-            info.models[model_id] = model_info = ModelInstalledInfo(
-                id=model_id,
-                type=model.type,
-                registered_name=registered_name,
-                options=options,
-                completions=model.completions,
-                legacy_completions=model.legacy_completions,
-                registration_id="",
-            )
+            try:
+                stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
+                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                info.models[model_id] = model_info = ModelInstalledInfo(
+                    id=model_id,
+                    type=model.type,
+                    registered_name=registered_name,
+                    options=options,
+                    completions=model.completions,
+                    legacy_completions=model.legacy_completions,
+                    registration_id="",
+                )
 
-            url_base = urljoin(info.parsed_options.api_url, self.api_version)
-            props = get_model_props(model)
-            if model.type == "llm":
-                model_info.registration_id = self.endpoint_registry.register_chat_completion_as_proxy(
-                    model=registered_name,
-                    props=props,
-                    messages=ProxyOptions(
-                        url=urljoin(url_base, "messages"),
-                        rewrite_model_to=model.real_model_name or model_id,
-                        headers=headers,
-                    )
-                    if model.messages
-                    else None,
-                    responses=ProxyOptions(
-                        url=urljoin(url_base, "responses"),
-                        rewrite_model_to=model.real_model_name or model_id,
-                        headers=headers,
-                    )
-                    if model.responses
-                    else None,
-                    chat_completions=ProxyOptions(
-                        url=urljoin(url_base, "chat/completions"),
-                        rewrite_model_to=model.real_model_name or model_id,
-                        headers=headers,
-                    )
-                    if model.completions
-                    else None,
-                    completions=ProxyOptions(
-                        url=urljoin(url_base, "completions"),
-                        rewrite_model_to=model.real_model_name or model_id,
-                        headers=headers,
-                    )
-                    if model.legacy_completions
-                    else None,
-                    ollama_chat=None,
-                    registration_options=None,
-                )
-            if model.type == "tts":
-                url = urljoin(url_base, "audio/speech")
-                model_info.registration_id = self.endpoint_registry.register_audio_speech_as_proxy(
-                    model=registered_name,
-                    props=props,
-                    options=ProxyOptions(
-                        url=url,
-                        rewrite_model_to=model.real_model_name or model_id,
-                        headers=headers,
-                    ),
-                    registration_options=None,
-                )
-            if model.type == "stt":
-                url = urljoin(url_base, "audio/transcriptions")
-                model_info.registration_id = self.endpoint_registry.register_audio_transcriptions_as_proxy(
-                    model=registered_name,
-                    props=props,
-                    options=ProxyOptions(
-                        url=url,
-                        rewrite_model_to=model.real_model_name or model_id,
-                        headers=headers,
-                    ),
-                    registration_options=None,
-                )
-            if model.type == "txt2img":
-                url = urljoin(url_base, "images/generations")
-                model_info.registration_id = self.endpoint_registry.register_image_generations_as_proxy(
-                    model=registered_name,
-                    props=props,
-                    options=ProxyOptions(
-                        url=url,
-                        rewrite_model_to=model.real_model_name or model_id,
-                        headers=headers,
-                    ),
-                    registration_options=None,
-                )
-            if model.type == "embedding":
-                url = urljoin(url_base, "embeddings")
-                model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
-                    model=registered_name,
-                    props=props,
-                    options=ProxyOptions(
-                        url=url,
-                        rewrite_model_to=model.real_model_name or model_id,
-                        headers=headers,
-                    ),
-                    registration_options=None,
-                )
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
-            self.models_downloaded[model_id] = DownloadedInfo()
-            return InstallModelOut(status="OK", details="Installed")
+                url_base = urljoin(info.parsed_options.api_url, self.api_version)
+                props = get_model_props(model)
+                try:
+                    if model.type == "llm":
+                        model_info.registration_id = self.endpoint_registry.register_chat_completion_as_proxy(
+                            model=registered_name,
+                            props=props,
+                            messages=ProxyOptions(
+                                url=urljoin(url_base, "messages"),
+                                rewrite_model_to=model.real_model_name or model_id,
+                                headers=headers,
+                            )
+                            if model.messages
+                            else None,
+                            responses=ProxyOptions(
+                                url=urljoin(url_base, "responses"),
+                                rewrite_model_to=model.real_model_name or model_id,
+                                headers=headers,
+                            )
+                            if model.responses
+                            else None,
+                            chat_completions=ProxyOptions(
+                                url=urljoin(url_base, "chat/completions"),
+                                rewrite_model_to=model.real_model_name or model_id,
+                                headers=headers,
+                            )
+                            if model.completions
+                            else None,
+                            completions=ProxyOptions(
+                                url=urljoin(url_base, "completions"),
+                                rewrite_model_to=model.real_model_name or model_id,
+                                headers=headers,
+                            )
+                            if model.legacy_completions
+                            else None,
+                            ollama_chat=None,
+                            registration_options=None,
+                        )
+                    if model.type == "tts":
+                        url = urljoin(url_base, "audio/speech")
+                        model_info.registration_id = self.endpoint_registry.register_audio_speech_as_proxy(
+                            model=registered_name,
+                            props=props,
+                            options=ProxyOptions(
+                                url=url,
+                                rewrite_model_to=model.real_model_name or model_id,
+                                headers=headers,
+                            ),
+                            registration_options=None,
+                        )
+                    if model.type == "stt":
+                        url = urljoin(url_base, "audio/transcriptions")
+                        model_info.registration_id = self.endpoint_registry.register_audio_transcriptions_as_proxy(
+                            model=registered_name,
+                            props=props,
+                            options=ProxyOptions(
+                                url=url,
+                                rewrite_model_to=model.real_model_name or model_id,
+                                headers=headers,
+                            ),
+                            registration_options=None,
+                        )
+                    if model.type == "txt2img":
+                        url = urljoin(url_base, "images/generations")
+                        model_info.registration_id = self.endpoint_registry.register_image_generations_as_proxy(
+                            model=registered_name,
+                            props=props,
+                            options=ProxyOptions(
+                                url=url,
+                                rewrite_model_to=model.real_model_name or model_id,
+                                headers=headers,
+                            ),
+                            registration_options=None,
+                        )
+                    if model.type == "embedding":
+                        url = urljoin(url_base, "embeddings")
+                        model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
+                            model=registered_name,
+                            props=props,
+                            options=ProxyOptions(
+                                url=url,
+                                rewrite_model_to=model.real_model_name or model_id,
+                                headers=headers,
+                            ),
+                            registration_options=None,
+                        )
+                    stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
+                    self.models_downloaded[model_id] = DownloadedInfo()
+                    return InstallModelOut(status="OK", details="Installed")
+                except Exception:
+                    if info.models.get(model_id) is model_info:
+                        info.models.pop(model_id, None)
+                    raise
+            finally:
+                self._installing.discard(key)
 
         return PromiseWithProgress(func=func)
 

@@ -487,11 +487,13 @@ async def _fetch_tools_from_sse_endpoint(sse_url: str, extra_headers: dict[str, 
 
 class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
     models: dict[str, dict[str, SrvMcpModel]]
+    _installing: set[tuple[str, str]]
 
     def _after_init(self) -> None:
         self.models = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
         self.load_default_models("default")
+        self._installing = set()
 
     def load_default_models(self, instance: str) -> None:
         """Load default models to instance."""
@@ -1170,112 +1172,129 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         info = self.get_instance_installed_info(instance)
         self.models.setdefault(instance, {})
-        if model_id in info.models:
-            return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed"))
+        key = (instance, model_id)
+        if model_id in info.models or key in self._installing:
+            return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed or being installed right now."))
         if model_id not in self.models[instance]:
             raise HTTPException(400, "Model not found")
+        self._installing.add(key)
         model = self.models[instance][model_id]
         if not options.spec:
             options.spec = {}
         if "prefix" not in options.spec:
             options.spec["prefix"] = model.default_prefix
         model.model_props.prefix = options.spec["prefix"]
-        parsed_model_options = try_parse_pydantic(McpModelOptions, options.spec)
+        try:
+            parsed_model_options = try_parse_pydantic(McpModelOptions, options.spec)
 
-        self.check_envs(model.required_envs, parsed_model_options.envs)
-        self.check_headers(model.required_headers, parsed_model_options.headers)
+            self.check_envs(model.required_envs, parsed_model_options.envs)
+            self.check_headers(model.required_headers, parsed_model_options.headers)
 
-        if model.kind == "proxy":
-            registration_id = self._register_proxy_model(model, parsed_model_options)
-            assert model.proxy_url is not None
-            info.models[model_id] = ModelInstalledInfo(
-                id=model_id,
-                options=options,
-                docker_options=None,
-                container_host="",
-                container_port=0,
-                docker_exposed_port=0,
-                registration_id=registration_id,
-                prefix=parsed_model_options.prefix,
-                base_url=model.proxy_url,
-                headers=parsed_model_options.headers,
-                envs={},
-            )
-            task = asyncio.create_task(self._fetch_tools_background(instance, model_id))
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
-            return PromiseWithProgress(value=InstallModelOut(status="OK", details="Installed"))
+            if model.kind == "proxy":
+                registration_id = self._register_proxy_model(model, parsed_model_options)
+                assert model.proxy_url is not None
+                info.models[model_id] = ModelInstalledInfo(
+                    id=model_id,
+                    options=options,
+                    docker_options=None,
+                    container_host="",
+                    container_port=0,
+                    docker_exposed_port=0,
+                    registration_id=registration_id,
+                    prefix=parsed_model_options.prefix,
+                    base_url=model.proxy_url,
+                    headers=parsed_model_options.headers,
+                    envs={},
+                )
+                task = asyncio.create_task(self._fetch_tools_background(instance, model_id))
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+                self._installing.discard(key)
+                return PromiseWithProgress(value=InstallModelOut(status="OK", details="Installed"))
 
-        if model.options is None:
-            raise HTTPException(400, "options are required for this model kind")
-        if model.kind != "user":
-            await self._verify_docker_image(model.options.image, options.ignore_warnings)
+            if model.options is None:
+                raise HTTPException(400, "options are required for this model kind.")  # noqa: TRY301
+            if model.kind != "user":
+                await self._verify_docker_image(model.options.image, options.ignore_warnings)
+        except Exception:
+            self._installing.discard(key)
+            raise
 
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
-            model_dir = self._get_working_dir() / "models"
-            model_dir.mkdir(parents=True, exist_ok=True)
-            subnet = self.docker_service.get_docker_subnet()
-            docker_options = model.options
-            assert docker_options is not None
-            if model.kind == "user":
-                dockerfile_dir = self._get_dockerfile_dir(instance, model_id)
-                await self.docker_service.build_image(dockerfile_dir, docker_options.image, stream)
-                size_bytes = await self.docker_service.get_local_docker_image_size(docker_options.image)
-                if size_bytes:
-                    model.size = fmt_size(size_bytes)
-                    await self._persist_custom_model_size(instance, model)
-            else:
-                image = DockerImage(name=docker_options.image, size=model.size)
-                await self._download_image_or_set_progress(stream, image)
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
-            docker_options_edited = deepcopy(docker_options)
-            docker_options_edited.env_vars = docker_options_edited.env_vars | parsed_model_options.envs
-            docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options_edited)
-            container_host = self.docker_service.get_container_host(subnet, docker_options_edited.name)
-            container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options_edited.image_port)
-            info.models[model_id] = model_info = ModelInstalledInfo(
-                id=model_id,
-                options=options,
-                docker_options=docker_options_edited,
-                container_host=container_host,
-                container_port=container_port,
-                docker_exposed_port=docker_exposed_port,
-                registration_id="",
-                prefix=parsed_model_options.prefix,
-                base_url=get_base_url(container_host, container_port),
-                headers=parsed_model_options.headers,
-                envs=parsed_model_options.envs,
-            )
-            if model.proxy_transport == "sse":
-                model_info.registration_id = self.endpoint_registry.register_mcp_sse_endpoint_as_proxy(
-                    url=model_info.prefix,
-                    props=model.model_props,
-                    options=ProxyOptions(
-                        url=model_info.base_url + "/sse",
-                        allowed_request_headers=["accept", "mcp-session-id"],
-                        allowed_response_headers=["accept", "mcp-session-id"],
-                        headers=model.headers | parsed_model_options.headers if model.headers else parsed_model_options.headers,
-                    ),
-                    registration_options=None,
+            try:
+                model_dir = self._get_working_dir() / "models"
+                model_dir.mkdir(parents=True, exist_ok=True)
+                subnet = self.docker_service.get_docker_subnet()
+                docker_options = model.options
+                assert docker_options is not None
+                if model.kind == "user":
+                    dockerfile_dir = self._get_dockerfile_dir(instance, model_id)
+                    await self.docker_service.build_image(dockerfile_dir, docker_options.image, stream)
+                    size_bytes = await self.docker_service.get_local_docker_image_size(docker_options.image)
+                    if size_bytes:
+                        model.size = fmt_size(size_bytes)
+                        await self._persist_custom_model_size(instance, model)
+                else:
+                    image = DockerImage(name=docker_options.image, size=model.size)
+                    await self._download_image_or_set_progress(stream, image)
+                stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
+                docker_options_edited = deepcopy(docker_options)
+                docker_options_edited.env_vars = docker_options_edited.env_vars | parsed_model_options.envs
+                docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options_edited)
+                container_host = self.docker_service.get_container_host(subnet, docker_options_edited.name)
+                container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options_edited.image_port)
+                info.models[model_id] = model_info = ModelInstalledInfo(
+                    id=model_id,
+                    options=options,
+                    docker_options=docker_options_edited,
+                    container_host=container_host,
+                    container_port=container_port,
+                    docker_exposed_port=docker_exposed_port,
+                    registration_id="",
+                    prefix=parsed_model_options.prefix,
+                    base_url=get_base_url(container_host, container_port),
+                    headers=parsed_model_options.headers,
+                    envs=parsed_model_options.envs,
                 )
-            else:
-                model_info.registration_id = self.endpoint_registry.register_mcp_endpoint_as_proxy(
-                    url=model_info.prefix,
-                    props=model.model_props,
-                    options=ProxyOptions(
-                        url=model_info.base_url + "/mcp",
-                        allowed_request_headers=["accept", "mcp-session-id"],
-                        allowed_response_headers=["accept", "mcp-session-id"],
-                        headers=model.headers | parsed_model_options.headers if model.headers else parsed_model_options.headers,
-                    ),
-                    registration_options=None,
-                )
-            self.models_downloaded[model_id] = DownloadedInfo(docker_options.image)
-            task = asyncio.create_task(self._fetch_tools_background(instance, model_id))
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
-            return InstallModelOut(status="OK", details="Installed")
+                try:
+                    if model.proxy_transport == "sse":
+                        model_info.registration_id = self.endpoint_registry.register_mcp_sse_endpoint_as_proxy(
+                            url=model_info.prefix,
+                            props=model.model_props,
+                            options=ProxyOptions(
+                                url=model_info.base_url + "/sse",
+                                allowed_request_headers=["accept", "mcp-session-id"],
+                                allowed_response_headers=["accept", "mcp-session-id"],
+                                headers=model.headers | parsed_model_options.headers if model.headers else parsed_model_options.headers,
+                            ),
+                            registration_options=None,
+                        )
+                    else:
+                        model_info.registration_id = self.endpoint_registry.register_mcp_endpoint_as_proxy(
+                            url=model_info.prefix,
+                            props=model.model_props,
+                            options=ProxyOptions(
+                                url=model_info.base_url + "/mcp",
+                                allowed_request_headers=["accept", "mcp-session-id"],
+                                allowed_response_headers=["accept", "mcp-session-id"],
+                                headers=model.headers | parsed_model_options.headers if model.headers else parsed_model_options.headers,
+                            ),
+                            registration_options=None,
+                        )
+                    self.models_downloaded[model_id] = DownloadedInfo(docker_options.image)
+                    task = asyncio.create_task(self._fetch_tools_background(instance, model_id))
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+                    stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
+                    return InstallModelOut(status="OK", details="Installed")
+                except Exception:
+                    if model_info.registration_id:
+                        self.endpoint_registry.unregister_mcp_endpoint(model_info.prefix, model_info.registration_id)
+                    if info.models.get(model_id) is model_info:
+                        info.models.pop(model_id, None)
+                    raise
+            finally:
+                self._installing.discard(key)
 
         return PromiseWithProgress(func=func)
 

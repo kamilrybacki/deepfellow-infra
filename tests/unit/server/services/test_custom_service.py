@@ -739,3 +739,52 @@ async def test_resolve_custom_model_size_returns_none_on_exception(svc: CustomSe
     result = await svc._resolve_custom_model_size({"image": "myimage:latest"})  # pyright: ignore[reportPrivateUsage]
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_install_model_registration_failure_rolls_back_model(svc: CustomService, deps: dict[str, Any]) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
+    deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8090)
+    deps["docker_service"].get_container_host.return_value = "172.20.0.1"
+    deps["docker_service"].get_container_port.return_value = 8090
+    deps["endpoint_registry"].register_custom_endpoint_as_proxy.side_effect = RuntimeError("registry down")
+
+    promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+        "default", "lemmatizer", InstallModelIn(spec={"prefix": "lemmatizer"})
+    )
+    with pytest.raises(RuntimeError):
+        await promise.wait()
+
+    installed = svc.instances_info["default"].installed
+    assert installed is not None
+    assert "lemmatizer" not in installed.models
+
+
+@pytest.mark.asyncio
+async def test_install_model_registration_failure_skips_rollback_when_already_removed(svc: CustomService, deps: dict[str, Any]) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
+    deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8090)
+    deps["docker_service"].get_container_host.return_value = "172.20.0.1"
+    deps["docker_service"].get_container_port.return_value = 8090
+
+    def side_effect(*args: object, **kwargs: object) -> None:
+        installed = svc.instances_info["default"].installed
+        assert installed is not None
+        installed.models.pop("lemmatizer", None)
+        raise RuntimeError("registry down")
+
+    deps["endpoint_registry"].register_custom_endpoint_as_proxy.side_effect = side_effect
+
+    promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+        "default", "lemmatizer", InstallModelIn(spec={"prefix": "lemmatizer"})
+    )
+    with pytest.raises(RuntimeError):
+        await promise.wait()
+
+    installed = svc.instances_info["default"].installed
+    assert installed is not None
+    assert "lemmatizer" not in installed.models

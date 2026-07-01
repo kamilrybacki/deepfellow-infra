@@ -1106,3 +1106,71 @@ async def test_resolve_custom_model_size_returns_none_on_exception(svc: RerankSe
         result = await svc._resolve_custom_model_size({"hf_id": "google/model"})  # pyright: ignore[reportPrivateUsage]
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_install_model_registration_failure_rolls_back_model_without_unregister(
+    svc: RerankService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    installed = _make_installed_info()
+    svc.instances_info["default"].installed = installed
+    model_id = next(iter(_const.models))
+    deps["endpoint_registry"].register_rerank_as_proxy.side_effect = RuntimeError("registry down")
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert model_id not in installed.models
+    assert deps["endpoint_registry"].unregister_rerank.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_install_model_post_registration_failure_unregisters_and_rolls_back(
+    svc: RerankService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    installed = _make_installed_info()
+    svc.instances_info["default"].installed = installed
+    model_id = next(iter(_const.models))
+    deps["endpoint_registry"].register_rerank_as_proxy.return_value = "reg-rerank"
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.rerank_service.fetch_from", new_callable=AsyncMock, side_effect=RuntimeError("fetch failed")),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={"alive_time": 60}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert model_id not in installed.models
+    assert deps["endpoint_registry"].unregister_rerank.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_install_model_registration_failure_skips_rollback_when_already_removed(
+    svc: RerankService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    installed = _make_installed_info()
+    svc.instances_info["default"].installed = installed
+    model_id = next(iter(_const.models))
+
+    def side_effect(*args: object, **kwargs: object) -> None:
+        installed.models.pop(model_id, None)
+        raise RuntimeError("registry down")
+
+    deps["endpoint_registry"].register_rerank_as_proxy.side_effect = side_effect
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert model_id not in installed.models

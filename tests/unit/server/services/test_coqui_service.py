@@ -650,6 +650,26 @@ async def test_uninstall_model_skips_when_not_in_installed(svc: CoquiService, de
 
 
 @pytest.mark.asyncio
+async def test_install_model_registration_failure_rolls_back_model(svc: CoquiService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info()
+    installed.parsed_options = CoquiOptions(hardware=False)
+    svc.instances_info["default"].installed = installed
+    model_id = next(iter(_const.models))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=5002)
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "container"
+    deps["docker_service"].get_container_host.return_value = "localhost"
+    deps["docker_service"].get_container_port.return_value = 5002
+    deps["endpoint_registry"].register_audio_speech.side_effect = RuntimeError("registry down")
+
+    promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(RuntimeError):
+        await promise.wait()
+
+    assert model_id not in installed.models
+
+
+@pytest.mark.asyncio
 async def test_create_handler_uses_default_speaker_when_no_voice() -> None:
     handler = _create_handler("http://localhost:5002", "p225", "mp3")
 
@@ -822,3 +842,28 @@ async def test_uninstall_model_non_tts_type_skips_unregister(svc: CoquiService, 
     assert "m1" not in installed.models
     assert deps["endpoint_registry"].unregister_audio_speech.call_count == 0
     assert deps["docker_service"].uninstall_docker.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_install_model_registration_failure_skips_rollback_when_already_removed(svc: CoquiService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info()
+    installed.parsed_options = CoquiOptions(hardware=False)
+    svc.instances_info["default"].installed = installed
+    model_id = next(iter(_const.models))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=5002)
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "container"
+    deps["docker_service"].get_container_host.return_value = "localhost"
+    deps["docker_service"].get_container_port.return_value = 5002
+
+    def side_effect(*args: object, **kwargs: object) -> None:
+        installed.models.pop(model_id, None)
+        raise RuntimeError("registry down")
+
+    deps["endpoint_registry"].register_audio_speech.side_effect = side_effect
+
+    promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(RuntimeError):
+        await promise.wait()
+
+    assert model_id not in installed.models

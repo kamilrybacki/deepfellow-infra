@@ -269,6 +269,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
     _blob_to_model: dict[str, str]
     _model_manifest_loaded: bool
     _vram_cache: dict[tuple[str, str], float]
+    _installing: set[tuple[str, str]]
 
     @property
     def _supported_gpus(self) -> list[GpuInfo]:
@@ -283,6 +284,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         self._blob_to_model = {}
         self._model_manifest_loaded = False
         self._vram_cache = {}
+        self._installing = set()
 
     def load_default_models(self, instance: str) -> None:
         """Load default models to instance."""
@@ -551,10 +553,14 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         return PromiseWithProgress(func=func)
 
-    async def _uninstall_instance(self, instance: str, options: UninstallServiceIn) -> None:
+    async def _uninstall_instance(self, instance: str, options: UninstallServiceIn) -> None:  # noqa: C901
         installed = self.get_instance_info(instance).installed
         if installed:
             models = list(installed.models.copy().values())
+
+            for model in models:
+                if (instance, model.id) in self._installing:
+                    raise HTTPException(409, f"Model {model.id!r} is currently being installed; cancel it before deleting the instance")
 
             for model in models:
                 if model.type == "llm":
@@ -1150,129 +1156,150 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         if not self.models.get(instance):
             self.models[instance] = {}
 
-        if model_id in info.models:
-            return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed"))
+        key = (instance, model_id)
+        if model_id in info.models or key in self._installing:
+            return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed or being installed right now."))
 
         if model_id not in self.models[instance]:
             raise HTTPException(400, f"Model {model_id!r} not found")
 
+        self._installing.add(key)
         model = self.models[instance][model_id]
 
         async def func(input_stream: Stream[StreamChunk]) -> InstallModelOut:  # noqa: C901
-            rewrite_model_to = model_id
-            internal_name = model_id
-            new_modelfile: str | None = None
+            try:
+                rewrite_model_to = model_id
+                internal_name = model_id
+                new_modelfile: str | None = None
 
-            service_form_context_window = info.parsed_options.context_length
-            model_form_context_window = parsed_model_options.context_length
+                service_form_context_window = info.parsed_options.context_length
+                model_form_context_window = parsed_model_options.context_length
 
-            # Default model with custom context
-            if model.type == "llm" and parsed_model_options.context_length is not None:
-                if model.modelfile:
-                    new_modelfile = f"{model.modelfile}\nPARAMETER num_ctx {parsed_model_options.context_length}"
+                # Default model with custom context
+                if model.type == "llm" and parsed_model_options.context_length is not None:
+                    if model.modelfile:
+                        new_modelfile = f"{model.modelfile}\nPARAMETER num_ctx {parsed_model_options.context_length}"
+                    else:
+                        internal_name = model_id + "-customcontextlength"
+                        rewrite_model_to = internal_name
+                        new_modelfile = f"FROM {model_id}\nPARAMETER num_ctx {parsed_model_options.context_length}"
+
+                modelfile_recipe = new_modelfile or model.modelfile
+                model_context = model.context
+                if modelfile_recipe:
+                    new_model_context = await self._install_from_modelfile(
+                        input_stream, model_id, modelfile_recipe, internal_name, info, model
+                    )
+                    if new_model_context is not None:
+                        model_context = new_model_context
+
                 else:
-                    internal_name = model_id + "-customcontextlength"
-                    rewrite_model_to = internal_name
-                    new_modelfile = f"FROM {model_id}\nPARAMETER num_ctx {parsed_model_options.context_length}"
+                    if not await self.is_model_installed(info.base_url, model_id):
+                        await self._download_model_or_set_progress(input_stream, info.base_url, model.id, model.id, model.size)
 
-            modelfile_recipe = new_modelfile or model.modelfile
-            model_context = model.context
-            if modelfile_recipe:
-                new_model_context = await self._install_from_modelfile(input_stream, model_id, modelfile_recipe, internal_name, info, model)
-                if new_model_context is not None:
-                    model_context = new_model_context
+                input_stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
 
-            else:
-                if not await self.is_model_installed(info.base_url, model_id):
-                    await self._download_model_or_set_progress(input_stream, info.base_url, model.id, model.id, model.size)
+                if parsed_model_options.alive_time != "":
+                    await fetch_from(
+                        f"{info.base_url}/api/generate",
+                        "POST",
+                        {"model": model_id, "keep_alive": parsed_model_options.alive_time},
+                    )
 
-            input_stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
-
-            if parsed_model_options.alive_time != "":
-                await fetch_from(
-                    f"{info.base_url}/api/generate",
-                    "POST",
-                    {"model": model_id, "keep_alive": parsed_model_options.alive_time},
+                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                info.models[model_id] = model_info = ModelInstalledInfo(
+                    id=model_id,
+                    type=model.type,
+                    registered_name=registered_name,
+                    options=options,
+                    registration_id="",
+                    internal_name=internal_name,
                 )
+                try:
+                    model_max_context_window = model_context
+                    service_max_context_window = self.default_context_length
+                    default_context_window = self.get_default_context_window(model_max_context_window, service_max_context_window)
+                    max_context_window = model_form_context_window or model_max_context_window or service_max_context_window
 
-            registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
-            info.models[model_id] = model_info = ModelInstalledInfo(
-                id=model_id,
-                type=model.type,
-                registered_name=registered_name,
-                options=options,
-                registration_id="",
-                internal_name=internal_name,
-            )
-            model_max_context_window = model_context
-            service_max_context_window = self.default_context_length
-            default_context_window = self.get_default_context_window(model_max_context_window, service_max_context_window)
-            max_context_window = model_form_context_window or model_max_context_window or service_max_context_window
+                    context_window = model_form_context_window or service_form_context_window or default_context_window
+                    context_window = min(context_window, max_context_window)
+                    if model.type == "llm":
+                        model_info.registration_id = self.endpoint_registry.register_chat_completion_as_proxy(
+                            model=registered_name,
+                            props=ModelProps(
+                                private=True,
+                                type=model.type,
+                                endpoints=LLM_ENDPOINTS,
+                                context_window=context_window,
+                                max_context_window=max_context_window,
+                            ),
+                            chat_completions=ProxyOptions(url=f"{info.base_url}/v1/chat/completions", rewrite_model_to=rewrite_model_to),
+                            completions=ProxyOptions(url=f"{info.base_url}/v1/completions", rewrite_model_to=rewrite_model_to),
+                            responses=ProxyOptions(url=f"{info.base_url}/v1/responses", rewrite_model_to=rewrite_model_to),
+                            messages=ProxyOptions(url=f"{info.base_url}/v1/messages", rewrite_model_to=rewrite_model_to),
+                            ollama_chat=ProxyOptions(url=f"{info.base_url}/api/chat", rewrite_model_to=rewrite_model_to),
+                            registration_options=None,
+                        )
+                    if model.type == "embedding":
+                        model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
+                            model=registered_name,
+                            props=ModelProps(
+                                private=True,
+                                type=model.type,
+                                endpoints=EMBEDDINGS_ENDPOINTS,
+                                context_window=context_window,
+                                max_context_window=max_context_window,
+                            ),
+                            options=ProxyOptions(url=f"{info.base_url}/v1/embeddings", rewrite_model_to=rewrite_model_to),
+                            registration_options=None,
+                        )
+                    if model.type == "txt2img":
+                        model_info.registration_id = self.endpoint_registry.register_image_generations_as_proxy(
+                            model=registered_name,
+                            props=ModelProps(
+                                private=True,
+                                type=model.type,
+                                endpoints=IMG_ENDPOINTS,
+                                context_window=context_window,
+                                max_context_window=max_context_window,
+                            ),
+                            options=ProxyOptions(url=f"{info.base_url}/v1/images/generations", rewrite_model_to=rewrite_model_to),
+                            registration_options=None,
+                        )
+                    input_stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
 
-            context_window = model_form_context_window or service_form_context_window or default_context_window
-            context_window = min(context_window, max_context_window)
-            if model.type == "llm":
-                model_info.registration_id = self.endpoint_registry.register_chat_completion_as_proxy(
-                    model=registered_name,
-                    props=ModelProps(
-                        private=True,
-                        type=model.type,
-                        endpoints=LLM_ENDPOINTS,
-                        context_window=context_window,
-                        max_context_window=max_context_window,
-                    ),
-                    chat_completions=ProxyOptions(url=f"{info.base_url}/v1/chat/completions", rewrite_model_to=rewrite_model_to),
-                    completions=ProxyOptions(url=f"{info.base_url}/v1/completions", rewrite_model_to=rewrite_model_to),
-                    responses=ProxyOptions(url=f"{info.base_url}/v1/responses", rewrite_model_to=rewrite_model_to),
-                    messages=ProxyOptions(url=f"{info.base_url}/v1/messages", rewrite_model_to=rewrite_model_to),
-                    ollama_chat=ProxyOptions(url=f"{info.base_url}/api/chat", rewrite_model_to=rewrite_model_to),
-                    registration_options=None,
-                )
-            if model.type == "embedding":
-                model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
-                    model=registered_name,
-                    props=ModelProps(
-                        private=True,
-                        type=model.type,
-                        endpoints=EMBEDDINGS_ENDPOINTS,
-                        context_window=context_window,
-                        max_context_window=max_context_window,
-                    ),
-                    options=ProxyOptions(url=f"{info.base_url}/v1/embeddings", rewrite_model_to=rewrite_model_to),
-                    registration_options=None,
-                )
-            if model.type == "txt2img":
-                model_info.registration_id = self.endpoint_registry.register_image_generations_as_proxy(
-                    model=registered_name,
-                    props=ModelProps(
-                        private=True,
-                        type=model.type,
-                        endpoints=IMG_ENDPOINTS,
-                        context_window=context_window,
-                        max_context_window=max_context_window,
-                    ),
-                    options=ProxyOptions(url=f"{info.base_url}/v1/images/generations", rewrite_model_to=rewrite_model_to),
-                    registration_options=None,
-                )
-            input_stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
+                    self.models_downloaded[model_id] = DownloadedInfo()
 
-            self.models_downloaded[model_id] = DownloadedInfo()
+                    if model.hash:
+                        for alias_model_id, alias_model in self.models[instance].items():
+                            if alias_model.hash == model.hash:
+                                self.models_downloaded[alias_model_id] = DownloadedInfo()
 
-            if model.hash:
-                for alias_model_id, alias_model in self.models[instance].items():
-                    if alias_model.hash == model.hash:
-                        self.models_downloaded[alias_model_id] = DownloadedInfo()
-
-            return InstallModelOut(status="OK", details="Installed")
+                    return InstallModelOut(status="OK", details="Installed")
+                except Exception:
+                    if model_info.registration_id:
+                        if model_info.type == "llm":
+                            self.endpoint_registry.unregister_chat_completion(model_info.registered_name, model_info.registration_id)
+                        if model_info.type == "embedding":
+                            self.endpoint_registry.unregister_embeddings(model_info.registered_name, model_info.registration_id)
+                        if model_info.type == "txt2img":
+                            self.endpoint_registry.unregister_image_generations(model_info.registered_name, model_info.registration_id)
+                    if info.models.get(model_id) is model_info:
+                        info.models.pop(model_id, None)
+                    raise
+            finally:
+                self._installing.discard(key)
 
         return PromiseWithProgress(func=func)
 
-    async def _uninstall_model(self, instance: str, model_id: str, options: UninstallModelIn) -> None:
+    async def _uninstall_model(self, instance: str, model_id: str, options: UninstallModelIn) -> None:  # noqa: C901
         self._arch_cache.pop((instance, model_id), None)
         self._model_manifest_loaded = False
         self._blob_to_model = {}
         self._log_cache.clear()
         info = self.get_instance_installed_info(instance)
+        if (instance, model_id) in self._installing:
+            raise HTTPException(409, f"Model {model_id!r} is currently being installed; cancel the install before deleting")
         if model_id in info.models:
             model = info.models[model_id]
             del info.models[model_id]

@@ -130,10 +130,12 @@ class DownloadedInfo:
 
 class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
     models: dict[str, dict[str, "SrvCustomModel"]]
+    _installing: set[tuple[str, str]]
 
     def _after_init(self) -> None:
         self.models = {}
         self.load_default_models("default")
+        self._installing = set()
 
     def load_default_models(self, instance: str) -> None:
         """Load default models to instance."""
@@ -402,8 +404,9 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
         info = self.get_instance_installed_info(instance)
         if not self.models.get(instance):
             self.models[instance] = {}
-        if model_id in info.models:
-            return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed"))
+        key = (instance, model_id)
+        if model_id in info.models or key in self._installing:
+            return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed or being installed right now."))
         if model_id not in self.models[instance]:
             raise HTTPException(400, "Model not found")
         model = self.models[instance][model_id]
@@ -416,36 +419,46 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
         docker_options = model.options(options.spec) if isinstance(model.options, Callable) else model.options
         await self._verify_docker_image(docker_options.image, options.ignore_warnings)
 
+        self._installing.add(key)
+
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
-            model_dir = self._get_working_dir() / "models"
-            model_dir.mkdir(parents=True, exist_ok=True)
-            subnet = self.docker_service.get_docker_subnet()
-            image = DockerImage(name=docker_options.image, size=model.size)
-            await self._download_image_or_set_progress(stream, image)
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
-            docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
-            container_host = self.docker_service.get_container_host(subnet, docker_options.name)
-            container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
-            info.models[model_id] = model_info = ModelInstalledInfo(
-                id=model_id,
-                options=options,
-                docker_options=docker_options,
-                container_host=container_host,
-                container_port=container_port,
-                docker_exposed_port=docker_exposed_port,
-                registration_id="",
-                prefix=parsed_model_options.prefix,
-                base_url=get_base_url(container_host, container_port),
-            )
-            model_info.registration_id = self.endpoint_registry.register_custom_endpoint_as_proxy(
-                url=model_info.prefix,
-                props=model.model_props,
-                options=ProxyOptions(url=model_info.base_url),
-                registration_options=None,
-            )
-            self.models_downloaded[model_id] = DownloadedInfo(image.name)
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
-            return InstallModelOut(status="OK", details="Installed")
+            try:
+                model_dir = self._get_working_dir() / "models"
+                model_dir.mkdir(parents=True, exist_ok=True)
+                subnet = self.docker_service.get_docker_subnet()
+                image = DockerImage(name=docker_options.image, size=model.size)
+                await self._download_image_or_set_progress(stream, image)
+                stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
+                docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
+                container_host = self.docker_service.get_container_host(subnet, docker_options.name)
+                container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
+                info.models[model_id] = model_info = ModelInstalledInfo(
+                    id=model_id,
+                    options=options,
+                    docker_options=docker_options,
+                    container_host=container_host,
+                    container_port=container_port,
+                    docker_exposed_port=docker_exposed_port,
+                    registration_id="",
+                    prefix=parsed_model_options.prefix,
+                    base_url=get_base_url(container_host, container_port),
+                )
+                try:
+                    model_info.registration_id = self.endpoint_registry.register_custom_endpoint_as_proxy(
+                        url=model_info.prefix,
+                        props=model.model_props,
+                        options=ProxyOptions(url=model_info.base_url),
+                        registration_options=None,
+                    )
+                    self.models_downloaded[model_id] = DownloadedInfo(image.name)
+                    stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
+                    return InstallModelOut(status="OK", details="Installed")
+                except Exception:
+                    if info.models.get(model_id) is model_info:
+                        info.models.pop(model_id, None)
+                    raise
+            finally:
+                self._installing.discard(key)
 
         return PromiseWithProgress(func=func)
 

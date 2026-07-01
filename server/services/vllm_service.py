@@ -192,11 +192,13 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
     models: dict[str, dict[str, VllmModel]]
     gpu_memory_utilization = 0
     _vram_cache: dict[tuple[str, str], float]
+    _installing: set[tuple[str, str]]
 
     def _after_init(self) -> None:
         self.models = {}
         self.load_default_models("default")
         self._vram_cache = {}
+        self._installing = set()
 
     def load_default_models(self, instance: str) -> None:
         """Load default models to instance."""
@@ -620,132 +622,146 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             registration_options=None,
         )
 
-    async def _install_model(
+    async def _install_model(  # noqa: C901
         self, instance: str, model_id: str, options: InstallModelIn
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_model_options = try_parse_pydantic(VllmModelOptions, options.spec) if options.spec else VllmModelOptions()
 
         info = self.get_instance_installed_info(instance)
 
-        if model_id in info.models:
-            return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed"))
+        key = (instance, model_id)
+        if model_id in info.models or key in self._installing:
+            return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed or being installed right now."))
 
         if model_id not in self.models[instance]:
             raise HTTPException(400, f"Model {model_id!r} not found")
 
+        self._installing.add(key)
         model = self.models[instance][model_id]
 
-        use_gpu = self.is_given_hardware_support_gpu(info.parsed_options.hardware)
-        gpu_memory_utilization = await self._get_gpu_memory_utilization(parsed_model_options, model) if use_gpu else None
-        user_model_length = await self._get_max_model_length(parsed_model_options, model)
-        quantization = await self._get_quantization(parsed_model_options, model)
+        try:
+            use_gpu = self.is_given_hardware_support_gpu(info.parsed_options.hardware)
+            gpu_memory_utilization = await self._get_gpu_memory_utilization(parsed_model_options, model) if use_gpu else None
+            user_model_length = await self._get_max_model_length(parsed_model_options, model)
+            quantization = await self._get_quantization(parsed_model_options, model)
+        except Exception:
+            self._installing.discard(key)
+            raise
 
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
-            model_id_fixed = model_id.replace("/", "-")
-            models_dir = self._get_working_dir() / "models"
-            model_dir = models_dir / model_id_fixed
-            model_dir.mkdir(parents=True, exist_ok=True)
-            local_model_path: Path | None = await self._download_model_or_set_progress(stream, model_id, model, model_dir)
-
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
-            docker_model_path = Path(self.hugging_face_cache_path) / "hub" / model_id_fixed
-            compile_cache_dir = model_dir / "compile_cache"
-            compile_cache_dir.mkdir(parents=True, exist_ok=True)
-            model_cache_dir = model_dir / ".cache"
-            model_cache_dir.mkdir(parents=True, exist_ok=True)
-            volumes = [
-                f"{local_model_path}:{docker_model_path}",
-                f"{compile_cache_dir}:/root/.cache/vllm",
-                f"{model_cache_dir}:{docker_model_path}/.cache",
-            ]
-
-            vllm_command = self._build_vllm_command(
-                docker_model_path=docker_model_path,
-                model_id=model_id,
-                opts=parsed_model_options,
-                quantization=quantization,
-                gpu_memory_utilization=gpu_memory_utilization,
-                user_model_length=user_model_length,
-                use_gpu=use_gpu,
-            )
-
-            if not model.env_vars:
-                model.env_vars = {}
-
-            model.env_vars["HF_HUB_OFFLINE"] = "1"
-            model.env_vars["HF_HOME"] = self.hugging_face_cache_path
-            if not use_gpu:
-                model.env_vars["VLLM_USE_V1"] = "1"
-            model.env_vars.update(parsed_model_options.extra_envs)
-
-            image = self._get_image(use_gpu)
-
-            subnet = self.docker_service.get_docker_subnet()
-            service_name = f"{self.get_service_id(instance)}-{normalize_name(model_id)}"
-            docker_options = DockerOptions(
-                name=service_name,
-                container_name=self.docker_service.get_docker_container_name(service_name),
-                image=image.name,
-                command=" ".join(vllm_command),
-                image_port=8000,
-                env_vars=model.env_vars,
-                restart="unless-stopped",
-                volumes=volumes,
-                hardware=self.get_specified_hardware_parts(info.parsed_options.hardware),
-                shm_size=model.shm_size,
-                ulimits=model.ulimits,
-                subnet=subnet,
-                healthcheck={
-                    "test": "curl --fail http://localhost:8000/health || exit 1",
-                    "interval": "80s",
-                    "timeout": "60s",
-                    "retries": "3",
-                    "start_period": "240s",
-                },
-            )
             try:
-                docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
-            except asyncio.CancelledError:
-                self._release_gpu_utilization(gpu_memory_utilization)
-                raise
-            except Exception:
-                self._release_gpu_utilization(gpu_memory_utilization)
-                await self.docker_service.stop_docker(docker_options)
-                raise
-            registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
-            container_host = self.docker_service.get_container_host(subnet, docker_options.name)
-            container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
-            if model.model_type == "llm":
-                max_context_window = await get_model_dir_context_window(local_model_path)
-                context_window = user_model_length or max_context_window
-            else:
-                max_context_window = None
-                context_window = None
-            info.models[model_id] = model_info = ModelInstalledInfo(
-                id=model_id,
-                registered_name=registered_name,
-                options=options,
-                docker=docker_options,
-                container_host=container_host,
-                container_port=container_port,
-                docker_exposed_port=docker_exposed_port,
-                registration_id="",
-                model_path=model_dir,
-                base_url=get_base_url(container_host, container_port),
-                gpu_memory_utilization=gpu_memory_utilization,
-                model_type=model.model_type,
-            )
-            model_info.registration_id = self._register_model_endpoint(
-                model_info=model_info,
-                model=model,
-                registered_name=registered_name,
-                model_id=model_id,
-                context_window=context_window,
-                max_context_window=max_context_window,
-            )
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
-            self.models_downloaded[model_id] = DownloadedInfo(str(local_model_path))
-            return InstallModelOut(status="OK", details="Installed")
+                model_id_fixed = model_id.replace("/", "-")
+                models_dir = self._get_working_dir() / "models"
+                model_dir = models_dir / model_id_fixed
+                model_dir.mkdir(parents=True, exist_ok=True)
+                local_model_path: Path | None = await self._download_model_or_set_progress(stream, model_id, model, model_dir)
+
+                stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
+                docker_model_path = Path(self.hugging_face_cache_path) / "hub" / model_id_fixed
+                compile_cache_dir = model_dir / "compile_cache"
+                compile_cache_dir.mkdir(parents=True, exist_ok=True)
+                model_cache_dir = model_dir / ".cache"
+                model_cache_dir.mkdir(parents=True, exist_ok=True)
+                volumes = [
+                    f"{local_model_path}:{docker_model_path}",
+                    f"{compile_cache_dir}:/root/.cache/vllm",
+                    f"{model_cache_dir}:{docker_model_path}/.cache",
+                ]
+
+                vllm_command = self._build_vllm_command(
+                    docker_model_path=docker_model_path,
+                    model_id=model_id,
+                    opts=parsed_model_options,
+                    quantization=quantization,
+                    gpu_memory_utilization=gpu_memory_utilization,
+                    user_model_length=user_model_length,
+                    use_gpu=use_gpu,
+                )
+
+                if not model.env_vars:
+                    model.env_vars = {}
+
+                model.env_vars["HF_HUB_OFFLINE"] = "1"
+                model.env_vars["HF_HOME"] = self.hugging_face_cache_path
+                if not use_gpu:
+                    model.env_vars["VLLM_USE_V1"] = "1"
+                model.env_vars.update(parsed_model_options.extra_envs)
+
+                image = self._get_image(use_gpu)
+
+                subnet = self.docker_service.get_docker_subnet()
+                service_name = f"{self.get_service_id(instance)}-{normalize_name(model_id)}"
+                docker_options = DockerOptions(
+                    name=service_name,
+                    container_name=self.docker_service.get_docker_container_name(service_name),
+                    image=image.name,
+                    command=" ".join(vllm_command),
+                    image_port=8000,
+                    env_vars=model.env_vars,
+                    restart="unless-stopped",
+                    volumes=volumes,
+                    hardware=self.get_specified_hardware_parts(info.parsed_options.hardware),
+                    shm_size=model.shm_size,
+                    ulimits=model.ulimits,
+                    subnet=subnet,
+                    healthcheck={
+                        "test": "curl --fail http://localhost:8000/health || exit 1",
+                        "interval": "80s",
+                        "timeout": "60s",
+                        "retries": "3",
+                        "start_period": "240s",
+                    },
+                )
+                try:
+                    docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
+                except asyncio.CancelledError:
+                    self._release_gpu_utilization(gpu_memory_utilization)
+                    raise
+                except Exception:
+                    self._release_gpu_utilization(gpu_memory_utilization)
+                    await self.docker_service.stop_docker(docker_options)
+                    raise
+                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                container_host = self.docker_service.get_container_host(subnet, docker_options.name)
+                container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
+                if model.model_type == "llm":
+                    max_context_window = await get_model_dir_context_window(local_model_path)
+                    context_window = user_model_length or max_context_window
+                else:
+                    max_context_window = None
+                    context_window = None
+                info.models[model_id] = model_info = ModelInstalledInfo(
+                    id=model_id,
+                    registered_name=registered_name,
+                    options=options,
+                    docker=docker_options,
+                    container_host=container_host,
+                    container_port=container_port,
+                    docker_exposed_port=docker_exposed_port,
+                    registration_id="",
+                    model_path=model_dir,
+                    base_url=get_base_url(container_host, container_port),
+                    gpu_memory_utilization=gpu_memory_utilization,
+                    model_type=model.model_type,
+                )
+                try:
+                    model_info.registration_id = self._register_model_endpoint(
+                        model_info=model_info,
+                        model=model,
+                        registered_name=registered_name,
+                        model_id=model_id,
+                        context_window=context_window,
+                        max_context_window=max_context_window,
+                    )
+                    stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
+                    self.models_downloaded[model_id] = DownloadedInfo(str(local_model_path))
+                    return InstallModelOut(status="OK", details="Installed")
+                except Exception:
+                    if info.models.get(model_id) is model_info:
+                        info.models.pop(model_id, None)
+                    raise
+            finally:
+                self._installing.discard(key)
 
         return PromiseWithProgress(func=func)
 

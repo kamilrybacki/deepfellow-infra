@@ -144,11 +144,13 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
     models: dict[str, dict[str, OllamaModel]]
     support_responses: bool
     support_messages: bool
+    _installing: set[tuple[str, str]]
 
     def _after_init(self) -> None:
         self.models = {}
         self._sync_tasks: dict[str, asyncio.Task[None]] = {}
         self.load_default_models("default")
+        self._installing = set()
 
     def load_default_models(self, instance: str) -> None:
         """Load default models to instance."""
@@ -582,79 +584,98 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                 else:
                     break
 
-    async def _install_model(
+    async def _install_model(  # noqa: C901
         self, instance: str, model_id: str, options: InstallModelIn
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_model_options = try_parse_pydantic(OllamaModelOptions, options.spec) if options.spec else OllamaModelOptions()
         info = self.get_instance_installed_info(instance)
 
-        if model_id in info.models:
-            return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed"))
+        key = (instance, model_id)
+        if model_id in info.models or key in self._installing:
+            return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed or being installed right now."))
 
         if model_id not in self.models[instance]:
             raise HTTPException(400, "Model not found")
 
+        self._installing.add(key)
         model = self.models[instance][model_id]
 
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
-            await self._download_model_or_set_progress(stream, model, model_id, info.base_url)
+            try:
+                await self._download_model_or_set_progress(stream, model, model_id, info.base_url)
 
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
-            if parsed_model_options.alive_time != "":
-                await fetch_from(
-                    f"{info.base_url}/api/generate",
-                    "POST",
-                    {"model": model_id, "keep_alive": parsed_model_options.alive_time},
-                )
+                stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
+                if parsed_model_options.alive_time != "":
+                    await fetch_from(
+                        f"{info.base_url}/api/generate",
+                        "POST",
+                        {"model": model_id, "keep_alive": parsed_model_options.alive_time},
+                    )
 
-            context_length = await self._fetch_context_length(info.base_url, model_id)
-            registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
-            info.models[model_id] = model_info = ModelInstalledInfo(
-                id=model_id,
-                type=model.type,
-                registered_name=registered_name,
-                options=options,
-                registration_id="",
-            )
-            if model.type == "llm":
-                model_info.registration_id = self.endpoint_registry.register_chat_completion_as_proxy(
-                    model=registered_name,
-                    props=ModelProps(
-                        private=True,
-                        type="llm",
-                        endpoints=self.get_supported_endpoints(),
-                        context_window=context_length,
-                        max_context_window=context_length,
-                    ),
-                    chat_completions=ProxyOptions(url=f"{info.base_url}/v1/chat/completions", rewrite_model_to=model_id),
-                    completions=ProxyOptions(url=f"{info.base_url}/v1/completions", rewrite_model_to=model_id),
-                    responses=(
-                        ProxyOptions(url=f"{info.base_url}/v1/responses", rewrite_model_to=model_id) if self.support_responses else None
-                    ),
-                    messages=(
-                        ProxyOptions(url=f"{info.base_url}/v1/messages", rewrite_model_to=model_id) if self.support_messages else None
-                    ),
-                    ollama_chat=ProxyOptions(url=f"{info.base_url}/api/chat", rewrite_model_to=model_id),
-                    registration_options=None,
+                context_length = await self._fetch_context_length(info.base_url, model_id)
+                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                info.models[model_id] = model_info = ModelInstalledInfo(
+                    id=model_id,
+                    type=model.type,
+                    registered_name=registered_name,
+                    options=options,
+                    registration_id="",
                 )
-            if model.type == "embedding":
-                model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
-                    model=registered_name,
-                    props=ModelProps(
-                        private=True,
-                        type="embedding",
-                        endpoints=EMBEDDINGS_ENDPOINTS,
-                        context_window=context_length,
-                        max_context_window=context_length,
-                    ),
-                    options=ProxyOptions(url=f"{info.base_url}/v1/embeddings", rewrite_model_to=model_id),
-                    registration_options=None,
-                )
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
-            self.models_downloaded[model_id] = DownloadedInfo()
-            await self._sync_models_from_external_ollama(instance, info, is_initial_sync=False)
-            await self._save()
-            return InstallModelOut(status="OK", details="Installed")
+                try:
+                    if model.type == "llm":
+                        model_info.registration_id = self.endpoint_registry.register_chat_completion_as_proxy(
+                            model=registered_name,
+                            props=ModelProps(
+                                private=True,
+                                type="llm",
+                                endpoints=self.get_supported_endpoints(),
+                                context_window=context_length,
+                                max_context_window=context_length,
+                            ),
+                            chat_completions=ProxyOptions(url=f"{info.base_url}/v1/chat/completions", rewrite_model_to=model_id),
+                            completions=ProxyOptions(url=f"{info.base_url}/v1/completions", rewrite_model_to=model_id),
+                            responses=(
+                                ProxyOptions(url=f"{info.base_url}/v1/responses", rewrite_model_to=model_id)
+                                if self.support_responses
+                                else None
+                            ),
+                            messages=(
+                                ProxyOptions(url=f"{info.base_url}/v1/messages", rewrite_model_to=model_id)
+                                if self.support_messages
+                                else None
+                            ),
+                            ollama_chat=ProxyOptions(url=f"{info.base_url}/api/chat", rewrite_model_to=model_id),
+                            registration_options=None,
+                        )
+                    if model.type == "embedding":
+                        model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
+                            model=registered_name,
+                            props=ModelProps(
+                                private=True,
+                                type="embedding",
+                                endpoints=EMBEDDINGS_ENDPOINTS,
+                                context_window=context_length,
+                                max_context_window=context_length,
+                            ),
+                            options=ProxyOptions(url=f"{info.base_url}/v1/embeddings", rewrite_model_to=model_id),
+                            registration_options=None,
+                        )
+                    stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
+                    self.models_downloaded[model_id] = DownloadedInfo()
+                    await self._sync_models_from_external_ollama(instance, info, is_initial_sync=False)
+                    await self._save()
+                    return InstallModelOut(status="OK", details="Installed")
+                except Exception:
+                    if model_info.registration_id:
+                        if model.type == "llm":
+                            self.endpoint_registry.unregister_chat_completion(model_info.registered_name, model_info.registration_id)
+                        if model.type == "embedding":
+                            self.endpoint_registry.unregister_embeddings(model_info.registered_name, model_info.registration_id)
+                    if info.models.get(model_id) is model_info:
+                        info.models.pop(model_id, None)
+                    raise
+            finally:
+                self._installing.discard(key)
 
         return PromiseWithProgress(func=func)
 
