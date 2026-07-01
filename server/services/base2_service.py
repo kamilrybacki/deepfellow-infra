@@ -376,6 +376,14 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         """Return auto-fetched size string for the model, or None if not supported."""
         return None
 
+    def get_custom_model_definition(self, custom_model_id: CustomModelId) -> dict[str, Any] | None:
+        """Return the stored spec a custom model was created from, searching all instances by id."""
+        for instance in self.instances_info.values():
+            for custom in instance.config.custom or []:
+                if custom.id == custom_model_id:
+                    return custom.data
+        return None
+
     async def add_custom_model(self, instance: str, options: AddCustomModelIn) -> CustomModelId:
         """Add custom model."""
         spec = dict(options.spec)
@@ -415,13 +423,21 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         if model is None:
             raise HTTPException(404, f"Custom model {custom_model_id} not found.")
         new_data: dict[str, Any] = dict(options.spec)
+        if not new_data.get("size"):
+            resolved = await self._resolve_custom_model_size(new_data, instance)
+            new_data["size"] = resolved or model.data.get("size") or "unknown"
         await self._update_custom_model(instance, model, new_data)
         model.data = new_data
         await self._save()
 
-    async def _update_custom_model(self, instance: str, model: CustomModel, new_data: dict[str, Any]) -> None:  # noqa: ARG002
-        """Update custom model."""
-        raise HTTPException(400, "This service does not support custom model updates.")
+    async def _update_custom_model(self, instance: str, model: CustomModel, new_data: dict[str, Any]) -> None:
+        """Update custom model by rebuilding it: remove the old, add the new, restoring the old on failure."""
+        self._remove_custom_model(instance, model)
+        try:
+            self._add_custom_model(instance, CustomModel(id=model.id, data=new_data))
+        except Exception:
+            self._add_custom_model(instance, model)
+            raise
 
     async def install_model(
         self, instance: str, model_id: str, options: InstallModelIn

@@ -361,7 +361,7 @@ async def test_update_custom_model_public_api_persists_data(svc: McpService, tmp
     with patch.object(svc, "_get_working_dir", return_value=tmp_path):
         await svc.update_custom_model("default", "uuid-user-1", AddCustomModelIn(spec=new_spec))
 
-    assert model.data == new_spec
+    assert model.data == {**new_spec, "size": "unknown"}
     svc.service_provider.save_service_config.assert_awaited_once()
 
 
