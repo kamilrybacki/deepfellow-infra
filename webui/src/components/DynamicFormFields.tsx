@@ -205,6 +205,21 @@ export function initFormData(fields: SpecField[]): Record<string, unknown> {
   return initial;
 }
 
+export function mergeInitialData(
+  fields: SpecField[],
+  initialData: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  const defaults = initFormData(fields);
+  if (!initialData) return defaults;
+  const merged = { ...defaults };
+  for (const field of fields) {
+    if (field.name in initialData) {
+      merged[field.name] = initialData[field.name];
+    }
+  }
+  return merged;
+}
+
 export function validateFields(
   fields: SpecField[],
   formData: Record<string, unknown>,

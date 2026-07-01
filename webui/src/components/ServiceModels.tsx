@@ -733,6 +733,28 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
     },
   });
 
+  const updateCustomModelMutation = useMutation({
+    mutationFn: async ({
+      customModelId,
+      spec,
+    }: {
+      customModelId: string;
+      spec: Record<string, unknown>;
+    }) => {
+      return apiClient.updateCustomModel(serviceId, customModelId, spec);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: ["admin", "services", serviceId, "models"],
+      });
+      modal.close();
+      toast.success("Custom model updated successfully");
+    },
+    onError: (error) => {
+      toast.error(`Failed to update custom model: ${error.message}`);
+    },
+  });
+
   const removeCustomModelMutation = useMutation({
     mutationFn: async ({ customModelId }: { customModelId: string }) => {
       return apiClient.removeCustomModel(serviceId, customModelId);
@@ -1191,6 +1213,51 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
     }
   }, []);
 
+  const handleEditCustomModelClick = useCallback(
+    (model: ServiceModel) => {
+      const customModelId = model.custom;
+      if (!customModelId) {
+        toast.error("Model is not a custom model.");
+        return;
+      }
+      if (model.installed) {
+        toast.error(
+          "Cannot edit custom model: it is currently installed. Please uninstall it first.",
+        );
+        return;
+      }
+      if (!serviceInfo?.custom_model_spec) return;
+      const fields = serviceInfo.custom_model_spec.fields;
+
+      modal.open(DynamicFormModal, {
+        title: `Edit custom model ${model.id}`,
+        fields,
+        initialData: (model.custom_spec ?? {}) as Record<string, unknown>,
+        deferRender: true,
+        submitLabel: "Save",
+        submittingLabel: "Saving...",
+        onSubmit: (spec: Record<string, unknown>) => {
+          const cleanedSpec = Object.fromEntries(
+            Object.entries(spec).filter(
+              ([_, value]) => value !== null && value !== undefined,
+            ),
+          ) as Record<string, unknown>;
+          updateCustomModelMutation.mutate({
+            customModelId,
+            spec: cleanedSpec,
+          });
+        },
+        isSubmitting: updateCustomModelMutation.isPending,
+      });
+    },
+    [
+      modal,
+      serviceInfo,
+      updateCustomModelMutation.isPending,
+      updateCustomModelMutation.mutate,
+    ],
+  );
+
   const sortedModels = useMemo(() => {
     if (!modelsData?.list) return [];
 
@@ -1399,6 +1466,7 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
         onInstallClick={handleInstallClick}
         onRemoveCustomModelClick={handleRemoveCustomModelClick}
         onEditMcpServerClick={handleEditMcpServerClick}
+        onEditCustomModelClick={handleEditCustomModelClick}
         onPurgeClick={handlePurgeClick}
         onTestClick={handleTestClick}
         onShowDockerLogs={handleShowDockerLogs}
@@ -1460,6 +1528,7 @@ type ModelsTableProps = {
   onInstallClick: (model: ServiceModel) => void | Promise<void>;
   onRemoveCustomModelClick: (model: ServiceModel) => void;
   onEditMcpServerClick: (model: ServiceModel) => void;
+  onEditCustomModelClick: (model: ServiceModel) => void;
   onPurgeClick: (modelId: string) => void;
   onTestClick: (model: ServiceModel) => void;
   onShowDockerLogs: (modelId: string) => void | Promise<void>;
@@ -1481,6 +1550,7 @@ const ModelsTable = memo(function ModelsTable({
   onInstallClick,
   onRemoveCustomModelClick,
   onEditMcpServerClick,
+  onEditCustomModelClick,
   onPurgeClick,
   onTestClick,
   onShowDockerLogs,
@@ -1544,6 +1614,7 @@ const ModelsTable = memo(function ModelsTable({
                 onInstallClick={onInstallClick}
                 onRemoveCustomModelClick={onRemoveCustomModelClick}
                 onEditMcpServerClick={onEditMcpServerClick}
+                onEditCustomModelClick={onEditCustomModelClick}
                 onPurgeClick={onPurgeClick}
                 onTestClick={onTestClick}
                 onShowDockerLogs={onShowDockerLogs}
@@ -1572,6 +1643,7 @@ type ModelRowProps = {
   onInstallClick: (model: ServiceModel) => void | Promise<void>;
   onRemoveCustomModelClick: (model: ServiceModel) => void;
   onEditMcpServerClick: (model: ServiceModel) => void;
+  onEditCustomModelClick: (model: ServiceModel) => void;
   onPurgeClick: (modelId: string) => void;
   onTestClick: (model: ServiceModel) => void;
   onShowDockerLogs: (modelId: string) => void | Promise<void>;
@@ -1593,6 +1665,7 @@ const ModelRow = memo(function ModelRow({
   onInstallClick,
   onRemoveCustomModelClick,
   onEditMcpServerClick,
+  onEditCustomModelClick,
   onPurgeClick,
   onTestClick,
   onShowDockerLogs,
@@ -1756,7 +1829,11 @@ const ModelRow = memo(function ModelRow({
                 {model.custom && (
                   <>
                     <DropdownMenuItem
-                      onClick={() => onEditMcpServerClick(model)}
+                      onClick={() =>
+                        serviceId === "mcp"
+                          ? onEditMcpServerClick(model)
+                          : onEditCustomModelClick(model)
+                      }
                     >
                       Edit
                     </DropdownMenuItem>

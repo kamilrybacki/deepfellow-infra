@@ -22,7 +22,7 @@ limitations under the License.
 import { useEffect, useMemo, useState } from "react";
 import {
   DynamicFormFields,
-  initFormData,
+  mergeInitialData,
   validateFields,
 } from "./DynamicFormFields";
 
@@ -72,17 +72,11 @@ export function DynamicFormModal({
     isLoading ||
     (deferRender && open && renderFields.length === 0 && fields.length > 0);
 
-  const initialData = useMemo(() => {
-    const defaults = initFormData(renderFields);
-    if (!initialDataProp) return defaults;
-    const merged = { ...defaults };
-    for (const field of renderFields) {
-      if (field.name in initialDataProp) {
-        merged[field.name] = initialDataProp[field.name];
-      }
-    }
-    return merged;
-  }, [renderFields, initialDataProp]);
+  // Use `fields`, not `renderFields`, so formData holds every value before deferred fields mount.
+  const initialData = useMemo(
+    () => mergeInitialData(fields, initialDataProp),
+    [fields, initialDataProp],
+  );
   const [formData, setFormData] =
     useState<Record<string, unknown>>(initialData);
   const [errors, setErrors] = useState<Record<string, string>>({});

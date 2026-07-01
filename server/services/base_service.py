@@ -75,6 +75,10 @@ class BaseService(ABC):
     def get_custom_model_spec(self) -> CustomModelSpecification | None:
         """Return the custom model specification or None if custom model is not supported."""
 
+    def get_custom_model_definition(self, custom_model_id: CustomModelId) -> dict[str, Any] | None:  # noqa: ARG002
+        """Return the stored spec a custom model was created from, or None if unavailable."""
+        return None
+
     def get_info(self, instance: str) -> RetrieveServiceOut:
         """Return the service info."""
         return RetrieveServiceOut(

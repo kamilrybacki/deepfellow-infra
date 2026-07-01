@@ -7,7 +7,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
@@ -303,6 +303,59 @@ async def test_list_models_from_service(services_manager: ServicesManager):
 
     assert svc.list_models.await_count == 1
     assert svc.list_models.await_args == call("default", filters)
+
+
+def _custom_model_out(custom_spec: dict[str, Any] | None) -> RetrieveModelOut:
+    return RetrieveModelOut(
+        id="my-custom",
+        service="ollama",
+        type="llm",
+        installed=False,
+        downloaded=True,
+        size="small",
+        spec=ModelSpecification(fields=[]),
+        has_docker=True,
+        custom="cm-1",
+        custom_spec=custom_spec,
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_models_from_service_enriches_custom_spec(services_manager: ServicesManager):
+    svc = FakeService("ollama")
+    svc.list_models = AsyncMock(return_value=ListModelsOut(list=[_custom_model_out(None)]))
+    svc.get_custom_model_definition = MagicMock(return_value={"id": "my-custom", "image": "test/image"})
+    services_manager.register_service(svc)
+
+    result = await services_manager.list_models_from_service("ollama", ListModelsFilters())
+
+    svc.get_custom_model_definition.assert_called_once_with("cm-1")
+    assert result.list[0].custom_spec == {"id": "my-custom", "image": "test/image"}
+
+
+@pytest.mark.asyncio
+async def test_list_models_from_service_default_definition_is_none(services_manager: ServicesManager):
+    svc = FakeService("ollama")
+    svc.list_models = AsyncMock(return_value=ListModelsOut(list=[_custom_model_out(None)]))
+    services_manager.register_service(svc)
+
+    result = await services_manager.list_models_from_service("ollama", ListModelsFilters())
+
+    assert result.list[0].custom_spec is None
+
+
+@pytest.mark.asyncio
+async def test_list_models_from_service_preserves_existing_custom_spec(services_manager: ServicesManager):
+    existing = {"kind": "user", "id": "my-custom"}
+    svc = FakeService("ollama")
+    svc.list_models = AsyncMock(return_value=ListModelsOut(list=[_custom_model_out(existing)]))
+    svc.get_custom_model_definition = MagicMock(return_value={"should": "not be used"})
+    services_manager.register_service(svc)
+
+    result = await services_manager.list_models_from_service("ollama", ListModelsFilters())
+
+    svc.get_custom_model_definition.assert_not_called()
+    assert result.list[0].custom_spec == existing
 
 
 @pytest.mark.asyncio

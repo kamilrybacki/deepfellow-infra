@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, call
 import pytest
 from fastapi import HTTPException
 
+from server.docker import DockerOptions
 from server.models.models import AddCustomModelIn, InstallModelIn, ListModelsFilters, ModelInfo, UninstallModelIn
 from server.models.services import InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import CustomModel, Instance, InstanceConfig
@@ -274,6 +275,19 @@ def test_add_custom_model_adds_to_models(svc: CustomService) -> None:
     assert "my-custom" in svc.models["default"]
 
 
+def test_get_custom_model_definition_returns_stored_spec(svc: CustomService) -> None:
+    model = CustomModel(id="cm-1", data=_CUSTOM_MODEL_DATA)
+    svc.instances_info["default"].config.custom = [model]
+
+    assert svc.get_custom_model_definition("cm-1") == _CUSTOM_MODEL_DATA
+
+
+def test_get_custom_model_definition_unknown_id_returns_none(svc: CustomService) -> None:
+    svc.instances_info["default"].config.custom = [CustomModel(id="cm-1", data=_CUSTOM_MODEL_DATA)]
+
+    assert svc.get_custom_model_definition("nonexistent-id") is None
+
+
 def test_add_custom_model_duplicate_raises(svc: CustomService) -> None:
     svc._add_custom_model("default", CustomModel(id="cm-1", data=_CUSTOM_MODEL_DATA))  # pyright: ignore[reportPrivateUsage]
     with pytest.raises(HTTPException) as exc:
@@ -305,9 +319,64 @@ async def test_update_custom_model_not_found_raises_404(svc: CustomService) -> N
 
 
 @pytest.mark.asyncio
-async def test_update_custom_model_default_raises_400(svc: CustomService) -> None:
-    model = CustomModel(id="cm-1", data=_CUSTOM_MODEL_DATA)
+async def test_update_custom_model_persists_and_rebuilds_model(svc: CustomService) -> None:
+    model = CustomModel(id="cm-1", data=dict(_CUSTOM_MODEL_DATA))
+    svc._add_custom_model("default", model)  # pyright: ignore[reportPrivateUsage]
     svc.instances_info["default"].config.custom = [model]
+    svc.service_provider.save_service_config = AsyncMock()
+
+    new_data = {**_CUSTOM_MODEL_DATA, "image": "test/updated:latest"}
+    await svc.update_custom_model("default", "cm-1", AddCustomModelIn(spec=new_data))
+
+    assert svc.instances_info["default"].config.custom[0].data["image"] == "test/updated:latest"
+    options = svc.models["default"]["my-custom"].options
+    assert isinstance(options, DockerOptions)
+    assert options.image == "test/updated:latest"
+
+
+@pytest.mark.asyncio
+async def test_update_custom_model_preserves_size_when_form_omits_it(svc: CustomService) -> None:
+    model = CustomModel(id="cm-1", data=dict(_CUSTOM_MODEL_DATA))
+    svc._add_custom_model("default", model)  # pyright: ignore[reportPrivateUsage]
+    svc.instances_info["default"].config.custom = [model]
+    svc.service_provider.save_service_config = AsyncMock()
+
+    spec_without_size = {k: v for k, v in _CUSTOM_MODEL_DATA.items() if k != "size"}
+    spec_without_size["image"] = "test/updated:latest"
+    await svc.update_custom_model("default", "cm-1", AddCustomModelIn(spec=spec_without_size))
+
+    assert svc.instances_info["default"].config.custom[0].data["size"] == "1GB"
+
+
+@pytest.mark.asyncio
+async def test_update_custom_model_rolls_back_when_add_fails(svc: CustomService) -> None:
+    model_a = CustomModel(id="cm-1", data={**_CUSTOM_MODEL_DATA, "id": "model-a", "default_prefix": "model-a"})
+    model_b = CustomModel(id="cm-2", data={**_CUSTOM_MODEL_DATA, "id": "model-b", "default_prefix": "model-b"})
+    svc._add_custom_model("default", model_a)  # pyright: ignore[reportPrivateUsage]
+    svc._add_custom_model("default", model_b)  # pyright: ignore[reportPrivateUsage]
+    svc.instances_info["default"].config.custom = [model_a, model_b]
+    svc.service_provider.save_service_config = AsyncMock()
+
+    with pytest.raises(HTTPException) as exc:
+        await svc.update_custom_model(
+            "default", "cm-1", AddCustomModelIn(spec={**_CUSTOM_MODEL_DATA, "id": "model-b", "default_prefix": "model-b"})
+        )
+
+    assert exc.value.status_code == 400
+    assert "model-a" in svc.models["default"]
+    assert "model-b" in svc.models["default"]
+    assert svc.instances_info["default"].config.custom[0].data["id"] == "model-a"
+
+
+@pytest.mark.asyncio
+async def test_update_custom_model_when_in_use_raises_400(svc: CustomService) -> None:
+    model = CustomModel(id="cm-1", data=dict(_CUSTOM_MODEL_DATA))
+    svc._add_custom_model("default", model)  # pyright: ignore[reportPrivateUsage]
+    svc.instances_info["default"].config.custom = [model]
+    svc.instances_info["default"].installed = InstalledInfo(
+        models={"my-custom": MagicMock()},
+        options=InstallServiceIn(spec={}),
+    )
 
     with pytest.raises(HTTPException) as exc:
         await svc.update_custom_model("default", "cm-1", AddCustomModelIn(spec=_CUSTOM_MODEL_DATA))

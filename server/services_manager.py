@@ -127,18 +127,34 @@ class ServicesManager:
         for service in self.services.values():
             for instance in service.instances_info:
                 if service.is_installed(instance) and (filters.service_id is None or service.get_type() == filters.service_id):
-                    res.append(await service.list_models(instance, filter))
+                    out = await service.list_models(instance, filter)
+                    for model in out.list:
+                        self._enrich_custom_spec(service, model)
+                    res.append(out)
         return ListAllModelsOut(list=[x for sublist in res for x in sublist.list])
 
     async def list_models_from_service(self, service_id: str, filters: ListModelsFilters) -> ListModelsOut:
         """List models."""
         service_type, instance = self.split_service_type_and_instance(service_id)
-        return await self._get_service(service_type).list_models(instance, filters)
+        service = self._get_service(service_type)
+        out = await service.list_models(instance, filters)
+        for model in out.list:
+            self._enrich_custom_spec(service, model)
+        return out
 
     async def get_model_from_service(self, service_id: str, model_id: str) -> RetrieveModelOut:
         """Get the model from service."""
         service_type, instance = self.split_service_type_and_instance(service_id)
-        return await self._get_service(service_type).get_model(instance, model_id)
+        service = self._get_service(service_type)
+        model = await service.get_model(instance, model_id)
+        self._enrich_custom_spec(service, model)
+        return model
+
+    @staticmethod
+    def _enrich_custom_spec(service: BaseService, model: RetrieveModelOut) -> None:
+        """Fill custom_spec for a custom model from its stored definition, unless the service already set it."""
+        if model.custom and model.custom_spec is None:
+            model.custom_spec = service.get_custom_model_definition(model.custom)
 
     async def get_model_install_progress(self, service_id: str, model_id: str) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         """Get model install progress."""
