@@ -511,9 +511,11 @@ class SpeachesModel:
 
 class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
     models: dict[str, dict[str, SpeachesModel]]
+    _installing: set[tuple[str, str]]
 
     def _after_init(self) -> None:
         self.models = {}
+        self._installing = set()
         self.load_default_models("default")
 
     def load_default_models(self, instance: str) -> None:
@@ -841,7 +843,7 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
                 else:
                     break
 
-    async def _install_model(
+    async def _install_model(  # noqa: C901
         self, instance: str, model_id: str, options: InstallModelIn
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_model_options = try_parse_pydantic(SpeachesAIModelOptions, options.spec) if options.spec else SpeachesAIModelOptions()
@@ -850,64 +852,74 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
         if not self.models.get(instance):
             self.models[instance] = {}
 
-        if model_id in info.models:
-            return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed"))
+        key = (instance, model_id)
+        if model_id in info.models or key in self._installing:
+            return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed or being installed right now."))
 
         if model_id not in self.models[instance]:
             raise HTTPException(400, "Model not found")
 
         model = self.models[instance][model_id]
+        self._installing.add(key)
 
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
-            model_dir = Path()
-            model_id_fixed = f"models--{model_id.replace('/', '--')}"
-            models_dir = self._get_working_dir() / "cache"
-            model_dir = models_dir / model_id_fixed
-            model_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                model_dir = Path()
+                model_id_fixed = f"models--{model_id.replace('/', '--')}"
+                models_dir = self._get_working_dir() / "cache"
+                model_dir = models_dir / model_id_fixed
+                model_dir.mkdir(parents=True, exist_ok=True)
 
-            if not model.custom and not model.langs_models:
-                await self._download_model_or_set_progress(stream, model, model_id, model_dir)
+                if not model.custom and not model.langs_models:
+                    await self._download_model_or_set_progress(stream, model, model_id, model_dir)
 
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
+                stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
 
-            registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
-            info.models[model_id] = model_info = ModelInstalledInfo(
-                id=model_id,
-                type=model.type,
-                registered_name=registered_name,
-                options=options,
-                registration_id="",
-                model_path=model_dir,
-                default_model=model.default_model or None,
-                langs_models=model.langs_models or None,
-            )
-            if model.type == "tts":
+                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                info.models[model_id] = model_info = ModelInstalledInfo(
+                    id=model_id,
+                    type=model.type,
+                    registered_name=registered_name,
+                    options=options,
+                    registration_id="",
+                    model_path=model_dir,
+                    default_model=model.default_model or None,
+                    langs_models=model.langs_models or None,
+                )
+                try:
+                    if model.type == "tts":
 
-                async def on_request(body: CreateSpeechRequest, request: Request | None) -> StreamingResponse:
-                    body.voice = "" if not body.voice else body.voice  # Fix for 422 status code
-                    proxy_options = ProxyOptions(url=f"{info.base_url}/v1/audio/speech", rewrite_model_to=model_id)
-                    if model.id and model.default_model and model.langs_models:
-                        proxy_options.rewrite_model_to = body.model = self.choose_model_for_language(
-                            body.input, model.default_model, model.langs_models
+                        async def on_request(body: CreateSpeechRequest, request: Request | None) -> StreamingResponse:
+                            body.voice = "" if not body.voice else body.voice  # Fix for 422 status code
+                            proxy_options = ProxyOptions(url=f"{info.base_url}/v1/audio/speech", rewrite_model_to=model_id)
+                            if model.id and model.default_model and model.langs_models:
+                                proxy_options.rewrite_model_to = body.model = self.choose_model_for_language(
+                                    body.input, model.default_model, model.langs_models
+                                )
+                            return await post_json(body, proxy_options, request)
+
+                        model_info.registration_id = self.endpoint_registry.register_audio_speech(
+                            model=registered_name,
+                            props=ModelProps(private=True, type=model.type, endpoints=TTS_ENDPOINTS),
+                            endpoint=SimpleEndpoint(on_request=on_request),
+                            registration_options=None,
                         )
-                    return await post_json(body, proxy_options, request)
-
-                model_info.registration_id = self.endpoint_registry.register_audio_speech(
-                    model=registered_name,
-                    props=ModelProps(private=True, type=model.type, endpoints=TTS_ENDPOINTS),
-                    endpoint=SimpleEndpoint(on_request=on_request),
-                    registration_options=None,
-                )
-            if model.type == "stt":
-                model_info.registration_id = self.endpoint_registry.register_audio_transcriptions_as_proxy(
-                    model=registered_name,
-                    props=ModelProps(private=True, type=model.type, endpoints=STT_ENDPOINTS),
-                    options=ProxyOptions(url=f"{info.base_url}/v1/audio/transcriptions", rewrite_model_to=model_id),
-                    registration_options=None,
-                )
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
-            self.models_downloaded[model_id] = DownloadedInfo(model_path=str(model_dir))
-            return InstallModelOut(status="OK", details="Installed")
+                    if model.type == "stt":
+                        model_info.registration_id = self.endpoint_registry.register_audio_transcriptions_as_proxy(
+                            model=registered_name,
+                            props=ModelProps(private=True, type=model.type, endpoints=STT_ENDPOINTS),
+                            options=ProxyOptions(url=f"{info.base_url}/v1/audio/transcriptions", rewrite_model_to=model_id),
+                            registration_options=None,
+                        )
+                    stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
+                    self.models_downloaded[model_id] = DownloadedInfo(model_path=str(model_dir))
+                    return InstallModelOut(status="OK", details="Installed")
+                except Exception:
+                    if info.models.get(model_id) is model_info:
+                        info.models.pop(model_id, None)
+                    raise
+            finally:
+                self._installing.discard(key)
 
         return PromiseWithProgress(func=func)
 

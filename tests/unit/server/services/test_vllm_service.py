@@ -1534,4 +1534,63 @@ async def test_install_model_releases_gpu_on_cancelled_error(svc: VllmService, d
             await promise.wait()
 
     assert svc2.gpu_memory_utilization == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_install_model_registration_failure_rolls_back_model(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    installed = _setup_install_mocks(svc, deps)
+    model_id = next(iter(svc.models["default"]))
+    deps["endpoint_registry"].register_chat_completion_as_proxy.side_effect = RuntimeError("registry down")
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert model_id not in installed.models
     deps["docker_service"].stop_docker.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_install_model_registration_failure_skips_rollback_when_already_removed(
+    svc: VllmService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    installed = _setup_install_mocks(svc, deps)
+    model_id = next(iter(svc.models["default"]))
+
+    def side_effect(*args: object, **kwargs: object) -> None:
+        installed.models.pop(model_id, None)
+        raise RuntimeError("registry down")
+
+    deps["endpoint_registry"].register_chat_completion_as_proxy.side_effect = side_effect
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert model_id not in installed.models
+
+
+@pytest.mark.asyncio
+async def test_install_model_pre_func_exception_discards_installing_key(svc: VllmService, deps: dict[str, Any]) -> None:
+    _setup_install_mocks(svc, deps)
+    model_id = next(iter(svc.models["default"]))
+
+    with (
+        patch.object(svc, "_get_quantization", new_callable=AsyncMock, side_effect=RuntimeError("quantization failed")),  # pyright: ignore[reportPrivateUsage]
+        pytest.raises(RuntimeError),
+    ):
+        await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+
+    assert ("default", model_id) not in svc._installing  # pyright: ignore[reportPrivateUsage]

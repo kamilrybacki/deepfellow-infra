@@ -28,6 +28,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Fixed models appearing twice in Infra UI Mesh when installed twice in a short timespan.
 - Fixed inflated Ollama VRAM/RAM estimates for not-yet-loaded models: the estimate now uses the context Ollama actually runs with instead of the model's full native window.
 - User-defined (Command/stdio) MCP servers now show their size in the WebUI instead of "N/A": it is resolved from the locally built Docker image on install and persisted so it survives restarts.
 - Fixed the WebUI model-install progress percentage drifting out of sync between the table row and the bottom-right toast (most visible on slow connections): the toast now reads its `%` from the install-progress store (the same source as the row) instead of computing it from a raw value, so it respects the store's monotonicity rules and no longer freezes during the final completion animation.

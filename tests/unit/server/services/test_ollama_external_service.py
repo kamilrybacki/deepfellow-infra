@@ -1499,4 +1499,78 @@ async def test_uninstall_instance_cancels_active_sync_task(svc: OllamaExternalSe
 
     await asyncio.sleep(0)
     assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_install_model_registration_failure_rolls_back_model_without_unregister(
+    svc: OllamaExternalService, installed: InstalledInfo, deps: dict[str, Any]
+) -> None:
+    svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm")
+    deps["endpoint_registry"].register_chat_completion_as_proxy.side_effect = RuntimeError("registry down")
+
+    with patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock):  # pyright: ignore[reportPrivateUsage]
+        promise = await svc._install_model("default", "test-llm", InstallModelIn())  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert "test-llm" not in installed.models
+    assert deps["endpoint_registry"].unregister_chat_completion.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_install_model_post_registration_failure_unregisters_and_rolls_back(
+    svc: OllamaExternalService, installed: InstalledInfo, deps: dict[str, Any]
+) -> None:
+    svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm")
+    deps["endpoint_registry"].register_chat_completion_as_proxy.return_value = "reg-llm"
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_sync_models_from_external_ollama", new_callable=AsyncMock, side_effect=RuntimeError("sync failed")),  # pyright: ignore[reportPrivateUsage]
+    ):
+        promise = await svc._install_model("default", "test-llm", InstallModelIn())  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert "test-llm" not in installed.models
+    assert deps["endpoint_registry"].unregister_chat_completion.call_count == 1
     assert "default" not in svc._sync_tasks  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_install_model_post_registration_failure_unregisters_embedding_and_rolls_back(
+    svc: OllamaExternalService, installed: InstalledInfo, deps: dict[str, Any]
+) -> None:
+    svc.models["default"]["test-emb"] = OllamaModel(id="test-emb", size="500MB", type="embedding")
+    deps["endpoint_registry"].register_embeddings_as_proxy.return_value = "reg-emb"
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_sync_models_from_external_ollama", new_callable=AsyncMock, side_effect=RuntimeError("sync failed")),  # pyright: ignore[reportPrivateUsage]
+    ):
+        promise = await svc._install_model("default", "test-emb", InstallModelIn())  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert "test-emb" not in installed.models
+    assert deps["endpoint_registry"].unregister_embeddings.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_install_model_registration_failure_skips_rollback_when_already_removed(
+    svc: OllamaExternalService, installed: InstalledInfo, deps: dict[str, Any]
+) -> None:
+    svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm")
+
+    def side_effect(*args: object, **kwargs: object) -> None:
+        installed.models.pop("test-llm", None)
+        raise RuntimeError("registry down")
+
+    deps["endpoint_registry"].register_chat_completion_as_proxy.side_effect = side_effect
+
+    with patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock):  # pyright: ignore[reportPrivateUsage]
+        promise = await svc._install_model("default", "test-llm", InstallModelIn())  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert "test-llm" not in installed.models

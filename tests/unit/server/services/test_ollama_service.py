@@ -2371,3 +2371,138 @@ async def test_install_model_context_window_capped_by_service_context_when_servi
     props: ModelProps = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs["props"]
     assert props.context_window == 4096
     assert props.max_context_window == 8192
+
+
+@pytest.mark.asyncio
+async def test_uninstall_instance_raises_409_when_model_is_being_installed(svc: OllamaService) -> None:
+    installed = _make_installed_info(svc)
+    model_id = "test-llm"
+    installed.models[model_id] = ModelInstalledInfo(
+        id=model_id,
+        registered_name=model_id,
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="",
+        internal_name=None,
+    )
+    svc.instances_info["default"].installed = installed
+    svc._installing.add(("default", model_id))  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(HTTPException) as exc_info:
+        await svc._uninstall_instance("default", UninstallServiceIn(purge=False))  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_install_model_registration_failure_rolls_back_model(svc: OllamaService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info(svc)
+    svc.instances_info["default"].installed = installed
+    model_id = "test-llm"
+    svc.models["default"][model_id] = OllamaModel(id=model_id, size="1GB", type="llm", hash="abc", context=4096, modelfile=None)
+    deps["endpoint_registry"].register_chat_completion_as_proxy.side_effect = RuntimeError("registry down")
+
+    with patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=200, data="")
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert model_id not in installed.models
+
+
+@pytest.mark.asyncio
+async def test_uninstall_model_raises_409_when_model_is_being_installed(svc: OllamaService) -> None:
+    installed = _make_installed_info(svc)
+    svc.instances_info["default"].installed = installed
+    model_id = "test-llm"
+    svc._installing.add(("default", model_id))  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(HTTPException) as exc_info:
+        await svc._uninstall_model("default", model_id, UninstallModelIn(purge=False))  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_install_model_post_registration_failure_unregisters_and_rolls_back(svc: OllamaService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info(svc)
+    svc.instances_info["default"].installed = installed
+    model_id = "test-llm"
+    svc.models["default"][model_id] = OllamaModel(id=model_id, size="1GB", type="llm", hash="abc", context=4096, modelfile=None)
+    deps["endpoint_registry"].register_chat_completion_as_proxy.return_value = "reg-llm"
+    svc.models_downloaded = MagicMock()  # pyright: ignore[reportAttributeAccessIssue]
+    svc.models_downloaded.__setitem__ = MagicMock(side_effect=RuntimeError("storage failed"))
+
+    with patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=200, data="")
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert model_id not in installed.models
+    assert deps["endpoint_registry"].unregister_chat_completion.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_install_model_post_registration_failure_unregisters_embedding_and_rolls_back(
+    svc: OllamaService, deps: dict[str, Any]
+) -> None:
+    installed = _make_installed_info(svc)
+    svc.instances_info["default"].installed = installed
+    model_id = "test-emb"
+    svc.models["default"][model_id] = OllamaModel(id=model_id, size="500MB", type="embedding", hash="def", context=None, modelfile=None)
+    deps["endpoint_registry"].register_embeddings_as_proxy.return_value = "reg-emb"
+    svc.models_downloaded = MagicMock()  # pyright: ignore[reportAttributeAccessIssue]
+    svc.models_downloaded.__setitem__ = MagicMock(side_effect=RuntimeError("storage failed"))
+
+    with patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=200, data="")
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert model_id not in installed.models
+    assert deps["endpoint_registry"].unregister_embeddings.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_install_model_post_registration_failure_unregisters_txt2img_and_rolls_back(svc: OllamaService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info(svc)
+    svc.instances_info["default"].installed = installed
+    model_id = "test-img"
+    svc.models["default"][model_id] = OllamaModel(id=model_id, size="2GB", type="txt2img", hash="ghi", context=None, modelfile=None)
+    deps["endpoint_registry"].register_image_generations_as_proxy.return_value = "reg-img"
+    svc.models_downloaded = MagicMock()  # pyright: ignore[reportAttributeAccessIssue]
+    svc.models_downloaded.__setitem__ = MagicMock(side_effect=RuntimeError("storage failed"))
+
+    with patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=200, data="")
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert model_id not in installed.models
+    assert deps["endpoint_registry"].unregister_image_generations.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_install_model_registration_failure_skips_rollback_when_already_removed(svc: OllamaService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info(svc)
+    svc.instances_info["default"].installed = installed
+    model_id = "test-llm"
+    svc.models["default"][model_id] = OllamaModel(id=model_id, size="1GB", type="llm", hash="abc", context=4096, modelfile=None)
+
+    def side_effect(*args: object, **kwargs: object) -> None:
+        installed.models.pop(model_id, None)
+        raise RuntimeError("registry down")
+
+    deps["endpoint_registry"].register_chat_completion_as_proxy.side_effect = side_effect
+
+    with patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=200, data="")
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert model_id not in installed.models

@@ -136,9 +136,11 @@ class DownloadedInfo:
 
 class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
     models: dict[str, dict[str, RerankModel]]
+    _installing: set[tuple[str, str]]
 
     def _after_init(self) -> None:
         self.models = {}
+        self._installing = set()
         self.load_default_models("default")
 
     def load_default_models(self, instance: str) -> None:
@@ -429,7 +431,7 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
                 else:
                     break
 
-    async def _install_model(
+    async def _install_model(  # noqa: C901
         self, instance: str, model_id: str, options: InstallModelIn
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_model_options = try_parse_pydantic(RerankModelOptions, options.spec) if options.spec else RerankModelOptions()
@@ -438,57 +440,69 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
         if not self.models.get(instance):
             self.models[instance] = {}
 
-        if model_id in info.models:
+        key = (instance, model_id)
+        if model_id in info.models or key in self._installing:
             return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed"))
 
         if model_id not in _const.models:
             raise HTTPException(400, "Model not found")
 
         model = self.models[instance][model_id]
+        self._installing.add(key)
 
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
-            model_id_fixed = "models--" + model_id.replace("/", "--")
-            models_dir = self._get_working_dir() / "main/hub"
-            model_dir = models_dir / model_id_fixed
-            model_dir.mkdir(parents=True, exist_ok=True)
-            await self._download_model_or_set_progress(stream, model, model_id, model_dir)
+            try:
+                model_id_fixed = "models--" + model_id.replace("/", "--")
+                models_dir = self._get_working_dir() / "main/hub"
+                model_dir = models_dir / model_id_fixed
+                model_dir.mkdir(parents=True, exist_ok=True)
+                await self._download_model_or_set_progress(stream, model, model_id, model_dir)
 
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
-            registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
-            info.models[model_id] = model_info = ModelInstalledInfo(
-                id=model_id,
-                type=model.type,
-                registered_name=registered_name,
-                options=options,
-                registration_id="",
-            )
-            if model.type == "rerank":
-                model_info.registration_id = self.endpoint_registry.register_rerank_as_proxy(
-                    model=registered_name,
-                    props=ModelProps(
-                        private=True,
-                        type=model.type,
-                        endpoints=["/v1/rerank"],
-                    ),
-                    options=ProxyOptions(url=f"{info.base_url}/v1/rerank", rewrite_model_to=model_id),
-                    registration_options=None,
+                stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
+                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                info.models[model_id] = model_info = ModelInstalledInfo(
+                    id=model_id,
+                    type=model.type,
+                    registered_name=registered_name,
+                    options=options,
+                    registration_id="",
                 )
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
+                try:
+                    if model.type == "rerank":
+                        model_info.registration_id = self.endpoint_registry.register_rerank_as_proxy(
+                            model=registered_name,
+                            props=ModelProps(
+                                private=True,
+                                type=model.type,
+                                endpoints=["/v1/rerank"],
+                            ),
+                            options=ProxyOptions(url=f"{info.base_url}/v1/rerank", rewrite_model_to=model_id),
+                            registration_options=None,
+                        )
+                    stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
 
-            if parsed_model_options.alive_time is not None:
-                await fetch_from(
-                    f"{info.base_url}/v1/model/configure",
-                    "POST",
-                    {"model": model_id, "alive_time": parsed_model_options.alive_time},
-                )
-            if parsed_model_options.preload:
-                await fetch_from(
-                    f"{info.base_url}/v1/model/load",
-                    "POST",
-                    {"model": model_id},
-                )
-            self.models_downloaded[model_id] = DownloadedInfo(model_path=str(model_dir))
-            return InstallModelOut(status="OK", details="Installed")
+                    if parsed_model_options.alive_time is not None:
+                        await fetch_from(
+                            f"{info.base_url}/v1/model/configure",
+                            "POST",
+                            {"model": model_id, "alive_time": parsed_model_options.alive_time},
+                        )
+                    if parsed_model_options.preload:
+                        await fetch_from(
+                            f"{info.base_url}/v1/model/load",
+                            "POST",
+                            {"model": model_id},
+                        )
+                    self.models_downloaded[model_id] = DownloadedInfo(model_path=str(model_dir))
+                    return InstallModelOut(status="OK", details="Installed")
+                except Exception:
+                    if model_info.registration_id:
+                        self.endpoint_registry.unregister_rerank(model_info.registered_name, model_info.registration_id)
+                    if info.models.get(model_id) is model_info:
+                        info.models.pop(model_id, None)
+                    raise
+            finally:
+                self._installing.discard(key)
 
         return PromiseWithProgress(func=func)
 

@@ -787,3 +787,40 @@ async def test_install_model_initialises_empty_models_dict_for_instance(openai_s
 
     assert exc.value.status_code == 400
     assert "default" in openai_svc.models
+
+
+@pytest.mark.asyncio
+async def test_install_model_registration_failure_rolls_back_model(openai_svc: OpenAIService, deps: dict[str, Any]) -> None:
+    openai_svc.instances_info["default"].installed = _make_installed()
+    deps["endpoint_registry"].register_chat_completion_as_proxy.side_effect = RuntimeError("registry down")
+
+    promise = await openai_svc._install_model("default", "gpt-4o", InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(RuntimeError):
+        await promise.wait()
+
+    installed = openai_svc.instances_info["default"].installed
+    assert installed is not None
+    assert "gpt-4o" not in installed.models
+
+
+@pytest.mark.asyncio
+async def test_install_model_registration_failure_skips_rollback_when_already_removed(
+    openai_svc: OpenAIService, deps: dict[str, Any]
+) -> None:
+    openai_svc.instances_info["default"].installed = _make_installed()
+
+    def side_effect(*args: object, **kwargs: object) -> None:
+        installed = openai_svc.instances_info["default"].installed
+        assert installed is not None
+        installed.models.pop("gpt-4o", None)
+        raise RuntimeError("registry down")
+
+    deps["endpoint_registry"].register_chat_completion_as_proxy.side_effect = side_effect
+
+    promise = await openai_svc._install_model("default", "gpt-4o", InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(RuntimeError):
+        await promise.wait()
+
+    installed = openai_svc.instances_info["default"].installed
+    assert installed is not None
+    assert "gpt-4o" not in installed.models

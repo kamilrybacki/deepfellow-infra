@@ -1048,3 +1048,48 @@ async def test_install_model_appends_parallel_flag_when_num_parallel_gt_1(
 
     assert len(captured) == 1
     assert "--parallel 4" in captured[0].command  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_install_model_registration_failure_rolls_back_model(svc: LLamacppService, deps: dict[str, Any], tmp_path: Path) -> None:
+    installed = _setup_install_mocks(svc, deps)
+    model_id = next(iter(svc.models["default"]))
+    deps["endpoint_registry"].register_chat_completion_as_proxy.side_effect = RuntimeError("registry down")
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=(tmp_path / "model.gguf", "model.gguf")),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.llamacpp_service.get_gguf_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.llamacpp_service.get_base_url", return_value="http://localhost:8080"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert model_id not in installed.models
+
+
+@pytest.mark.asyncio
+async def test_install_model_registration_failure_skips_rollback_when_already_removed(
+    svc: LLamacppService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    installed = _setup_install_mocks(svc, deps)
+    model_id = next(iter(svc.models["default"]))
+
+    def side_effect(*args: object, **kwargs: object) -> None:
+        installed.models.pop(model_id, None)
+        raise RuntimeError("registry down")
+
+    deps["endpoint_registry"].register_chat_completion_as_proxy.side_effect = side_effect
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=(tmp_path / "model.gguf", "model.gguf")),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.llamacpp_service.get_gguf_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.llamacpp_service.get_base_url", return_value="http://localhost:8080"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert model_id not in installed.models

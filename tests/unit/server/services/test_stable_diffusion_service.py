@@ -1724,3 +1724,76 @@ async def test_resolve_custom_model_size_returns_none_on_exception(svc: StableDi
         result = await svc._resolve_custom_model_size({"url": "https://example.com"})  # pyright: ignore[reportPrivateUsage]
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_install_model_registration_failure_rolls_back_model_without_unregister(
+    svc: StableDiffusionService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    installed = _make_installed_info()
+    svc.instances_info["default"].installed = installed
+    model_id = "Plant Milk Walnut"
+    model_path = tmp_path / "model.safetensors"
+    model_path.touch()
+    deps["endpoint_registry"].register_image_generations.side_effect = RuntimeError("registry down")
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=(model_path, "model.safetensors")),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "refresh_models", new_callable=AsyncMock),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert model_id not in installed.models
+    assert deps["endpoint_registry"].unregister_image_generations.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_install_model_post_registration_failure_unregisters_and_rolls_back(
+    svc: StableDiffusionService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    installed = _make_installed_info()
+    svc.instances_info["default"].installed = installed
+    model_id = "Plant Milk Walnut"
+    model_path = tmp_path / "model.safetensors"
+    model_path.touch()
+    deps["endpoint_registry"].register_image_generations.return_value = "reg-sd"
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=(model_path, "model.safetensors")),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "refresh_models", new_callable=AsyncMock, side_effect=RuntimeError("refresh failed")),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert model_id not in installed.models
+    assert deps["endpoint_registry"].unregister_image_generations.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_install_model_registration_failure_skips_rollback_when_already_removed(
+    svc: StableDiffusionService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    installed = _make_installed_info()
+    svc.instances_info["default"].installed = installed
+    model_id = "Plant Milk Walnut"
+    model_path = tmp_path / "model.safetensors"
+    model_path.touch()
+
+    def side_effect(*args: object, **kwargs: object) -> None:
+        installed.models.pop(model_id, None)
+        raise RuntimeError("registry down")
+
+    deps["endpoint_registry"].register_image_generations.side_effect = side_effect
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=(model_path, "model.safetensors")),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "refresh_models", new_callable=AsyncMock),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert model_id not in installed.models

@@ -274,9 +274,11 @@ class DefaultSdNextConfig(NamedTuple):
 
 class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
     models: dict[str, dict[str, StableDiffusionModel]]
+    _installing: set[tuple[str, str]]
 
     def _after_init(self) -> None:
         self.models = {}
+        self._installing = set()
         self.load_default_models("default")
 
     def load_default_models(self, instance: str) -> None:
@@ -667,45 +669,57 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
         parsed_model_options = try_parse_pydantic(SDModelOptions, options.spec) if options.spec else SDModelOptions()
         info = self.get_instance_installed_info(instance)
 
-        if model_id in info.models:
+        key = (instance, model_id)
+        if model_id in info.models or key in self._installing:
             return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed"))
 
         if model_id not in self.models[instance]:
             raise HTTPException(400, "Model not found")
 
         model = self.models[instance][model_id]
+        self._installing.add(key)
 
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
-            local_model_path, model_filename = await self._download_model_or_set_progress(stream, model, model_id)
+            try:
+                local_model_path, model_filename = await self._download_model_or_set_progress(stream, model, model_id)
 
-            if not local_model_path:
-                raise HTTPException(400, "Something went wrong with downloading")
+                if not local_model_path:
+                    raise HTTPException(400, "Something went wrong with downloading")
 
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
+                stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
 
-            registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
-            model_path = local_model_path.absolute()
-            info.models[model_id] = model_info = ModelInstalledInfo(
-                id=model_id,
-                type=model.type,
-                registered_name=registered_name,
-                options=options,
-                model_path=model_path,
-                registration_id="",
-            )
-            model_filename = model.filename.split(".")[0]
-            if model.type == "txt2img":
-                model_info.registration_id = self.endpoint_registry.register_image_generations(
-                    model=registered_name,
-                    props=ModelProps(private=True, type=model.type, endpoints=IMG_ENDPOINTS),
-                    endpoint=SimpleEndpoint(on_request=_stable_diffusion_handler(info.base_url, model_filename)),
-                    registration_options=None,
+                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                model_path = local_model_path.absolute()
+                info.models[model_id] = model_info = ModelInstalledInfo(
+                    id=model_id,
+                    type=model.type,
+                    registered_name=registered_name,
+                    options=options,
+                    model_path=model_path,
+                    registration_id="",
                 )
+                model_filename = model.filename.split(".")[0]
+                try:
+                    if model.type == "txt2img":
+                        model_info.registration_id = self.endpoint_registry.register_image_generations(
+                            model=registered_name,
+                            props=ModelProps(private=True, type=model.type, endpoints=IMG_ENDPOINTS),
+                            endpoint=SimpleEndpoint(on_request=_stable_diffusion_handler(info.base_url, model_filename)),
+                            registration_options=None,
+                        )
 
-            await self.refresh_models(instance)
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
-            self.models_downloaded[model_id] = DownloadedInfo(str(model_path))
-            return InstallModelOut(status="OK", details="Installed")
+                    await self.refresh_models(instance)
+                    stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
+                    self.models_downloaded[model_id] = DownloadedInfo(str(model_path))
+                    return InstallModelOut(status="OK", details="Installed")
+                except Exception:
+                    if model_info.registration_id:
+                        self.endpoint_registry.unregister_image_generations(model_info.registered_name, model_info.registration_id)
+                    if info.models.get(model_id) is model_info:
+                        info.models.pop(model_id, None)
+                    raise
+            finally:
+                self._installing.discard(key)
 
         return PromiseWithProgress(func=func)
 

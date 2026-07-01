@@ -1268,4 +1268,47 @@ async def test_uninstall_model_purge_skips_rmtree_for_dot_path(svc: SpeachesAISe
         await svc._uninstall_model("default", "my-tts", UninstallModelIn(purge=True))  # pyright: ignore[reportPrivateUsage]
 
     assert mock_rmtree.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_install_model_registration_failure_rolls_back_model(svc: SpeachesAIService, deps: dict[str, Any], tmp_path: Path) -> None:
+    installed = _make_installed_info()
+    svc.instances_info["default"].installed = installed
+    stt_model_id = next(m.id for m in svc.models["default"].values() if m.type == "stt")
+    deps["endpoint_registry"].register_audio_transcriptions_as_proxy.side_effect = RuntimeError("registry down")
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+    ):
+        promise = await svc._install_model("default", stt_model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert stt_model_id not in installed.models
     assert "my-tts" not in svc.models_downloaded
+
+
+@pytest.mark.asyncio
+async def test_install_model_registration_failure_skips_rollback_when_already_removed(
+    svc: SpeachesAIService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    installed = _make_installed_info()
+    svc.instances_info["default"].installed = installed
+    stt_model_id = next(m.id for m in svc.models["default"].values() if m.type == "stt")
+
+    def side_effect(*args: object, **kwargs: object) -> None:
+        installed.models.pop(stt_model_id, None)
+        raise RuntimeError("registry down")
+
+    deps["endpoint_registry"].register_audio_transcriptions_as_proxy.side_effect = side_effect
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+    ):
+        promise = await svc._install_model("default", stt_model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert stt_model_id not in installed.models

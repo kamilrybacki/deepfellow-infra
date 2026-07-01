@@ -195,6 +195,7 @@ class DownloadedInfo:
 class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
     models: dict[str, dict[str, LlamacppModel]]
     _vram_cache: dict[tuple[str, str], float]
+    _installing: set[tuple[str, str]]
 
     @property
     def _supported_gpus(self) -> list[GpuInfo]:
@@ -205,6 +206,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
         self.models = {}
         self.load_default_models("default")
         self._vram_cache = {}
+        self._installing = set()
 
     @staticmethod
     def mib_to_gib(mib: float) -> float | None:
@@ -521,93 +523,109 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         return local_model_path, filename
 
-    async def _install_model(
+    async def _install_model(  # noqa: C901
         self, instance: str, model_id: str, options: InstallModelIn
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_model_options = try_parse_pydantic(LLamacppModelOptions, options.spec) if options.spec else LLamacppModelOptions()
         installed = self.get_instance_installed_info(instance)
-        if model_id in installed.models:
-            return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed"))
+
+        key = (instance, model_id)
+        if model_id in installed.models or key in self._installing:
+            return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed or being installed right now."))
         if model_id not in self.models[instance]:
             raise HTTPException(400, "Model not found")
+
+        self._installing.add(key)
         model = self.models[instance][model_id]
 
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
-            local_model_path, model_filename = await self._download_model_or_set_progress(stream, model, model_id)
+            try:
+                local_model_path, model_filename = await self._download_model_or_set_progress(stream, model, model_id)
 
-            stream.emit(StreamChunkProgress(type="progress", stage="download", value=1, data={}))
+                stream.emit(StreamChunkProgress(type="progress", stage="download", value=1, data={}))
 
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
-            if not local_model_path or not model_filename:
-                raise HTTPException(400, "Local model path was not set up and not return by downloader.")
+                stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
+                if not local_model_path or not model_filename:
+                    raise HTTPException(400, "Local model path was not set up and not return by downloader.")
 
-            max_context_window = await get_gguf_context_window(local_model_path)
-            context_window = max_context_window
-            additional_options = []
+                max_context_window = await get_gguf_context_window(local_model_path)
+                context_window = max_context_window
+                additional_options = []
 
-            if max_model_context_window := parsed_model_options.max_model_length:
-                context_window = max_model_context_window
-                additional_options.extend([" --ctx-size", str(max_model_context_window)])
+                if max_model_context_window := parsed_model_options.max_model_length:
+                    context_window = max_model_context_window
+                    additional_options.extend([" --ctx-size", str(max_model_context_window)])
 
-            model_in_container = f"/models/{model_filename}"
-            volumes = [f"{local_model_path.absolute()}:{model_in_container}:ro"]
-            command_options = ["--host 0.0.0.0", "--port 8080", f"--model {model_in_container}", *additional_options]
-            kv_cache_type = installed.parsed_options.kv_cache_type
-            if kv_cache_type != "f16":
-                command_options.extend([f"--cache-type-k {kv_cache_type}", f"--cache-type-v {kv_cache_type}"])
-            if installed.parsed_options.num_parallel > 1:
-                command_options.append(f"--parallel {installed.parsed_options.num_parallel}")
-            if model.jinja:
-                command_options.append("--jinja")
-            command = " ".join(command_options)
-            subnet = self.docker_service.get_docker_subnet()
-            service_name = f"{self.get_id(instance)}-{normalize_name(model_id)}"
-            hardware_parts = self.get_specified_hardware_parts(installed.parsed_options.hardware)
-            image = self._get_image(hardware_parts)
-            docker_options = DockerOptions(
-                name=service_name,
-                container_name=self.docker_service.get_docker_container_name(service_name),
-                image=image.name,
-                command=command,
-                image_port=8080,
-                restart="unless-stopped",
-                volumes=volumes,
-                hardware=hardware_parts,
-                subnet=subnet,
-            )
-            docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
-            self._log_cache.pop(docker_options.container_name or "", None)
-            registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
-            container_host = self.docker_service.get_container_host(subnet, docker_options.name)
-            container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
-            installed.models[model_id] = model_info = ModelInstalledInfo(
-                id=model_id,
-                registered_name=registered_name,
-                options=options,
-                docker=docker_options,
-                model_path=local_model_path.absolute(),
-                container_host=container_host,
-                container_port=container_port,
-                docker_exposed_port=docker_exposed_port,
-                registration_id="",
-                base_url=get_base_url(container_host, container_port),
-                context_window=context_window,
-            )
-            model_info.registration_id = self.endpoint_registry.register_chat_completion_as_proxy(
-                model=registered_name,
-                props=ModelProps(
-                    private=True, type="llm", endpoints=LLM_ENDPOINTS, context_window=context_window, max_context_window=max_context_window
-                ),
-                chat_completions=ProxyOptions(url=f"{model_info.base_url}/v1/chat/completions", rewrite_model_to=model_id),
-                completions=ProxyOptions(url=f"{model_info.base_url}/v1/completions", rewrite_model_to=model_id),
-                responses=ProxyOptions(url=f"{model_info.base_url}/v1/responses", rewrite_model_to=model_id),
-                messages=ProxyOptions(url=f"{model_info.base_url}/v1/messages", rewrite_model_to=model_id),
-                ollama_chat=None,
-                registration_options=None,
-            )
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
-            self.models_downloaded[model_id] = DownloadedInfo(str(local_model_path))
-            return InstallModelOut(status="OK", details="Installed")
+                model_in_container = f"/models/{model_filename}"
+                volumes = [f"{local_model_path.absolute()}:{model_in_container}:ro"]
+                command_options = ["--host 0.0.0.0", "--port 8080", f"--model {model_in_container}", *additional_options]
+                kv_cache_type = installed.parsed_options.kv_cache_type
+                if kv_cache_type != "f16":
+                    command_options.extend([f"--cache-type-k {kv_cache_type}", f"--cache-type-v {kv_cache_type}"])
+                if installed.parsed_options.num_parallel > 1:
+                    command_options.append(f"--parallel {installed.parsed_options.num_parallel}")
+                if model.jinja:
+                    command_options.append("--jinja")
+                command = " ".join(command_options)
+                subnet = self.docker_service.get_docker_subnet()
+                service_name = f"{self.get_id(instance)}-{normalize_name(model_id)}"
+                hardware_parts = self.get_specified_hardware_parts(installed.parsed_options.hardware)
+                image = self._get_image(hardware_parts)
+                docker_options = DockerOptions(
+                    name=service_name,
+                    container_name=self.docker_service.get_docker_container_name(service_name),
+                    image=image.name,
+                    command=command,
+                    image_port=8080,
+                    restart="unless-stopped",
+                    volumes=volumes,
+                    hardware=hardware_parts,
+                    subnet=subnet,
+                )
+                docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
+                self._log_cache.pop(docker_options.container_name or "", None)
+                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                container_host = self.docker_service.get_container_host(subnet, docker_options.name)
+                container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
+                installed.models[model_id] = model_info = ModelInstalledInfo(
+                    id=model_id,
+                    registered_name=registered_name,
+                    options=options,
+                    docker=docker_options,
+                    model_path=local_model_path.absolute(),
+                    container_host=container_host,
+                    container_port=container_port,
+                    docker_exposed_port=docker_exposed_port,
+                    registration_id="",
+                    base_url=get_base_url(container_host, container_port),
+                    context_window=context_window,
+                )
+                try:
+                    model_info.registration_id = self.endpoint_registry.register_chat_completion_as_proxy(
+                        model=registered_name,
+                        props=ModelProps(
+                            private=True,
+                            type="llm",
+                            endpoints=LLM_ENDPOINTS,
+                            context_window=context_window,
+                            max_context_window=max_context_window,
+                        ),
+                        chat_completions=ProxyOptions(url=f"{model_info.base_url}/v1/chat/completions", rewrite_model_to=model_id),
+                        completions=ProxyOptions(url=f"{model_info.base_url}/v1/completions", rewrite_model_to=model_id),
+                        responses=ProxyOptions(url=f"{model_info.base_url}/v1/responses", rewrite_model_to=model_id),
+                        messages=ProxyOptions(url=f"{model_info.base_url}/v1/messages", rewrite_model_to=model_id),
+                        ollama_chat=None,
+                        registration_options=None,
+                    )
+                    stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
+                    self.models_downloaded[model_id] = DownloadedInfo(str(local_model_path))
+                    return InstallModelOut(status="OK", details="Installed")
+                except Exception:
+                    if installed.models.get(model_id) is model_info:
+                        installed.models.pop(model_id, None)
+                    raise
+            finally:
+                self._installing.discard(key)
 
         return PromiseWithProgress(func=func)
 

@@ -163,9 +163,11 @@ class CoquiCmdOptions:
 
 class CoquiService(Base2Service[InstalledInfo, DownloadedInfo]):
     models: dict[str, dict[str, CoquiModel]]
+    _installing: set[tuple[str, str]]
 
     def _after_init(self) -> None:
         self.models = {}
+        self._installing = set()
         self.load_default_models("default")
 
     def load_default_models(self, instance: str) -> None:
@@ -336,72 +338,83 @@ class CoquiService(Base2Service[InstalledInfo, DownloadedInfo]):
         parsed_model_options = try_parse_pydantic(CoquiModelOptions, options.spec) if options.spec else CoquiModelOptions()
         info = self.get_instance_installed_info(instance)
 
-        if model_id in info.models:
-            return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed"))
+        key = (instance, model_id)
+        if model_id in info.models or key in self._installing:
+            return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed or being installed right now."))
 
         if model_id not in _const.models:
             raise HTTPException(400, "Model not found")
 
         model = _const.models[model_id]
+        self._installing.add(key)
 
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
-            volumes = [f"{self._get_working_output_dir()}:/root/tts-output", f"{self._get_working_dir()}/models:/root/.local/share/tts"]
-            use_gpu = self.is_given_hardware_support_gpu(info.parsed_options.hardware)
-            image = self._get_image(use_gpu)
-            subnet = self.docker_service.get_docker_subnet()
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
-            service_name = f"{self.get_service_id(instance)}-{model.docker_name}"
-            docker_options = DockerOptions(
-                name=service_name,
-                container_name=self.docker_service.get_docker_container_name(service_name),
-                image=image.name,
-                command=self._build_coqui_command(
-                    CoquiCmdOptions(
-                        model_name=model_id,
-                        model_path=None,
-                        cuda=use_gpu,
-                        language=model.language,
-                    )
-                ),
-                entrypoint="/bin/bash",
-                image_port=5002,
-                restart="unless-stopped",
-                volumes=volumes,
-                hardware=self.get_specified_hardware_parts(info.parsed_options.hardware),
-                subnet=subnet,
-                healthcheck={
-                    "test": (
-                        """python3 -c 'import requests, sys; r = requests.get("http://localhost:5002");"""
-                        """ r.raise_for_status(); print("Success");'"""
+            model_info: ModelInstalledInfo | None = None
+            try:
+                volumes = [f"{self._get_working_output_dir()}:/root/tts-output", f"{self._get_working_dir()}/models:/root/.local/share/tts"]
+                use_gpu = self.is_given_hardware_support_gpu(info.parsed_options.hardware)
+                image = self._get_image(use_gpu)
+                subnet = self.docker_service.get_docker_subnet()
+                stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
+                service_name = f"{self.get_service_id(instance)}-{model.docker_name}"
+                docker_options = DockerOptions(
+                    name=service_name,
+                    container_name=self.docker_service.get_docker_container_name(service_name),
+                    image=image.name,
+                    command=self._build_coqui_command(
+                        CoquiCmdOptions(
+                            model_name=model_id,
+                            model_path=None,
+                            cuda=use_gpu,
+                            language=model.language,
+                        )
                     ),
-                    "interval": "30s",
-                    "timeout": "10s",
-                    "retries": "3",
-                    "start_period": "5s",
-                },
-            )
-            docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
-            registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
-            info.models[model_id] = model_info = ModelInstalledInfo(
-                id=model_id,
-                type=model.model_type,
-                registered_name=registered_name,
-                options=options,
-                docker=docker_options,
-                container_host=self.docker_service.get_container_host(subnet, docker_options.name),
-                container_port=self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port),
-                docker_exposed_port=docker_exposed_port,
-                registration_id="",
-            )
-            model_info.registration_id = self.endpoint_registry.register_audio_speech(
-                model=registered_name,
-                props=ModelProps(private=True, type="tts", endpoints=TTS_ENDPOINTS),
-                endpoint=SimpleEndpoint(on_request=_create_handler(model_info.base_url, model.default_speaker, model.response_format)),
-                registration_options=None,
-            )
-            stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
-            self.models_downloaded[model_id] = DownloadedInfo()
-            return InstallModelOut(status="OK", details="Installed")
+                    entrypoint="/bin/bash",
+                    image_port=5002,
+                    restart="unless-stopped",
+                    volumes=volumes,
+                    hardware=self.get_specified_hardware_parts(info.parsed_options.hardware),
+                    subnet=subnet,
+                    healthcheck={
+                        "test": (
+                            """python3 -c 'import requests, sys; r = requests.get("http://localhost:5002");"""
+                            """ r.raise_for_status(); print("Success");'"""
+                        ),
+                        "interval": "30s",
+                        "timeout": "10s",
+                        "retries": "3",
+                        "start_period": "5s",
+                    },
+                )
+                docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
+                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                info.models[model_id] = model_info = ModelInstalledInfo(
+                    id=model_id,
+                    type=model.model_type,
+                    registered_name=registered_name,
+                    options=options,
+                    docker=docker_options,
+                    container_host=self.docker_service.get_container_host(subnet, docker_options.name),
+                    container_port=self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port),
+                    docker_exposed_port=docker_exposed_port,
+                    registration_id="",
+                )
+
+                model_info.registration_id = self.endpoint_registry.register_audio_speech(
+                    model=registered_name,
+                    props=ModelProps(private=True, type="tts", endpoints=TTS_ENDPOINTS),
+                    endpoint=SimpleEndpoint(on_request=_create_handler(model_info.base_url, model.default_speaker, model.response_format)),
+                    registration_options=None,
+                )
+                stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
+                self.models_downloaded[model_id] = DownloadedInfo()
+                return InstallModelOut(status="OK", details="Installed")
+            except Exception:
+                if info.models.get(model_id) is model_info:
+                    info.models.pop(model_id, None)
+                raise
+            finally:
+                self._installing.discard(key)
 
         return PromiseWithProgress(func=func)
 
