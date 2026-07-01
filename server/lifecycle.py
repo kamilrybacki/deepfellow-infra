@@ -33,6 +33,7 @@ from server.services.custom_service import CustomService
 from server.services.googleai_service import GoogleAIService
 from server.services.llamacpp_service import LLamacppService
 from server.services.mcp_service import McpService
+from server.services.ollama_cloud_service import OllamaCloudService
 from server.services.ollama_external_service import OllamaExternalService
 from server.services.ollama_service import OllamaService
 from server.services.openai_service import OpenAIService
@@ -105,6 +106,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         services_manager.register_service(GoogleAIService(*model_input))
         services_manager.register_service(LLamacppService(*model_input))
         services_manager.register_service(McpService(*model_input))
+        services_manager.register_service(OllamaCloudService(*model_input))
         services_manager.register_service(OllamaExternalService(*model_input))
         services_manager.register_service(OllamaService(*model_input))
         services_manager.register_service(OpenAIService(*model_input))

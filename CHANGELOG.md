@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- Ollama Cloud support with cached model list.
+
 ### Fixed
 - Installing an MCP server without a required API key/header (e.g. brave-search without `BRAVE_API_KEY`, ollama-websearch without `OLLAMA_API_KEY`) no longer shows a fake download that runs to completion without installing anything. The missing field is now flagged inline in the install form before submit, and the backend rejects the request with a clear error listing the missing keys.
 - The Cancel button for an in-progress model installation in the WebUI now appears in the model's table row, so it stays available after refreshing the page. Previously cancelling was only possible from the bottom progress toast, which disappeared on refresh and left the installation with no way to cancel.
