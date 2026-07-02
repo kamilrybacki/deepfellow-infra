@@ -12,6 +12,7 @@
 import asyncio
 import re
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -378,7 +379,8 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
             num_ctx = model_info.context_window or llamacpp_default_context_window
             cache_bit = parse_cache_type_bits(info.parsed_options.kv_cache_type)
             num_parallel = info.parsed_options.num_parallel
-            return estimate_vram_gb(arch, weights_bytes, num_ctx, cache_bit, num_parallel)
+            with suppress(Exception):
+                return estimate_vram_gb(arch, weights_bytes, num_ctx, cache_bit, num_parallel)
 
         return None
 

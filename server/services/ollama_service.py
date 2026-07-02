@@ -682,10 +682,10 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                 info = data.get("model_info", {})
                 arch = info.get("general.architecture", "")
                 params = ArchParams(
-                    hidden_size=info.get(f"{arch}.embedding_length", 0),
-                    num_attention_heads=info.get(f"{arch}.attention.head_count", 1),
-                    num_key_value_heads=info.get(f"{arch}.attention.head_count_kv", 1),
-                    num_hidden_layers=info.get(f"{arch}.block_count", 0),
+                    hidden_size=info.get(f"{arch}.embedding_length") or 0,
+                    num_attention_heads=info.get(f"{arch}.attention.head_count") or 1,
+                    num_key_value_heads=info.get(f"{arch}.attention.head_count_kv") or 1,
+                    num_hidden_layers=info.get(f"{arch}.block_count") or 0,
                     sliding_window=info.get(f"{arch}.attention.sliding_window"),
                 )
 
@@ -731,7 +731,9 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         cache_type = os.environ.get("OLLAMA_KV_CACHE_TYPE", "f16")
         cache_bit = parse_cache_type_bits(cache_type)
         num_parallel = num_parallel or int(os.environ.get("OLLAMA_NUM_PARALLEL", 1))
-        return estimate_vram_gb(arch, size_bytes, num_ctx, cache_bit, num_parallel, parameters, bytes_weight)
+        with suppress(Exception):
+            return estimate_vram_gb(arch, size_bytes, num_ctx, cache_bit, num_parallel, parameters, bytes_weight)
+        return None
 
     async def _get_vram_from_logs(self, instance: str, ollama_name: str, memory_load: MemoryLoadOut | None = None) -> float | None:
         """Return actual VRAM usage from Docker logs for the most recent load of a model."""
