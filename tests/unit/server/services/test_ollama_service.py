@@ -36,6 +36,7 @@ from server.services.ollama_service import (
 )
 from server.utils.core import DownloadedPacket, FetchResult, PreDownloadPacket, Stream, StreamChunkProgress
 from server.utils.hardware import IntelGpuInfo, NvidiaGpuInfo
+from server.utils.vram_calculator import ArchParams
 
 if TYPE_CHECKING:
     from server.models.api import ModelProps
@@ -2197,6 +2198,17 @@ async def test_resolve_vram_info_not_loaded_estimate_none(svc: OllamaService) ->
 
     assert is_loaded is False
     assert vram is None
+
+
+@pytest.mark.asyncio
+async def test_get_vram_estimate_returns_none_when_estimate_raises(svc: OllamaService) -> None:
+    arch = ArchParams(hidden_size=4096, num_attention_heads=32, num_key_value_heads=0, num_hidden_layers=32)
+    with patch.object(svc, "_get_arch_params", new_callable=AsyncMock, return_value=arch):
+        result = await svc._get_vram_estimate(  # pyright: ignore[reportPrivateUsage]
+            "default", "http://localhost:11434", "gemma4", 0, num_ctx=4096
+        )
+
+    assert result is None
 
 
 @pytest.mark.asyncio
