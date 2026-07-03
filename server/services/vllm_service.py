@@ -48,6 +48,7 @@ from server.models.models import (
 from server.models.services import (
     InstallServiceIn,
     InstallServiceProgress,
+    ServiceField,
     ServiceOptions,
     ServiceSize,
     ServiceSpecification,
@@ -69,6 +70,7 @@ from server.utils.core import (
 from server.utils.files import get_model_dir_context_window
 from server.utils.hardware import HardwarePartInfo
 from server.utils.loading import Progress
+from server.utils.registry_client import image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fetch_huggingface_model_size
 
 logger = logging.getLogger("uvicorn.error")
@@ -224,7 +226,16 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
     def get_spec(self) -> ServiceSpecification:
         """Return the service specification."""
         fields = self.add_hardware_field_to_spec(add_cpu_option_only_on_avx512_support=True)
-
+        fields.append(
+            ServiceField(
+                type="docker-tags",
+                name="image_version",
+                description="Docker image version",
+                docker_image=_const.images["gpu"].name.split(":")[0],
+                depends_on="hardware",
+                required=False,
+            )
+        )
         return ServiceSpecification(fields=fields)
 
     def get_model_spec(self, instance: str, model_type: str) -> ModelSpecification:
@@ -329,14 +340,20 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
     def _load_download_info(self, data: dict[str, Any]) -> DownloadedInfo:
         return DownloadedInfo(**data)
 
+    async def _validate_update_options(self, options: InstallServiceIn) -> None:
+        """Normalize the hardware spec and validate the requested image_version, if any."""
+        if "hardware" not in options.spec:
+            options.spec["hardware"] = options.spec.get("gpu", self.docker_service.has_gpu_support)
+        await self.validate_docker_image_version(options.spec.get("image_version"), options.spec.get("hardware"))
+
     async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self.load_default_models(instance)
 
-        if "hardware" not in options.spec:
-            options.spec["hardware"] = options.spec.get("gpu", self.docker_service.has_gpu_support)
+        await self._validate_update_options(options)
         parsed_options = try_parse_pydantic(VllmOptions, options.spec)
-        image = self._get_image(self.is_given_hardware_support_gpu(parsed_options.hardware))
+        image_version = options.spec.get("image_version")
+        image = self._get_image(self.is_given_hardware_support_gpu(parsed_options.hardware), image_version)
         await self._verify_docker_image(image.name, options.ignore_warnings)
 
         async def func(stream: Stream[StreamChunk]) -> InstalledInfo:
@@ -348,6 +365,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
 
     async def _uninstall_instance(self, instance: str, options: UninstallServiceIn) -> None:
         installed = self.get_instance_info(instance).installed
+        installed_images = {model.docker.image for model in installed.models.values()} if installed else set()
         if installed:
             await asyncio.gather(
                 *[
@@ -360,10 +378,12 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         self.instances_info[instance].installed = None
 
         if options.purge:
-            if len(self.instances_info) < 2:
+            if not any(i.installed for i in self.instances_info.values()):
                 self.service_downloaded = False
                 for image in _const.images.values():
                     await self.docker_service.remove_image(image.name)
+                for image_name in installed_images:
+                    await self.docker_service.remove_image(image_name)
                 await self._clear_working_dir()
                 self.models_downloaded = {}
 
@@ -687,7 +707,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     model.env_vars["VLLM_USE_V1"] = "1"
                 model.env_vars.update(parsed_model_options.extra_envs)
 
-                image = self._get_image(use_gpu)
+                image = self._get_image(use_gpu, info.options.spec.get("image_version") if info.options else None)
 
                 subnet = self.docker_service.get_docker_subnet()
                 service_name = f"{self.get_service_id(instance)}-{normalize_name(model_id)}"
@@ -765,8 +785,39 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         return PromiseWithProgress(func=func)
 
-    def _get_image(self, gpu: bool) -> DockerImage:
-        return _const.images["gpu"] if gpu else _const.images["cpu"]
+    def _get_image(self, gpu: bool, image_version: str | None = None) -> DockerImage:
+        base = _const.images["gpu"] if gpu else _const.images["cpu"]
+        if image_version:
+            base_name = base.name.split(":")[0]
+            return DockerImage(name=f"{base_name}:{image_version}", size=base.size)
+        return base
+
+    def _use_gpu_image(self, hardware: str | None) -> bool:
+        """Return whether the given hardware string selects the GPU image variant."""
+        return hardware is None or not str(hardware).lower().startswith("cpu")
+
+    def get_docker_image_repo(self, hardware: str | None) -> str:
+        """Return the Docker repo tags are fetched from for the given hardware (GPU and CPU use different repos)."""
+        base = _const.images["gpu"] if self._use_gpu_image(hardware) else _const.images["cpu"]
+        return base.name.split(":")[0]
+
+    async def get_docker_tags(self, hardware: str | None) -> list[str]:
+        """Fetch available Docker image tags for the vLLM image matching the selected hardware."""
+        base_image = self.get_docker_image_repo(hardware)
+        client = registry_for(base_image, self.config.docker_hub_token or None)
+        tags = await client.get_tags(image_without_registry_prefix(base_image))
+        return self.filter_docker_tags(tags, hardware)
+
+    def filter_docker_tags(self, tags: list[str], hardware: str | None) -> list[str]:
+        """Filter tags to GPU (-cu*) variants; CPU tags come from a dedicated repo and need no filtering."""
+        if hardware is None or not self._use_gpu_image(hardware):
+            return tags
+        return [t for t in tags if re.search(r"cu\d", t, re.IGNORECASE) and "cpu" not in t.lower()]
+
+    def get_default_docker_tag(self, hardware: str | None) -> str | None:
+        """Return the pinned default vLLM image tag for the given hardware variant."""
+        base = _const.images["gpu"] if self._use_gpu_image(hardware) else _const.images["cpu"]
+        return base.name.split(":")[1]
 
     async def _uninstall_model(self, instance: str, model_id: str, options: UninstallModelIn) -> None:
         info = self.get_instance_installed_info(instance)

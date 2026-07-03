@@ -602,6 +602,7 @@ export function ServicesList() {
               ...serviceDetail.spec.fields,
             ]
           : serviceDetail.spec.fields,
+        serviceId: serviceDetail.id,
         onSubmit: (spec: Record<string, unknown>) => {
           const instance = installAnotherInstance
             ? (spec.instance as string)
@@ -660,6 +661,7 @@ export function ServicesList() {
       title: `Edit ${service.id}`,
       fields: service.spec.fields,
       initialData: currentValues,
+      serviceId: service.id,
       submitLabel: "Save",
       submittingLabel: "Saving...",
       onSubmit: (spec: Record<string, unknown>) => {

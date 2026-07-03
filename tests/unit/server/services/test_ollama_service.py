@@ -1324,6 +1324,7 @@ async def test_uninstall_instance_skips_model_uninstall_when_shared_with_other_i
 @pytest.mark.asyncio
 async def test_uninstall_instance_purge_with_multiple_instances_does_not_remove_image(svc: OllamaService, deps: dict[str, Any]) -> None:
     svc.instances_info["gpu-1"] = Instance(None, None, {}, InstanceConfig())
+    svc.instances_info["gpu-1"].installed = _make_installed_info(svc, "gpu-1")
     installed = _make_installed_info(svc)
     svc.instances_info["default"].installed = installed
     deps["docker_service"].uninstall_docker = AsyncMock()
@@ -1343,6 +1344,7 @@ async def test_uninstall_instance_purge_removes_non_default_instance(svc: Ollama
     installed = _make_installed_info(svc)
     svc.instances_info["gpu-1"].installed = installed
     deps["docker_service"].uninstall_docker = AsyncMock()
+    deps["docker_service"].remove_image = AsyncMock()
 
     with (
         patch.object(svc, "_uninstall_model", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
@@ -1351,6 +1353,21 @@ async def test_uninstall_instance_purge_removes_non_default_instance(svc: Ollama
         await svc._uninstall_instance("gpu-1", UninstallServiceIn(purge=True))  # pyright: ignore[reportPrivateUsage]
 
     assert "gpu-1" not in svc.instances_info
+
+
+@pytest.mark.asyncio
+async def test_uninstall_instance_purge_on_already_uninstalled_instance_skips_own_image_removal(
+    svc: OllamaService, deps: dict[str, Any]
+) -> None:
+    deps["docker_service"].remove_image = AsyncMock()
+
+    with (
+        patch.object(svc, "_uninstall_model", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_clear_working_dir", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+    ):
+        await svc._uninstall_instance("default", UninstallServiceIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert deps["docker_service"].remove_image.call_args_list == [call(_const.image.name)]
 
 
 @pytest.mark.asyncio
@@ -2383,6 +2400,29 @@ async def test_install_model_context_window_capped_by_service_context_when_servi
     props: ModelProps = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs["props"]
     assert props.context_window == 4096
     assert props.max_context_window == 8192
+
+
+def test_get_image_with_version_overrides_tag(svc: OllamaService) -> None:
+    image = svc._get_image(image_version="0.5.0")  # pyright: ignore[reportPrivateUsage]
+    base = _const.image.name.split(":")[0]
+    assert image.name == f"{base}:0.5.0"
+    assert image.size == _const.image.size
+
+
+@pytest.mark.asyncio
+async def test_get_docker_tags_returns_filtered_tags(svc: OllamaService) -> None:
+    mock_client = AsyncMock()
+    mock_client.get_tags = AsyncMock(return_value=["0.5.0", "0.4.0"])
+    with (
+        patch("server.services.ollama_service.registry_for", return_value=mock_client),
+        patch("server.services.ollama_service.image_without_registry_prefix", return_value="ollama/ollama"),
+    ):
+        tags = await svc.get_docker_tags(None)
+    assert tags == ["0.5.0", "0.4.0"]
+
+
+def test_get_default_docker_tag_returns_pinned_version(svc: OllamaService) -> None:
+    assert svc.get_default_docker_tag(None) == _const.image.name.split(":")[1]
 
 
 @pytest.mark.asyncio

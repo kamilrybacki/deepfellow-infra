@@ -896,6 +896,44 @@ async def test_uninstall_instance_purge_clears_service_state(svc: VllmService, d
 
 
 @pytest.mark.asyncio
+async def test_uninstall_instance_purge_with_other_instance_installed_does_not_remove_image(svc: VllmService, deps: dict[str, Any]) -> None:
+    svc.instances_info["extra"] = Instance(None, None, {}, InstanceConfig())
+    svc.instances_info["extra"].installed = _make_installed_info()
+    svc.instances_info["default"].installed = _make_installed_info()
+    deps["docker_service"].remove_image = AsyncMock()
+
+    with (
+        patch.object(svc, "_uninstall_model", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_clear_working_dir", new_callable=AsyncMock) as mock_clear,  # pyright: ignore[reportPrivateUsage]
+    ):
+        await svc._uninstall_instance("default", UninstallServiceIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert deps["docker_service"].remove_image.call_count == 0
+    assert mock_clear.call_count == 0
+    assert svc.instances_info["default"].installed is None
+    assert "extra" in svc.instances_info
+
+
+@pytest.mark.asyncio
+async def test_uninstall_instance_purge_removes_per_model_docker_images(svc: VllmService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info()
+    model_info = _make_model_installed_info("test-model")
+    model_info.docker.image = "vllm-model-image:tag"
+    installed.models["test-model"] = model_info
+    svc.instances_info["default"].installed = installed
+    deps["docker_service"].remove_image = AsyncMock()
+
+    with (
+        patch.object(svc, "_uninstall_model", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_clear_working_dir", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+    ):
+        await svc._uninstall_instance("default", UninstallServiceIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    removed_images = {c.args[0] for c in deps["docker_service"].remove_image.call_args_list}
+    assert "vllm-model-image:tag" in removed_images
+
+
+@pytest.mark.asyncio
 async def test_stop_instance_does_nothing_when_not_installed(svc: VllmService) -> None:
     svc.instances_info["default"].installed = None
 
@@ -1554,6 +1592,71 @@ async def test_install_model_registration_failure_rolls_back_model(svc: VllmServ
 
     assert model_id not in installed.models
     deps["docker_service"].stop_docker.assert_not_called()
+
+
+def test_get_image_with_version_overrides_tag_gpu(svc: VllmService) -> None:
+    image = svc._get_image(gpu=True, image_version="v0.9.0")  # pyright: ignore[reportPrivateUsage]
+    base = _const.images["gpu"].name.split(":")[0]
+    assert image.name == f"{base}:v0.9.0"
+    assert image.size == _const.images["gpu"].size
+
+
+def test_get_image_with_version_overrides_tag_cpu(svc: VllmService) -> None:
+    image = svc._get_image(gpu=False, image_version="v0.9.0")  # pyright: ignore[reportPrivateUsage]
+    base = _const.images["cpu"].name.split(":")[0]
+    assert image.name == f"{base}:v0.9.0"
+    assert image.size == _const.images["cpu"].size
+
+
+@pytest.mark.asyncio
+async def test_get_docker_tags_returns_filtered_tags(svc: VllmService) -> None:
+    mock_client = AsyncMock()
+    mock_client.get_tags = AsyncMock(return_value=["v0.9.0-cu130", "v0.9.0-cpu"])
+    with (
+        patch("server.services.vllm_service.registry_for", return_value=mock_client),
+        patch("server.services.vllm_service.image_without_registry_prefix", return_value="vllm/vllm-openai"),
+    ):
+        tags = await svc.get_docker_tags("GPU")
+    assert "v0.9.0-cu130" in tags
+    assert "v0.9.0-cpu" not in tags
+
+
+@pytest.mark.asyncio
+async def test_get_docker_tags_cpu_hardware_returns_tags_unfiltered(svc: VllmService) -> None:
+    mock_client = AsyncMock()
+    mock_client.get_tags = AsyncMock(return_value=["v0.19.0", "v0.19.1"])
+    cpu_base = _const.images["cpu"].name.split(":")[0]
+    with (
+        patch("server.services.vllm_service.registry_for", return_value=mock_client),
+        patch("server.services.vllm_service.image_without_registry_prefix", return_value="cpu/vllm-openai") as mock_img,
+    ):
+        tags = await svc.get_docker_tags("cpu")
+    assert tags == ["v0.19.0", "v0.19.1"]
+    mock_img.assert_called_once_with(cpu_base)
+
+
+def test_get_default_docker_tag_gpu(svc: VllmService) -> None:
+    assert svc.get_default_docker_tag("GPU") == _const.images["gpu"].name.split(":")[1]
+
+
+def test_get_default_docker_tag_cpu(svc: VllmService) -> None:
+    assert svc.get_default_docker_tag("cpu") == _const.images["cpu"].name.split(":")[1]
+
+
+def test_get_default_docker_tag_defaults_to_gpu_when_no_hardware(svc: VllmService) -> None:
+    assert svc.get_default_docker_tag(None) == _const.images["gpu"].name.split(":")[1]
+
+
+def test_get_docker_image_repo_gpu(svc: VllmService) -> None:
+    assert svc.get_docker_image_repo("GPU") == _const.images["gpu"].name.split(":")[0]
+
+
+def test_get_docker_image_repo_cpu(svc: VllmService) -> None:
+    assert svc.get_docker_image_repo("cpu") == _const.images["cpu"].name.split(":")[0]
+
+
+def test_get_docker_image_repo_defaults_to_gpu_when_no_hardware(svc: VllmService) -> None:
+    assert svc.get_docker_image_repo(None) == _const.images["gpu"].name.split(":")[0]
 
 
 @pytest.mark.asyncio

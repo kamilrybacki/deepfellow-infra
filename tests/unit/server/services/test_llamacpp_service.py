@@ -711,6 +711,44 @@ async def test_uninstall_instance_purge_clears_service_state(svc: LLamacppServic
 
 
 @pytest.mark.asyncio
+async def test_uninstall_instance_purge_with_other_instance_installed_skips_cleanup(svc: LLamacppService, deps: dict[str, Any]) -> None:
+    svc.instances_info["extra"] = Instance(None, None, {}, InstanceConfig())
+    svc.instances_info["extra"].installed = _make_installed_info(svc, "extra")
+    svc.instances_info["default"].installed = _make_installed_info(svc)
+    deps["docker_service"].remove_image = AsyncMock()
+
+    with (
+        patch.object(svc, "_uninstall_model", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_clear_working_dir", new_callable=AsyncMock) as mock_clear,  # pyright: ignore[reportPrivateUsage]
+    ):
+        await svc._uninstall_instance("default", UninstallServiceIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert deps["docker_service"].remove_image.call_count == 0
+    assert mock_clear.call_count == 0
+    assert svc.instances_info["default"].installed is None
+    assert "extra" in svc.instances_info
+
+
+@pytest.mark.asyncio
+async def test_uninstall_instance_purge_removes_per_model_docker_images(svc: LLamacppService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info(svc)
+    model_info = _make_model_installed_info("test-model")
+    model_info.docker.image = "llamacpp-model-image:tag"
+    installed.models["test-model"] = model_info
+    svc.instances_info["default"].installed = installed
+    deps["docker_service"].remove_image = AsyncMock()
+
+    with (
+        patch.object(svc, "_uninstall_model", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_clear_working_dir", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+    ):
+        await svc._uninstall_instance("default", UninstallServiceIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    removed_images = {c.args[0] for c in deps["docker_service"].remove_image.call_args_list}
+    assert "llamacpp-model-image:tag" in removed_images
+
+
+@pytest.mark.asyncio
 async def test_stop_instance_does_nothing_when_not_installed(svc: LLamacppService) -> None:
     svc.instances_info["default"].installed = None
 
@@ -1048,6 +1086,70 @@ async def test_install_model_appends_parallel_flag_when_num_parallel_gt_1(
 
     assert len(captured) == 1
     assert "--parallel 4" in captured[0].command  # type: ignore[union-attr]
+
+
+def test_get_image_with_version_overrides_tag(svc: LLamacppService) -> None:
+    image = svc._get_image(hardware=[], image_version="server-cuda-b9999")  # pyright: ignore[reportPrivateUsage]
+    base = _const.images["cpu"].name.split(":")[0]
+    assert image.name == f"{base}:server-cuda-b9999"
+    assert image.size == _const.images["cpu"].size
+
+
+@pytest.mark.asyncio
+async def test_get_docker_tags_returns_filtered_tags(svc: LLamacppService) -> None:
+    mock_client = AsyncMock()
+    mock_client.get_tags = AsyncMock(return_value=["server-cuda-b7836", "server-b7836", "server-vulkan-b7836"])
+    with (
+        patch("server.services.llamacpp_service.registry_for", return_value=mock_client),
+        patch("server.services.llamacpp_service.image_without_registry_prefix", return_value="ggml-org/llama.cpp"),
+    ):
+        tags = await svc.get_docker_tags("GPU")
+    assert "server-cuda-b7836" in tags
+    assert "server-b7836" not in tags
+
+
+@pytest.mark.asyncio
+async def test_get_docker_tags_cpu_hardware_returns_plain_tags(svc: LLamacppService) -> None:
+    mock_client = AsyncMock()
+    mock_client.get_tags = AsyncMock(return_value=["server-cuda-b7836", "server-b7836", "server-vulkan-b7836"])
+    with (
+        patch("server.services.llamacpp_service.registry_for", return_value=mock_client),
+        patch("server.services.llamacpp_service.image_without_registry_prefix", return_value="ggml-org/llama.cpp"),
+    ):
+        tags = await svc.get_docker_tags("cpu")
+    assert "server-b7836" in tags
+    assert "server-cuda-b7836" not in tags
+    assert "server-vulkan-b7836" not in tags
+
+
+def test_get_default_docker_tag_gpu(svc: LLamacppService) -> None:
+    assert svc.get_default_docker_tag("GPU") == _const.images["gpu"].name.split(":")[1]
+
+
+def test_get_default_docker_tag_cpu(svc: LLamacppService) -> None:
+    assert svc.get_default_docker_tag("cpu") == _const.images["cpu"].name.split(":")[1]
+
+
+def test_get_default_docker_tag_vulkan(svc: LLamacppService) -> None:
+    assert svc.get_default_docker_tag("intel") == _const.images["vulkan"].name.split(":")[1]
+
+
+def test_get_default_docker_tag_defaults_to_gpu_when_no_hardware(svc: LLamacppService) -> None:
+    assert svc.get_default_docker_tag(None) == _const.images["gpu"].name.split(":")[1]
+
+
+def test_get_image_with_nvidia_gpu_and_version_overrides_tag(svc: LLamacppService) -> None:
+    image = svc._get_image(hardware=[MagicMock(spec=NvidiaGpuInfo)], image_version="server-cuda-b9999")  # pyright: ignore[reportPrivateUsage]
+    base = _const.images["gpu"].name.split(":")[0]
+    assert image.name == f"{base}:server-cuda-b9999"
+    assert image.size == _const.images["gpu"].size
+
+
+def test_get_image_with_intel_gpu_and_version_overrides_tag(svc: LLamacppService) -> None:
+    image = svc._get_image(hardware=[MagicMock(spec=IntelGpuInfo)], image_version="server-vulkan-b9999")  # pyright: ignore[reportPrivateUsage]
+    base = _const.images["vulkan"].name.split(":")[0]
+    assert image.name == f"{base}:server-vulkan-b9999"
+    assert image.size == _const.images["vulkan"].size
 
 
 @pytest.mark.asyncio

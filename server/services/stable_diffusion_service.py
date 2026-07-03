@@ -474,7 +474,7 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
         self.instances_info[instance].installed = None
 
         if options.purge:
-            if len(self.instances_info) < 2:
+            if not any(i.installed for i in self.instances_info.values()):
                 self.service_downloaded = False
                 for image in _const.images.values():
                     await self.docker_service.remove_image(image.name)

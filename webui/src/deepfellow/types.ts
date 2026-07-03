@@ -38,12 +38,15 @@ export interface SpecField {
     | "oneof"
     | "list"
     | "map"
-    | "textarea";
+    | "textarea"
+    | "docker-tags";
   required: boolean;
   default?: string | number | boolean;
   placeholder?: string;
   values?: (string | { label: string; value: string })[]; // For oneof type
   display?: string; // Conditional display: "fieldName=value"
+  docker_image?: string; // For docker-tags type: base image name without tag
+  depends_on?: string; // For docker-tags type: field whose value is forwarded as ?hardware=
   required_keys?: string[]; // For map type: keys that must be present with a non-empty value
 }
 

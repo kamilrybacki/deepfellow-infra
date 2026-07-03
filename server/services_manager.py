@@ -45,6 +45,7 @@ logger = logging.getLogger("uvicorn.error")
 class ServicesManager:
     def __init__(self):
         self.services: dict[str, BaseService] = {}
+        self.docker_tags_cache: dict[tuple[str, str | None], tuple[list[str], str, float]] = {}
 
     def split_service_type_and_instance(self, service_id: str) -> tuple[str, str]:
         """Convert service id to service type and instance with validation."""
@@ -205,6 +206,24 @@ class ServicesManager:
         """Trigger immediate model sync for the service instance."""
         service_type, instance = self.split_service_type_and_instance(service_id)
         await self._get_service(service_type).sync_models(instance)
+
+    async def get_docker_tags_for_service(self, service_id: str, hardware: str | None) -> list[str]:
+        """Fetch available Docker image tags for the service, hardware-filtered."""
+        service_type, _instance = self.split_service_type_and_instance(service_id)
+        return await self._get_service(service_type).get_docker_tags(hardware)
+
+    def get_default_docker_tag_for_service(self, service_id: str, hardware: str | None) -> str | None:
+        """Return the pinned default Docker image tag for the service, hardware-aware."""
+        service_type, _instance = self.split_service_type_and_instance(service_id)
+        return self._get_service(service_type).get_default_docker_tag(hardware)
+
+    def get_docker_image_repo_for_service(self, service_id: str, hardware: str | None) -> str | None:
+        """Return the Docker repo tags are fetched from for the service, hardware-aware.
+
+        None if the service's tags come from the same repo regardless of hardware.
+        """
+        service_type, _instance = self.split_service_type_and_instance(service_id)
+        return self._get_service(service_type).get_docker_image_repo(hardware)
 
     async def get_docker_logs(self, service_id: str, model_id: str | None) -> str:
         """Get docker logs."""

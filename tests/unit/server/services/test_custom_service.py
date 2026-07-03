@@ -651,6 +651,26 @@ async def test_uninstall_instance_with_purge_deletes_non_default_instance(svc: C
     assert "gpu-1" not in svc.instances_info
 
 
+@pytest.mark.asyncio
+async def test_uninstall_instance_purge_with_other_instance_installed_does_not_clear_working_dir(
+    svc: CustomService,
+) -> None:
+    # Branch 267->272: another instance is still installed, so the shared working dir
+    # cleanup must be skipped even though this instance is being purged.
+    svc.instances_info["gpu-1"] = Instance(None, None, {}, InstanceConfig())
+    svc.instances_info["gpu-1"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    svc.service_downloaded = True
+    svc._clear_working_dir = AsyncMock()  # pyright: ignore[reportAttributeAccessIssue, reportPrivateUsage]
+
+    await svc._uninstall_instance("default", UninstallServiceIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert svc._clear_working_dir.call_count == 0  # pyright: ignore[reportAttributeAccessIssue, reportPrivateUsage]
+    assert svc.service_downloaded is True
+    assert svc.instances_info["default"].installed is None
+    assert "gpu-1" in svc.instances_info
+
+
 def test_add_custom_model_creates_instance_dict_when_missing(svc: CustomService) -> None:
     del svc.models["default"]
     model = CustomModel(id="cm-1", data=_CUSTOM_MODEL_DATA)

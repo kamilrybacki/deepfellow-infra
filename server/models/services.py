@@ -45,6 +45,8 @@ class ServiceField(BaseModel):
     placeholder: str | None = None
     required: bool = True
     values: list[OneOfOption | str] | None = None
+    docker_image: str | None = None
+    depends_on: str | None = None
 
 
 class ServiceSpecification(BaseModel):
@@ -144,3 +146,9 @@ class MemoryLoadSession(BaseModel):
 
 class MemoryLoadOut(BaseModel):
     sessions: list[MemoryLoadSession]
+
+
+class DockerTagsOut(BaseModel):
+    image: str
+    tags: list[str]
+    default: str | None = None

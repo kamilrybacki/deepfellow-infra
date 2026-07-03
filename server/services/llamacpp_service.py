@@ -41,6 +41,7 @@ from server.models.models import (
 from server.models.services import (
     InstallServiceIn,
     InstallServiceProgress,
+    ServiceField,
     ServiceOptions,
     ServiceSize,
     ServiceSpecification,
@@ -62,6 +63,7 @@ from server.utils.core import (
 from server.utils.files import get_gguf_arch_params, get_gguf_context_window
 from server.utils.hardware import GpuInfo, HardwarePartInfo, IntelGpuInfo, NvidiaGpuInfo
 from server.utils.loading import Progress
+from server.utils.registry_client import image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fetch_file_size_from_url
 from server.utils.vram_calculator import estimate_vram_gb, parse_cache_type_bits
 
@@ -238,6 +240,16 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
     def get_spec(self) -> ServiceSpecification:
         """Return the service specification."""
         fields = self.add_hardware_field_to_spec()
+        fields.append(
+            ServiceField(
+                type="docker-tags",
+                name="image_version",
+                description="Docker image version",
+                docker_image=_const.images["gpu"].name.split(":")[0],
+                depends_on="hardware",
+                required=False,
+            )
+        )
         return ServiceSpecification(fields=fields)
 
     def get_model_spec(self) -> ModelSpecification:
@@ -281,15 +293,21 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
     def _load_download_info(self, data: dict[str, Any]) -> DownloadedInfo:
         return DownloadedInfo(**data)
 
+    async def _validate_update_options(self, options: InstallServiceIn) -> None:
+        """Normalize the hardware spec and validate the requested image_version, if any."""
+        if "hardware" not in options.spec:
+            options.spec["hardware"] = options.spec.get("gpu", self.docker_service.has_gpu_support)
+        await self.validate_docker_image_version(options.spec.get("image_version"), options.spec.get("hardware"))
+
     async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self.load_default_models(instance)
 
-        if "hardware" not in options.spec:
-            options.spec["hardware"] = options.spec.get("gpu", self.docker_service.has_gpu_support)
+        await self._validate_update_options(options)
         parsed_options = try_parse_pydantic(LLamacppOptions, options.spec)
         hardware_parts = self.get_specified_hardware_parts(parsed_options.hardware)
-        image = self._get_image(hardware_parts)
+        image_version = options.spec.get("image_version")
+        image = self._get_image(hardware_parts, image_version)
         await self._verify_docker_image(image.name, options.ignore_warnings)
 
         async def func(stream: Stream[StreamChunk]) -> InstalledInfo:
@@ -301,6 +319,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
 
     async def _uninstall_instance(self, instance: str, options: UninstallServiceIn) -> None:
         installed = self.get_instance_info(instance).installed
+        installed_images = {model.docker.image for model in installed.models.values()} if installed else set()
         if installed:
             await asyncio.gather(
                 *[
@@ -313,10 +332,12 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
         self.instances_info[instance].installed = None
 
         if options.purge:
-            if len(self.instances_info) < 2:
+            if not any(i.installed for i in self.instances_info.values()):
                 self.service_downloaded = False
                 for image in _const.images.values():
                     await self.docker_service.remove_image(image.name)
+                for image_name in installed_images:
+                    await self.docker_service.remove_image(image_name)
 
                 await self._clear_working_dir()
                 self.models_downloaded = {}
@@ -572,7 +593,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
                 subnet = self.docker_service.get_docker_subnet()
                 service_name = f"{self.get_id(instance)}-{normalize_name(model_id)}"
                 hardware_parts = self.get_specified_hardware_parts(installed.parsed_options.hardware)
-                image = self._get_image(hardware_parts)
+                image = self._get_image(hardware_parts, installed.options.spec.get("image_version") if installed.options else None)
                 docker_options = DockerOptions(
                     name=service_name,
                     container_name=self.docker_service.get_docker_container_name(service_name),
@@ -631,12 +652,50 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         return PromiseWithProgress(func=func)
 
-    def _get_image(self, hardware: Sequence[HardwarePartInfo]) -> DockerImage:
+    def _get_image(self, hardware: Sequence[HardwarePartInfo], image_version: str | None = None) -> DockerImage:
         if any(isinstance(h, NvidiaGpuInfo) for h in hardware):
-            return _const.images["gpu"]
-        if any(isinstance(h, IntelGpuInfo) for h in hardware):
-            return _const.images["vulkan"]
-        return _const.images["cpu"]
+            base = _const.images["gpu"]
+        elif any(isinstance(h, IntelGpuInfo) for h in hardware):
+            base = _const.images["vulkan"]
+        else:
+            base = _const.images["cpu"]
+        if image_version:
+            base_name = base.name.split(":")[0]
+            return DockerImage(name=f"{base_name}:{image_version}", size=base.size)
+        return base
+
+    def _image_variant_for_hardware(self, hardware: str | None) -> ImageTypes:
+        """Return the `_const.images` key matching the given hardware string."""
+        hw = str(hardware).lower() if hardware else ""
+        if hw.startswith("cpu"):
+            return "cpu"
+        if "vulkan" in hw or "intel" in hw:
+            return "vulkan"
+        return "gpu"
+
+    async def get_docker_tags(self, hardware: str | None) -> list[str]:
+        """Fetch available Docker image tags from GHCR for the llama.cpp image."""
+        base_image = _const.images["gpu"].name.split(":")[0]
+        client = registry_for(base_image, self.config.docker_hub_token or None)
+        tags = await client.get_tags(image_without_registry_prefix(base_image))
+        return self.filter_docker_tags(tags, hardware)
+
+    def filter_docker_tags(self, tags: list[str], hardware: str | None) -> list[str]:
+        """Filter tags to the appropriate variant (cuda/vulkan/plain) based on selected hardware."""
+        if hardware is None:
+            return tags
+        tags = [t for t in tags if t.startswith("server-")]
+        variant = self._image_variant_for_hardware(hardware)
+        if variant == "cpu":
+            return [t for t in tags if "cuda" not in t.lower() and "vulkan" not in t.lower()]
+        if variant == "vulkan":
+            return [t for t in tags if "vulkan" in t.lower()]
+        return [t for t in tags if "cuda" in t.lower()]
+
+    def get_default_docker_tag(self, hardware: str | None) -> str | None:
+        """Return the pinned default llama.cpp image tag for the given hardware variant."""
+        base = _const.images[self._image_variant_for_hardware(hardware)]
+        return base.name.split(":")[1]
 
     async def _uninstall_model(self, instance: str, model_id: str, options: UninstallModelIn) -> None:
         info = self.get_instance_installed_info(instance)

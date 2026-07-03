@@ -38,6 +38,7 @@ interface DynamicFormModalProps {
   deferRender?: boolean;
   submitLabel?: string;
   submittingLabel?: string;
+  serviceId?: string;
 }
 
 export function DynamicFormModal({
@@ -52,6 +53,7 @@ export function DynamicFormModal({
   deferRender = false,
   submitLabel = "Install",
   submittingLabel = "Installing...",
+  serviceId,
 }: DynamicFormModalProps) {
   const [renderFields, setRenderFields] = useState<SpecField[]>(
     deferRender ? [] : fields,
@@ -164,6 +166,7 @@ export function DynamicFormModal({
                 formData={formData}
                 errors={errors}
                 onChange={handleChange}
+                serviceId={serviceId}
               />
             )}
           </div>
