@@ -9,8 +9,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import {
   Select,
   SelectContent,
@@ -19,8 +32,15 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { apiClient } from "@/deepfellow/client";
 import type { SpecField } from "@/deepfellow/types";
-import { useMemo } from "react";
+import {
+  CheckIcon,
+  ChevronsUpDownIcon,
+  Loader2Icon,
+  RotateCcwIcon,
+} from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ListInput } from "./ListInput";
 import { MapInput } from "./MapInput";
 
@@ -29,6 +49,163 @@ export interface DynamicFormFieldsProps {
   formData: Record<string, unknown>;
   errors: Record<string, string>;
   onChange: (name: string, value: unknown) => void;
+  serviceId?: string;
+}
+
+interface DockerTagsFieldProps {
+  field: SpecField;
+  value: string;
+  onChange: (value: string) => void;
+  serviceId: string;
+  hardware: string | undefined;
+}
+
+function DockerTagsField({
+  field,
+  value,
+  onChange,
+  serviceId,
+  hardware,
+}: DockerTagsFieldProps) {
+  const [open, setOpen] = useState(false);
+  const [tags, setTags] = useState<string[]>([]);
+  const [defaultTag, setDefaultTag] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(false);
+  const previousHardware = useRef(hardware);
+
+  useEffect(() => {
+    if (previousHardware.current !== hardware) {
+      previousHardware.current = hardware;
+      onChange("");
+    }
+  }, [hardware, onChange]);
+
+  const fetchTags = useCallback(async () => {
+    setLoading(true);
+    setError(false);
+    try {
+      const result = await apiClient.getDockerTags(serviceId, hardware);
+      setTags(result.tags);
+      setDefaultTag(result.default);
+    } catch {
+      setError(true);
+      setTags([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [serviceId, hardware]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(false);
+    void apiClient.getDockerTags(serviceId, hardware).then(
+      (result) => {
+        if (!cancelled) {
+          setTags(result.tags);
+          setDefaultTag(result.default);
+          setLoading(false);
+        }
+      },
+      () => {
+        if (!cancelled) {
+          setError(true);
+          setTags([]);
+          setLoading(false);
+        }
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [serviceId, hardware]);
+
+  const busy = loading;
+
+  if (error && tags.length === 0) {
+    return (
+      <div className="flex gap-2">
+        <Input
+          id={field.name}
+          placeholder={field.placeholder || "e.g. 0.20.4"}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+        />
+        <button
+          type="button"
+          onClick={fetchTags}
+          disabled={busy}
+          className="shrink-0 p-2 rounded-md border border-input bg-background hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
+          title="Retry fetching tags"
+        >
+          {busy ? (
+            <Loader2Icon className="size-4 animate-spin" />
+          ) : (
+            <RotateCcwIcon className="size-4" />
+          )}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          role="combobox"
+          aria-expanded={open}
+          aria-controls="version-listbox"
+          className="flex h-9 w-full items-center justify-between rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm ring-offset-background placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+          disabled={busy}
+        >
+          <span className={value ? "" : "text-muted-foreground"}>
+            {loading
+              ? "Loading tags…"
+              : value ||
+                (defaultTag ? `${defaultTag} (current)` : "Select version…")}
+          </span>
+          {loading ? (
+            <Loader2Icon className="ml-2 size-4 shrink-0 animate-spin opacity-50" />
+          ) : (
+            <ChevronsUpDownIcon className="ml-2 size-4 shrink-0 opacity-50" />
+          )}
+        </button>
+      </PopoverTrigger>
+      <PopoverContent className="w-[300px] p-0" align="start">
+        <Command>
+          <CommandInput placeholder="Search tags…" />
+          <CommandList
+            id="version-listbox"
+            onWheel={(e) => e.nativeEvent.stopPropagation()}
+          >
+            <CommandEmpty>No tags found.</CommandEmpty>
+            <CommandGroup>
+              {tags.map((tag) => (
+                <CommandItem
+                  key={tag}
+                  value={tag}
+                  onSelect={(selected) => {
+                    onChange(selected === value ? "" : selected);
+                    setOpen(false);
+                  }}
+                >
+                  {tag}
+                  {!value && tag === defaultTag && (
+                    <span className="ml-auto text-muted-foreground text-xs">
+                      current
+                    </span>
+                  )}
+                  {value === tag && <CheckIcon className="ml-auto size-4" />}
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
 }
 
 export function DynamicFormFields({
@@ -36,6 +213,7 @@ export function DynamicFormFields({
   formData,
   errors,
   onChange,
+  serviceId,
 }: DynamicFormFieldsProps) {
   const visibleFields = useMemo(
     () =>
@@ -66,7 +244,19 @@ export function DynamicFormFields({
               </span>
             )}
           </Label>
-          {field.type === "bool" ? (
+          {field.type === "docker-tags" && serviceId ? (
+            <DockerTagsField
+              field={field}
+              value={(formData[field.name] as string | undefined) ?? ""}
+              onChange={(v) => onChange(field.name, v)}
+              serviceId={serviceId}
+              hardware={
+                field.depends_on
+                  ? (formData[field.depends_on] as string | undefined)
+                  : undefined
+              }
+            />
+          ) : field.type === "bool" ? (
             <div className="flex items-center space-x-2">
               <Checkbox
                 id={field.name}

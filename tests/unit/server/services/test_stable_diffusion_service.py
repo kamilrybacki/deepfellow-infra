@@ -1118,6 +1118,27 @@ async def test_uninstall_instance_purge_removes_non_default_instance(svc: Stable
     assert "extra" not in svc.instances_info
 
 
+@pytest.mark.asyncio
+async def test_uninstall_instance_purge_with_other_instance_installed_does_not_remove_image(
+    svc: StableDiffusionService, deps: dict[str, Any]
+) -> None:
+    svc.instances_info["extra"] = Instance(None, None, {}, InstanceConfig())
+    svc.instances_info["extra"].installed = _make_installed_info(instance="extra")
+    svc.instances_info["default"].installed = _make_installed_info()
+    svc.service_downloaded = True
+    deps["docker_service"].uninstall_docker = AsyncMock()
+    deps["docker_service"].remove_image = AsyncMock()
+
+    with patch.object(svc, "_clear_working_dir", new_callable=AsyncMock) as mock_clear:  # pyright: ignore[reportPrivateUsage]
+        await svc._uninstall_instance("default", UninstallServiceIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert deps["docker_service"].remove_image.call_count == 0
+    assert mock_clear.call_count == 0
+    assert svc.service_downloaded is True
+    assert svc.instances_info["default"].installed is None
+    assert "extra" in svc.instances_info
+
+
 def test_split_text_no_sd_tags_returns_empty_dict_and_original() -> None:
     opts, text = split_text_to_json_and_prompt("hello world")
 

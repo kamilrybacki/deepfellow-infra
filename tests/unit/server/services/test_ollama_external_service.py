@@ -376,10 +376,33 @@ async def test_uninstall_instance_purge_deletes_non_default_instance(svc: Ollama
     svc.instances_info["extra"].installed = _make_installed_info()
     svc.models["extra"] = {}
 
-    with patch.object(svc, "_uninstall_model", new_callable=AsyncMock):  # pyright: ignore[reportPrivateUsage]
+    with (
+        patch.object(svc, "_uninstall_model", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_clear_working_dir", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+    ):
         await svc._uninstall_instance("extra", UninstallServiceIn(purge=True))  # pyright: ignore[reportPrivateUsage]
 
     assert "extra" not in svc.instances_info
+
+
+@pytest.mark.asyncio
+async def test_uninstall_instance_purge_with_other_instance_installed_does_not_clear_working_dir(
+    svc: OllamaExternalService,
+) -> None:
+    svc.instances_info["extra"] = Instance(None, None, {}, InstanceConfig())
+    svc.instances_info["extra"].installed = _make_installed_info()
+    svc.instances_info["default"].installed = _make_installed_info()
+    svc.models["extra"] = {}
+
+    with (
+        patch.object(svc, "_uninstall_model", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_clear_working_dir", new_callable=AsyncMock) as mock_clear,  # pyright: ignore[reportPrivateUsage]
+    ):
+        await svc._uninstall_instance("default", UninstallServiceIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert mock_clear.call_count == 0
+    assert svc.instances_info["default"].installed is None
+    assert "extra" in svc.instances_info
 
 
 @pytest.mark.asyncio

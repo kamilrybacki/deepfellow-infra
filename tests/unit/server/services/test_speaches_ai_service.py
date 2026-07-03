@@ -1092,10 +1092,32 @@ async def test_uninstall_instance_purge_removes_non_default_instance(svc: Speach
     svc.instances_info["extra"].installed = installed
     svc.models["extra"] = {}
     deps["docker_service"].uninstall_docker = AsyncMock()
+    deps["docker_service"].remove_image = AsyncMock()
 
-    await svc._uninstall_instance("extra", UninstallServiceIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+    with patch.object(svc, "_clear_working_dir", new_callable=AsyncMock):  # pyright: ignore[reportPrivateUsage]
+        await svc._uninstall_instance("extra", UninstallServiceIn(purge=True))  # pyright: ignore[reportPrivateUsage]
 
     assert "extra" not in svc.instances_info
+
+
+@pytest.mark.asyncio
+async def test_uninstall_instance_purge_with_other_instance_installed_does_not_remove_image(
+    svc: SpeachesAIService, deps: dict[str, Any]
+) -> None:
+    svc.instances_info["extra"] = Instance(None, None, {}, InstanceConfig())
+    svc.instances_info["extra"].installed = _make_installed_info("extra")
+    svc.models["extra"] = {}
+    installed = _make_installed_info()
+    svc.instances_info["default"].installed = installed
+    deps["docker_service"].uninstall_docker = AsyncMock()
+
+    with patch.object(svc, "_clear_working_dir", new_callable=AsyncMock) as mock_clear:  # pyright: ignore[reportPrivateUsage]
+        await svc._uninstall_instance("default", UninstallServiceIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert deps["docker_service"].remove_image.call_count == 0
+    assert mock_clear.call_count == 0
+    assert svc.instances_info["default"].installed is None
+    assert "extra" in svc.instances_info
 
 
 @pytest.mark.asyncio

@@ -391,10 +391,11 @@ async def test_uninstall_instance_purge_clears_download_state(svc: CoquiService,
 
 
 @pytest.mark.asyncio
-async def test_uninstall_instance_non_default_purge_removes_instance(svc: CoquiService) -> None:
+async def test_uninstall_instance_non_default_purge_removes_instance(svc: CoquiService, deps: dict[str, Any]) -> None:
     svc.instances_info["extra"] = Instance(None, None, {}, InstanceConfig())
     installed = _make_installed_info()
     svc.instances_info["extra"].installed = installed
+    deps["docker_service"].remove_image = AsyncMock()
     options = UninstallServiceIn(purge=True)
 
     with (
@@ -404,6 +405,27 @@ async def test_uninstall_instance_non_default_purge_removes_instance(svc: CoquiS
         await svc._uninstall_instance("extra", options)  # pyright: ignore[reportPrivateUsage]
 
     assert "extra" not in svc.instances_info
+
+
+@pytest.mark.asyncio
+async def test_uninstall_instance_purge_with_other_instance_installed_does_not_remove_image(
+    svc: CoquiService, deps: dict[str, Any]
+) -> None:
+    svc.instances_info["extra"] = Instance(None, None, {}, InstanceConfig())
+    svc.instances_info["extra"].installed = _make_installed_info()
+    installed = _make_installed_info()
+    svc.instances_info["default"].installed = installed
+
+    with (
+        patch.object(svc, "_uninstall_model", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_clear_working_dir", new_callable=AsyncMock) as mock_clear,  # pyright: ignore[reportPrivateUsage]
+    ):
+        await svc._uninstall_instance("default", UninstallServiceIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert deps["docker_service"].remove_image.call_count == 0
+    assert mock_clear.call_count == 0
+    assert svc.instances_info["default"].installed is None
+    assert "extra" in svc.instances_info
 
 
 def test_get_docker_compose_file_path_raises_400_no_model_id(svc: CoquiService) -> None:

@@ -218,6 +218,40 @@ async def test_uninstall_service(services_manager: ServicesManager):
 
 
 @pytest.mark.asyncio
+async def test_get_docker_tags_for_service(services_manager: ServicesManager):
+    svc = FakeService("ollama")
+    svc.get_docker_tags = AsyncMock(return_value=["v1", "v2"])
+    services_manager.register_service(svc)
+
+    result = await services_manager.get_docker_tags_for_service("ollama", "gpu")
+
+    svc.get_docker_tags.assert_awaited_once_with("gpu")
+    assert result == ["v1", "v2"]
+
+
+def test_get_default_docker_tag_for_service(services_manager: ServicesManager):
+    svc = FakeService("ollama")
+    svc.get_default_docker_tag = MagicMock(return_value="v1")
+    services_manager.register_service(svc)
+
+    result = services_manager.get_default_docker_tag_for_service("ollama", "gpu")
+
+    svc.get_default_docker_tag.assert_called_once_with("gpu")
+    assert result == "v1"
+
+
+def test_get_docker_image_repo_for_service(services_manager: ServicesManager):
+    svc = FakeService("ollama")
+    svc.get_docker_image_repo = MagicMock(return_value="public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo")
+    services_manager.register_service(svc)
+
+    result = services_manager.get_docker_image_repo_for_service("ollama", "cpu")
+
+    svc.get_docker_image_repo.assert_called_once_with("cpu")
+    assert result == "public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo"
+
+
+@pytest.mark.asyncio
 async def test_list_models_from_all_services_installed_only(services_manager: ServicesManager):
     svc_installed = FakeService("svc-a", installed=True)
     svc_not_installed = FakeService("svc-b", installed=False)

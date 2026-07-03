@@ -341,6 +341,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
 
         preserved_models = (self._generate_instance_config(info.installed, info.config.custom).models) or []
 
+        await self._validate_update_options(options)
         await self._uninstall_instance(instance, UninstallServiceIn(purge=False))
 
         async def func(data: InstalledInfoType) -> InstallServiceOut:
@@ -358,6 +359,15 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         next_promise = promise.next(func, on_error)
         self.instances_info[instance].installing = InstallingInstance(promise=next_promise)
         return next_promise
+
+    async def _validate_update_options(self, options: InstallServiceIn) -> None:
+        """Validate new options before update_instance tears down the existing installation.
+
+        No-op by default. Override for services whose `_install_instance` can reject the new
+        options (e.g. an unavailable Docker image tag) — without this, update_instance's
+        uninstall-then-reinstall ordering would destroy a working installation before the
+        rejection surfaces, since `_install_instance` only validates after being invoked.
+        """
 
     @abstractmethod
     async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfoType, StreamChunk]:

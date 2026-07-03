@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 - Ollama Cloud support with cached model list.
+- Ollama, llama.cpp, and vLLM service install and edit dialogs now include a searchable **Docker image version** selector populated from the container registry, filtered by the selected hardware variant. Leave the field empty to use the default bundled version.
+- New `GET /admin/services/{id}/docker-tags` API endpoint returns available Docker image tags for a service, with server-side caching (2 h TTL) and optional `?hardware=` filtering.
+- Optional `DOCKER_HUB_TOKEN` environment variable for authenticated Docker Hub access to raise rate limits when fetching image tags.
 
 ### Fixed
 - VRAM estimation no longer crashes the entire model listing endpoint when a model (e.g. Qwen3.5, Gemma4) reports `null` for `num_key_value_heads` in its Ollama architecture metadata; VRAM is shown as unavailable for that model instead of returning HTTP 500.

@@ -45,6 +45,7 @@ def config() -> MagicMock:
     mock.metrics_username = ""
     mock.metrics_password = SecretStr("")
     mock.connect_to_mesh_url = ""
+    mock.docker_hub_token = ""
     mock.mcp_sse_session_ttl_seconds = 300
     mock.mcp_sse_max_sessions = 128
     mock.otel_exporter_otlp_endpoint = "http://localhost:4317"

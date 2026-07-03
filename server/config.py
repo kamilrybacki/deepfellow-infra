@@ -41,6 +41,8 @@ class AppSettings(BaseSettings):
     compose_prefix: str = "df_"
     stop_containers_on_shutdown: str = ""
 
+    docker_hub_token: str = ""
+
     mcp_sse_session_ttl_seconds: int = 300
     mcp_sse_max_sessions: int = 128
 

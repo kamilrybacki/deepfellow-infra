@@ -463,6 +463,23 @@ async def test_uninstall_non_default_instance_purge_removes_entry(svc: McpServic
     assert "gpu-1" not in svc.instances_info
 
 
+@pytest.mark.asyncio
+async def test_uninstall_instance_purge_with_other_instance_installed_does_not_clear_working_dir(svc: McpService) -> None:
+    # branch 693->698: purging one instance while another instance is still installed skips the shared cleanup
+    svc.instances_info["gpu-1"] = Instance(None, None, {}, InstanceConfig())
+    svc.instances_info["gpu-1"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    svc.service_downloaded = True
+
+    with patch.object(svc, "_clear_working_dir", new=AsyncMock()) as mock_clear:
+        await svc._uninstall_instance("default", UninstallServiceIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert mock_clear.call_count == 0
+    assert svc.service_downloaded is True
+    assert svc.instances_info["default"].installed is None
+    assert "gpu-1" in svc.instances_info
+
+
 def test_get_docker_compose_file_path_no_model_id_raises_400(svc: McpService) -> None:
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
 

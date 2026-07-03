@@ -363,6 +363,22 @@ async def test_uninstall_instance_with_purge_deletes_non_default_instance(openai
 
 
 @pytest.mark.asyncio
+async def test_uninstall_instance_purge_with_other_instance_installed_does_not_clear_working_dir(
+    openai_svc: OpenAIService,
+) -> None:
+    openai_svc.instances_info["default"].installed = _make_installed()
+    openai_svc.instances_info["gpu-1"] = Instance(None, None, {}, InstanceConfig())
+    openai_svc.instances_info["gpu-1"].installed = _make_installed()
+    openai_svc._clear_working_dir = AsyncMock()  # pyright: ignore[reportAttributeAccessIssue, reportPrivateUsage]
+
+    await openai_svc._uninstall_instance("default", UninstallServiceIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert openai_svc._clear_working_dir.call_count == 0  # pyright: ignore[reportAttributeAccessIssue, reportPrivateUsage]
+    assert openai_svc.instances_info["default"].installed is None
+    assert "gpu-1" in openai_svc.instances_info
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("model_id", "model_type", "unregister_method"),
     [

@@ -74,6 +74,7 @@ from server.utils.files import detect_context_window_from_path
 from server.utils.hardware import GpuInfo, HardwarePartInfo, IntelGpuInfo, get_vram_gb
 from server.utils.loading import Progress
 from server.utils.ollama import raise_ollama_pull_error
+from server.utils.registry_client import image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fetch_ollama_ref_bytes, fmt_size
 from server.utils.vram_calculator import GGUF_QUANTS, ArchParams, estimate_vram_gb, parse_cache_type_bits, parse_parameter_count
 
@@ -345,6 +346,13 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                     description="Default context length (OLLAMA_CONTEXT_LENGTH)",
                     required=False,
                 ),
+                ServiceField(
+                    type="docker-tags",
+                    name="image_version",
+                    description="Docker image version",
+                    docker_image=_const.image.name.split(":")[0],
+                    required=False,
+                ),
             ]
         )
 
@@ -468,8 +476,22 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             custom=custom,
         )
 
-    def _get_image(self) -> DockerImage:
+    def _get_image(self, image_version: str | None = None) -> DockerImage:
+        if image_version:
+            base = _const.image.name.split(":")[0]
+            return DockerImage(name=f"{base}:{image_version}", size=_const.image.size)
         return _const.image
+
+    async def get_docker_tags(self, hardware: str | None) -> list[str]:
+        """Fetch available Docker image tags from Docker Hub for the Ollama image."""
+        base_image = _const.image.name.split(":")[0]
+        client = registry_for(base_image, self.config.docker_hub_token or None)
+        tags = await client.get_tags(image_without_registry_prefix(base_image))
+        return self.filter_docker_tags(tags, hardware)
+
+    def get_default_docker_tag(self, hardware: str | None) -> str | None:  # noqa: ARG002
+        """Return the pinned default Ollama image tag."""
+        return _const.image.name.split(":")[1]
 
     def _load_download_info(self, data: dict[str, Any]) -> DownloadedInfo:
         return DownloadedInfo(**data)
@@ -495,14 +517,20 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         envs["OLLAMA_NO_CLOUD"] = "1"
         return envs
 
+    async def _validate_update_options(self, options: InstallServiceIn) -> None:
+        """Normalize the hardware spec and validate the requested image_version, if any."""
+        if "hardware" not in options.spec:
+            options.spec["hardware"] = options.spec.get("gpu", self.docker_service.has_gpu_support)
+        await self.validate_docker_image_version(options.spec.get("image_version"), options.spec.get("hardware"))
+
     async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self.load_default_models(instance)
 
-        if "hardware" not in options.spec:
-            options.spec["hardware"] = options.spec.get("gpu", self.docker_service.has_gpu_support)
+        await self._validate_update_options(options)
         parsed_options = try_parse_pydantic(OllamaOptions, options.spec)
-        image = self._get_image()
+        image_version = options.spec.get("image_version")
+        image = self._get_image(image_version)
         await self._verify_docker_image(image.name, options.ignore_warnings)
 
         async def func(stream: Stream[StreamChunk]) -> InstalledInfo:
@@ -582,9 +610,11 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         self.instances_info[instance].installed = None
         if options.purge:
-            if len(self.instances_info) < 2:
+            if not any(i.installed for i in self.instances_info.values()):
                 self.service_downloaded = False
                 await self.docker_service.remove_image(_const.image.name)
+                if installed:
+                    await self.docker_service.remove_image(installed.docker.image)
                 await self._clear_working_dir()
                 self.models_downloaded = {}
 

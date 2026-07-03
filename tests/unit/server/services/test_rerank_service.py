@@ -904,6 +904,28 @@ async def test_uninstall_instance_removes_non_default_instance_on_purge(svc: Rer
 
 
 @pytest.mark.asyncio
+async def test_uninstall_instance_purge_with_other_instance_installed_does_not_remove_image(
+    svc: RerankService, deps: dict[str, Any]
+) -> None:
+    svc.instances_info["extra"] = Instance(None, None, {}, InstanceConfig())
+    svc.instances_info["extra"].installed = _make_installed_info("extra")
+    svc.instances_info["default"].installed = _make_installed_info()
+    deps["docker_service"].uninstall_docker = AsyncMock()
+    deps["docker_service"].remove_image = AsyncMock()
+
+    with (
+        patch.object(svc, "_uninstall_model", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_clear_working_dir", new_callable=AsyncMock) as mock_clear,  # pyright: ignore[reportPrivateUsage]
+    ):
+        await svc._uninstall_instance("default", UninstallServiceIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert deps["docker_service"].remove_image.call_count == 0
+    assert mock_clear.call_count == 0
+    assert svc.instances_info["default"].installed is None
+    assert "extra" in svc.instances_info
+
+
+@pytest.mark.asyncio
 async def test_uninstall_instance_sets_installed_to_none_when_not_installed(svc: RerankService, deps: dict[str, Any]) -> None:
     svc.instances_info["default"].installed = None
 

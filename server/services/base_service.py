@@ -9,6 +9,7 @@
 
 """Base service."""
 
+import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -37,6 +38,9 @@ from server.models.services import (
 )
 from server.serviceprovider import ServiceRawConfig
 from server.utils.core import PromiseWithProgress, StreamChunk
+from server.utils.registry_client import RegistryUnavailableError, image_without_registry_prefix, registry_for
+
+logger = logging.getLogger("uvicorn.error")
 
 
 class BaseService(ABC):
@@ -174,6 +178,66 @@ class BaseService(ABC):
 
     async def sync_models(self, instance: str) -> None:  # noqa: B027
         """Trigger an immediate model sync. No-op for services without sync support."""
+
+    async def get_docker_tags(self, hardware: str | None) -> list[str]:  # noqa: ARG002
+        """Return available Docker image tags for this service. Empty list by default."""
+        return []
+
+    def get_default_docker_tag(self, hardware: str | None) -> str | None:  # noqa: ARG002
+        """Return the pinned default Docker image tag used when no version is selected. None by default."""
+        return None
+
+    def get_docker_image_repo(self, hardware: str | None) -> str | None:  # noqa: ARG002
+        """Return the Docker repo (no tag) that get_docker_tags fetches from for the given hardware.
+
+        None by default, meaning the repo is the same regardless of hardware (falls back to the
+        spec field's static `docker_image`). Override when different hardware variants live in
+        different repos, so the reported repo actually matches where the tags came from.
+        """
+        return None
+
+    def filter_docker_tags(self, tags: list[str], hardware: str | None) -> list[str]:  # noqa: ARG002
+        """Filter tags for the given hardware variant. Passthrough by default."""
+        return tags
+
+    def _resolve_docker_image_repo(self, hardware: str | None) -> str | None:
+        """Return the repo (no tag) backing get_docker_tags(), falling back to the spec field's static docker_image."""
+        return self.get_docker_image_repo(hardware) or next(
+            (f.docker_image for f in self.get_spec().fields if f.type == "docker-tags" and f.docker_image), None
+        )
+
+    async def validate_docker_image_version(self, image_version: str | None, hardware: str | bool | None) -> None:
+        """Raise 400 if image_version is set but isn't among the available tags for the given hardware.
+
+        If the registry can't be reached, validation is skipped (fail-open) rather than blocking
+        the install — but a successfully fetched, genuinely empty tag list still rejects any
+        explicit image_version, since it means no tag is known to be valid.
+
+        get_docker_tags() only returns the most recent tags (capped by the registry client), so a
+        tag missing from that list isn't necessarily invalid — e.g. installing an older tag via the
+        CLI. Before rejecting, check the registry directly for that specific tag's existence.
+        """
+        if not image_version:
+            return
+        if isinstance(hardware, bool):
+            hardware = "GPU" if hardware else "CPU"
+        try:
+            tags = await self.get_docker_tags(hardware)
+        except RegistryUnavailableError:
+            logger.warning("Skipping docker image tag validation for %r: registry unavailable", image_version)
+            return
+        if image_version in tags:
+            return
+        docker_image = self._resolve_docker_image_repo(hardware)
+        if docker_image:
+            try:
+                client = registry_for(docker_image)
+                if await client.tag_exists(image_without_registry_prefix(docker_image), image_version):
+                    return
+            except RegistryUnavailableError:
+                logger.warning("Skipping docker image tag existence check for %r: registry unavailable", image_version)
+                return
+        raise HTTPException(400, f"Docker image tag '{image_version}' is not available for this service")
 
     @abstractmethod
     async def get_docker_logs(self, instance: str, model_id: str | None) -> str:

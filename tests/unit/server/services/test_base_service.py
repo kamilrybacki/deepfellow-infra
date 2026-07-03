@@ -31,6 +31,7 @@ from server.models.services import (
     InstallServiceIn,
     InstallServiceOut,
     RetrieveServiceOut,
+    ServiceField,
     ServiceSpecification,
     UninstallServiceIn,
 )
@@ -46,6 +47,7 @@ from server.services.base2_service import (
 from server.services.base_service import BaseService
 from server.utils.core import PromiseWithProgress, Stream, StreamChunk, StreamChunkProgress
 from server.utils.hardware import NvidiaGpuInfo
+from server.utils.registry_client import RegistryUnavailableError
 
 
 class _BaseImpl(BaseService):
@@ -292,6 +294,155 @@ def test_service_has_docker_default_false(base_svc: _BaseImpl) -> None:
 
 def test_is_cloud_service_default_false(base_svc: _BaseImpl) -> None:
     assert base_svc.is_cloud_service() is False
+
+
+@pytest.mark.asyncio
+async def test_get_docker_tags_default_returns_empty(base_svc: _BaseImpl) -> None:
+    result = await base_svc.get_docker_tags(None)
+    assert result == []
+
+
+def test_filter_docker_tags_default_passthrough(base_svc: _BaseImpl) -> None:
+    tags = ["v1.0", "v2.0", "latest"]
+    assert base_svc.filter_docker_tags(tags, "gpu") == tags
+
+
+def test_get_default_docker_tag_default_returns_none(base_svc: _BaseImpl) -> None:
+    assert base_svc.get_default_docker_tag(None) is None
+
+
+def test_get_docker_image_repo_default_returns_none(base_svc: _BaseImpl) -> None:
+    assert base_svc.get_docker_image_repo(None) is None
+
+
+@pytest.mark.asyncio
+async def test_validate_docker_image_version_noop_when_not_set(base_svc: _BaseImpl) -> None:
+    await base_svc.validate_docker_image_version(None, "gpu")
+
+
+@pytest.mark.asyncio
+async def test_validate_docker_image_version_passes_when_tag_available(base_svc: _BaseImpl) -> None:
+    with patch.object(base_svc, "get_docker_tags", AsyncMock(return_value=["v1.0", "v2.0"])):
+        await base_svc.validate_docker_image_version("v1.0", "gpu")
+
+
+@pytest.mark.asyncio
+async def test_validate_docker_image_version_raises_when_tag_unavailable(base_svc: _BaseImpl) -> None:
+    with (
+        patch.object(base_svc, "get_docker_tags", AsyncMock(return_value=["v1.0", "v2.0"])),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await base_svc.validate_docker_image_version("v9.9", "gpu")
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_validate_docker_image_version_rejects_when_tag_list_genuinely_empty(base_svc: _BaseImpl) -> None:
+    """A successfully fetched but empty tag list means no tag is known to be valid — reject."""
+    with (
+        patch.object(base_svc, "get_docker_tags", AsyncMock(return_value=[])),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await base_svc.validate_docker_image_version("v9.9", "gpu")
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_validate_docker_image_version_skips_when_registry_unavailable(base_svc: _BaseImpl) -> None:
+    with patch.object(base_svc, "get_docker_tags", AsyncMock(side_effect=RegistryUnavailableError("unreachable"))):
+        await base_svc.validate_docker_image_version("v9.9", "gpu")
+
+
+@pytest.mark.parametrize(
+    ("hardware", "expected"),
+    [
+        (True, "GPU"),
+        (False, "CPU"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_validate_docker_image_version_normalizes_bool_hardware(base_svc: _BaseImpl, hardware: bool, expected: str) -> None:
+    """A bool hardware default (has_gpu_support) must not be str()-ed into 'True'/'False'."""
+    get_docker_tags = AsyncMock(return_value=["v1.0"])
+    with patch.object(base_svc, "get_docker_tags", get_docker_tags):
+        await base_svc.validate_docker_image_version("v1.0", hardware)
+
+    get_docker_tags.assert_awaited_once_with(expected)
+
+
+@pytest.mark.asyncio
+async def test_validate_docker_image_version_passes_when_tag_exists_outside_capped_list(base_svc: _BaseImpl) -> None:
+    """A tag older than the registry's capped get_docker_tags() list can still be installed via CLI."""
+    mock_client = MagicMock()
+    mock_client.tag_exists = AsyncMock(return_value=True)
+    with (
+        patch.object(base_svc, "get_docker_tags", AsyncMock(return_value=["v2.0"])),
+        patch.object(base_svc, "get_docker_image_repo", return_value="ollama/ollama"),
+        patch("server.services.base_service.registry_for", return_value=mock_client) as mock_registry_for,
+    ):
+        await base_svc.validate_docker_image_version("v0.1-old", "gpu")
+
+    mock_registry_for.assert_called_once_with("ollama/ollama")
+    mock_client.tag_exists.assert_awaited_once_with("ollama/ollama", "v0.1-old")
+
+
+@pytest.mark.asyncio
+async def test_validate_docker_image_version_raises_when_tag_exists_check_returns_false(base_svc: _BaseImpl) -> None:
+    mock_client = MagicMock()
+    mock_client.tag_exists = AsyncMock(return_value=False)
+    with (
+        patch.object(base_svc, "get_docker_tags", AsyncMock(return_value=["v2.0"])),
+        patch.object(base_svc, "get_docker_image_repo", return_value="ollama/ollama"),
+        patch("server.services.base_service.registry_for", return_value=mock_client),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await base_svc.validate_docker_image_version("v9.9", "gpu")
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_validate_docker_image_version_skips_when_tag_exists_check_registry_unavailable(base_svc: _BaseImpl) -> None:
+    mock_client = MagicMock()
+    mock_client.tag_exists = AsyncMock(side_effect=RegistryUnavailableError("unreachable"))
+    with (
+        patch.object(base_svc, "get_docker_tags", AsyncMock(return_value=["v2.0"])),
+        patch.object(base_svc, "get_docker_image_repo", return_value="ollama/ollama"),
+        patch("server.services.base_service.registry_for", return_value=mock_client),
+    ):
+        await base_svc.validate_docker_image_version("v0.1-old", "gpu")
+
+
+@pytest.mark.asyncio
+async def test_validate_docker_image_version_raises_without_falling_back_when_repo_unknown(base_svc: _BaseImpl) -> None:
+    """No get_docker_image_repo override and no docker-tags spec field means no repo to check against."""
+    with (
+        patch.object(base_svc, "get_docker_tags", AsyncMock(return_value=["v2.0"])),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await base_svc.validate_docker_image_version("v9.9", "gpu")
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_validate_docker_image_version_resolves_repo_from_spec_field_fallback(base_svc: _BaseImpl) -> None:
+    """When get_docker_image_repo() returns None, fall back to the docker-tags spec field's docker_image."""
+    mock_client = MagicMock()
+    mock_client.tag_exists = AsyncMock(return_value=True)
+    spec = ServiceSpecification(
+        fields=[ServiceField(type="docker-tags", name="image_version", description="", docker_image="ollama/ollama")]
+    )
+    with (
+        patch.object(base_svc, "get_docker_tags", AsyncMock(return_value=["v2.0"])),
+        patch.object(base_svc, "get_spec", return_value=spec),
+        patch("server.services.base_service.registry_for", return_value=mock_client) as mock_registry_for,
+    ):
+        await base_svc.validate_docker_image_version("v0.1-old", "gpu")
+
+    mock_registry_for.assert_called_once_with("ollama/ollama")
 
 
 @pytest.mark.asyncio
@@ -1245,6 +1396,53 @@ async def test_update_instance_tears_down_then_reinstalls(base2_svc: _Base2Impl,
     assert uninstall_mock.await_args.args[1].purge is False
     assert base2_svc.instances_info["default"].installed is new_installed
     assert base2_svc.instances_info["default"].installing is None
+
+
+@pytest.mark.asyncio
+async def test_update_instance_validates_options_before_uninstalling(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_svc.instances_info["default"].installed = object()
+    promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value={})
+    calls: list[str] = []
+
+    async def record_validate(_options: InstallServiceIn) -> None:
+        calls.append("validate")
+
+    async def record_uninstall(_instance: str, _options: Any) -> None:
+        calls.append("uninstall")
+
+    with (
+        patch.object(base2_svc, "_validate_update_options", new=record_validate),
+        patch.object(base2_svc, "_uninstall_instance", new=record_uninstall),
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(return_value=promise)),
+    ):
+        result_promise = await base2_svc.update_instance("default", InstallServiceIn(spec={}))
+        await result_promise.wait()
+
+    assert calls == ["validate", "uninstall"]
+
+
+@pytest.mark.asyncio
+async def test_update_instance_does_not_uninstall_when_validation_rejects_options(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any]
+) -> None:
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_svc.instances_info["default"].installed = object()
+
+    async def reject(_options: InstallServiceIn) -> None:
+        raise HTTPException(400, "Docker image tag 'bogus' is not available for this service")
+
+    with (
+        patch.object(base2_svc, "_validate_update_options", new=reject),
+        patch.object(base2_svc, "_uninstall_instance", new=AsyncMock()) as uninstall_mock,
+        patch.object(base2_svc, "_install_instance", new=AsyncMock()),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await base2_svc.update_instance("default", InstallServiceIn(spec={"image_version": "bogus"}))
+
+    assert exc_info.value.status_code == 400
+    uninstall_mock.assert_not_awaited()
+    assert base2_svc.instances_info["default"].installed is not None
 
 
 @pytest.mark.asyncio
