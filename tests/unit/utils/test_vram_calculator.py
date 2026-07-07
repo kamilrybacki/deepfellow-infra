@@ -10,11 +10,16 @@
 import pytest
 
 from server.utils.vram_calculator import (
+    GGUF_QUANTS,
+    GIB,
     ArchParams,
     cal_compute_buffer_bytes,
+    cal_context_size_bytes,
     cal_input_buffer_bytes,
     cal_kv_cache_bytes,
+    cal_model_size_bytes,
     estimate_vram_gb,
+    get_quant_overhead,
     parse_cache_type_bits,
     parse_parameter_count,
 )
@@ -247,3 +252,49 @@ def test_estimate_vram_gb_num_parallel_increases_estimate():
     assert result is not None
     assert single is not None
     assert result > single
+
+
+def test_estimate_vram_gb_overhead_factor_scales_model_size_only():
+    weights_bytes = 4_000_000_000
+    num_ctx = 2048
+
+    base = estimate_vram_gb(LLAMA3_8B, weights_bytes=weights_bytes, num_ctx=num_ctx)
+    result = estimate_vram_gb(LLAMA3_8B, weights_bytes=weights_bytes, num_ctx=num_ctx, overhead_factor=1.2)
+
+    model_size = cal_model_size_bytes(weights_bytes, None, None)
+    context_size = cal_context_size_bytes(LLAMA3_8B, num_ctx)
+    expected = round((model_size * 1.2 + context_size) / GIB, 2)
+
+    assert base is not None
+    assert result is not None
+    assert result > base
+    assert result == expected
+    # context_size is untouched by overhead, so the ratio is less than the raw factor
+    assert result / base < 1.2
+
+
+@pytest.mark.parametrize(
+    ("quant", "expected"),
+    [
+        ("Q4_K_M", 1.02),
+        ("Q4_0", 1.02),
+        ("Q4_1", 1.02),
+        ("Q8_0", 1.0),
+        ("Q5_K_M", 1.01),
+        ("Q6_K", 1.01),
+        ("Q3_K_M", 1.03),
+        ("Q2_K", 1.04),
+        ("IQ4_XS", 1.04),
+        ("F16", 1.0),
+        ("BF16", 1.0),
+        (None, 1.0),
+        ("UNKNOWN_QUANT", 1.0),
+    ],
+)
+def test_get_quant_overhead(quant: str | None, expected: float):
+    assert get_quant_overhead(quant) == expected
+
+
+def test_gguf_quants_contains_common_types():
+    for quant in ("F16", "BF16", "Q4_1", "Q5_1", "Q4_K_M", "Q8_0"):
+        assert quant in GGUF_QUANTS, f"{quant} missing from GGUF_QUANTS"

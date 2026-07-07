@@ -13,7 +13,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import re
 import shutil
 from collections.abc import Sequence
@@ -76,7 +75,14 @@ from server.utils.loading import Progress
 from server.utils.ollama import raise_ollama_pull_error
 from server.utils.registry_client import image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fetch_ollama_ref_bytes, fmt_size
-from server.utils.vram_calculator import GGUF_QUANTS, ArchParams, estimate_vram_gb, parse_cache_type_bits, parse_parameter_count
+from server.utils.vram_calculator import (
+    GGUF_QUANTS,
+    ArchParams,
+    estimate_vram_gb,
+    get_quant_overhead,
+    parse_cache_type_bits,
+    parse_parameter_count,
+)
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -254,6 +260,7 @@ class ModelSize(NamedTuple):
     size_bytes: int
     parameters: int | None
     bytes_weight: float | None
+    quantization_level: str | None = None
 
 
 class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
@@ -735,6 +742,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                         model.get("size", 0),
                         parse_parameter_count(details.get("parameter_size", "")),
                         GGUF_QUANTS.get(details.get("quantization_level", "")),
+                        details.get("quantization_level"),
                     )
                     for model in json.loads(result.data).get("models", [])
                     for details in (model.get("details", {}),)
@@ -752,17 +760,23 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         parameters: int | None = None,
         bytes_weight: float | None = None,
         num_parallel: int | None = None,
+        quantization_level: str | None = None,
     ) -> float | None:
         arch = await self._get_arch_params(instance, base_url, model_name)
 
         if arch is None or num_ctx is None:
             return None
 
-        cache_type = os.environ.get("OLLAMA_KV_CACHE_TYPE", "f16")
-        cache_bit = parse_cache_type_bits(cache_type)
-        num_parallel = num_parallel or int(os.environ.get("OLLAMA_NUM_PARALLEL", 1))
         with suppress(Exception):
-            return estimate_vram_gb(arch, size_bytes, num_ctx, cache_bit, num_parallel, parameters, bytes_weight)
+            cache_bit = parse_cache_type_bits(self.config.ollama_kv_cache_type)
+            num_parallel = num_parallel or self.config.ollama_num_parallel
+            quant_overhead = get_quant_overhead(quantization_level)
+            env_margin = self.config.ollama_vram_overhead_factor
+            estimate = estimate_vram_gb(
+                arch, size_bytes, num_ctx, cache_bit, num_parallel, parameters, bytes_weight, overhead_factor=quant_overhead
+            )
+            return round(estimate * env_margin, 2) if estimate is not None else None
+
         return None
 
     async def _get_vram_from_logs(self, instance: str, ollama_name: str, memory_load: MemoryLoadOut | None = None) -> float | None:
@@ -812,9 +826,9 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         cache_key = (instance, ollama_name)
         if not is_loaded:
             self._vram_cache.pop(cache_key, None)
-            size_bytes, parameters, bpw = sizes.get(ollama_name, ModelSize(0, None, None))
+            size_bytes, parameters, bpw, quantization_level = sizes.get(ollama_name, ModelSize(0, None, None, None))
             vram_estimate = await self._get_vram_estimate(
-                instance, base_url, ollama_name, size_bytes, model_context, parameters, bpw, num_parallel
+                instance, base_url, ollama_name, size_bytes, model_context, parameters, bpw, num_parallel, quantization_level
             )
             return False, vram_estimate
 
@@ -825,9 +839,9 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         if vram_estimate is None:
             num_ctx = loaded_info.get(ollama_name) or model_context
-            size_bytes, parameters, bpw = sizes.get(ollama_name, ModelSize(0, None, None))
+            size_bytes, parameters, bpw, quantization_level = sizes.get(ollama_name, ModelSize(0, None, None, None))
             vram_estimate = await self._get_vram_estimate(
-                instance, base_url, ollama_name, size_bytes, num_ctx, parameters, bpw, num_parallel
+                instance, base_url, ollama_name, size_bytes, num_ctx, parameters, bpw, num_parallel, quantization_level
             )
 
         if vram_estimate is not None:

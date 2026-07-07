@@ -51,6 +51,9 @@ def config() -> MagicMock:
     mock.otel_exporter_otlp_endpoint = "http://localhost:4317"
     mock.otel_tracing_enabled = False
     mock.otel_logging_enabled = False
+    mock.ollama_kv_cache_type = "f16"
+    mock.ollama_num_parallel = 1
+    mock.ollama_vram_overhead_factor = 1.0
     return mock
 
 

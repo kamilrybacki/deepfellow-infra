@@ -24,6 +24,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - All built-in MCP servers and custom services now have descriptions and repository URLs populated in their definitions.
 - User-defined MCP servers (Command and Remote URL) support optional Description and Repository URL fields when added through the WebUI.
 
+### Fixed
+
+- Fixed VRAM estimation to use the correct bits-per-weight for each specific GGUF quantization variant (e.g. Q4_0 vs Q4_K_M) instead of a single per-model-family value, and applies a small per-family runtime-overhead multiplier (Q4 → ×1.02, Q8 → ×1.0, etc.) calibrated against real GPU measurements rather than guessed.
+
 ## [0.29.0] - 2026-06-19
 
 ### Added
