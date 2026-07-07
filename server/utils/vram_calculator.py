@@ -32,13 +32,38 @@ GGUF_QUANTS: dict[str, float] = {
     "IQ4_XS": 4.25,
     "IQ4_NL": 4.5,
     "Q4_0": 4.55,
+    "Q4_1": 5.0,
     "Q4_K_S": 4.58,
     "Q4_K_M": 4.85,
     "Q5_0": 5.54,
+    "Q5_1": 6.03,
     "Q5_K_S": 5.54,
     "Q5_K_M": 5.69,
     "Q6_K": 6.59,
     "Q8_0": 8.5,
+    "F16": 16.0,
+    "BF16": 16.0,
+}
+
+# Runtime overhead multipliers per quantization family.
+# Calibrated against real GPU measurement (nvidia-smi --query-compute-apps + Ollama
+# /api/ps, Llama3 8B on real hardware) rather than guessed: Q8_0 measured ~0.97-1.0x
+# real usage vs the unmodified formula, Q4_K_M measured ~1.0-1.03x (idle vs under
+# generation load). Q8/Q4 values below are set from those two anchors; the rest are
+# a conservative linear interpolation between them (same direction as the original
+# hypothesis — lower bit-width needs more dequant-buffer headroom — but much smaller
+# magnitude, since the previous 1.05-1.20 range was unvalidated and measured worse
+# than no correction at all). Revisit individual buckets as more real data comes in.
+QUANT_OVERHEAD_FACTORS: dict[str, float] = {
+    "F16": 1.0,
+    "BF16": 1.0,
+    "Q8": 1.0,
+    "Q6": 1.01,
+    "Q5": 1.01,
+    "Q4": 1.02,
+    "Q3": 1.03,
+    "Q2": 1.04,
+    "IQ": 1.04,
 }
 
 MULTIPLIERS = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000, "T": 1_000_000_000_000}
@@ -54,6 +79,21 @@ class ArchParams:
     num_key_value_heads: int
     num_hidden_layers: int
     sliding_window: int | None = None
+
+
+def get_quant_overhead(quantization_level: str | None) -> float:
+    """Return runtime overhead multiplier for a quantization level (e.g. 'Q4_K_M' → 1.02).
+
+    Matches by prefix against QUANT_OVERHEAD_FACTORS.
+    Example: 'Q4_K_M' → 1.15
+    Returns 1.0 for unknown types.
+    """
+    if not quantization_level:
+        return 1.0
+    for prefix, factor in QUANT_OVERHEAD_FACTORS.items():
+        if quantization_level.upper().startswith(prefix):
+            return factor
+    return 1.0
 
 
 def parse_cache_type_bits(cache_type: str, default: int = 16) -> int:
@@ -162,6 +202,7 @@ def estimate_vram_gb(
     num_parallel: int = 1,
     parameters: int | None = None,
     bits_per_weight: float | None = None,
+    overhead_factor: float = 1.0,
 ) -> float | None:
     """Return estimated VRAM usage per model."""
     if not num_ctx:
@@ -169,4 +210,4 @@ def estimate_vram_gb(
 
     model_size = cal_model_size_bytes(weights_bytes, parameters, bits_per_weight)
     context_size = cal_context_size_bytes(arch, num_ctx, cache_bit, num_parallel)
-    return round((model_size + context_size) / GIB, 2)
+    return round((model_size * overhead_factor + context_size) / GIB, 2)

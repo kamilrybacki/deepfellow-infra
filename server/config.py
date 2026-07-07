@@ -12,7 +12,7 @@
 import os
 from pathlib import Path
 
-from pydantic import SecretStr, ValidationError
+from pydantic import AliasChoices, Field, SecretStr, ValidationError
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 
@@ -53,6 +53,10 @@ class AppSettings(BaseSettings):
     otel_exporter_otlp_endpoint: str = "http://localhost:4317"
     otel_tracing_enabled: bool = False
     otel_logging_enabled: bool = False
+
+    ollama_kv_cache_type: str = Field(default="f16", validation_alias=AliasChoices("OLLAMA_KV_CACHE_TYPE"))
+    ollama_num_parallel: int = Field(default=1, validation_alias=AliasChoices("OLLAMA_NUM_PARALLEL"))
+    ollama_vram_overhead_factor: float = Field(default=1.0, validation_alias=AliasChoices("OLLAMA_VRAM_OVERHEAD_FACTOR"))
 
     model_config = SettingsConfigDict(
         env_file=".env",

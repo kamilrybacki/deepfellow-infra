@@ -60,8 +60,12 @@ def _make_installed_info(svc: OllamaService, instance: str = "default") -> Insta
 
 @pytest.fixture
 def deps() -> dict[str, Any]:
+    config = MagicMock()
+    config.ollama_kv_cache_type = "f16"
+    config.ollama_num_parallel = 1
+    config.ollama_vram_overhead_factor = 1.0
     return {
-        "config": MagicMock(),
+        "config": config,
         "endpoint_registry": MagicMock(),
         "service_provider": MagicMock(),
         "model_downloader": MagicMock(),
