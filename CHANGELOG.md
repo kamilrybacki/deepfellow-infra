@@ -17,6 +17,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Installing an MCP server without a required API key/header (e.g. brave-search without `BRAVE_API_KEY`, ollama-websearch without `OLLAMA_API_KEY`) no longer shows a fake download that runs to completion without installing anything. The missing field is now flagged inline in the install form before submit, and the backend rejects the request with a clear error listing the missing keys.
 - The Cancel button for an in-progress model installation in the WebUI now appears in the model's table row, so it stays available after refreshing the page. Previously cancelling was only possible from the bottom progress toast, which disappeared on refresh and left the installation with no way to cancel.
 
+### Changed
+- Stable Diffusion service to Stable Diffusion Next
+- Chnage errors with Stable Diffusion to contain Stable Diffusion Next
+
 ## [0.30.0] - 2026-06-26
 
 ### Added
@@ -51,7 +55,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fixed `KeyError` crash when the install-progress error callback fired after the progress entry was already removed.
 - Fixed MCP service teardown silently swallowing errors from model uninstall; errors are now logged.
 - Fixed VLLM GPU memory utilization not being released when model installation is cancelled via `asyncio.CancelledError`.
-- Installing a GPU-dependent service (e.g. Stable Diffusion) on a host without the NVIDIA container toolkit now surfaces a clear, actionable error instead of silently appearing to succeed and then failing health checks repeatedly.
+- Installing a GPU-dependent service (e.g. Stable Diffusion Next) on a host without the NVIDIA container toolkit now surfaces a clear, actionable error instead of silently appearing to succeed and then failing health checks repeatedly.
 - `push_to_github` release job no longer fails on a shallow clone; release tags are now verified to originate from `main`.
 - CI no longer fails `pyright` non-deterministically on merge pipelines: the CI uv version is bumped to `0.11.8`, which understands the relative `exclude-newer` cooldown, so `uv.lock` is honored instead of being silently ignored and re-resolved. A `required-version = ">=0.11.8"` floor prevents an older uv from reintroducing the issue.
 - Requesting a model that is not installed now returns `404 Model not found` instead of the misleading `400 Given model is not supported`. The `400` response is now reserved for the case where the model exists but does not support the requested endpoint (e.g. calling `/v1/embeddings` with a chat model).
@@ -112,7 +116,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 - Fixed typo `uliumits` → `ulimits` in `DockerOptions` (`docker.py`).
-- Fixed Stable Diffusion `n_iter` value defaulting to `None`/`0` when `body.n` is falsy — now correctly defaults to `1`.
+- Fixed Stable Diffusion Next `n_iter` value defaulting to `None`/`0` when `body.n` is falsy — now correctly defaults to `1`.
 
 ## [0.26.3] - 26.05.2026
 

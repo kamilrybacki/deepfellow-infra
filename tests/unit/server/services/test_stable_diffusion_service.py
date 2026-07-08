@@ -117,7 +117,7 @@ def svc(deps: dict[str, Any]) -> StableDiffusionService:
 
 
 def test_get_type(svc: StableDiffusionService) -> None:
-    assert svc.get_type() == "stable-diffusion"
+    assert svc.get_type() == "stable-diffusion-next"
 
 
 def test_get_description_not_empty(svc: StableDiffusionService) -> None:
