@@ -42,3 +42,4 @@ memory
 .claude/skills/write-docs
 .claude/skills/daily-report
 .claude/skills/write-python-tests
+.claude/skills/release

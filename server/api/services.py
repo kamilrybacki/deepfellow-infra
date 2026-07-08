@@ -20,6 +20,7 @@ from server.core.dependencies import auth_admin, get_endpoint_registry, get_serv
 from server.endpointregistry import EndpointRegistry
 from server.models.api import RegistrationId
 from server.models.services import (
+    CatalogRefreshOut,
     DockerTagsOut,
     InstallServiceIn,
     ListAllModelsFilters,
@@ -43,6 +44,8 @@ logger = logging.getLogger("uvicorn.error")
 
 router = APIRouter(prefix="/admin/services", tags=["Services"])
 
+_CATALOG_REFRESH_TTL = 6 * 3600  # 6 hours
+catalog_refresh_cache: dict[str, tuple[int, int, float]] = {}  # service_id -> (added, total, timestamp)
 _DOCKER_TAGS_TTL = 7200  # seconds
 
 
@@ -139,6 +142,31 @@ async def test_model(
     """Test a model by making a simple request to it."""
     result = await endpoint_registry.test_model(registration_id)
     return JSONResponse(result)
+
+
+@router.post(
+    "/{service_id}/catalog/refresh",
+    summary="Refresh the model catalog from the external library API.",
+)
+async def refresh_catalog(
+    service_id: Annotated[str, Path(description="The ID of the service")],
+    services_manager: Annotated[ServicesManager, Depends(get_services_manager)],
+    _: Annotated[str, Depends(auth_admin)],
+    force: Annotated[bool, Query(description="Bypass the 6-hour TTL and force a fresh fetch")] = False,
+) -> CatalogRefreshOut:
+    """Fetch trending models from the external catalog API and merge them into the service's model list.
+
+    Results are cached for 6 hours. Pass ?force=true to bypass the cache.
+    """
+    if not force:
+        cached = catalog_refresh_cache.get(service_id)
+        if cached and time.monotonic() - cached[2] < _CATALOG_REFRESH_TTL:
+            cached_added, cached_total, _ts = cached
+            return CatalogRefreshOut(added=cached_added, total=cached_total)
+
+    added, total = await services_manager.refresh_catalog(service_id)
+    catalog_refresh_cache[service_id] = (added, total, time.monotonic())
+    return CatalogRefreshOut(added=added, total=total)
 
 
 @router.get(

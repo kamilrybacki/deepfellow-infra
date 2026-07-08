@@ -207,6 +207,14 @@ class ServicesManager:
         service_type, instance = self.split_service_type_and_instance(service_id)
         await self._get_service(service_type).sync_models(instance)
 
+    async def refresh_catalog(self, service_id: str) -> tuple[int, int]:
+        """Refresh the model catalog from the external library API.
+
+        Returns (added, total). Raises HTTPException 405 if the service does not support catalog refresh.
+        """
+        service_type, _instance = self.split_service_type_and_instance(service_id)
+        return await self._get_service(service_type).refresh_catalog()
+
     async def get_docker_tags_for_service(self, service_id: str, hardware: str | None) -> list[str]:
         """Fetch available Docker image tags for the service, hardware-filtered."""
         service_type, _instance = self.split_service_type_and_instance(service_id)

@@ -148,6 +148,11 @@ class MemoryLoadOut(BaseModel):
     sessions: list[MemoryLoadSession]
 
 
+class CatalogRefreshOut(BaseModel):
+    added: int
+    total: int
+
+
 class DockerTagsOut(BaseModel):
     image: str
     tags: list[str]

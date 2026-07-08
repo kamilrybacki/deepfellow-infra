@@ -111,6 +111,10 @@ class BaseService(ABC):
         """Cancel an in-progress model install. Services without install progress cannot cancel."""
         raise HTTPException(405, f"Service for model {model_id} does not support cancelling an installation.")
 
+    async def refresh_catalog(self) -> tuple[int, int]:
+        """Refresh the model catalog from an external library API. Services without a catalog cannot refresh."""
+        raise HTTPException(405, "This service does not support catalog refresh")
+
     @abstractmethod
     def is_installed(self, instance: str) -> bool:
         """Check whether instance is installed."""

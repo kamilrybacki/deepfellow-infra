@@ -847,24 +847,46 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
     },
   });
 
-  const syncModelsMutation = useMutation({
+  const hasOllamaCatalog = serviceInfo?.type === "ollama";
+
+  const refreshMutation = useMutation({
     mutationFn: async () => {
-      return apiClient.syncModels(serviceId);
+      const [syncResult, catalogResult] = await Promise.allSettled([
+        apiClient.syncModels(serviceId),
+        hasOllamaCatalog
+          ? apiClient.refreshCatalog(serviceId, true)
+          : Promise.resolve(null),
+      ]);
+      return { syncResult, catalogResult };
     },
-    onSuccess: () => {
+    onSuccess: ({ syncResult, catalogResult }) => {
       queryClient.invalidateQueries({
         queryKey: ["admin", "services", serviceId, "models"],
       });
-      toast.success(
-        isOllamaExternal
-          ? "Models synced successfully"
-          : "Models refreshed successfully",
-      );
-    },
-    onError: (error) => {
-      toast.error(
-        `Failed to ${isOllamaExternal ? "sync" : "refresh"} models: ${error.message}`,
-      );
+
+      const syncFailed = syncResult.status === "rejected";
+      const catalogFailed = catalogResult.status === "rejected";
+      const syncedLabel = isOllamaExternal
+        ? "Models synced successfully"
+        : "Models refreshed successfully";
+
+      if (syncFailed && catalogFailed) {
+        toast.error("Failed to refresh models and catalog.");
+      } else if (syncFailed) {
+        toast.error(
+          `Failed to ${isOllamaExternal ? "sync" : "refresh"} models, but the catalog was refreshed.`,
+        );
+      } else if (catalogFailed) {
+        toast.error(`${syncedLabel}, but catalog refresh failed.`);
+      } else {
+        const data =
+          catalogResult.status === "fulfilled" ? catalogResult.value : null;
+        const catalogMsg =
+          data && data.added > 0
+            ? ` ${data.added} new model${data.added === 1 ? "" : "s"} added to catalog.`
+            : "";
+        toast.success(`${syncedLabel}.${catalogMsg}`);
+      }
     },
   });
 
@@ -1334,10 +1356,10 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
           <div className="flex gap-2">
             <Button
               variant="outline"
-              onClick={() => syncModelsMutation.mutate()}
-              disabled={syncModelsMutation.isPending}
+              onClick={() => refreshMutation.mutate()}
+              disabled={refreshMutation.isPending}
             >
-              {syncModelsMutation.isPending
+              {refreshMutation.isPending
                 ? isOllamaExternal
                   ? "Syncing…"
                   : "Refreshing…"

@@ -2406,6 +2406,52 @@ async def test_install_model_context_window_capped_by_service_context_when_servi
     assert props.max_context_window == 8192
 
 
+@pytest.mark.asyncio
+async def test_refresh_catalog_adds_new_models(svc: OllamaService) -> None:
+    new_entry = {"id": "new-model:7b", "size": "4.1 GB", "hash": "sha256:abc123"}
+    with patch("server.services.ollama_service.OllamaCatalogClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.fetch_trending.return_value = [new_entry]
+        mock_cls.return_value = mock_client
+
+        added, total = await svc.refresh_catalog()
+
+    assert added == 1
+    assert "new-model:7b" in svc._dynamic_models  # pyright: ignore[reportPrivateUsage]
+    assert total == len(svc.models["default"])
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalog_skips_existing_static_models(svc: OllamaService) -> None:
+    existing_id = next(iter(svc.models["default"]))
+    existing_entry = {"id": existing_id, "size": "4.1 GB", "hash": "sha256:abc"}
+    with patch("server.services.ollama_service.OllamaCatalogClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.fetch_trending.return_value = [existing_entry]
+        mock_cls.return_value = mock_client
+
+        added, _ = await svc.refresh_catalog()
+
+    assert added == 0
+    assert existing_id not in svc._dynamic_models  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalog_updates_instance_models(svc: OllamaService) -> None:
+    svc.models["second"] = {}
+    svc.load_default_models("second")
+    new_entry = {"id": "brand-new:3b", "size": "2.0 GB", "hash": "sha256:def"}
+    with patch("server.services.ollama_service.OllamaCatalogClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.fetch_trending.return_value = [new_entry]
+        mock_cls.return_value = mock_client
+
+        await svc.refresh_catalog()
+
+    assert "brand-new:3b" in svc.models["default"]
+    assert "brand-new:3b" in svc.models["second"]
+
+
 def test_get_image_with_version_overrides_tag(svc: OllamaService) -> None:
     image = svc._get_image(image_version="0.5.0")  # pyright: ignore[reportPrivateUsage]
     base = _const.image.name.split(":")[0]
