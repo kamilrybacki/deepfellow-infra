@@ -29,7 +29,7 @@ class OllamaCloudService(RemoteService):
 
     def _after_init(self) -> None:
         super()._after_init()
-        self._models_cache_time = 0.0
+        self._models_cache_time = float("-inf")
 
     def get_type(self) -> str:
         """Return the service type."""

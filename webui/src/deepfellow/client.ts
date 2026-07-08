@@ -467,6 +467,17 @@ export class DeepFellowClient {
     );
   }
 
+  async refreshCatalog(
+    serviceId: string,
+    force?: boolean,
+  ): Promise<{ added: number; total: number }> {
+    const params = force ? "?force=true" : "";
+    return this.makeRequest<{ added: number; total: number }>(
+      `/admin/services/${serviceId}/catalog/refresh${params}`,
+      { method: "POST" },
+    );
+  }
+
   async getDockerTags(
     serviceId: string,
     hardware?: string,

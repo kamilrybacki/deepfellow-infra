@@ -73,6 +73,7 @@ from server.utils.files import detect_context_window_from_path
 from server.utils.hardware import GpuInfo, HardwarePartInfo, IntelGpuInfo, get_vram_gb
 from server.utils.loading import Progress
 from server.utils.ollama import raise_ollama_pull_error
+from server.utils.ollama_catalog import OllamaCatalogClient
 from server.utils.registry_client import image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fetch_ollama_ref_bytes, fmt_size
 from server.utils.vram_calculator import (
@@ -272,6 +273,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
     _MODEL_BLOB_RE = re.compile(r"blobs/sha256-([a-f0-9]+)")
 
     models: dict[str, dict[str, OllamaModel]]
+    _dynamic_models: dict[str, OllamaModel]
     default_context_length: int
     _arch_cache: dict[tuple[str, str], ArchParams]
     _blob_to_model: dict[str, str]
@@ -286,6 +288,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
 
     def _after_init(self) -> None:
         self.models = {}
+        self._dynamic_models = {}
         self.load_default_models("default")
         self.default_context_length = self.get_default_context_value()
         self._arch_cache = {}
@@ -295,8 +298,37 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         self._installing = set()
 
     def load_default_models(self, instance: str) -> None:
-        """Load default models to instance."""
-        self.models[instance] = _const.models.copy()
+        """Load default models to instance (merges static catalog with dynamic overlay)."""
+        self.models[instance] = {**_const.models, **{k: v for k, v in self._dynamic_models.items() if k not in _const.models}}
+
+    async def refresh_catalog(self) -> tuple[int, int]:
+        """Fetch trending models from the Ollama library and merge them into the dynamic catalog.
+
+        Returns (added, total) where added is the number of newly-discovered models and
+        total is the combined count of static + dynamic models.
+        """
+        client = OllamaCatalogClient()
+        entries = await client.fetch_trending()
+
+        added = 0
+        for entry in entries:
+            model_id = str(entry["id"])
+            if model_id in _const.models or model_id in self._dynamic_models:
+                continue
+            self._dynamic_models[model_id] = OllamaModel(
+                id=model_id,
+                size=str(entry["size"]),
+                type="llm",
+                hash=str(entry["hash"]),
+                context=0,
+            )
+            added += 1
+
+        for instance in list(self.models):
+            self.load_default_models(instance)
+
+        total = len(_const.models) + len(self._dynamic_models)
+        return added, total
 
     def get_type(self) -> str:
         """Return the type."""
