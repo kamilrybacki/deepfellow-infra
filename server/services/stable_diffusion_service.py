@@ -287,7 +287,7 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
 
     def get_type(self) -> str:
         """Return the service id."""
-        return "stable-diffusion"
+        return "stable-diffusion-next"
 
     def get_description(self) -> str:
         """Return the service description."""
@@ -387,7 +387,7 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
         if "hardware" not in options.spec:
             options.spec["hardware"] = options.spec.get("gpu", self.docker_service.has_gpu_support)
         if platform.system() == "Darwin":
-            raise HTTPException(400, "Stable Diffusion is not supported on macOS")
+            raise HTTPException(400, "Stable Diffusion Next is not supported on macOS")
         parsed_options = try_parse_pydantic(SDOptions, options.spec)
         volumes = [
             f"{self._get_working_models_dir()}:/mnt/models",
@@ -487,7 +487,7 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
                 del self.instances_info[instance]
 
     async def stop_instance(self, instance: str) -> None:
-        """Stop the Stable Diffusion service Docker container."""
+        """Stop the Stable Diffusion Next service Docker container."""
         installed = self.get_instance_info(instance).installed
         if not installed:
             return
@@ -997,7 +997,7 @@ def _stable_diffusion_handler(base_url: str, model_filename: str) -> EndpointCal
 
             if response.status != 200:
                 raise HTTPException(
-                    500, (f"Something went wrong inside Stable Diffusion Web UI.Error {response.status}: {response.content}")
+                    500, (f"Something went wrong inside Stable Diffusion Next Web UI. Error {response.status}: {response.content}")
                 )
 
             data_raw = await response.json()
