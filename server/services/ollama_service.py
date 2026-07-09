@@ -169,7 +169,7 @@ class OllamaAiConst(BaseModel):
 
 
 _const = OllamaAiConst(
-    image=DockerImage(name="ollama/ollama:0.20.4", size="6.2 GB"),
+    image=DockerImage(name="ollama/ollama:0.31.1", size="6.2 GB"),
     models=_read_models(),
 )
 

@@ -137,8 +137,8 @@ def _read_models() -> dict[str, VllmModel]:
 
 _const = VllmConst(
     images={
-        "gpu": DockerImage(name="vllm/vllm-openai:v0.19.0-cu130-ubuntu2404", size="20 GB"),
-        "cpu": DockerImage(name="public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo:v0.19.0", size="3.7 GB"),
+        "gpu": DockerImage(name="vllm/vllm-openai:v0.24.0-cu129-ubuntu2404", size="20 GB"),
+        "cpu": DockerImage(name="vllm/vllm-openai-cpu:v0.24.0", size="3.7 GB"),
     },
     models=_read_models(),
 )
