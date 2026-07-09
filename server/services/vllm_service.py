@@ -659,16 +659,20 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         self._installing.add(key)
         model = self.models[instance][model_id]
 
+        gpu_memory_utilization: float | None = None
         try:
             use_gpu = self.is_given_hardware_support_gpu(info.parsed_options.hardware)
             gpu_memory_utilization = await self._get_gpu_memory_utilization(parsed_model_options, model) if use_gpu else None
             user_model_length = await self._get_max_model_length(parsed_model_options, model)
             quantization = await self._get_quantization(parsed_model_options, model)
         except Exception:
+            self._release_gpu_utilization(gpu_memory_utilization)
             self._installing.discard(key)
             raise
 
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
+            model_info: ModelInstalledInfo | None = None
+            docker_options: DockerOptions | None = None
             try:
                 model_id_fixed = model_id.replace("/", "-")
                 models_dir = self._get_working_dir() / "models"
@@ -732,15 +736,9 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                         "start_period": "240s",
                     },
                 )
-                try:
-                    docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
-                except asyncio.CancelledError:
-                    self._release_gpu_utilization(gpu_memory_utilization)
-                    raise
-                except Exception:
-                    self._release_gpu_utilization(gpu_memory_utilization)
-                    await self.docker_service.stop_docker(docker_options)
-                    raise
+
+                docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
+
                 registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
                 container_host = self.docker_service.get_container_host(subnet, docker_options.name)
                 container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
@@ -764,22 +762,25 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     gpu_memory_utilization=gpu_memory_utilization,
                     model_type=model.model_type,
                 )
-                try:
-                    model_info.registration_id = self._register_model_endpoint(
-                        model_info=model_info,
-                        model=model,
-                        registered_name=registered_name,
-                        model_id=model_id,
-                        context_window=context_window,
-                        max_context_window=max_context_window,
-                    )
-                    stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
-                    self.models_downloaded[model_id] = DownloadedInfo(str(local_model_path))
-                    return InstallModelOut(status="OK", details="Installed")
-                except Exception:
-                    if info.models.get(model_id) is model_info:
-                        info.models.pop(model_id, None)
-                    raise
+                model_info.registration_id = self._register_model_endpoint(
+                    model_info=model_info,
+                    model=model,
+                    registered_name=registered_name,
+                    model_id=model_id,
+                    context_window=context_window,
+                    max_context_window=max_context_window,
+                )
+                stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
+                self.models_downloaded[model_id] = DownloadedInfo(str(local_model_path))
+                return InstallModelOut(status="OK", details="Installed")
+            except BaseException:
+                self._release_gpu_utilization(gpu_memory_utilization)
+                if model_info is not None and info.models.get(model_id) is model_info:
+                    info.models.pop(model_id, None)
+                if docker_options is not None:
+                    with suppress(Exception):
+                        await self.docker_service.stop_docker(docker_options)
+                raise
             finally:
                 self._installing.discard(key)
 
