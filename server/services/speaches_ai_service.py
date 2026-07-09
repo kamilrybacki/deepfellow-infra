@@ -73,8 +73,8 @@ class SpeachesAiConst(BaseModel):
 
 _const = SpeachesAiConst(
     images={
-        "gpu": DockerImage(name="ghcr.io/speaches-ai/speaches:0.9.0-rc.1-cuda", size="5.9 GB"),
-        "cpu": DockerImage(name="ghcr.io/speaches-ai/speaches:0.9.0-rc.1-cpu", size="1.6 GB"),
+        "gpu": DockerImage(name="ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cuda", size="5.9 GB"),
+        "cpu": DockerImage(name="ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu", size="1.6 GB"),
     },
     audio_speech_models=[
         ("speaches-ai/Kokoro-82M-v1.0-ONNX-fp16", ""),

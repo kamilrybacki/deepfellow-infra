@@ -13,6 +13,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - New `GET /admin/services/{id}/docker-tags` API endpoint returns available Docker image tags for a service, with server-side caching (2 h TTL) and optional `?hardware=` filtering.
 - Optional `DOCKER_HUB_TOKEN` environment variable for authenticated Docker Hub access to raise rate limits when fetching image tags.
 
+### Changed
+- Bumped bundled Docker image versions for llama.cpp, Ollama, vLLM, and speaches-ai to their latest available releases.
+
 ### Fixed
 - VRAM estimation no longer crashes the entire model listing endpoint when a model (e.g. Qwen3.5, Gemma4) reports `null` for `num_key_value_heads` in its Ollama architecture metadata; VRAM is shown as unavailable for that model instead of returning HTTP 500.
 - Installing an MCP server without a required API key/header (e.g. brave-search without `BRAVE_API_KEY`, ollama-websearch without `OLLAMA_API_KEY`) no longer shows a fake download that runs to completion without installing anything. The missing field is now flagged inline in the install form before submit, and the backend rejects the request with a clear error listing the missing keys.
