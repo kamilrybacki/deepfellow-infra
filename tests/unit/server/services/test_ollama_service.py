@@ -20,11 +20,12 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from server.models.models import InstallModelIn, ListModelsFilters, UninstallModelIn
-from server.models.services import InstallServiceIn, MemoryLoadOut, MemoryLoadSession, UninstallServiceIn
+from server.models.services import InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import CustomModel, Instance, InstanceConfig
 from server.services.ollama_service import (
     DownloadedInfo,
     InstalledInfo,
+    LoadedModelInfo,
     ModelInstalledInfo,
     OllamaModel,
     OllamaModelFile,
@@ -2129,37 +2130,11 @@ async def test_resolve_custom_model_size_exception_in_outer_try(svc: OllamaServi
 
 
 @pytest.mark.asyncio
-async def test_get_memory_load_processes_blob_line(svc: OllamaService) -> None:
-    installed = _make_installed_info(svc)
-    svc.instances_info["default"].installed = installed
-    # Line with a blob reference but no memory line (covers MODEL_BLOB_RE match + MEMORY_LINE_RE no-match branch)
-    raw = "blobs/sha256-abc123def456\nsome other line without memory info\n"
-
-    with (
-        patch.object(svc, "_get_docker_logs", new_callable=AsyncMock, return_value=raw),
-        patch.object(svc, "resolve_blob", new_callable=AsyncMock, return_value="llama3"),
-    ):
-        result = await svc.get_memory_load("default")
-
-    assert isinstance(result, MemoryLoadOut)
-    assert result.sessions == []
-
-
-@pytest.mark.asyncio
-async def test_get_vram_from_logs_with_preloaded_memory_load(svc: OllamaService) -> None:
-    memory_load = MemoryLoadOut(sessions=[MemoryLoadSession(model="llama3", components=[], total="8.0 GiB")])
-
-    result = await svc._get_vram_from_logs("default", "llama3", memory_load=memory_load)  # pyright: ignore[reportPrivateUsage]
-
-    assert result == pytest.approx(8.0, abs=0.1)
-
-
-@pytest.mark.asyncio
 async def test_resolve_vram_info_cache_hit(svc: OllamaService) -> None:
     installed = _make_installed_info(svc)
     svc.instances_info["default"].installed = installed
     svc._vram_cache[("default", "llama3")] = 6.0  # pyright: ignore[reportPrivateUsage]
-    loaded_info = {"llama3": 4096}
+    loaded_info = {"llama3": LoadedModelInfo(context_length=4096, vram_gb=None)}
 
     is_loaded, vram = await svc._resolve_vram_info(  # pyright: ignore[reportPrivateUsage]
         "default", "llama3", None, loaded_info, {}, "http://localhost:11434", None
@@ -2173,12 +2148,9 @@ async def test_resolve_vram_info_cache_hit(svc: OllamaService) -> None:
 async def test_resolve_vram_info_vram_estimate_none_not_cached(svc: OllamaService) -> None:
     installed = _make_installed_info(svc)
     svc.instances_info["default"].installed = installed
-    loaded_info = {"llama3": 4096}
+    loaded_info = {"llama3": LoadedModelInfo(context_length=4096, vram_gb=None)}
 
-    with (
-        patch.object(svc, "_get_vram_from_logs", new_callable=AsyncMock, return_value=None),
-        patch.object(svc, "_get_vram_estimate", new_callable=AsyncMock, return_value=None),
-    ):
+    with patch.object(svc, "_get_vram_estimate", new_callable=AsyncMock, return_value=None):
         is_loaded, vram = await svc._resolve_vram_info(  # pyright: ignore[reportPrivateUsage]
             "default", "llama3", None, loaded_info, {}, "http://localhost:11434", None
         )
@@ -2193,7 +2165,7 @@ async def test_resolve_vram_info_not_loaded_returns_formula_estimate(svc: Ollama
     installed = _make_installed_info(svc)
     svc.instances_info["default"].installed = installed
     svc._vram_cache[("default", "llama3")] = 6.0  # pyright: ignore[reportPrivateUsage]
-    loaded_info: dict[str, int] = {}  # model not in VRAM
+    loaded_info: dict[str, LoadedModelInfo] = {}  # model not in VRAM
 
     with patch.object(svc, "_get_vram_estimate", new_callable=AsyncMock, return_value=4.5) as mock_estimate:
         is_loaded, vram = await svc._resolve_vram_info(  # pyright: ignore[reportPrivateUsage]
@@ -2210,7 +2182,7 @@ async def test_resolve_vram_info_not_loaded_returns_formula_estimate(svc: Ollama
 async def test_resolve_vram_info_not_loaded_estimate_none(svc: OllamaService) -> None:
     installed = _make_installed_info(svc)
     svc.instances_info["default"].installed = installed
-    loaded_info: dict[str, int] = {}
+    loaded_info: dict[str, LoadedModelInfo] = {}
 
     with patch.object(svc, "_get_vram_estimate", new_callable=AsyncMock, return_value=None):
         is_loaded, vram = await svc._resolve_vram_info(  # pyright: ignore[reportPrivateUsage]
@@ -2239,12 +2211,52 @@ async def test_get_model_with_loaded_info_none(svc: OllamaService) -> None:
     model_id = next(iter(svc.models["default"]))
 
     with (
-        patch.object(svc, "get_loaded_model_info", new_callable=AsyncMock, return_value=None),
+        patch.object(svc, "_get_loaded_models", new_callable=AsyncMock, return_value=None),
         patch.object(svc, "_get_model_sizes", new_callable=AsyncMock, return_value={}),
     ):
         result = await svc.get_model("default", model_id)
 
     assert result.id == model_id
+
+
+@pytest.mark.asyncio
+async def test_get_model_resolves_vram_when_loaded_info_available(svc: OllamaService) -> None:
+    installed = _make_installed_info(svc)
+    svc.instances_info["default"].installed = installed
+    model_id = next(iter(svc.models["default"]))
+
+    with (
+        patch.object(svc, "_get_loaded_models", new_callable=AsyncMock, return_value={}),
+        patch.object(svc, "_get_model_sizes", new_callable=AsyncMock, return_value={}),
+    ):
+        result = await svc.get_model("default", model_id)
+
+    assert result.id == model_id
+    assert result.is_loaded is False
+
+
+@pytest.mark.asyncio
+async def test_list_models_resolves_vram_when_loaded_info_available(svc: OllamaService) -> None:
+    installed = _make_installed_info(svc)
+    model_id = next(iter(svc.models["default"]))
+    installed.models[model_id] = ModelInstalledInfo(
+        id=model_id,
+        registered_name=model_id,
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+        internal_name=None,
+    )
+    svc.instances_info["default"].installed = installed
+
+    with (
+        patch.object(svc, "_get_loaded_models", new_callable=AsyncMock, return_value={}),
+        patch.object(svc, "_get_model_sizes", new_callable=AsyncMock, return_value={}),
+    ):
+        result = await svc.list_models("default", ListModelsFilters())
+
+    resolved = next(m for m in result.list if m.id == model_id)
+    assert resolved.is_loaded is False
 
 
 @pytest.mark.asyncio
