@@ -12,8 +12,6 @@
 import asyncio
 import hashlib
 import json
-import logging
-import re
 import shutil
 from collections.abc import Sequence
 from contextlib import suppress
@@ -48,9 +46,6 @@ from server.models.models import (
 from server.models.services import (
     InstallServiceIn,
     InstallServiceProgress,
-    MemoryLoadComponent,
-    MemoryLoadOut,
-    MemoryLoadSession,
     ServiceField,
     ServiceOptions,
     ServiceSpecification,
@@ -70,7 +65,7 @@ from server.utils.core import (
     try_parse_pydantic,
 )
 from server.utils.files import detect_context_window_from_path
-from server.utils.hardware import GpuInfo, HardwarePartInfo, IntelGpuInfo, get_vram_gb
+from server.utils.hardware import GpuInfo, HardwarePartInfo, IntelGpuInfo
 from server.utils.loading import Progress
 from server.utils.ollama import raise_ollama_pull_error
 from server.utils.ollama_catalog import OllamaCatalogClient
@@ -78,15 +73,13 @@ from server.utils.registry_client import image_without_registry_prefix, registry
 from server.utils.size_fetcher import fetch_ollama_ref_bytes, fmt_size
 from server.utils.vram_calculator import (
     GGUF_QUANTS,
+    GIB,
     ArchParams,
     estimate_vram_gb,
     get_quant_overhead,
     parse_cache_type_bits,
     parse_parameter_count,
 )
-
-logger = logging.getLogger("uvicorn.error")
-
 
 type Quantization = Literal[
     "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q3_K_S", "q3_K_M", "q3_K_L", "q4_K_S", "q4_K_M", "q5_K_S", "q5_K_M", "q6_K"
@@ -264,20 +257,17 @@ class ModelSize(NamedTuple):
     quantization_level: str | None = None
 
 
-class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
-    _MEMORY_LINE_RE = re.compile(
-        r'msg="(?P<name>model weights|kv cache|compute graph|total memory)"'
-        r"(?:\s+device=(?P<device>\S+))?"
-        r'.*?size="(?P<size>[^"]+)"'
-    )
-    _MODEL_BLOB_RE = re.compile(r"blobs/sha256-([a-f0-9]+)")
+class LoadedModelInfo(NamedTuple):
+    context_length: int
+    vram_gb: float | None
+    """Ollama's own live measurement of VRAM usage for this model (via /api/ps size_vram), if reported."""
 
+
+class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
     models: dict[str, dict[str, OllamaModel]]
     _dynamic_models: dict[str, OllamaModel]
     default_context_length: int
     _arch_cache: dict[tuple[str, str], ArchParams]
-    _blob_to_model: dict[str, str]
-    _model_manifest_loaded: bool
     _vram_cache: dict[tuple[str, str], float]
     _installing: set[tuple[str, str]]
 
@@ -292,8 +282,6 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         self.load_default_models("default")
         self.default_context_length = self.get_default_context_value()
         self._arch_cache = {}
-        self._blob_to_model = {}
-        self._model_manifest_loaded = False
         self._vram_cache = {}
         self._installing = set()
 
@@ -677,32 +665,6 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         return self.docker_service.get_docker_compose_file_path(info.docker.name)
 
-    async def get_memory_load(self, instance: str) -> MemoryLoadOut:
-        """Parse docker logs and return per-model-load memory breakdown sessions."""
-        info = self.get_instance_installed_info(instance)
-        container_name = info.docker.container_name or ""
-        raw = await self._get_docker_logs(container_name)
-
-        current_model = None
-        sessions: list[MemoryLoadSession] = []
-        current: list[MemoryLoadComponent] = []
-        for line in raw.splitlines():
-            if m_model := self._MODEL_BLOB_RE.search(line):
-                current_model = await self.resolve_blob(f"sha256-{m_model.group(1)}")
-
-            if data := self._MEMORY_LINE_RE.search(line):
-                name = data.group("name")
-                device = data.group("device")
-                size = data.group("size")
-
-                if name == "total memory":
-                    sessions.append(MemoryLoadSession(model=current_model, components=current, total=size))
-                    current = []
-                else:
-                    current.append(MemoryLoadComponent(name=name, device=device, size=size))
-
-        return MemoryLoadOut(sessions=sessions)
-
     def service_has_docker(self) -> bool:
         """Return true when docker is started when service is installed."""
         return True
@@ -811,31 +773,33 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         return None
 
-    async def _get_vram_from_logs(self, instance: str, ollama_name: str, memory_load: MemoryLoadOut | None = None) -> float | None:
-        """Return actual VRAM usage from Docker logs for the most recent load of a model."""
+    async def get_loaded_model_info(self, instance: str) -> dict[str, int] | None:
+        """Return {model_name: context_length} for models currently loaded in VRAM. None if not applicable."""
+        loaded = await self._get_loaded_models(instance)
+        return None if loaded is None else {name: info.context_length for name, info in loaded.items()}
+
+    async def _get_loaded_models(self, instance: str) -> dict[str, LoadedModelInfo] | None:
+        """Return {model_name: LoadedModelInfo} for models currently loaded in VRAM, or None if the query failed.
+
+        Returning None (rather than an empty dict) lets callers tell "confirmed nothing loaded"
+        apart from "failed to ask Ollama", so a transient failure doesn't get treated as an unload.
+        """
+        info = self.get_instance_installed_info(instance)
         try:
-            if memory_load is None:
-                memory_load = await self.get_memory_load(instance)
+            result = await fetch_from(f"{info.base_url}/api/ps")
+            if result.status_code != 200:
+                return None
+            data = json.loads(result.data)
+            models = data.get("models", [])
+            return {
+                m["name"]: LoadedModelInfo(
+                    context_length=m.get("context_length", 0),
+                    vram_gb=round(size_vram / GIB, 2) if (size_vram := m.get("size_vram")) else None,
+                )
+                for m in models
+            }
         except Exception:
             return None
-
-        result: float | None = None
-        for session in memory_load.sessions:
-            if (session.model == ollama_name) and (parsed := get_vram_gb(session.total)) and (parsed > 0):
-                result = round(parsed, 2)
-
-        return result
-
-    async def get_loaded_model_info(self, instance: str) -> dict[str, int] | None:
-        """Return {model_name: context_length} for models currently loaded in VRAM."""
-        info = self.get_instance_installed_info(instance)
-        with suppress(Exception):
-            result = await fetch_from(f"{info.base_url}/api/ps")
-            if result.status_code == 200:
-                data = json.loads(result.data)
-                return {m["name"]: m.get("context_length", 0) for m in data.get("models", [])}
-
-        return {}
 
     def _effective_context(self, model_context: int | None, parsed_options: OllamaOptions) -> int:
         """Return the context Ollama runs with for an idle model: native window capped by the service context."""
@@ -847,16 +811,19 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         instance: str,
         ollama_name: str,
         model_context: int | None,
-        loaded_info: dict[str, int],
+        loaded_info: dict[str, LoadedModelInfo],
         sizes: dict[str, ModelSize],
         base_url: str,
         num_parallel: int | None,
-        memory_load: MemoryLoadOut | None = None,
     ) -> tuple[bool, float | None]:
-        """Return (is_loaded, vram_estimate_gb) for a model."""
-        is_loaded = ollama_name in loaded_info
+        """Return (is_loaded, vram_estimate_gb) for a model.
+
+        For loaded models, prefers Ollama's own live-measured VRAM usage (from loaded_info);
+        falls back to a calculated estimate when Ollama doesn't report a measurement.
+        """
         cache_key = (instance, ollama_name)
-        if not is_loaded:
+        loaded = loaded_info.get(ollama_name)
+        if loaded is None:
             self._vram_cache.pop(cache_key, None)
             size_bytes, parameters, bpw, quantization_level = sizes.get(ollama_name, ModelSize(0, None, None, None))
             vram_estimate = await self._get_vram_estimate(
@@ -864,17 +831,18 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             )
             return False, vram_estimate
 
+        if loaded.vram_gb is not None:
+            self._vram_cache[cache_key] = loaded.vram_gb
+            return True, loaded.vram_gb
+
         if cache_key in self._vram_cache:
             return True, self._vram_cache[cache_key]
 
-        vram_estimate = await self._get_vram_from_logs(instance, ollama_name, memory_load)
-
-        if vram_estimate is None:
-            num_ctx = loaded_info.get(ollama_name) or model_context
-            size_bytes, parameters, bpw, quantization_level = sizes.get(ollama_name, ModelSize(0, None, None, None))
-            vram_estimate = await self._get_vram_estimate(
-                instance, base_url, ollama_name, size_bytes, num_ctx, parameters, bpw, num_parallel, quantization_level
-            )
+        num_ctx = loaded.context_length or model_context
+        size_bytes, parameters, bpw, quantization_level = sizes.get(ollama_name, ModelSize(0, None, None, None))
+        vram_estimate = await self._get_vram_estimate(
+            instance, base_url, ollama_name, size_bytes, num_ctx, parameters, bpw, num_parallel, quantization_level
+        )
 
         if vram_estimate is not None:
             self._vram_cache[cache_key] = vram_estimate
@@ -895,11 +863,8 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                 continue
 
             info = self.get_instance_installed_info(instance_name)
-            loaded_info = await self.get_loaded_model_info(instance_name)
+            loaded_info = await self._get_loaded_models(instance_name)
             sizes = await self._get_model_sizes(info.base_url)
-            memory_load: MemoryLoadOut | None = None
-            with suppress(Exception):
-                memory_load = await self.get_memory_load(instance_name)
 
             for model_id, model in instance_models.items():
                 if model_id in info.models:
@@ -920,7 +885,6 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                             sizes,
                             info.base_url,
                             info.parsed_options.num_parallel,
-                            memory_load,
                         )
                     out_list.append(
                         RetrieveModelOut(
@@ -952,7 +916,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         model = self.models[instance][model_id]
         installed = info.models[model_id].get_info() if model_id in info.models else self._get_model_installed_info(instance, model_id)
-        loaded_info = await self.get_loaded_model_info(instance)
+        loaded_info = await self._get_loaded_models(instance)
         sizes = await self._get_model_sizes(info.base_url)
         is_loaded: bool | None = None
         vram_estimate: float | None = None
@@ -1225,9 +1189,6 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         self, instance: str, model_id: str, options: InstallModelIn
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         self._arch_cache.pop((instance, model_id), None)
-        self._model_manifest_loaded = False
-        self._blob_to_model = {}
-        self._log_cache.clear()
         parsed_model_options = try_parse_pydantic(OllamaModelOptions, options.spec) if options.spec else OllamaModelOptions()
         info = self.get_instance_installed_info(instance)
 
@@ -1372,9 +1333,6 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
 
     async def _uninstall_model(self, instance: str, model_id: str, options: UninstallModelIn) -> None:  # noqa: C901
         self._arch_cache.pop((instance, model_id), None)
-        self._model_manifest_loaded = False
-        self._blob_to_model = {}
-        self._log_cache.clear()
         info = self.get_instance_installed_info(instance)
         if (instance, model_id) in self._installing:
             raise HTTPException(409, f"Model {model_id!r} is currently being installed; cancel the install before deleting")
@@ -1420,50 +1378,3 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         if self.hardware.total_vram_gb > 256:
             return 262144  # 256 * 1024
         return 32768  # 32 * 1024
-
-    async def resolve_blob(self, blob_path: str) -> str:
-        """Resolve a blob SHA256 digest (from Docker logs) to a human-readable model name (e.g. 'llama3').
-
-        Ollama logs reference model layers by blob digest rather than model name.
-        This method looks up the digest in a manifest index built from
-        models/manifests/registry.ollama.ai to find the corresponding model tag,
-        then returns only the final name component.
-        Returns the original path if no digest is found, or 'unknown (<digest>)' if the digest is not in the index.
-        """
-        await self._load_model_manifest_index()
-        sha_regex = r"sha256[-:]([a-f0-9]+)"
-        if match := re.search(sha_regex, blob_path):
-            digest = f"sha256:{match.group(1)}"
-            resolved = self._blob_to_model.get(digest)
-            return resolved.split("/")[-1] if resolved else f"unknown ({digest[:12]})"
-
-        return blob_path
-
-    async def _load_model_manifest_index(self) -> None:
-        if self._model_manifest_loaded:
-            return
-
-        manifests_base = Path(self._get_working_dir()) / "main" / "models" / "manifests"
-        if not manifests_base.exists():
-            return
-
-        manifest_paths = await asyncio.to_thread(
-            lambda: [p for p in manifests_base.rglob("*") if p.is_file() and not p.name.startswith(".")]
-        )
-
-        new_index: dict[str, str] = {}
-        for manifest_path in manifest_paths:
-            try:
-                async with aiofiles.open(manifest_path) as f:
-                    content = await f.read()
-                data = json.loads(content)
-                rel = manifest_path.relative_to(manifests_base)
-                model_tag = f"{rel.parent}:{rel.name}" if rel.parent.parts else rel.name
-                digests = [data.get("config", {}).get("digest")]
-                digests += [layer.get("digest") for layer in data.get("layers", [])]
-                new_index.update({d: model_tag for d in digests if d})
-            except Exception:
-                logger.exception("Failed to parse manifest %s", manifest_path)
-
-        self._blob_to_model = new_index
-        self._model_manifest_loaded = True

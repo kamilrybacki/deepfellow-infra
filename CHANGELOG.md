@@ -15,10 +15,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 - Bumped bundled Docker image versions for llama.cpp, Ollama, vLLM, and speaches-ai to their latest available releases.
+- Ollama VRAM usage for loaded models is now read directly from Ollama's `/api/ps` response instead of being parsed from container logs.
 
 ### Fixed
 - vLLM now releases reserved GPU memory and stops the model container on every model-install error path (option parsing, download, container start, post-start setup, and endpoint registration), not just on a Docker `RuntimeError`. Previously a failure after the container started left it running and kept the GPU-utilization budget occupied, blocking further model loads until a full service restart.
 - VRAM estimation no longer crashes the entire model listing endpoint when a model (e.g. Qwen3.5, Gemma4) reports `null` for `num_key_value_heads` in its Ollama architecture metadata; VRAM is shown as unavailable for that model instead of returning HTTP 500.
+- A transient failure to reach Ollama's `/api/ps` no longer reports a still-loaded model as unloaded with a lower-fidelity VRAM estimate.
 - Installing an MCP server without a required API key/header (e.g. brave-search without `BRAVE_API_KEY`, ollama-websearch without `OLLAMA_API_KEY`) no longer shows a fake download that runs to completion without installing anything. The missing field is now flagged inline in the install form before submit, and the backend rejects the request with a clear error listing the missing keys.
 - The Cancel button for an in-progress model installation in the WebUI now appears in the model's table row, so it stays available after refreshing the page. Previously cancelling was only possible from the bottom progress toast, which disappeared on refresh and left the installation with no way to cancel.
 

@@ -9,16 +9,15 @@
 
 import json
 import time
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
 from server.docker import DockerOptions
-from server.models.services import InstallServiceIn, MemoryLoadComponent, MemoryLoadOut, MemoryLoadSession
-from server.services.ollama_service import InstalledInfo, ModelSize, OllamaOptions, OllamaService
-from server.utils.core import CommandResult, FetchResult
+from server.models.services import InstallServiceIn
+from server.services.ollama_service import InstalledInfo, LoadedModelInfo, ModelSize, OllamaOptions, OllamaService
+from server.utils.core import FetchResult
 from server.utils.vram_calculator import ArchParams
 
 _ARCH = ArchParams(
@@ -32,8 +31,6 @@ _ARCH = ArchParams(
 def _make_service() -> OllamaService:
     svc = object.__new__(OllamaService)
     svc._arch_cache = {}  # pyright: ignore[reportPrivateUsage]
-    svc._blob_to_model = {}  # pyright: ignore[reportPrivateUsage]
-    svc._model_manifest_loaded = False  # pyright: ignore[reportPrivateUsage]
     svc._vram_cache = {}  # pyright: ignore[reportPrivateUsage]
     svc._log_cache = {}  # pyright: ignore[reportPrivateUsage]
     svc.config = MagicMock()
@@ -61,180 +58,6 @@ def _make_installed_info(container_name: str = "ollama-default") -> InstalledInf
         docker_exposed_port=11434,
         base_url="http://localhost:11434",
     )
-
-
-@pytest.mark.asyncio
-async def test_resolve_blob_known_digest():
-    svc = _make_service()
-    svc._model_manifest_loaded = True  # pyright: ignore[reportPrivateUsage]
-    svc._blob_to_model = {"sha256:abc123": "library/llama3:latest"}  # pyright: ignore[reportPrivateUsage]
-
-    result = await svc.resolve_blob("/root/.ollama/blobs/sha256-abc123")
-
-    assert result == "llama3:latest"
-
-
-@pytest.mark.asyncio
-async def test_resolve_blob_unknown_digest():
-    svc = _make_service()
-    svc._model_manifest_loaded = True  # pyright: ignore[reportPrivateUsage]
-    svc._blob_to_model = {}  # pyright: ignore[reportPrivateUsage]
-
-    result = await svc.resolve_blob("/root/.ollama/blobs/sha256-abc123def456")
-
-    assert result == "unknown (sha256:abc12)"
-
-
-@pytest.mark.asyncio
-async def test_resolve_blob_no_digest_in_path():
-    svc = _make_service()
-    svc._model_manifest_loaded = True  # pyright: ignore[reportPrivateUsage]
-
-    result = await svc.resolve_blob("/some/path/without/hash")
-
-    assert result == "/some/path/without/hash"
-
-
-_SINGLE_SESSION_LOGS = """\
-msg="model weights" device=cuda0 size="4.20 GiB"
-msg="kv cache" device=cuda0 size="0.50 GiB"
-msg="total memory" size="4.70 GiB"
-"""
-
-_TWO_SESSION_LOGS = """\
-msg="model weights" device=cuda0 size="4.20 GiB"
-msg="kv cache" device=cuda0 size="0.50 GiB"
-msg="total memory" size="4.70 GiB"
-msg="model weights" device=cuda0 size="8.00 GiB"
-msg="kv cache" device=cuda0 size="1.00 GiB"
-msg="total memory" size="9.00 GiB"
-"""
-
-
-@pytest.mark.asyncio
-@patch("server.services.base2_service.Utils.run_command", new_callable=AsyncMock)
-async def test_get_memory_load_single_session(mock_cmd: AsyncMock):
-    mock_cmd.return_value = CommandResult(exit_code=0, stdout=_SINGLE_SESSION_LOGS, stderr="")
-    svc = _make_service()
-    svc._model_manifest_loaded = True  # pyright: ignore[reportPrivateUsage]
-
-    with patch.object(svc, "get_instance_installed_info", return_value=_make_installed_info()):
-        result = await svc.get_memory_load("default")
-
-    assert len(result.sessions) == 1
-    session = result.sessions[0]
-    assert session.total == "4.70 GiB"
-    assert session.components == [
-        MemoryLoadComponent(name="model weights", device="cuda0", size="4.20 GiB"),
-        MemoryLoadComponent(name="kv cache", device="cuda0", size="0.50 GiB"),
-    ]
-
-
-@pytest.mark.asyncio
-@patch("server.services.base2_service.Utils.run_command", new_callable=AsyncMock)
-async def test_get_memory_load_two_sessions(mock_cmd: AsyncMock):
-    mock_cmd.return_value = CommandResult(exit_code=0, stdout=_TWO_SESSION_LOGS, stderr="")
-    svc = _make_service()
-    svc._model_manifest_loaded = True  # pyright: ignore[reportPrivateUsage]
-
-    with patch.object(svc, "get_instance_installed_info", return_value=_make_installed_info()):
-        result = await svc.get_memory_load("default")
-
-    assert len(result.sessions) == 2
-    assert result.sessions[0].total == "4.70 GiB"
-    assert result.sessions[1].total == "9.00 GiB"
-
-
-@pytest.mark.asyncio
-@patch("server.services.base2_service.Utils.run_command", new_callable=AsyncMock)
-async def test_get_memory_load_empty_logs(mock_cmd: AsyncMock):
-    mock_cmd.return_value = CommandResult(exit_code=0, stdout="", stderr="")
-    svc = _make_service()
-    svc._model_manifest_loaded = True  # pyright: ignore[reportPrivateUsage]
-
-    with patch.object(svc, "get_instance_installed_info", return_value=_make_installed_info()):
-        result = await svc.get_memory_load("default")
-
-    assert result.sessions == []
-
-
-@pytest.mark.asyncio
-async def test_load_model_manifest_index_already_loaded():
-    svc = _make_service()
-    svc._model_manifest_loaded = True  # pyright: ignore[reportPrivateUsage]
-    svc._blob_to_model = {"sha256:abc": "model:latest"}  # pyright: ignore[reportPrivateUsage]
-
-    await svc._load_model_manifest_index()  # pyright: ignore[reportPrivateUsage]
-
-    assert svc._blob_to_model == {"sha256:abc": "model:latest"}  # pyright: ignore[reportPrivateUsage]
-
-
-@pytest.mark.asyncio
-async def test_load_model_manifest_index_no_manifests_dir(tmp_path: Path):
-    svc = _make_service()
-
-    with patch.object(svc, "_get_working_dir", return_value=tmp_path):
-        await svc._load_model_manifest_index()  # pyright: ignore[reportPrivateUsage]
-
-    assert svc._blob_to_model == {}  # pyright: ignore[reportPrivateUsage]
-    assert not svc._model_manifest_loaded  # pyright: ignore[reportPrivateUsage]
-
-
-@pytest.mark.asyncio
-async def test_load_model_manifest_index_builds_index(tmp_path: Path):
-    manifests_dir = tmp_path / "main" / "models" / "manifests" / "registry.ollama.ai" / "library" / "llama3"
-    manifests_dir.mkdir(parents=True)
-    manifest = {
-        "config": {"digest": "sha256:config1"},
-        "layers": [{"digest": "sha256:layer1"}, {"digest": "sha256:layer2"}],
-    }
-    (manifests_dir / "latest").write_text(json.dumps(manifest))
-    svc = _make_service()
-
-    with patch.object(svc, "_get_working_dir", return_value=tmp_path):
-        await svc._load_model_manifest_index()  # pyright: ignore[reportPrivateUsage]
-
-    assert svc._blob_to_model == {  # pyright: ignore[reportPrivateUsage]
-        "sha256:config1": "registry.ollama.ai/library/llama3:latest",
-        "sha256:layer1": "registry.ollama.ai/library/llama3:latest",
-        "sha256:layer2": "registry.ollama.ai/library/llama3:latest",
-    }
-    assert svc._model_manifest_loaded  # pyright: ignore[reportPrivateUsage]
-
-
-@pytest.mark.asyncio
-async def test_load_model_manifest_index_custom_registry(tmp_path: Path):
-    manifests_dir = tmp_path / "main" / "models" / "manifests" / "my-registry.internal" / "models" / "llama3"
-    manifests_dir.mkdir(parents=True)
-    manifest = {
-        "config": {"digest": "sha256:cfgcustom"},
-        "layers": [{"digest": "sha256:layercustom"}],
-    }
-    (manifests_dir / "latest").write_text(json.dumps(manifest))
-    svc = _make_service()
-
-    with patch.object(svc, "_get_working_dir", return_value=tmp_path):
-        await svc._load_model_manifest_index()  # pyright: ignore[reportPrivateUsage]
-
-    assert "sha256:cfgcustom" in svc._blob_to_model  # pyright: ignore[reportPrivateUsage]
-    assert "sha256:layercustom" in svc._blob_to_model  # pyright: ignore[reportPrivateUsage]
-    tag = svc._blob_to_model["sha256:cfgcustom"]  # pyright: ignore[reportPrivateUsage]
-    assert tag.startswith("my-registry.internal/")
-    assert tag.endswith(":latest")
-
-
-@pytest.mark.asyncio
-async def test_load_model_manifest_index_skips_invalid_json(tmp_path: Path):
-    manifests_dir = tmp_path / "main" / "models" / "manifests" / "registry.ollama.ai" / "library" / "llama3"
-    manifests_dir.mkdir(parents=True)
-    (manifests_dir / "latest").write_text("not valid json {{{")
-    svc = _make_service()
-
-    with patch.object(svc, "_get_working_dir", return_value=tmp_path):
-        await svc._load_model_manifest_index()  # pyright: ignore[reportPrivateUsage]
-
-    assert svc._blob_to_model == {}  # pyright: ignore[reportPrivateUsage]
-    assert svc._model_manifest_loaded  # pyright: ignore[reportPrivateUsage]
 
 
 _LLAMA3_INFO = {
@@ -504,75 +327,9 @@ async def test_get_vram_estimate_quant_and_env_overhead_combined(mock_arch: Asyn
     assert result == pytest.approx(9.5 * 1.1)
 
 
-def _make_memory_load(*sessions: tuple[str | None, str]) -> MemoryLoadOut:
-    return MemoryLoadOut(sessions=[MemoryLoadSession(model=model, total=total, components=[]) for model, total in sessions])
-
-
-@pytest.mark.asyncio
-@patch("server.services.ollama_service.get_vram_gb")
-async def test_get_vram_from_logs_returns_value(mock_vram_gb: MagicMock):
-    mock_vram_gb.return_value = 4.7
-    svc = _make_service()
-    memory_load = _make_memory_load(("llama3:latest", "4.70 GiB"))
-
-    with patch.object(svc, "get_memory_load", new=AsyncMock(return_value=memory_load)):
-        result = await svc._get_vram_from_logs("default", "llama3:latest")  # pyright: ignore[reportPrivateUsage]
-
-    assert result == 4.7
-
-
-@pytest.mark.asyncio
-@patch("server.services.ollama_service.get_vram_gb")
-async def test_get_vram_from_logs_last_matching_session_wins(mock_vram_gb: MagicMock):
-    mock_vram_gb.side_effect = [4.7, 9.0]
-    svc = _make_service()
-    memory_load = _make_memory_load(("llama3:latest", "4.70 GiB"), ("llama3:latest", "9.00 GiB"))
-
-    with patch.object(svc, "get_memory_load", new=AsyncMock(return_value=memory_load)):
-        result = await svc._get_vram_from_logs("default", "llama3:latest")  # pyright: ignore[reportPrivateUsage]
-
-    assert result == 9.0
-
-
-@pytest.mark.asyncio
-async def test_get_vram_from_logs_exception_returns_none():
-    svc = _make_service()
-
-    with patch.object(svc, "get_memory_load", new=AsyncMock(side_effect=RuntimeError("fail"))):
-        result = await svc._get_vram_from_logs("default", "llama3:latest")  # pyright: ignore[reportPrivateUsage]
-
-    assert result is None
-
-
-@pytest.mark.asyncio
-@patch("server.services.ollama_service.get_vram_gb")
-async def test_get_vram_from_logs_no_matching_model_returns_none(mock_vram_gb: MagicMock):
-    mock_vram_gb.return_value = 4.7
-    svc = _make_service()
-    memory_load = _make_memory_load(("other-model:latest", "4.70 GiB"))
-
-    with patch.object(svc, "get_memory_load", new=AsyncMock(return_value=memory_load)):
-        result = await svc._get_vram_from_logs("default", "llama3:latest")  # pyright: ignore[reportPrivateUsage]
-
-    assert result is None
-
-
-@pytest.mark.asyncio
-@patch("server.services.ollama_service.get_vram_gb")
-async def test_get_vram_from_logs_zero_vram_returns_none(mock_vram_gb: MagicMock):
-    mock_vram_gb.return_value = 0.0
-    svc = _make_service()
-    memory_load = _make_memory_load(("llama3:latest", "0.00 GiB"))
-
-    with patch.object(svc, "get_memory_load", new=AsyncMock(return_value=memory_load)):
-        result = await svc._get_vram_from_logs("default", "llama3:latest")  # pyright: ignore[reportPrivateUsage]
-
-    assert result is None
-
-
 @pytest.mark.asyncio
 @patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock)
-async def test_get_loaded_model_info_returns_models(mock_fetch: AsyncMock):
+async def test_get_loaded_models_returns_models(mock_fetch: AsyncMock):
     mock_fetch.return_value = _make_fetch_result(
         200,
         {"models": [{"name": "llama3:latest", "context_length": 4096}, {"name": "mistral:latest"}]},
@@ -580,33 +337,88 @@ async def test_get_loaded_model_info_returns_models(mock_fetch: AsyncMock):
     svc = _make_service()
 
     with patch.object(svc, "get_instance_installed_info", return_value=_make_installed_info()):
-        result = await svc.get_loaded_model_info("default")
+        result = await svc._get_loaded_models("default")  # pyright: ignore[reportPrivateUsage]
 
-    assert result == {"llama3:latest": 4096, "mistral:latest": 0}
+    assert result == {
+        "llama3:latest": LoadedModelInfo(context_length=4096, vram_gb=None),
+        "mistral:latest": LoadedModelInfo(context_length=0, vram_gb=None),
+    }
 
 
 @pytest.mark.asyncio
 @patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock)
-async def test_get_loaded_model_info_non_200_returns_empty(mock_fetch: AsyncMock):
+async def test_get_loaded_models_reports_measured_vram(mock_fetch: AsyncMock):
+    mock_fetch.return_value = _make_fetch_result(
+        200,
+        {
+            "models": [
+                {"name": "llama3:latest", "context_length": 4096, "size_vram": 5046586573},
+                {"name": "mistral:latest", "context_length": 2048, "size_vram": 0},
+            ]
+        },
+    )
+    svc = _make_service()
+
+    with patch.object(svc, "get_instance_installed_info", return_value=_make_installed_info()):
+        result = await svc._get_loaded_models("default")  # pyright: ignore[reportPrivateUsage]
+
+    assert result is not None
+    assert result["llama3:latest"].vram_gb == pytest.approx(4.7, abs=0.01)
+    assert result["mistral:latest"].vram_gb is None
+    # _get_loaded_models no longer mutates _vram_cache directly — _resolve_vram_info owns that.
+    assert svc._vram_cache == {}  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+@patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock)
+async def test_get_loaded_models_non_200_returns_none(mock_fetch: AsyncMock):
     mock_fetch.return_value = _make_fetch_result(503, {})
+    svc = _make_service()
+
+    with patch.object(svc, "get_instance_installed_info", return_value=_make_installed_info()):
+        result = await svc._get_loaded_models("default")  # pyright: ignore[reportPrivateUsage]
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+@patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock)
+async def test_get_loaded_models_exception_returns_none(mock_fetch: AsyncMock):
+    mock_fetch.side_effect = RuntimeError("connection error")
+    svc = _make_service()
+
+    with patch.object(svc, "get_instance_installed_info", return_value=_make_installed_info()):
+        result = await svc._get_loaded_models("default")  # pyright: ignore[reportPrivateUsage]
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+@patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock)
+async def test_get_loaded_model_info_maps_to_context_length_for_base_contract(mock_fetch: AsyncMock):
+    """The public, base-class-compatible wrapper exposes only {model: context_length}, dict[str, int] | None."""
+    mock_fetch.return_value = _make_fetch_result(
+        200,
+        {"models": [{"name": "llama3:latest", "context_length": 4096, "size_vram": 5046586573}]},
+    )
     svc = _make_service()
 
     with patch.object(svc, "get_instance_installed_info", return_value=_make_installed_info()):
         result = await svc.get_loaded_model_info("default")
 
-    assert result == {}
+    assert result == {"llama3:latest": 4096}
 
 
 @pytest.mark.asyncio
 @patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock)
-async def test_get_loaded_model_info_exception_returns_empty(mock_fetch: AsyncMock):
+async def test_get_loaded_model_info_returns_none_on_failure(mock_fetch: AsyncMock):
     mock_fetch.side_effect = RuntimeError("connection error")
     svc = _make_service()
 
     with patch.object(svc, "get_instance_installed_info", return_value=_make_installed_info()):
         result = await svc.get_loaded_model_info("default")
 
-    assert result == {}
+    assert result is None
 
 
 @pytest.mark.asyncio
@@ -621,40 +433,78 @@ async def test_resolve_vram_info_not_loaded_returns_false_none():
 
 
 @pytest.mark.asyncio
-async def test_resolve_vram_info_vram_from_logs():
+async def test_resolve_vram_info_prefers_fresh_measured_vram_over_stale_cache():
+    """A fresh measurement from this poll must win even over a previously cached (possibly stale) value."""
     svc = _make_service()
+    svc._vram_cache[("default", "llama3:latest")] = 9.5  # stale, from an earlier estimate  # pyright: ignore[reportPrivateUsage]
 
-    with (
-        patch.object(svc, "_get_vram_from_logs", new=AsyncMock(return_value=4.7)),
-        patch.object(svc, "_get_vram_estimate", new=AsyncMock(return_value=9.5)),
-    ):
+    with patch.object(svc, "_get_vram_estimate", new=AsyncMock(return_value=None)) as mock_estimate:
         result = await svc._resolve_vram_info(  # pyright: ignore[reportPrivateUsage]
             "default",
             "llama3:latest",
             4096,
-            loaded_info={"llama3:latest": 4096},
+            loaded_info={"llama3:latest": LoadedModelInfo(context_length=4096, vram_gb=4.7)},
             sizes={},
             base_url="http://localhost:11434",
             num_parallel=None,
         )
 
     assert result == (True, 4.7)
+    assert svc._vram_cache[("default", "llama3:latest")] == 4.7  # pyright: ignore[reportPrivateUsage]
+    mock_estimate.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_resolve_vram_info_falls_back_to_estimate():
+async def test_resolve_vram_info_measured_zero_is_used_not_treated_as_missing():
+    """size_vram: 0 (vram_gb=0.0) must be reported and cached as 0.0, not fall through to the estimate."""
     svc = _make_service()
-    sizes = {"llama3:latest": ModelSize(8 * 1024**3, 8_000_000_000, 4.85, "Q4_K_M")}
 
-    with (
-        patch.object(svc, "_get_vram_from_logs", new=AsyncMock(return_value=None)),
-        patch.object(svc, "_get_vram_estimate", new=AsyncMock(return_value=9.5)) as mock_estimate,
-    ):
+    with patch.object(svc, "_get_vram_estimate", new=AsyncMock(return_value=9.5)) as mock_estimate:
         result = await svc._resolve_vram_info(  # pyright: ignore[reportPrivateUsage]
             "default",
             "llama3:latest",
             4096,
-            loaded_info={"llama3:latest": 4096},
+            loaded_info={"llama3:latest": LoadedModelInfo(context_length=4096, vram_gb=0.0)},
+            sizes={},
+            base_url="http://localhost:11434",
+            num_parallel=None,
+        )
+
+    assert result == (True, 0.0)
+    mock_estimate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_vram_info_uses_cached_estimate_when_no_fresh_measurement():
+    svc = _make_service()
+    svc._vram_cache[("default", "llama3:latest")] = 4.7  # pyright: ignore[reportPrivateUsage]
+
+    with patch.object(svc, "_get_vram_estimate", new=AsyncMock(return_value=9.5)) as mock_estimate:
+        result = await svc._resolve_vram_info(  # pyright: ignore[reportPrivateUsage]
+            "default",
+            "llama3:latest",
+            4096,
+            loaded_info={"llama3:latest": LoadedModelInfo(context_length=4096, vram_gb=None)},
+            sizes={},
+            base_url="http://localhost:11434",
+            num_parallel=None,
+        )
+
+    assert result == (True, 4.7)
+    mock_estimate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_vram_info_falls_back_to_estimate_when_not_cached():
+    svc = _make_service()
+    sizes = {"llama3:latest": ModelSize(8 * 1024**3, 8_000_000_000, 4.85, "Q4_K_M")}
+
+    with patch.object(svc, "_get_vram_estimate", new=AsyncMock(return_value=9.5)) as mock_estimate:
+        result = await svc._resolve_vram_info(  # pyright: ignore[reportPrivateUsage]
+            "default",
+            "llama3:latest",
+            4096,
+            loaded_info={"llama3:latest": LoadedModelInfo(context_length=4096, vram_gb=None)},
             sizes=sizes,
             base_url="http://localhost:11434",
             num_parallel=2,
@@ -679,15 +529,12 @@ async def test_resolve_vram_info_falls_back_to_estimate():
 async def test_resolve_vram_info_uses_model_context_as_fallback():
     svc = _make_service()
 
-    with (
-        patch.object(svc, "_get_vram_from_logs", new=AsyncMock(return_value=None)),
-        patch.object(svc, "_get_vram_estimate", new=AsyncMock(return_value=5.0)) as mock_estimate,
-    ):
+    with patch.object(svc, "_get_vram_estimate", new=AsyncMock(return_value=5.0)) as mock_estimate:
         result = await svc._resolve_vram_info(  # pyright: ignore[reportPrivateUsage]
             "default",
             "llama3:latest",
             8192,
-            loaded_info={"llama3:latest": 0},
+            loaded_info={"llama3:latest": LoadedModelInfo(context_length=0, vram_gb=None)},
             sizes={},
             base_url="http://localhost:11434",
             num_parallel=None,
@@ -695,17 +542,6 @@ async def test_resolve_vram_info_uses_model_context_as_fallback():
 
     assert result == (True, 5.0)
     assert mock_estimate.call_args.args[4] == 8192
-
-
-@pytest.mark.asyncio
-async def test_resolve_blob_non_root_prefix():
-    svc = _make_service()
-    svc._model_manifest_loaded = True  # pyright: ignore[reportPrivateUsage]
-    svc._blob_to_model = {"sha256:abc123": "library/llama3:latest"}  # pyright: ignore[reportPrivateUsage]
-
-    result = await svc.resolve_blob("/home/ollama/.ollama/blobs/sha256-abc123")
-
-    assert result == "llama3:latest"
 
 
 @pytest.mark.asyncio
