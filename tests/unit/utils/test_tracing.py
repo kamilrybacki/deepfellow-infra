@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from opentelemetry.trace.status import StatusCode
 from pydantic import BaseModel
 
-from server.utils.tracing import FuncArgs, InfraTracer, setup_otlp_logging
+from server.utils.tracing import FuncArgs, InfraTracer, OtlpLoggingManager
 
 
 def _make_config(enabled: bool = True, endpoint: str = "http://localhost:4317") -> MagicMock:
@@ -79,8 +79,6 @@ def _patch_otel_context_managers():
         patch("server.utils.tracing.TracerProvider"),
         patch("server.utils.tracing.OTLPSpanExporter"),
         patch("server.utils.tracing.BatchSpanProcessor"),
-        patch("server.utils.tracing.trace.set_tracer_provider"),
-        patch("server.utils.tracing.trace.get_tracer"),
     ]
 
 
@@ -98,8 +96,8 @@ def test_setup_otlp_logging_creates_provider_with_service_name() -> None:
     cfg = _make_config(endpoint="http://otel:4317")
     patches = _patch_otlp_logging_context_managers()
 
-    with patches[0] as mock_provider_cls, patches[1], patches[2], patches[3], patches[4]:
-        setup_otlp_logging(cfg)
+    with patches[0] as mock_provider_cls, patches[1], patches[2], patches[3], patches[4], patch("server.utils.tracing.logging.getLogger"):
+        OtlpLoggingManager().setup(cfg)
 
     resource_arg = mock_provider_cls.call_args[1]["resource"]
     assert resource_arg.attributes["service.name"] == "llm-audit"
@@ -109,8 +107,8 @@ def test_setup_otlp_logging_uses_endpoint_from_config() -> None:
     cfg = _make_config(endpoint="http://otel:4317")
     patches = _patch_otlp_logging_context_managers()
 
-    with patches[0], patches[1] as mock_exporter_cls, patches[2], patches[3], patches[4]:
-        setup_otlp_logging(cfg)
+    with patches[0], patches[1] as mock_exporter_cls, patches[2], patches[3], patches[4], patch("server.utils.tracing.logging.getLogger"):
+        OtlpLoggingManager().setup(cfg)
 
     assert mock_exporter_cls.call_args == call(endpoint="http://otel:4317", insecure=True)
 
@@ -119,8 +117,15 @@ def test_setup_otlp_logging_registers_processor_and_sets_global_provider() -> No
     cfg = _make_config(endpoint="http://otel:4317")
     patches = _patch_otlp_logging_context_managers()
 
-    with patches[0] as mock_provider_cls, patches[1], patches[2] as mock_processor_cls, patches[3] as mock_set, patches[4]:
-        setup_otlp_logging(cfg)
+    with (
+        patches[0] as mock_provider_cls,
+        patches[1],
+        patches[2] as mock_processor_cls,
+        patches[3] as mock_set,
+        patches[4],
+        patch("server.utils.tracing.logging.getLogger"),
+    ):
+        OtlpLoggingManager().setup(cfg)
 
     provider = mock_provider_cls.return_value
     assert provider.add_log_record_processor.call_args == call(mock_processor_cls.return_value)
@@ -139,7 +144,7 @@ def test_setup_otlp_logging_attaches_handler_to_root_and_uvicorn_loggers() -> No
         patches[4] as mock_handler_cls,
         patch("server.utils.tracing.logging.getLogger") as mock_get_logger,
     ):
-        setup_otlp_logging(cfg)
+        OtlpLoggingManager().setup(cfg)
 
     handler = mock_handler_cls.return_value
     assert mock_handler_cls.call_args == call(level=logging.DEBUG, logger_provider=mock_provider_cls.return_value)
@@ -152,6 +157,82 @@ def test_setup_otlp_logging_attaches_handler_to_root_and_uvicorn_loggers() -> No
 
     for logger_call in mock_get_logger.return_value.addHandler.call_args_list:
         assert logger_call == call(handler)
+
+
+def test_teardown_otlp_logging_noop_when_no_handler() -> None:
+    manager = OtlpLoggingManager()
+
+    with patch("server.utils.tracing.logging.getLogger") as mock_get_logger:
+        manager.teardown()
+
+    assert mock_get_logger.call_count == 0
+
+
+def test_teardown_otlp_logging_removes_handler_from_loggers() -> None:
+    manager = OtlpLoggingManager()
+    handler = MagicMock()
+    manager._handler = handler  # pyright: ignore[reportPrivateUsage]
+
+    with patch("server.utils.tracing.logging.getLogger") as mock_get_logger:
+        manager.teardown()
+
+        logger_names = [c[0][0] if c[0] else "" for c in mock_get_logger.call_args_list]
+        assert logger_names == ["", "uvicorn", "uvicorn.error", "uvicorn.access"]
+        for logger_call in mock_get_logger.return_value.removeHandler.call_args_list:
+            assert logger_call == call(handler)
+
+        assert manager._handler is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_teardown_otlp_logging_shuts_down_old_provider() -> None:
+    manager = OtlpLoggingManager()
+    manager._handler = MagicMock()  # pyright: ignore[reportPrivateUsage]
+    provider = MagicMock()
+    manager._provider = provider  # pyright: ignore[reportPrivateUsage]
+
+    with patch("server.utils.tracing.logging.getLogger"):
+        manager.teardown()
+
+    assert provider.shutdown.call_count == 1
+    assert manager._provider is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_reconfigure_otlp_logging_shuts_down_previous_provider_before_rebuilding() -> None:
+    cfg = _make_config()
+    cfg.otel_logging_enabled = True
+    manager = OtlpLoggingManager()
+    patches = _patch_otlp_logging_context_managers()
+
+    with patches[0] as mock_provider_cls, patches[1], patches[2], patches[3], patches[4], patch("server.utils.tracing.logging.getLogger"):
+        first_provider = mock_provider_cls.return_value
+        manager.setup(cfg)
+        manager.reconfigure(cfg)
+
+    assert first_provider.shutdown.call_count == 1
+
+
+def test_reconfigure_otlp_logging_sets_up_when_enabled() -> None:
+    cfg = _make_config()
+    cfg.otel_logging_enabled = True
+    manager = OtlpLoggingManager()
+
+    with patch.object(manager, "teardown") as mock_teardown, patch.object(manager, "setup") as mock_setup:
+        manager.reconfigure(cfg)
+
+    assert mock_teardown.call_count == 1
+    assert mock_setup.call_args == call(cfg)
+
+
+def test_reconfigure_otlp_logging_skips_setup_when_disabled() -> None:
+    cfg = _make_config()
+    cfg.otel_logging_enabled = False
+    manager = OtlpLoggingManager()
+
+    with patch.object(manager, "teardown") as mock_teardown, patch.object(manager, "setup") as mock_setup:
+        manager.reconfigure(cfg)
+
+    assert mock_teardown.call_count == 1
+    assert mock_setup.call_count == 0
 
 
 def test_func_args_defaults_are_none() -> None:
@@ -175,35 +256,28 @@ def test_infra_tracer_config_and_tracer_are_none() -> None:
     assert t.tracer is None
 
 
-def test_get_config_loads_config_on_first_call() -> None:
+def test_get_config_returns_config_when_set() -> None:
     t = InfraTracer("svc")
     cfg = _make_config()
+    t.config = cfg
 
-    with patch("server.utils.tracing.load_config", return_value=cfg) as mock_load:
-        result = t._get_config()  # pyright: ignore[reportPrivateUsage]
-
-    assert result is cfg
-    assert mock_load.call_count == 1
+    assert t._get_config() is cfg  # pyright: ignore[reportPrivateUsage]
 
 
-def test_get_config_caches_config_on_subsequent_calls() -> None:
+def test_get_config_raises_when_not_set() -> None:
     t = InfraTracer("svc")
-    cfg = _make_config()
 
-    with patch("server.utils.tracing.load_config", return_value=cfg) as mock_load:
+    with pytest.raises(RuntimeError, match=r"InfraTracer\.config was not set"):
         t._get_config()  # pyright: ignore[reportPrivateUsage]
-        t._get_config()  # pyright: ignore[reportPrivateUsage]
-
-    assert mock_load.call_count == 1
 
 
 def test_get_tracer_returns_tracer() -> None:
     t = InfraTracer("svc")
     t.config = _make_config(endpoint="http://otel:4317")
-    fake_tracer = MagicMock()
     patches = _patch_otel_context_managers()
 
-    with patches[0], patches[1], patches[2], patches[3], patch("server.utils.tracing.trace.get_tracer", return_value=fake_tracer):
+    with patches[0] as mock_provider_cls, patches[1], patches[2]:
+        fake_tracer = mock_provider_cls.return_value.get_tracer.return_value
         result = t._get_tracer()  # pyright: ignore[reportPrivateUsage]
 
     assert result is fake_tracer
@@ -212,14 +286,42 @@ def test_get_tracer_returns_tracer() -> None:
 def test_get_tracer_caches_tracer() -> None:
     t = InfraTracer("svc")
     t.config = _make_config()
-    fake_tracer = MagicMock()
     patches = _patch_otel_context_managers()
 
-    with patches[0], patches[1], patches[2], patches[3], patch("server.utils.tracing.trace.get_tracer", return_value=fake_tracer):
+    with patches[0] as mock_provider_cls, patches[1], patches[2]:
+        fake_tracer = mock_provider_cls.return_value.get_tracer.return_value
         t._get_tracer()  # pyright: ignore[reportPrivateUsage]
         t._get_tracer()  # pyright: ignore[reportPrivateUsage]
 
     assert t.tracer is fake_tracer
+    assert mock_provider_cls.return_value.get_tracer.call_count == 1
+
+
+def test_get_tracer_rebuilds_from_new_providers_tracer_when_endpoint_changes() -> None:
+    """The tracer must come from the freshly built provider, not a stale global one.
+
+    `trace.set_tracer_provider()` is set-once in the OTel SDK — a second call is a silent no-op —
+    so getting the tracer via `provider.get_tracer(...)` directly (bypassing the global registry)
+    is the only way a changed endpoint actually takes effect without a restart.
+    """
+    t = InfraTracer("svc")
+    t.config = _make_config(endpoint="http://old:4317")
+    patches = _patch_otel_context_managers()
+
+    with patches[0] as mock_provider_cls, patches[1], patches[2]:
+        first_provider = MagicMock()
+        second_provider = MagicMock()
+        mock_provider_cls.side_effect = [first_provider, second_provider]
+
+        first_tracer = t._get_tracer()  # pyright: ignore[reportPrivateUsage]
+        t.config.otel_exporter_otlp_endpoint = "http://new:4317"
+        second_tracer = t._get_tracer()  # pyright: ignore[reportPrivateUsage]
+
+    assert first_tracer is first_provider.get_tracer.return_value
+    assert second_tracer is second_provider.get_tracer.return_value
+    assert first_tracer is not second_tracer
+    assert first_provider.shutdown.call_count == 1
+    assert second_provider.shutdown.call_count == 0
 
 
 def test_set_success_attributes_sets_execution_time_and_ok_status() -> None:
@@ -424,6 +526,7 @@ async def test_trace_request_returns_result_when_tracing_enabled() -> None:
     fake_tracer = MagicMock()
     fake_tracer.start_span.return_value = span
     t.tracer = fake_tracer
+    t._tracer_endpoint = t.config.otel_exporter_otlp_endpoint  # pyright: ignore[reportPrivateUsage, reportOptionalMemberAccess]
 
     with patch("server.utils.tracing.trace.set_span_in_context"):
 
@@ -444,6 +547,7 @@ async def test_trace_request_re_raises_exception_and_ends_span() -> None:
     fake_tracer = MagicMock()
     fake_tracer.start_span.return_value = span
     t.tracer = fake_tracer
+    t._tracer_endpoint = t.config.otel_exporter_otlp_endpoint  # pyright: ignore[reportPrivateUsage, reportOptionalMemberAccess]
 
     with patch("server.utils.tracing.trace.set_span_in_context"):
 
@@ -465,6 +569,7 @@ async def test_trace_request_streaming_response_sets_attributes() -> None:
     fake_tracer = MagicMock()
     fake_tracer.start_span.return_value = span
     t.tracer = fake_tracer
+    t._tracer_endpoint = t.config.otel_exporter_otlp_endpoint  # pyright: ignore[reportPrivateUsage, reportOptionalMemberAccess]
 
     async def body_gen():
         yield b"data"
@@ -489,6 +594,7 @@ async def test_trace_request_json_response_sets_attributes() -> None:
     fake_tracer = MagicMock()
     fake_tracer.start_span.return_value = span
     t.tracer = fake_tracer
+    t._tracer_endpoint = t.config.otel_exporter_otlp_endpoint  # pyright: ignore[reportPrivateUsage, reportOptionalMemberAccess]
 
     with patch("server.utils.tracing.trace.set_span_in_context"):
 
@@ -509,6 +615,7 @@ async def test_trace_request_base_model_response_sets_attributes() -> None:
     fake_tracer = MagicMock()
     fake_tracer.start_span.return_value = span
     t.tracer = fake_tracer
+    t._tracer_endpoint = t.config.otel_exporter_otlp_endpoint  # pyright: ignore[reportPrivateUsage, reportOptionalMemberAccess]
 
     class Resp(BaseModel):
         value: int
@@ -533,6 +640,7 @@ async def test_trace_request_unknown_response_type_sets_unknown_attributes() -> 
     fake_tracer = MagicMock()
     fake_tracer.start_span.return_value = span
     t.tracer = fake_tracer
+    t._tracer_endpoint = t.config.otel_exporter_otlp_endpoint  # pyright: ignore[reportPrivateUsage, reportOptionalMemberAccess]
     with patch("server.utils.tracing.trace.set_span_in_context"):
 
         @t.trace_request()

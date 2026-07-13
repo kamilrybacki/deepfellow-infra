@@ -69,7 +69,11 @@ WebUI (from `webui/` directory):
 ## Required Environment Variables
 
 Must be set before running:
-- `DF_NAME`, `DF_INFRA_URL`, `DF_INFRA_API_KEY`, `DF_INFRA_ADMIN_API_KEY`, `DF_MESH_KEY`
+- `DF_INFRA_ADMIN_API_KEY`
+
+`DF_NAME`, `DF_INFRA_URL`, `DF_INFRA_API_KEY`, `DF_MESH_KEY`, and most other settings are dynamic
+runtime config: defaulted at startup, then managed via the `GET`/`PUT /admin/config` API (and the
+WebUI settings page), persisted to `config.json` — not read from `.env`.
 
 Copy `example.env` to `.env` to get started. See `server/config.py` for full list.
 

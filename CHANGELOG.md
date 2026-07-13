@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 - Ollama service now has a "↻ Refresh catalog" button that fetches trending models from the Ollama library and merges them into the model list as a dynamic overlay, so newly released models show up without waiting for an app update. Each click always fetches fresh results; the 6-hour cache only applies to callers that don't pass `force=true`.
 - Ollama Cloud support with cached model list.
+- Most infra settings (mesh connection, API keys, MCP session limits, OTEL tracing/logging, etc.) are now stored in `config.json` and can be changed from the Configuration page (or the `/admin/config` API) without restarting the server. Only bootstrap settings still require `.env` and a restart.
 - Ollama, llama.cpp, and vLLM service install and edit dialogs now include a searchable **Docker image version** selector populated from the container registry, filtered by the selected hardware variant. Leave the field empty to use the default bundled version.
 - New `GET /admin/services/{id}/docker-tags` API endpoint returns available Docker image tags for a service, with server-side caching (2 h TTL) and optional `?hardware=` filtering.
 - Optional `DOCKER_HUB_TOKEN` environment variable for authenticated Docker Hub access to raise rate limits when fetching image tags.
@@ -18,6 +19,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Ollama VRAM usage for loaded models is now read directly from Ollama's `/api/ps` response instead of being parsed from container logs.
 
 ### Fixed
+- `config.json` is now written to the storage directory instead of the app directory, so dynamic settings (mesh key, API keys, etc.) survive container recreation instead of resetting on every redeploy.
+- OTEL trace/log exporter endpoint changes now take effect immediately instead of silently keeping the old endpoint until a restart.
 - vLLM now releases reserved GPU memory and stops the model container on every model-install error path (option parsing, download, container start, post-start setup, and endpoint registration), not just on a Docker `RuntimeError`. Previously a failure after the container started left it running and kept the GPU-utilization budget occupied, blocking further model loads until a full service restart.
 - VRAM estimation no longer crashes the entire model listing endpoint when a model (e.g. Qwen3.5, Gemma4) reports `null` for `num_key_value_heads` in its Ollama architecture metadata; VRAM is shown as unavailable for that model instead of returning HTTP 500.
 - A transient failure to reach Ollama's `/api/ps` no longer reports a still-loaded model as unloaded with a lower-fidelity VRAM estimate.

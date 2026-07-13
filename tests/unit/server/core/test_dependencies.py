@@ -20,14 +20,17 @@ from server.core.dependencies import (
     auth_metrics,
     auth_server,
     get_config,
+    get_config_lock,
     get_dependency,
     get_endpoint_registry,
     get_hardware,
     get_infra_websocket_server,
     get_metrics_service,
+    get_otlp_logging,
     get_parent_infra,
     get_service_provider,
     get_services_manager,
+    get_task_manager,
 )
 
 
@@ -76,6 +79,9 @@ def test_get_dependency_raises_runtime_error_when_missing() -> None:
         ("parent_infra", get_parent_infra),
         ("metrics_service", get_metrics_service),
         ("hardware", get_hardware),
+        ("task_manager", get_task_manager),
+        ("config_lock", get_config_lock),
+        ("otlp_logging", get_otlp_logging),
     ],
 )
 def test_getter_returns_state_value(state_key: str, getter: object) -> None:

@@ -7,7 +7,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -146,6 +146,24 @@ def test_endpoint_registry_setter_propagates_to_all_parents() -> None:
     assert p2.endpoint_registry == registry
 
 
+# --- get_children setter ---
+
+
+def test_get_children_setter_propagates_to_all_parents() -> None:
+    p1 = _make_parent("http://a.url")
+    p2 = _make_parent("http://b.url")
+    group = ParentInfraGroup([p1, p2])
+    callback = MagicMock()
+    group.get_children = callback
+    assert p1.get_children is callback
+    assert p2.get_children is callback
+
+
+def test_get_children_getter_defaults_to_dict() -> None:
+    group = ParentInfraGroup([])
+    assert group.get_children() == {}
+
+
 # --- run ---
 
 
@@ -173,3 +191,119 @@ async def test_run_with_parents_runs_all() -> None:
 def test_endpoint_registry_getter_returns_none_when_no_parents() -> None:
     group = ParentInfraGroup([])
     assert group.endpoint_registry is None
+
+
+# --- reconfigure ---
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_replaces_parents_when_mesh_url_set() -> None:
+    old_parent = _make_parent("http://old.url")
+    old_parent.stop = AsyncMock()
+    group = ParentInfraGroup([old_parent])
+    registry = MagicMock()
+    group.endpoint_registry = registry
+
+    config = MagicMock()
+    config.connect_to_mesh_url = "ws://new.url"
+    task_manager = MagicMock()
+
+    with patch("server.websockets.parent_infra_group.ParentInfra") as mock_parent_cls:
+        new_parent = mock_parent_cls.return_value
+        await group.reconfigure(config, task_manager)
+
+    old_parent.stop.assert_awaited_once()
+    mock_parent_cls.assert_called_once_with(config, task_manager, "ws://new.url")
+    assert group.parents == [new_parent]
+    assert new_parent.endpoint_registry == registry
+    task_manager.add_task_safe.assert_called_once_with(new_parent.run.return_value, "parent_infra_group.reconfigure")
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_clears_parents_when_mesh_url_empty() -> None:
+    old_parent = _make_parent("http://old.url")
+    old_parent.stop = AsyncMock()
+    group = ParentInfraGroup([old_parent])
+
+    config = MagicMock()
+    config.connect_to_mesh_url = ""
+    task_manager = MagicMock()
+
+    await group.reconfigure(config, task_manager)
+
+    old_parent.stop.assert_awaited_once()
+    assert group.parents == []
+    task_manager.add_task_safe.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_skips_endpoint_registry_propagation_when_never_assigned() -> None:
+    group = ParentInfraGroup([])
+
+    config = MagicMock()
+    config.connect_to_mesh_url = "ws://new.url"
+    task_manager = MagicMock()
+
+    with patch("server.websockets.parent_infra_group.ParentInfra") as mock_parent_cls:
+        new_parent = mock_parent_cls.return_value
+        await group.reconfigure(config, task_manager)
+
+    assert group.parents == [new_parent]
+    task_manager.add_task_safe.assert_called_once_with(new_parent.run.return_value, "parent_infra_group.reconfigure")
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_propagates_endpoint_registry_when_group_started_with_no_parents() -> None:
+    """Regression test: group started with an empty parents list (no `connect_to_mesh_url` at boot),
+    so `endpoint_registry` was assigned via the setter while `self.parents` was still empty. The new
+    parent created by a later `reconfigure()` call must still receive that registry."""
+    group = ParentInfraGroup([])
+    registry = MagicMock()
+    group.endpoint_registry = registry
+
+    config = MagicMock()
+    config.connect_to_mesh_url = "ws://new.url"
+    task_manager = MagicMock()
+
+    with patch("server.websockets.parent_infra_group.ParentInfra") as mock_parent_cls:
+        new_parent = mock_parent_cls.return_value
+        await group.reconfigure(config, task_manager)
+
+    assert group.parents == [new_parent]
+    assert new_parent.endpoint_registry == registry
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_propagates_get_children_to_new_parent() -> None:
+    """Regression test: get_children must survive a live mesh reconfigure, not just process restart —
+    otherwise the new parent silently reports an empty child list to its own parent up the mesh tree."""
+    old_parent = _make_parent("http://old.url")
+    old_parent.stop = AsyncMock()
+    group = ParentInfraGroup([old_parent])
+    callback = MagicMock()
+    group.get_children = callback
+
+    config = MagicMock()
+    config.connect_to_mesh_url = "ws://new.url"
+    task_manager = MagicMock()
+
+    with patch("server.websockets.parent_infra_group.ParentInfra") as mock_parent_cls:
+        new_parent = mock_parent_cls.return_value
+        await group.reconfigure(config, task_manager)
+
+    assert new_parent.get_children is callback
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_defaults_get_children_when_never_assigned() -> None:
+    group = ParentInfraGroup([])
+
+    config = MagicMock()
+    config.connect_to_mesh_url = "ws://new.url"
+    task_manager = MagicMock()
+
+    with patch("server.websockets.parent_infra_group.ParentInfra") as mock_parent_cls:
+        new_parent = mock_parent_cls.return_value
+        await group.reconfigure(config, task_manager)
+
+    assert new_parent.get_children is dict

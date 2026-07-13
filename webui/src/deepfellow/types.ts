@@ -164,6 +164,8 @@ export interface ConfigEntry {
   key: string;
   value: string;
   is_secret: boolean;
+  field_name: string;
+  is_editable: boolean;
 }
 
 export interface ConfigOut {

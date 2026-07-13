@@ -568,6 +568,15 @@ export class DeepFellowClient {
       `/admin/config/${encodeURIComponent(key)}/reveal`,
     );
   }
+
+  async updateDynamicConfig(
+    updates: Record<string, unknown>,
+  ): Promise<ConfigOut> {
+    return this.makeRequest<ConfigOut>("/admin/config", {
+      method: "PUT",
+      body: JSON.stringify(updates),
+    });
+  }
 }
 
 type ApiErrorPayload = {

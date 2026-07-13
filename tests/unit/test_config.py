@@ -110,6 +110,18 @@ def test_load_config_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.name == "test-node"
 
 
+def test_load_config_succeeds_with_only_admin_key_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The point of this migration: only `infra_admin_api_key` is a required bootstrap field now."""
+    for k in _REQUIRED_ENV:
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("DF_INFRA_ADMIN_API_KEY", "admin-key")
+
+    result = load_config()
+
+    assert result.name == ""
+    assert result.mesh_key.get_secret_value() == ""
+
+
 def test_load_config_missing_fields_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     for k in _REQUIRED_ENV:
         monkeypatch.delenv(k, raising=False)

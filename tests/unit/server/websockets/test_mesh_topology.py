@@ -18,6 +18,7 @@ from server.websockets.infra_client import InfraClient
 from server.websockets.infra_websocket_server import InfraWebsocketServer, InfraWsData
 from server.websockets.models import AncestorInfo, InitRequest, InitResponse, TopologyUpdateRequest
 from server.websockets.parent_infra import ParentInfra
+from server.websockets.parent_infra_group import ParentInfraGroup
 
 
 def _make_server(
@@ -342,9 +343,7 @@ def test_infra_websocket_server_registers_get_children_on_parents() -> None:
     parent_a = MagicMock()
     parent_b = MagicMock()
 
-    parent_infra = MagicMock()
-    parent_infra.parents = [parent_a, parent_b]
-    parent_infra.ancestors = []
+    parent_infra = ParentInfraGroup([parent_a, parent_b])
 
     server = InfraWebsocketServer(MagicMock(), parent_infra, MagicMock())
 
@@ -354,6 +353,24 @@ def test_infra_websocket_server_registers_get_children_on_parents() -> None:
     server._nested_topology["http://x.url"] = TopologyUpdateRequest(action="join", url="http://x.url", name="X")  # type: ignore[reportPrivateUsage]
     assert "http://x.url" in cast("dict[str, object]", parent_a.get_children())
     assert "http://x.url" in cast("dict[str, object]", parent_b.get_children())
+
+
+@pytest.mark.asyncio
+async def test_infra_websocket_server_get_children_survives_parent_group_reconfigure() -> None:
+    """Regression test: a `ParentInfraGroup.reconfigure()` call must propagate the same
+    get_children callback registered by InfraWebsocketServer to any newly created parent."""
+    parent_infra = ParentInfraGroup([])
+    server = InfraWebsocketServer(MagicMock(), parent_infra, MagicMock())
+    server._nested_topology["http://x.url"] = TopologyUpdateRequest(action="join", url="http://x.url", name="X")  # type: ignore[reportPrivateUsage]
+
+    config = MagicMock()
+    config.connect_to_mesh_url = "ws://new.url"
+    task_manager = MagicMock()
+    with patch("server.websockets.parent_infra_group.ParentInfra") as mock_parent_cls:
+        new_parent = mock_parent_cls.return_value
+        await parent_infra.reconfigure(config, task_manager)
+
+    assert "http://x.url" in cast("dict[str, object]", new_parent.get_children())
 
 
 @pytest.mark.asyncio

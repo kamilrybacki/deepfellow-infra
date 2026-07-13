@@ -9,6 +9,7 @@
 
 """Core FastAPI dependencies for the application."""
 
+import asyncio
 from typing import Annotated, Any
 
 from fastapi import Depends, HTTPException, Request, WebSocket
@@ -19,7 +20,9 @@ from server.endpointregistry import EndpointRegistry
 from server.metrics import MetricsService
 from server.serviceprovider import ServiceProvider
 from server.services_manager import ServicesManager
+from server.task_manager import TaskManager
 from server.utils.hardware import Hardware
+from server.utils.tracing import OtlpLoggingManager
 from server.websockets.infra_websocket_server import InfraWebsocketServer
 from server.websockets.parent_infra_group import ParentInfraGroup
 
@@ -56,6 +59,11 @@ def get_config(request: Request) -> AppSettings:
     return get_dependency(request, "config")
 
 
+def get_config_lock(request: Request) -> asyncio.Lock:
+    """Get the config.json read-merge-write lock from application state."""
+    return get_dependency(request, "config_lock")
+
+
 def get_infra_websocket_server(request: Request) -> InfraWebsocketServer:
     """Get InfraWebsocketServer from application state."""
     return get_dependency(request, "infra_websocket_server")
@@ -74,6 +82,16 @@ def get_hardware(request: Request) -> Hardware:
 def get_metrics_service(request: Request) -> MetricsService:
     """Get MetricsService instance from application state."""
     return get_dependency(request, "metrics_service")
+
+
+def get_task_manager(request: Request) -> TaskManager:
+    """Get TaskManager instance from application state."""
+    return get_dependency(request, "task_manager")
+
+
+def get_otlp_logging(request: Request) -> OtlpLoggingManager:
+    """Get OtlpLoggingManager instance from application state."""
+    return get_dependency(request, "otlp_logging")
 
 
 def auth_server(

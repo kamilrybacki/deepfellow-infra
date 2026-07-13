@@ -6,6 +6,8 @@ __pycache__
 /.venv
 /storage
 .env
+/config.json
+/config.json.bak*
 /.vscode
 /.claude/settings.json
 /.claude/settings.local.md

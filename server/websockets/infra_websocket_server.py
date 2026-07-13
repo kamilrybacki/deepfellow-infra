@@ -52,8 +52,7 @@ class InfraWebsocketServer(WebSocketServer[InfraWsData]):
         self._sub_connections: dict[str, str] = {}
         self._nested_topology: dict[str, TopologyUpdateRequest] = {}
         self.server = JsonRpcServer[InfraWsData](lambda method, params, context: self._handle_json_rpc_request(method, params, context))
-        for parent in parent_infra.parents:
-            parent.get_children = lambda: dict(self._nested_topology)
+        parent_infra.get_children = lambda: dict(self._nested_topology)
 
     @property
     def _own_ancestors(self) -> list[AncestorInfo]:

@@ -16,6 +16,8 @@ class ConfigEntry(BaseModel):
     key: str
     value: str
     is_secret: bool
+    field_name: str
+    is_editable: bool
 
 
 class ConfigOut(BaseModel):

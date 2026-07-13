@@ -18,8 +18,10 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Switch } from "@/components/ui/switch";
 import {
   Table,
   TableBody,
@@ -31,9 +33,19 @@ import {
 import { apiClient } from "@/deepfellow/client";
 import type { ConfigEntry } from "@/deepfellow/types";
 import { useRequireAuth } from "@/hooks/use-auth";
-import { useQuery } from "@tanstack/react-query";
+import { isBooleanValue } from "@/utils/config-helpers";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
-import { Clipboard, ClipboardCheck, Eye, EyeOff, Server } from "lucide-react";
+import {
+  Check,
+  Clipboard,
+  ClipboardCheck,
+  Eye,
+  EyeOff,
+  Pencil,
+  Server,
+  X,
+} from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 
@@ -220,11 +232,71 @@ function ConfigPage() {
 
   const [revealed, setRevealed] = useState<Record<string, string>>({});
   const [copied, setCopied] = useState<string | null>(null);
+  const [editing, setEditing] = useState<Record<string, string>>({});
+
+  const queryClient = useQueryClient();
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["admin-config"],
     queryFn: () => apiClient.getConfig(),
   });
+
+  const updateMutation = useMutation({
+    mutationFn: (updates: Record<string, unknown>) =>
+      apiClient.updateDynamicConfig(updates),
+  });
+
+  const startEdit = (entry: ConfigEntry) => {
+    setEditing((prev) => ({
+      ...prev,
+      // Never pre-fill a secret's edit field with the masked placeholder.
+      [entry.field_name]: entry.is_secret ? "" : entry.value,
+    }));
+  };
+
+  const cancelEdit = (entry: ConfigEntry) => {
+    setEditing((prev) => {
+      const next = { ...prev };
+      delete next[entry.field_name];
+      return next;
+    });
+  };
+
+  const confirmEdit = (entry: ConfigEntry) => {
+    const rawValue = editing[entry.field_name];
+    if (entry.is_secret && rawValue === "") {
+      // Blank secret edit means "no change" — don't send a request.
+      cancelEdit(entry);
+      return;
+    }
+
+    const value: unknown = isBooleanValue(entry.value)
+      ? rawValue === "True"
+      : rawValue;
+
+    updateMutation.mutate(
+      { [entry.field_name]: value },
+      {
+        onSuccess: () => {
+          queryClient.invalidateQueries({ queryKey: ["admin-config"] });
+          toast.success(`Updated ${entry.key}.`);
+          cancelEdit(entry);
+          // The revealed value is now stale (pre-edit) — stop showing it in place of the mask.
+          setRevealed((prev) => {
+            if (!(entry.key in prev)) return prev;
+            const next = { ...prev };
+            delete next[entry.key];
+            return next;
+          });
+        },
+        onError: (e) => {
+          toast.error(
+            `Failed to update ${entry.key}: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        },
+      },
+    );
+  };
 
   const fetchSecret = async (key: string): Promise<string> => {
     const result = await apiClient.revealConfigEntry(key);
@@ -333,7 +405,54 @@ function ConfigPage() {
                                 {entry.key}
                               </TableCell>
                               <TableCell className="font-mono text-sm">
-                                {entry.is_secret ? (
+                                {entry.field_name in editing ? (
+                                  isBooleanValue(entry.value) ? (
+                                    <Switch
+                                      checked={
+                                        editing[entry.field_name] === "True"
+                                      }
+                                      onCheckedChange={(checked) =>
+                                        setEditing((prev) => ({
+                                          ...prev,
+                                          [entry.field_name]: checked
+                                            ? "True"
+                                            : "False",
+                                        }))
+                                      }
+                                    />
+                                  ) : (
+                                    <Input
+                                      autoFocus
+                                      className="h-8 max-w-xs"
+                                      type={
+                                        entry.is_secret ? "password" : "text"
+                                      }
+                                      // Stop browsers from suggesting/autofilling a saved login
+                                      // password into this field just because type="password".
+                                      autoComplete={
+                                        entry.is_secret ? "new-password" : "off"
+                                      }
+                                      placeholder={
+                                        entry.is_secret
+                                          ? "Enter new value"
+                                          : undefined
+                                      }
+                                      value={editing[entry.field_name]}
+                                      onChange={(e) =>
+                                        setEditing((prev) => ({
+                                          ...prev,
+                                          [entry.field_name]: e.target.value,
+                                        }))
+                                      }
+                                      onKeyDown={(e) => {
+                                        if (e.key === "Enter")
+                                          confirmEdit(entry);
+                                        if (e.key === "Escape")
+                                          cancelEdit(entry);
+                                      }}
+                                    />
+                                  )
+                                ) : entry.is_secret ? (
                                   entry.key in revealed ? (
                                     revealed[entry.key]
                                   ) : (
@@ -351,38 +470,76 @@ function ConfigPage() {
                               </TableCell>
                               <TableCell className="pr-6 text-right">
                                 <div className="flex justify-end gap-1">
-                                  {entry.is_secret && (
-                                    <Button
-                                      variant="ghost"
-                                      size="icon"
-                                      className="size-7"
-                                      onClick={() => handleReveal(entry)}
-                                      title={
-                                        entry.key in revealed
-                                          ? "Hide value"
-                                          : "Reveal value"
-                                      }
-                                    >
-                                      {entry.key in revealed ? (
-                                        <EyeOff className="size-4" />
-                                      ) : (
-                                        <Eye className="size-4" />
+                                  {entry.field_name in editing ? (
+                                    <>
+                                      <Button
+                                        variant="ghost"
+                                        size="icon"
+                                        className="size-7"
+                                        onClick={() => confirmEdit(entry)}
+                                        disabled={updateMutation.isPending}
+                                        title="Save"
+                                      >
+                                        <Check className="size-4" />
+                                      </Button>
+                                      <Button
+                                        variant="ghost"
+                                        size="icon"
+                                        className="size-7"
+                                        onClick={() => cancelEdit(entry)}
+                                        disabled={updateMutation.isPending}
+                                        title="Cancel"
+                                      >
+                                        <X className="size-4" />
+                                      </Button>
+                                    </>
+                                  ) : (
+                                    <>
+                                      {entry.is_editable && (
+                                        <Button
+                                          variant="ghost"
+                                          size="icon"
+                                          className="size-7"
+                                          onClick={() => startEdit(entry)}
+                                          title="Edit value"
+                                        >
+                                          <Pencil className="size-4" />
+                                        </Button>
                                       )}
-                                    </Button>
+                                      {entry.is_secret && (
+                                        <Button
+                                          variant="ghost"
+                                          size="icon"
+                                          className="size-7"
+                                          onClick={() => handleReveal(entry)}
+                                          title={
+                                            entry.key in revealed
+                                              ? "Hide value"
+                                              : "Reveal value"
+                                          }
+                                        >
+                                          {entry.key in revealed ? (
+                                            <EyeOff className="size-4" />
+                                          ) : (
+                                            <Eye className="size-4" />
+                                          )}
+                                        </Button>
+                                      )}
+                                      <Button
+                                        variant="ghost"
+                                        size="icon"
+                                        className="size-7"
+                                        onClick={() => handleCopy(entry)}
+                                        title="Copy to clipboard"
+                                      >
+                                        {copied === entry.key ? (
+                                          <ClipboardCheck className="size-4" />
+                                        ) : (
+                                          <Clipboard className="size-4" />
+                                        )}
+                                      </Button>
+                                    </>
                                   )}
-                                  <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    className="size-7"
-                                    onClick={() => handleCopy(entry)}
-                                    title="Copy to clipboard"
-                                  >
-                                    {copied === entry.key ? (
-                                      <ClipboardCheck className="size-4" />
-                                    ) : (
-                                      <Clipboard className="size-4" />
-                                    )}
-                                  </Button>
                                 </div>
                               </TableCell>
                             </TableRow>

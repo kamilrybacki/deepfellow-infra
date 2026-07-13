@@ -9,6 +9,7 @@
 
 """Lifecycle."""
 
+import asyncio
 import logging
 import os
 import re
@@ -21,6 +22,7 @@ from fastapi import FastAPI
 from server.applicationcontext import ApplicationContext
 from server.config import ConfigError, load_config
 from server.docker import create_docker_service
+from server.dynamic_config import load_or_init as load_dynamic_config
 from server.endpointregistry import EndpointRegistry
 from server.metrics import MetricsService
 from server.metrics_registry import MetricsRegistry
@@ -46,7 +48,7 @@ from server.task_manager import TaskManager
 from server.utils.exceptions import AppStartError
 from server.utils.hardware import Hardware
 from server.utils.model_downloader import ModelDownloader
-from server.utils.tracing import setup_otlp_logging
+from server.utils.tracing import OtlpLoggingManager, tracer
 from server.websockets.infra_websocket_server import InfraWebsocketServer
 from server.websockets.parent_infra import ParentInfra
 from server.websockets.parent_infra_group import ParentInfraGroup
@@ -66,13 +68,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     try:
         try:
             app.state.config = config = load_config()
+            app.state.config_lock = asyncio.Lock()
+            load_dynamic_config(config)
         except ConfigError as e:
             raise AppStartError(str(e))  # noqa: B904
         except Exception as e:
-            raise AppStartError("Config error. Have you created the .env file?") from e
+            raise AppStartError("Config error. Check your .env file and config.json.") from e
 
+        tracer.config = config
+        app.state.otlp_logging = otlp_logging = OtlpLoggingManager()
         if config.otel_logging_enabled:
-            setup_otlp_logging(config)
+            otlp_logging.setup(config)
 
         if app.state.config.docker_subnet:
             check_subnet(app.state.config.docker_subnet)
