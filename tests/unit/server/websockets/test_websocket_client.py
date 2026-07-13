@@ -90,6 +90,39 @@ def test_send_enqueues_message_when_connected():
 
 
 @pytest.mark.asyncio
+async def test_stop_without_connection_just_flags_loop():
+    client = make_client()
+
+    await client.stop()
+
+    assert client.process_loop is False
+
+
+@pytest.mark.asyncio
+async def test_stop_closes_active_connection():
+    client = make_client()
+    connection = AsyncMock()
+    client.ws = (connection, asyncio.Queue())
+
+    await client.stop()
+
+    assert client.process_loop is False
+    connection.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stop_suppresses_close_exception():
+    client = make_client()
+    connection = AsyncMock()
+    connection.close.side_effect = Exception("boom")
+    client.ws = (connection, asyncio.Queue())
+
+    await client.stop()  # should not raise
+
+    assert client.process_loop is False
+
+
+@pytest.mark.asyncio
 async def test_run_skips_loop_when_before_loop_false():
     client = make_client()
     client.before_loop = AsyncMock(return_value=False)
@@ -149,6 +182,132 @@ async def test_loop_single_connect_disconnect_cycle():
 
     assert on_start_calls, "on_start should have been called"
     assert on_disconnect_calls, "on_disconnect should have been called"
+
+
+@pytest.mark.asyncio
+async def test_loop_closes_and_exits_promptly_when_stopped_during_connect():
+    """A stop() racing an in-flight connect() must not leave the client connected indefinitely.
+
+    While `websockets.connect()` is still resolving, `self.ws` is still `None`, so a concurrent
+    `stop()` call has nothing to close and only flips `process_loop`. Once the connect succeeds,
+    `loop()` must notice that flag before calling `on_start()`/awaiting `receive_task` — otherwise
+    the "stopped" client would stay connected until it happens to disconnect on its own.
+    """
+    client = make_client()
+    on_start_calls: list[bool] = []
+    client.on_start = AsyncMock(side_effect=lambda: on_start_calls.append(True))  # type: ignore[method-assign]
+
+    mock_ws = make_mock_ws()
+    mock_connect = make_connect_patch(mock_ws)
+
+    async def stop_mid_connect() -> MagicMock:
+        # Simulate stop() running while this connect() was in flight and self.ws was still None.
+        client.process_loop = False
+        return mock_ws
+
+    mock_connect.return_value.__aenter__ = AsyncMock(side_effect=stop_mid_connect)
+    mock_ws_module = MagicMock()
+    mock_ws_module.connect = mock_connect
+
+    with patch.object(_wc_module, "websockets", mock_ws_module):
+        await client.loop()
+
+    assert on_start_calls == [], "on_start must not run once stop() has been observed"
+    mock_ws.close.assert_awaited_once()
+    assert client.ws is None
+
+
+@pytest.mark.asyncio
+async def test_loop_calls_on_disconnect_when_stopped_during_connect():
+    """The stop-during-connect path is still a teardown — subclasses must get on_disconnect() too.
+
+    Every other exit from loop() (normal disconnect, connect exception) reaches on_disconnect();
+    this path shouldn't be an undocumented exception to that contract.
+    """
+    client = make_client()
+    on_disconnect_calls: list[bool] = []
+    client.on_disconnect = lambda: on_disconnect_calls.append(True)  # type: ignore[method-assign]
+
+    mock_ws = make_mock_ws()
+    mock_connect = make_connect_patch(mock_ws)
+
+    async def stop_mid_connect() -> MagicMock:
+        client.process_loop = False
+        return mock_ws
+
+    mock_connect.return_value.__aenter__ = AsyncMock(side_effect=stop_mid_connect)
+    mock_ws_module = MagicMock()
+    mock_ws_module.connect = mock_connect
+
+    with patch.object(_wc_module, "websockets", mock_ws_module):
+        await client.loop()
+
+    assert on_disconnect_calls, "on_disconnect should have been called"
+
+
+@pytest.mark.asyncio
+async def test_loop_cancels_hanging_receive_task_when_stopped_during_connect():
+    """The receive_task cancellation must be real, not just a no-op await.
+
+    `_receive_task` here hangs forever (waiting on an `Event` nobody sets), so if `loop()` merely
+    awaited it without cancelling first, `loop()` itself would never return. `asyncio.wait(...,
+    timeout=...)` (unlike `wait_for`) never touches the task's cancellation state itself, so it
+    can't be fooled by `loop()`'s own `suppress(asyncio.CancelledError)` the way `wait_for` can —
+    it only reports whether the task actually finished in time.
+    """
+    client = make_client()
+    never_set = asyncio.Event()
+
+    async def hanging_receive_task(_ws: object) -> None:
+        await never_set.wait()
+
+    client._receive_task = hanging_receive_task  # type: ignore[method-assign]
+
+    mock_ws = make_mock_ws()
+    mock_connect = make_connect_patch(mock_ws)
+
+    async def stop_mid_connect() -> MagicMock:
+        client.process_loop = False
+        return mock_ws
+
+    mock_connect.return_value.__aenter__ = AsyncMock(side_effect=stop_mid_connect)
+    mock_ws_module = MagicMock()
+    mock_ws_module.connect = mock_connect
+
+    with patch.object(_wc_module, "websockets", mock_ws_module):
+        loop_task = asyncio.create_task(client.loop())
+        done, pending = await asyncio.wait([loop_task], timeout=1.0)
+
+    if pending:
+        loop_task.cancel()
+        pytest.fail("loop() did not return — the hanging receive_task was never cancelled")
+
+    assert loop_task in done
+    mock_ws.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_loop_logs_and_continues_when_close_fails_during_disconnect(caplog: pytest.LogCaptureFixture):
+    client = make_client()
+
+    async def fake_on_start() -> None:
+        client.process_loop = False
+
+    client.on_start = fake_on_start  # type: ignore[method-assign]
+    mock_ws = make_mock_ws()
+    mock_ws.close = AsyncMock(side_effect=RuntimeError("close failed"))
+    mock_connect = make_connect_patch(mock_ws)
+    mock_ws_module = MagicMock()
+    mock_ws_module.connect = mock_connect
+
+    with (
+        patch.object(_wc_module, "websockets", mock_ws_module),
+        patch("asyncio.sleep", new=AsyncMock()),
+        caplog.at_level("ERROR", logger="uvicorn.error"),
+    ):
+        await client.loop()  # should not raise
+
+    assert "Error closing websocket connection during disconnect" in caplog.text
 
 
 @pytest.mark.asyncio

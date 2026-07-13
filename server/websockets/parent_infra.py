@@ -107,4 +107,5 @@ class ParentInfra(WebSocketClient):
 
     def check_subinfra_connection(self, model: CheckMeshConnection) -> bool:
         """Check if given sub infra connection data is valid."""
-        return self.one_time_key.check(model.connection_verifier) and self.config.infra_api_key.get_secret_value() == model.infra_api_key
+        api_key = self.config.infra_api_key.get_secret_value()
+        return self.one_time_key.check(model.connection_verifier) and api_key == model.infra_api_key

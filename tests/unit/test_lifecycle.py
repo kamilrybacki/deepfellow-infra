@@ -89,7 +89,8 @@ SERVICE_CLASSES = [
 
 _BASE_PATCHES = [
     "server.lifecycle.load_config",
-    "server.lifecycle.setup_otlp_logging",
+    "server.lifecycle.load_dynamic_config",
+    "server.lifecycle.OtlpLoggingManager",
     "server.lifecycle.Hardware",
     "server.lifecycle.MetricsRegistry",
     "server.lifecycle.TaskManager",
@@ -162,8 +163,10 @@ async def test_lifespan_calls_setup_otlp_logging_when_enabled(app: FastAPI, base
     async with lifespan(app):
         pass
 
-    assert base_mocks["server.lifecycle.setup_otlp_logging"].call_count == 1
-    assert base_mocks["server.lifecycle.setup_otlp_logging"].call_args == call(cfg)
+    otlp_logging = base_mocks["server.lifecycle.OtlpLoggingManager"].return_value
+    assert otlp_logging.setup.call_count == 1
+    assert otlp_logging.setup.call_args == call(cfg)
+    assert app.state.otlp_logging is otlp_logging
 
 
 @pytest.mark.asyncio
@@ -174,7 +177,8 @@ async def test_lifespan_skips_setup_otlp_logging_when_disabled(app: FastAPI, bas
     async with lifespan(app):
         pass
 
-    assert base_mocks["server.lifecycle.setup_otlp_logging"].call_count == 0
+    otlp_logging = base_mocks["server.lifecycle.OtlpLoggingManager"].return_value
+    assert otlp_logging.setup.call_count == 0
 
 
 @pytest.mark.asyncio
@@ -220,6 +224,25 @@ async def test_lifespan_exit_on_exceptions(app: FastAPI, base_mocks: dict[str, M
 
         assert mock_exit.call_count == 1
         assert mock_exit.call_args[0][0] == 1
+
+
+@pytest.mark.asyncio
+async def test_lifespan_reports_config_json_error_instead_of_env_hint(
+    app: FastAPI, base_mocks: dict[str, Mock], caplog: pytest.LogCaptureFixture
+) -> None:
+    _apply_base_patches(base_mocks)
+    base_mocks["server.lifecycle.load_dynamic_config"].side_effect = ConfigError("config.json is not valid JSON: boom")
+
+    with (
+        patch("server.lifecycle.os._exit", side_effect=SystemExit(1)),
+        caplog.at_level("ERROR", logger="uvicorn.error"),
+        pytest.raises(SystemExit),
+    ):
+        async with lifespan(app):
+            pass
+
+    assert "config.json is not valid JSON: boom" in caplog.text
+    assert "Have you created the .env file" not in caplog.text
 
 
 @pytest.mark.asyncio

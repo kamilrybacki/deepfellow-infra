@@ -30,25 +30,61 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.trace import Span, Tracer
 from pydantic import BaseModel
 
-from server.config import AppSettings, load_config
+from server.config import AppSettings
 
 uvicorn_logger = logging.getLogger("uvicorn")
 
 
-def setup_otlp_logging(config: AppSettings) -> None:
-    """Attach an OTLP log handler to the root Python logger and non-propagating uvicorn loggers."""
-    resource = Resource(attributes={"service.name": "llm-audit"})
-    provider = LoggerProvider(resource=resource)
-    processor = BatchLogRecordProcessor(OTLPLogExporter(endpoint=config.otel_exporter_otlp_endpoint, insecure=True))
-    provider.add_log_record_processor(processor)
-    set_logger_provider(provider)
+class OtlpLoggingManager:
+    """Owns the OTLP log handler lifecycle for one app instance.
 
-    handler = LoggingHandler(level=logging.DEBUG, logger_provider=provider)
-    logging.getLogger().addHandler(handler)
+    Lives on `app.state.otlp_logging` (see `lifecycle.py`) rather than as module state, so each
+    `FastAPI` app instance owns its own handler reference instead of sharing one across instances.
+    """
 
-    # uvicorn loggers have propagate=false in logging_config.yaml so they won't reach root
-    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
-        logging.getLogger(name).addHandler(handler)
+    def __init__(self) -> None:
+        self._handler: LoggingHandler | None = None
+        self._provider: LoggerProvider | None = None
+
+    def setup(self, config: AppSettings) -> None:
+        """Attach an OTLP log handler to the root Python logger and non-propagating uvicorn loggers.
+
+        Idempotent: calling this again after `teardown()` rebuilds the exporter with the current
+        `config.otel_exporter_otlp_endpoint`, so it can be re-applied when that value changes via
+        `/admin/config` without a process restart.
+        """
+        resource = Resource(attributes={"service.name": "llm-audit"})
+        provider = self._provider = LoggerProvider(resource=resource)
+        processor = BatchLogRecordProcessor(OTLPLogExporter(endpoint=config.otel_exporter_otlp_endpoint, insecure=True))
+        provider.add_log_record_processor(processor)
+        set_logger_provider(provider)
+
+        handler = self._handler = LoggingHandler(level=logging.DEBUG, logger_provider=provider)
+        logging.getLogger().addHandler(handler)
+
+        # uvicorn loggers have propagate=false in logging_config.yaml so they won't reach root
+        for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+            logging.getLogger(name).addHandler(handler)
+
+    def teardown(self) -> None:
+        """Detach the OTLP log handler previously attached by `setup()`, if any."""
+        if self._handler is None:
+            return
+        for name in ("", "uvicorn", "uvicorn.error", "uvicorn.access"):
+            logging.getLogger(name).removeHandler(self._handler)
+        self._handler = None
+
+        # Stop the old BatchLogRecordProcessor's background export thread — otherwise every
+        # reconfigure() leaks one more thread that outlives its now-detached handler forever.
+        if self._provider is not None:
+            self._provider.shutdown()
+            self._provider = None
+
+    def reconfigure(self, config: AppSettings) -> None:
+        """Apply an `otel_logging_enabled`/`otel_exporter_otlp_endpoint` change without a restart."""
+        self.teardown()
+        if config.otel_logging_enabled:
+            self.setup(config)
 
 
 class FuncArgs:
@@ -64,27 +100,37 @@ class InfraTracer:
 
     def __init__(self, service_name: str) -> None:
         self.service_name = service_name
-        self.config = None
+        self.config: AppSettings | None = None
         self.tracer = None
+        self._tracer_endpoint: str | None = None
+        self._provider: TracerProvider | None = None
 
     def _get_config(self) -> AppSettings:
         if self.config is None:
-            self.config = load_config()
+            msg = "InfraTracer.config was not set. Ensure lifecycle.py assigns `tracer.config` at startup."
+            raise RuntimeError(msg)
         return self.config
 
     def _get_tracer(self) -> Tracer:
-        if self.tracer is None:
+        otlp_endpoint = self._get_config().otel_exporter_otlp_endpoint
+        # Rebuild the provider if the endpoint changed via /admin/config, so the exporter target
+        # updates without a process restart. Get the tracer directly from this provider instance
+        # (not `trace.set_tracer_provider()` + `trace.get_tracer()`) — the OTel SDK's global
+        # tracer provider is set-once; a second call is a silent no-op, which would leave every
+        # rebuilt provider/exporter constructed-then-discarded and spans stuck on the old endpoint.
+        if self.tracer is None or self._tracer_endpoint != otlp_endpoint:
+            # Stop the old BatchSpanProcessor's background export thread before discarding its
+            # provider — otherwise every endpoint change via /admin/config leaks one more thread.
+            if self._provider is not None:
+                self._provider.shutdown()
+
             resource = Resource(attributes={"service.name": self.service_name})
-            provider = TracerProvider(resource=resource)
-            # Get OTLP endpoint from config
-
-            otlp_endpoint = self._get_config().otel_exporter_otlp_endpoint
-
+            provider = self._provider = TracerProvider(resource=resource)
             processor = BatchSpanProcessor(OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True))
             provider.add_span_processor(processor)
 
-            trace.set_tracer_provider(provider)
-            self.tracer = trace.get_tracer(__name__)
+            self.tracer = provider.get_tracer(__name__)
+            self._tracer_endpoint = otlp_endpoint
         return self.tracer
 
     def _set_success_attributes(self, span: Span, execution_time: float) -> None:

@@ -21,24 +21,40 @@ class ConfigError(Exception):
 
 
 class AppSettings(BaseSettings):
-    name: str
-    infra_url: str
+    """Bootstrap settings, sourced from `.env`.
+
+    Only fields needed before Docker/networking can come up are loaded from the environment
+    here. Everything else is dynamic: it is defaulted below and then populated/overwritten
+    at startup from `config.json` by `server.dynamic_config`, and mutated in place
+    thereafter by the `/admin/config` API. Because this same `AppSettings` instance is
+    passed by reference into every long-lived component, mutating an attribute here is
+    immediately visible everywhere without extra plumbing.
+    """
+
     infra_admin_api_key: SecretStr  # key to connect to marketplace
-    mesh_key: SecretStr  # key to connect subinfra through ws
-    infra_api_key: SecretStr  # key to call /v1/ endpoints
-    connect_to_mesh_url: str = ""
-    connect_to_mesh_key: SecretStr = SecretStr("")
 
     docker_subnet: str = ""
     storage_dir: str = ""
     storage_services_dir: str = ""
+    container_name_prefix: str = ""
+    compose_prefix: str = "df_"
+
+    # --- Everything below is dynamic: populated from config.json, mutable at runtime. ---
+
+    name: str = ""
+    infra_url: str = ""
+
+    mesh_key: SecretStr = SecretStr("")  # key to connect subinfra through ws
+    infra_api_key: SecretStr = SecretStr("")  # key to call /v1/ endpoints
+
+    connect_to_mesh_url: str = ""
+    connect_to_mesh_key: SecretStr = SecretStr("")
+
     hugging_face_token: SecretStr = SecretStr("")
     civitai_token: SecretStr = SecretStr("")
     adapter_registry_url: str = ""
     adapter_registry_secret: SecretStr = SecretStr("")
     log_payloads: str = ""
-    container_name_prefix: str = ""
-    compose_prefix: str = "df_"
     stop_containers_on_shutdown: str = ""
 
     docker_hub_token: str = ""
@@ -119,7 +135,7 @@ def get_main_dir() -> Path:
 
 
 def load_config() -> AppSettings:
-    """Load config."""
+    """Load bootstrap config from `.env`. Dynamic fields are populated afterwards from config.json."""
     try:
         return AppSettings()  # type: ignore
     except ValidationError as e:
