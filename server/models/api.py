@@ -143,6 +143,13 @@ class ResponseFormat(BaseModel):
     json_schema: dict[str, Any] | None
 
 
+class ChatCompletionReasoningConfig(BaseModel):
+    effort: Annotated[
+        Literal["high", "medium", "low", "max", "none"],
+        Field(description="Constrains effort on reasoning for reasoning models. Mirrors the top-level `reasoning_effort` field."),
+    ] = "none"
+
+
 class ChatCompletionRequest(BaseModel):
     messages: Annotated[
         list[ChatMessage],
@@ -301,6 +308,28 @@ class ChatCompletionRequest(BaseModel):
             )
         ),
     ] = None
+    reasoning_effort: Annotated[
+        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None,
+        Field(
+            description=(
+                "Constrains effort on reasoning for reasoning models. Supported by backends that expose reasoning/thinking "
+                "models (e.g. Ollama with deepseek-r1, qwq). Note that some reasoning models think by default even when "
+                "this field is omitted - use `none` to explicitly disable reasoning rather than relying on its absence. "
+                "AI SDK clients must set this via `providerOptions.<provider>.reasoning_effort`, since the SDK's portable "
+                "top-level `reasoning` parameter is not automatically translated for non-recognized providers like Ollama."
+            )
+        ),
+    ] = None
+    reasoning: Annotated[
+        ChatCompletionReasoningConfig | None,
+        Field(
+            description=(
+                'Alternative, nested form of `reasoning_effort` (`{"effort": ...}`), accepted for parity with backends '
+                "(e.g. Ollama) that support both forms. If both `reasoning_effort` and `reasoning.effort` are set, both are "
+                "forwarded to the backend as-is; DeepFellow does not resolve conflicts between them."
+            )
+        ),
+    ] = None
 
     model_config = {
         "json_schema_extra": {
@@ -314,7 +343,15 @@ class ChatCompletionRequest(BaseModel):
                     "temperature": 0.7,
                     "max_completion_tokens": 500,
                     "stream": False,
-                }
+                },
+                {
+                    "model": "deepseek-r1",
+                    "messages": [
+                        {"role": "user", "content": "Explain quantum entanglement in one paragraph."},
+                    ],
+                    "reasoning_effort": "medium",
+                    "stream": False,
+                },
             ]
         }
     }
