@@ -39,6 +39,16 @@ describe("formatSettingValue", () => {
     expect(formatSettingValue("unknown", f)).toBe("unknown");
   });
 
+  it("maps a legacy boolean oneof value to the GPU/CPU option label", () => {
+    const f = field({
+      name: "hardware",
+      type: "oneof",
+      values: [{ label: "Default GPU", value: "GPU" }, "CPU"],
+    });
+    expect(formatSettingValue(true, f)).toBe("Default GPU");
+    expect(formatSettingValue(false, f)).toBe("CPU");
+  });
+
   it("renders booleans as Yes/No", () => {
     const f = field({ name: "enabled", type: "bool" });
     expect(formatSettingValue(true, f)).toBe("Yes");

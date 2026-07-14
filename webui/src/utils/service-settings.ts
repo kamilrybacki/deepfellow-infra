@@ -34,6 +34,9 @@ export function formatSettingValue(value: unknown, field?: SpecField): string {
 
   switch (field?.type) {
     case "oneof":
+      if (typeof value === "boolean") {
+        return labelForOneOf(field, value ? "GPU" : "CPU");
+      }
       return typeof value === "string"
         ? labelForOneOf(field, value)
         : String(value);

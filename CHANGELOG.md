@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Ollama VRAM usage for loaded models is now read directly from Ollama's `/api/ps` response instead of being parsed from container logs.
 
 ### Fixed
+- Services installed via the CLI now show their actual hardware in the WebUI settings instead of `hardware: true`. The `hardware` selection is normalized on install to a descriptive value — "CPU", the specific card name for a single GPU (e.g. "GPU | NVIDIA GeForce RTX 4090 | 24 GB | 0"), or "GPUs" for several — and already-installed services fall back to a CPU/GPU label when displaying a stored boolean.
 - `config.json` is now written to the storage directory instead of the app directory, so dynamic settings (mesh key, API keys, etc.) survive container recreation instead of resetting on every redeploy.
 - OTEL trace/log exporter endpoint changes now take effect immediately instead of silently keeping the old endpoint until a restart.
 - vLLM now releases reserved GPU memory and stops the model container on every model-install error path (option parsing, download, container start, post-start setup, and endpoint registration), not just on a Docker `RuntimeError`. Previously a failure after the container started left it running and kept the GPU-utilization budget occupied, blocking further model loads until a full service restart.

@@ -386,6 +386,7 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         if "hardware" not in options.spec:
             options.spec["hardware"] = options.spec.get("gpu", self.docker_service.has_gpu_support)
+        options.spec["hardware"] = self.canonicalize_hardware_spec(options.spec["hardware"])
         if platform.system() == "Darwin":
             raise HTTPException(400, "Stable Diffusion Next is not supported on macOS")
         parsed_options = try_parse_pydantic(SDOptions, options.spec)
