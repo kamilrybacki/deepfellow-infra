@@ -206,6 +206,31 @@ def test_post_chat_completions_passes_model_to_registry(registry: MagicMock, cli
     assert registry.execute_chat_completion.call_args.args[0].model == "gpt-4"
 
 
+def test_post_chat_completions_passes_reasoning_effort_to_registry(
+    registry: MagicMock, client: TestClient, auth_header: dict[str, str]
+) -> None:
+    client.post("/v1/chat/completions", json={**CHAT_BODY, "reasoning_effort": "medium"}, headers=auth_header)
+
+    body = registry.execute_chat_completion.call_args.args[0]
+    assert body.reasoning_effort == "medium"
+    assert "reasoning_effort" in body.model_dump(exclude_none=True)
+
+
+def test_post_chat_completions_passes_both_reasoning_fields_unresolved(
+    registry: MagicMock, client: TestClient, auth_header: dict[str, str]
+) -> None:
+    client.post(
+        "/v1/chat/completions",
+        json={**CHAT_BODY, "reasoning_effort": "low", "reasoning": {"effort": "high"}},
+        headers=auth_header,
+    )
+
+    body = registry.execute_chat_completion.call_args.args[0]
+    raw = body.model_dump(exclude_none=True)
+    assert raw["reasoning_effort"] == "low"
+    assert raw["reasoning"] == {"effort": "high"}
+
+
 COMPLETIONS_BODY = {"model": "gpt-3.5", "prompt": "Once upon a time"}
 
 

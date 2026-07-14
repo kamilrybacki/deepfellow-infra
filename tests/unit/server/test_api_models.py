@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from starlette.datastructures import UploadFile
 
 from server.models.api import (
+    ChatCompletionReasoningConfig,
     ChatCompletionRequest,
     ComparisonFilter,
     CompletionLegacyRequest,
@@ -242,6 +243,49 @@ def test_chat_completion_n_out_of_range(n: int) -> None:
 def test_images_request_n_exceeds_limit() -> None:
     with pytest.raises(ValidationError):
         ImagesRequest(model="dall-e-3", prompt="cat", n=11)
+
+
+@pytest.mark.parametrize("effort", ["none", "low", "medium", "high", "max"])
+def test_chat_completion_reasoning_effort_valid(effort: str) -> None:
+    req = ChatCompletionRequest(**_base_chat_req(reasoning_effort=effort))  # pyright: ignore[reportArgumentType]
+
+    assert req.reasoning_effort == effort
+
+
+def test_chat_completion_reasoning_effort_invalid() -> None:
+    with pytest.raises(ValidationError):
+        ChatCompletionRequest(**_base_chat_req(reasoning_effort="extreme"))  # pyright: ignore[reportArgumentType]
+
+
+@pytest.mark.parametrize("effort", ["none", "low", "medium", "high", "max"])
+def test_chat_completion_reasoning_nested_effort_valid(effort: str) -> None:
+    req = ChatCompletionRequest(**_base_chat_req(reasoning={"effort": effort}))  # pyright: ignore[reportArgumentType]
+
+    assert req.reasoning == ChatCompletionReasoningConfig(effort=effort)  # pyright: ignore[reportArgumentType]
+
+
+def test_chat_completion_reasoning_nested_effort_invalid() -> None:
+    with pytest.raises(ValidationError):
+        ChatCompletionRequest(**_base_chat_req(reasoning={"effort": "extreme"}))  # pyright: ignore[reportArgumentType]
+
+
+def test_chat_completion_reasoning_fields_omitted_by_default() -> None:
+    req = ChatCompletionRequest(**_base_chat_req())  # pyright: ignore[reportArgumentType]
+
+    assert req.reasoning_effort is None
+    assert req.reasoning is None
+    assert "reasoning_effort" not in req.model_dump(exclude_none=True)
+    assert "reasoning" not in req.model_dump(exclude_none=True)
+
+
+def test_chat_completion_reasoning_both_fields_forwarded_without_disambiguation() -> None:
+    req = ChatCompletionRequest(
+        **_base_chat_req(reasoning_effort="low", reasoning={"effort": "high"})  # pyright: ignore[reportArgumentType]
+    )
+
+    raw = req.model_dump(exclude_none=True)
+    assert raw["reasoning_effort"] == "low"
+    assert raw["reasoning"] == {"effort": "high"}
 
 
 def test_images_request_n_at_limit() -> None:
