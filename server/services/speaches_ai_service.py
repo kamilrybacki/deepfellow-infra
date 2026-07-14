@@ -594,6 +594,7 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         if "hardware" not in options.spec:
             options.spec["hardware"] = options.spec.get("gpu", self.docker_service.has_gpu_support)
+        options.spec["hardware"] = self.canonicalize_hardware_spec(options.spec["hardware"])
         parsed_options = try_parse_pydantic(SpeachesAIOptions, options.spec)
         volumes = [f"{self._get_working_dir()}/cache:/home/ubuntu/.cache/huggingface/hub"]
 

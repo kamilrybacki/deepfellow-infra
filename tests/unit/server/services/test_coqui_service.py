@@ -811,7 +811,7 @@ async def test_install_instance_hardware_already_in_spec_skips_default(svc: Coqu
         result = await promise.wait()
 
     assert isinstance(result, InstalledInfo)
-    assert result.parsed_options.hardware is False
+    assert result.parsed_options.hardware == "CPU"
 
 
 @pytest.mark.asyncio

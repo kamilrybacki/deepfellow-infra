@@ -227,6 +227,7 @@ class CoquiService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         if "hardware" not in options.spec:
             options.spec["hardware"] = options.spec.get("gpu", self.docker_service.has_gpu_support)
+        options.spec["hardware"] = self.canonicalize_hardware_spec(options.spec["hardware"])
         parsed_options = try_parse_pydantic(CoquiOptions, options.spec)
         image = self._get_image(self.is_given_hardware_support_gpu(parsed_options.hardware))
         await self._verify_docker_image(image.name, options.ignore_warnings)

@@ -1269,7 +1269,7 @@ async def test_install_instance_does_not_override_hardware_when_already_in_spec(
         promise = await svc._install_instance("default", options)  # pyright: ignore[reportPrivateUsage]
         await promise.wait()
 
-    assert options.spec["hardware"] is False  # was not overwritten
+    assert options.spec["hardware"] == "CPU"
 
 
 @pytest.mark.asyncio

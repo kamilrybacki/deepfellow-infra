@@ -645,6 +645,24 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
 
         return gpus
 
+    def canonicalize_hardware_spec(self, hardware_specification: str | bool | None) -> str:
+        """Convert a hardware spec into the descriptive string used by the UI.
+
+        A CLI install may leave `hardware` as a bare bool (or None), which the UI renders literally
+        as "true"/"false". This resolves the value to an option produced by `add_hardware_field_to_spec`
+        ("CPU", "GPU | <name>" for a single GPU, or "GPUs" for several) so it displays correctly and
+        round-trips through the settings form. Descriptive strings are returned as-is.
+        """
+        if isinstance(hardware_specification, str):
+            return hardware_specification
+
+        gpus = [part for part in self.get_specified_hardware_parts(hardware_specification) if isinstance(part, GpuInfo)]
+        if not gpus:
+            return "CPU"
+        if len(gpus) == 1:
+            return f"GPU | {gpus[0].long_name}"
+        return "GPUs"
+
     def add_hardware_field_to_spec(
         self,
         fields: list[ServiceField] | None = None,

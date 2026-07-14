@@ -297,6 +297,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
         """Normalize the hardware spec and validate the requested image_version, if any."""
         if "hardware" not in options.spec:
             options.spec["hardware"] = options.spec.get("gpu", self.docker_service.has_gpu_support)
+        options.spec["hardware"] = self.canonicalize_hardware_spec(options.spec["hardware"])
         await self.validate_docker_image_version(options.spec.get("image_version"), options.spec.get("hardware"))
 
     async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
