@@ -187,6 +187,22 @@ def test_post_responses_passes_model_to_registry(registry: MagicMock, client: Te
     assert call_args.args[0].model == "resp-model"
 
 
+def test_post_responses_with_reasoning_omits_temperature_and_top_p(
+    registry: MagicMock, client: TestClient, auth_header: dict[str, str]
+) -> None:
+    client.post(
+        "/v1/responses",
+        json={**RESPONSES_BODY, "reasoning": {"effort": "high"}},
+        headers=auth_header,
+    )
+
+    body = registry.execute_responses.call_args.args[0]
+    raw = body.model_dump(exclude_none=True)
+    assert raw["reasoning"] == {"effort": "high"}
+    assert "temperature" not in raw
+    assert "top_p" not in raw
+
+
 CHAT_BODY = {
     "model": "gpt-4",
     "messages": [{"role": "user", "content": "Hi"}],

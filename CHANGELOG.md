@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Ollama VRAM usage for loaded models is now read directly from Ollama's `/api/ps` response instead of being parsed from container logs.
 
 ### Fixed
+- `/v1/responses` now supports the full OpenAI reasoning schema (`effort`, `summary`, `context`, `mode`) for both Ollama and OpenAI-backed models, and no longer sends default parameter values (`temperature`, `top_p`, `tool_choice`, etc.) that previously caused every request to reasoning-only OpenAI models (e.g. `gpt-5.4-mini`) to fail outright.
 - /v1/chat/completions now allows enabling/disabling 'reasoning' for reasoning models.
 - Services installed via the CLI now show their actual hardware in the WebUI settings instead of `hardware: true`. The `hardware` selection is normalized on install to a descriptive value — "CPU", the specific card name for a single GPU (e.g. "GPU | NVIDIA GeForce RTX 4090 | 24 GB | 0"), or "GPUs" for several — and already-installed services fall back to a CPU/GPU label when displaying a stored boolean.
 - `config.json` is now written to the storage directory instead of the app directory, so dynamic settings (mesh key, API keys, etc.) survive container recreation instead of resetting on every redeploy.
