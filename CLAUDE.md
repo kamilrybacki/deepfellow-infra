@@ -82,3 +82,12 @@ Copy `example.env` to `.env` to get started. See `server/config.py` for full lis
 - App requires Docker socket at runtime (`/run/user/1000/docker.sock` rootless or `/var/run/docker.sock` standard)
 - WebUI dev server proxies to backend — set `VITE_DF_SERVER_URL=http://localhost:8086/`
 - Auth is validated separately from linting: `just auth-static` (static) and `just auth-runtime` (runtime)
+
+## Development Workflow
+
+- Plane project key: `DFINFRA` (used as `{PROJECT}` in BASE_WORKFLOW.md)
+- No `Co-Authored-By` trailer in commit messages
+
+<!-- BASE_WORKFLOW.md is a gitignored symlink; install from `deepfellow-claude-skills/install-workflow.sh` -->
+
+@./BASE_WORKFLOW.md

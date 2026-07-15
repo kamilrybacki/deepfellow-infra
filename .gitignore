@@ -45,3 +45,6 @@ memory
 .claude/skills/daily-report
 .claude/skills/write-python-tests
 .claude/skills/release
+.claude/skills/plane-api
+.claude/skills/create-work-item
+/BASE_WORKFLOW.md
