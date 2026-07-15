@@ -23,6 +23,11 @@ from server.models.api import (
     CreateTranscriptionRequest,
     EmbeddingRequest,
     ImagesRequest,
+    Reasoning,
+    ReasoningConfig,
+    ReasoningContentItem,
+    ReasoningSummary,
+    ResponsesRequest,
 )
 
 
@@ -314,3 +319,128 @@ def test_completion_legacy_max_tokens_zero_allowed() -> None:
     req = CompletionLegacyRequest(prompt="hi", model="gpt-3.5", max_tokens=0)
 
     assert req.max_tokens == 0
+
+
+@pytest.mark.parametrize("effort", ["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+def test_reasoning_config_effort_valid(effort: str) -> None:
+    config = ReasoningConfig(effort=effort)  # pyright: ignore[reportArgumentType]
+
+    assert config.effort == effort
+
+
+def test_reasoning_config_effort_invalid() -> None:
+    with pytest.raises(ValidationError):
+        ReasoningConfig(effort="extreme")  # pyright: ignore[reportArgumentType]
+
+
+@pytest.mark.parametrize("value", ["auto", "concise", "detailed"])
+def test_reasoning_config_summary_and_generate_summary_valid(value: str) -> None:
+    config = ReasoningConfig(summary=value, generate_summary=value)  # pyright: ignore[reportArgumentType]
+
+    assert config.summary == value
+    assert config.generate_summary == value
+
+
+def test_reasoning_config_summary_invalid() -> None:
+    with pytest.raises(ValidationError):
+        ReasoningConfig(summary="verbose")  # pyright: ignore[reportArgumentType]
+
+
+@pytest.mark.parametrize("value", ["auto", "current_turn", "all_turns"])
+def test_reasoning_config_context_valid(value: str) -> None:
+    config = ReasoningConfig(context=value)  # pyright: ignore[reportArgumentType]
+
+    assert config.context == value
+
+
+def test_reasoning_config_context_invalid() -> None:
+    with pytest.raises(ValidationError):
+        ReasoningConfig(context="every_turn")  # pyright: ignore[reportArgumentType]
+
+
+@pytest.mark.parametrize("value", ["standard", "pro"])
+def test_reasoning_config_mode_valid(value: str) -> None:
+    config = ReasoningConfig(mode=value)  # pyright: ignore[reportArgumentType]
+
+    assert config.mode == value
+
+
+def test_reasoning_config_mode_invalid() -> None:
+    with pytest.raises(ValidationError):
+        ReasoningConfig(mode="turbo")  # pyright: ignore[reportArgumentType]
+
+
+def test_responses_request_minimal_omits_optional_fields() -> None:
+    req = ResponsesRequest(model="gpt-5.4-mini")
+
+    raw = req.model_dump(exclude_none=True)
+    for field in (
+        "input",
+        "instructions",
+        "tool_choice",
+        "tools",
+        "temperature",
+        "top_p",
+        "stream",
+        "max_tool_calls",
+        "parallel_tool_calls",
+        "include",
+        "background",
+        "metadata",
+        "service_tier",
+        "store",
+        "truncation",
+        "user",
+    ):
+        assert field not in raw, f"{field} should be omitted when not explicitly set"
+
+
+def test_responses_request_explicit_values_are_forwarded() -> None:
+    req = ResponsesRequest(
+        model="gpt-5.4-mini",
+        input="What is 2+2?",
+        temperature=0.5,
+        top_p=0.9,
+        stream=True,
+        store=False,
+        truncation="auto",
+        user="user-123",
+    )
+
+    raw = req.model_dump(exclude_none=True)
+    assert raw["input"] == "What is 2+2?"
+    assert raw["temperature"] == 0.5
+    assert raw["top_p"] == 0.9
+    assert raw["stream"] is True
+    assert raw["store"] is False
+    assert raw["truncation"] == "auto"
+    assert raw["user"] == "user-123"
+
+
+def test_responses_request_reasoning_omits_unset_fields() -> None:
+    req = ResponsesRequest(model="gpt-5.4-mini", reasoning=ReasoningConfig(effort="high"))  # pyright: ignore[reportArgumentType]
+
+    raw = req.model_dump(exclude_none=True)
+    assert raw["reasoning"] == {"effort": "high"}
+
+
+def test_reasoning_input_item_omits_id_status_encrypted_content() -> None:
+    item = Reasoning(summary=[ReasoningSummary(text="thinking...")])
+
+    raw = item.model_dump(exclude_none=True)
+    assert "id" not in raw
+    assert "status" not in raw
+    assert "encrypted_content" not in raw
+    assert raw["summary"] == [{"type": "summary_text", "text": "thinking..."}]
+
+
+def test_reasoning_input_item_forwards_content() -> None:
+    item = Reasoning(
+        id="rs_abc123",
+        summary=[ReasoningSummary(text="summary")],
+        content=[ReasoningContentItem(text="raw reasoning text")],
+    )
+
+    raw = item.model_dump(exclude_none=True)
+    assert raw["id"] == "rs_abc123"
+    assert raw["content"] == [{"type": "reasoning_text", "text": "raw reasoning text"}]

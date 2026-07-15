@@ -1088,12 +1088,18 @@ class ReasoningSummary(BaseModel):
     text: str
 
 
+class ReasoningContentItem(BaseModel):
+    type: Literal["reasoning_text"] = "reasoning_text"
+    text: str
+
+
 class Reasoning(BaseModel):
-    id: str = str(uuid4())
+    id: str | None = None
     type: Literal["reasoning"] = "reasoning"
-    status: Literal["in_progress", "completed", "incomplete"] = "completed"
+    status: Literal["in_progress", "completed", "incomplete"] | None = None
     summary: list[ReasoningSummary]
-    encrypted_content: str = ""
+    content: list[ReasoningContentItem] | None = None
+    encrypted_content: str | None = None
 
 
 class ImageGenerationCall(BaseModel):
@@ -1151,8 +1157,31 @@ class Prompt(BaseModel):
 
 
 class ReasoningConfig(BaseModel):
-    effort: Literal["low", "medium", "high"] = "medium"
-    summary: str = ""
+    effort: Annotated[
+        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None,
+        Field(
+            description=(
+                "Constrains effort on reasoning for reasoning models. Currently supported values are none, minimal, low, "
+                "medium, high, xhigh, and max."
+            )
+        ),
+    ] = None
+    summary: Annotated[
+        Literal["auto", "concise", "detailed"] | None,
+        Field(description="A summary of the reasoning performed by the model."),
+    ] = None
+    generate_summary: Annotated[
+        Literal["auto", "concise", "detailed"] | None,
+        Field(deprecated=True, description="Deprecated in favor of `summary`."),
+    ] = None
+    context: Annotated[
+        Literal["auto", "current_turn", "all_turns"] | None,
+        Field(description="Controls which reasoning items are rendered back to the model on later turns."),
+    ] = None
+    mode: Annotated[
+        Literal["standard", "pro"] | None,
+        Field(description="Controls the reasoning execution mode for the request."),
+    ] = None
 
 
 class TextFormat(BaseModel):
@@ -1349,9 +1378,11 @@ class ResponsesRequest(BaseModel):
             ),
         ),
     ]
-    input: Annotated[str | list[Input], Field(description="Text, image, or file inputs to the model, used to generate a response.")] = []
+    input: Annotated[
+        str | list[Input] | None, Field(description="Text, image, or file inputs to the model, used to generate a response.")
+    ] = None
     instructions: Annotated[
-        str,
+        str | None,
         Field(
             description=(
                 "Previous messages inserted into the model's context."
@@ -1359,23 +1390,24 @@ class ResponsesRequest(BaseModel):
                 "over to the next response. This makes it simple to swap out system (or developer) messages in new responses."
             ),
         ),
-    ] = ""
+    ] = None
     text: Annotated[
         TextConfig | None,
         Field(description="Configuration options for a text response from the model. Can be plain text, JSON or structured JSON."),
     ] = None
     prompt: Annotated[Prompt | None, Field(description="Reference to a prompt template and its variables.")] = None
     tool_choice: Annotated[
-        Literal["none", "auto", "required"] | HostedToolChoice | McpToolChoice,
+        Literal["none", "auto", "required"] | HostedToolChoice | McpToolChoice | None,
         Field(
             description=(
                 "[Currently not supported] How the model should select which tool (or tools) to use when generating a response. "
+                "`none` is the default when no tools are present. `auto` is the default if tools are present. "
                 "See the `tools` parameter below to see how to specify which tools the model can call."
             ),
         ),
-    ] = "auto"
+    ] = None
     tools: Annotated[
-        list[ToolResponses],
+        list[ToolResponses] | None,
         Field(
             description=(
                 "An array of tools the model may call while generating a response. You can specify which tool to use by setting "
@@ -1390,21 +1422,22 @@ class ResponsesRequest(BaseModel):
                 "typed arguments and outputs. You can also use custom tools to call your own code."
             ),
         ),
-    ] = []
+    ] = None
     temperature: Annotated[
-        float,
+        float | None,
         Field(
             ge=0.0,
             le=2.0,
             description=(
                 "What sampling temperature to use, between `0` and `2`. Higher values like `0.8` will make the output more random, "
                 "while lower values like `0.2` will make it more focused and deterministic. We generally recommend altering this "
-                "or `top_p` but not both."
+                "or `top_p` but not both. Not supported by all models - reasoning-only models may reject this parameter entirely "
+                "if it is present, so it is only forwarded when explicitly set."
             ),
         ),
-    ] = 1.0
+    ] = None
     top_p: Annotated[
-        float,
+        float | None,
         Field(
             ge=0.0,
             le=1.0,
@@ -1412,20 +1445,20 @@ class ResponsesRequest(BaseModel):
                 "An alternative to sampling with `temperature`, called nucleus sampling, where the model considers the results of the "
                 "tokens with `top_p` probability mass. So `0.1` means only the tokens comprising the top 10% probability mass "
                 "are considered."
-                "We generally recommend altering this or `temperature` but not both."
+                "We generally recommend altering this or `temperature` but not both. Not supported by all models - reasoning-only "
+                "models may reject this parameter entirely if it is present, so it is only forwarded when explicitly set."
             ),
         ),
-    ] = 1.0
+    ] = None
     reasoning: Annotated[ReasoningConfig | None, Field(description="Configuration options for reasoning models.")] = None
     stream: Annotated[
-        bool,
+        bool | None,
         Field(
             description=(
-                "[Currently not supported] If set to true, the model response data will be streamed to the client as it "
-                "is generated using server-sent events."
+                "If set to true, the model response data will be streamed to the client as it is generated using server-sent events."
             ),
         ),
-    ] = False
+    ] = None
     max_output_tokens: Annotated[
         int | None,
         Field(
@@ -1436,7 +1469,7 @@ class ResponsesRequest(BaseModel):
         ),
     ] = None
     max_tool_calls: Annotated[
-        int,
+        int | None,
         Field(
             ge=0,
             le=10,
@@ -1446,10 +1479,10 @@ class ResponsesRequest(BaseModel):
                 "Any further attempts to call a tool by the model will be ignored."
             ),
         ),
-    ] = 5
-    parallel_tool_calls: Annotated[bool, Field(description="Whether to allow the model to run tool calls in parallel.")] = False
-    include: Annotated[list[str], Field(description="Specify additional output data to include in the model response.")] = []
-    background: Annotated[bool, Field(description="Whether to run the model response in the background.")] = False
+    ] = None
+    parallel_tool_calls: Annotated[bool | None, Field(description="Whether to allow the model to run tool calls in parallel.")] = None
+    include: Annotated[list[str] | None, Field(description="Specify additional output data to include in the model response.")] = None
+    background: Annotated[bool | None, Field(description="Whether to run the model response in the background.")] = None
     previous_response_id: Annotated[
         str | None,
         Field(
@@ -1471,23 +1504,24 @@ class ResponsesRequest(BaseModel):
         ),
     ] = None
     metadata: Annotated[
-        dict[str, str | int | float | bool],
+        dict[str, str | int | float | bool] | None,
         Field(
             description=(
                 "Set of 16 key-value pairs that can be attached to an object. This can be useful for storing additional information "
                 "about the object in a structured format, and querying for objects via API or the dashboard."
             ),
         ),
-    ] = {}
+    ] = None
     service_tier: Annotated[
-        Literal["auto", "default", "flex", "priority"],
+        Literal["auto", "default", "flex", "priority"] | None,
         Field(deprecated=True, description="[Not supported. Placeholder for compatibility]"),
-    ] = "auto"
+    ] = None
     store: Annotated[
-        bool, Field(description="[Currently not supported] Whether to store the generated model response for later retrieval via API.")
-    ] = True
+        bool | None,
+        Field(description="[Currently not supported] Whether to store the generated model response for later retrieval via API."),
+    ] = None
     truncation: Annotated[
-        Literal["auto", "disabled"],
+        Literal["auto", "disabled"] | None,
         Field(
             description=(
                 "[Currently not supported] The truncation strategy to use for the model response."
@@ -1497,9 +1531,9 @@ class ResponsesRequest(BaseModel):
                 "fail with a 400 error."
             ),
         ),
-    ] = "disabled"
+    ] = None
     user: Annotated[
-        str,
+        str | None,
         Field(
             deprecated=True,
             description=(
@@ -1507,7 +1541,7 @@ class ResponsesRequest(BaseModel):
                 "Use `prompt_cache_key` instead to maintain caching optimizations. A stable identifier for your end-users."
             ),
         ),
-    ] = ""
+    ] = None
 
     model_config = {"json_schema_extra": {"examples": [{"model": "llama3.1:8b", "input": "Say Hello World o/."}]}}
 
