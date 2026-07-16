@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- New `GET /info` endpoint, authorized with the server key (`DF_INFRA_API_KEY`), returns the running Infra version (`{"version": "..."}`) read from `pyproject.toml`.
 - Ollama service now has a "↻ Refresh catalog" button that fetches trending models from the Ollama library and merges them into the model list as a dynamic overlay, so newly released models show up without waiting for an app update. Each click always fetches fresh results; the 6-hour cache only applies to callers that don't pass `force=true`.
 - Ollama Cloud support with cached model list.
 - Most infra settings (mesh connection, API keys, MCP session limits, OTEL tracing/logging, etc.) are now stored in `config.json` and can be changed from the Configuration page (or the `/admin/config` API) without restarting the server. Only bootstrap settings still require `.env` and a restart.
@@ -15,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Optional `DOCKER_HUB_TOKEN` environment variable for authenticated Docker Hub access to raise rate limits when fetching image tags.
 
 ### Changed
+- Container healthcheck (`scripts/healthcheck.py`) now probes `/health` instead of `/docs`, consistent with every other health probe.
 - Bumped bundled Docker image versions for llama.cpp, Ollama, vLLM, and speaches-ai to their latest available releases.
 - Ollama VRAM usage for loaded models is now read directly from Ollama's `/api/ps` response instead of being parsed from container logs.
 
