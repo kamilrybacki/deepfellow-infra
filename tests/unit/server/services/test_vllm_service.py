@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 from fastapi import HTTPException
 
+from server.docker import ContainerStatus
 from server.models.models import InstallModelIn, ListModelsFilters, UninstallModelIn
 from server.models.services import InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import CustomModel, Instance, InstanceConfig
@@ -1784,3 +1785,251 @@ async def test_install_model_pre_func_exception_discards_installing_key(svc: Vll
         await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
 
     assert ("default", model_id) not in svc._installing  # pyright: ignore[reportPrivateUsage]
+
+
+def _status(exists: bool = True, state: str = "running", health: str = "healthy", restart_count: int = 0) -> ContainerStatus:
+    return ContainerStatus(exists=exists, state=state, health=health, restart_count=restart_count)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_instance_models_running_healthy_does_not_release(svc: VllmService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info()
+    model_info = _make_model_installed_info(model_id="m1", gpu_memory_utilization=0.5)
+    installed.models["m1"] = model_info
+    svc.gpu_memory_utilization = 0.5
+    deps["docker_service"].get_container_status = AsyncMock(return_value=_status(state="running", health="healthy"))
+
+    await svc._reconcile_instance_models("default", installed)  # pyright: ignore[reportPrivateUsage]
+
+    assert "m1" in installed.models
+    assert svc.gpu_memory_utilization == 0.5
+    deps["endpoint_registry"].unregister_chat_completion.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_instance_models_recovers_within_threshold_resets_counter(svc: VllmService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info()
+    model_info = _make_model_installed_info(model_id="m1", gpu_memory_utilization=0.5)
+    installed.models["m1"] = model_info
+    svc.gpu_memory_utilization = 0.5
+    deps["docker_service"].get_container_status = AsyncMock(return_value=_status(state="exited", health=""))
+
+    await svc._reconcile_instance_models("default", installed)  # pyright: ignore[reportPrivateUsage]
+    await svc._reconcile_instance_models("default", installed)  # pyright: ignore[reportPrivateUsage]
+
+    assert svc._crash_poll_state[("default", "m1")] == 2  # pyright: ignore[reportPrivateUsage]
+
+    deps["docker_service"].get_container_status = AsyncMock(return_value=_status(state="running", health="healthy"))
+    await svc._reconcile_instance_models("default", installed)  # pyright: ignore[reportPrivateUsage]
+
+    assert ("default", "m1") not in svc._crash_poll_state  # pyright: ignore[reportPrivateUsage]
+    assert "m1" in installed.models
+    assert svc.gpu_memory_utilization == 0.5
+
+
+@pytest.mark.asyncio
+async def test_reconcile_instance_models_releases_after_threshold_bad_polls(svc: VllmService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info()
+    model_info = _make_model_installed_info(model_id="m1", registration_id="reg-1", gpu_memory_utilization=0.5, model_type="llm")
+    installed.models["m1"] = model_info
+    svc.gpu_memory_utilization = 0.5
+    deps["docker_service"].get_container_status = AsyncMock(return_value=_status(exists=False, state="", health=""))
+    deps["docker_service"].uninstall_docker = AsyncMock()
+
+    with patch.object(svc, "_save", new_callable=AsyncMock) as mock_save:
+        for _ in range(3):
+            await svc._reconcile_instance_models("default", installed)  # pyright: ignore[reportPrivateUsage]
+
+    assert "m1" not in installed.models
+    assert svc.gpu_memory_utilization == pytest.approx(0.0)
+    assert ("default", "m1") not in svc._crash_poll_state  # pyright: ignore[reportPrivateUsage]
+    deps["endpoint_registry"].unregister_chat_completion.assert_called_once_with("m1", "reg-1")
+    deps["docker_service"].uninstall_docker.assert_called_once_with(model_info.docker)
+    mock_save.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_instance_models_keeps_bookkeeping_when_teardown_fails_and_retries(svc: VllmService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info()
+    model_info = _make_model_installed_info(model_id="m1", registration_id="reg-1", gpu_memory_utilization=0.5)
+    installed.models["m1"] = model_info
+    svc.gpu_memory_utilization = 0.5
+    deps["docker_service"].get_container_status = AsyncMock(return_value=_status(exists=False, state="", health=""))
+    deps["docker_service"].uninstall_docker = AsyncMock(side_effect=RuntimeError("docker daemon busy"))
+
+    for _ in range(3):
+        await svc._reconcile_instance_models("default", installed)  # pyright: ignore[reportPrivateUsage]
+
+    # Teardown kept failing: bookkeeping stays untouched, nothing released yet.
+    assert "m1" in installed.models
+    assert svc.gpu_memory_utilization == pytest.approx(0.5)
+    deps["endpoint_registry"].unregister_chat_completion.assert_not_called()
+
+    # Teardown finally succeeds on a later tick, without needing 3 more bad polls first.
+    deps["docker_service"].uninstall_docker = AsyncMock()
+    with patch.object(svc, "_save", new_callable=AsyncMock) as mock_save:
+        await svc._reconcile_instance_models("default", installed)  # pyright: ignore[reportPrivateUsage]
+
+    assert "m1" not in installed.models
+    assert svc.gpu_memory_utilization == pytest.approx(0.0)
+    deps["endpoint_registry"].unregister_chat_completion.assert_called_once_with("m1", "reg-1")
+    mock_save.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_instance_models_recovers_while_teardown_was_failing(svc: VllmService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info()
+    model_info = _make_model_installed_info(model_id="m1", gpu_memory_utilization=0.5)
+    installed.models["m1"] = model_info
+    svc.gpu_memory_utilization = 0.5
+    deps["docker_service"].get_container_status = AsyncMock(return_value=_status(exists=False, state="", health=""))
+    deps["docker_service"].uninstall_docker = AsyncMock(side_effect=RuntimeError("docker daemon busy"))
+
+    for _ in range(3):
+        await svc._reconcile_instance_models("default", installed)  # pyright: ignore[reportPrivateUsage]
+
+    # Container comes back healthy on its own (e.g. manually restarted) before teardown ever succeeded.
+    deps["docker_service"].get_container_status = AsyncMock(return_value=_status(state="running", health="healthy"))
+    await svc._reconcile_instance_models("default", installed)  # pyright: ignore[reportPrivateUsage]
+
+    assert "m1" in installed.models
+    assert svc.gpu_memory_utilization == pytest.approx(0.5)
+    assert ("default", "m1") not in svc._crash_poll_state  # pyright: ignore[reportPrivateUsage]
+    deps["endpoint_registry"].unregister_chat_completion.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_instance_models_unhealthy_running_container_counts_as_bad(svc: VllmService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info()
+    model_info = _make_model_installed_info(model_id="m1", gpu_memory_utilization=0.5)
+    installed.models["m1"] = model_info
+    svc.gpu_memory_utilization = 0.5
+    deps["docker_service"].get_container_status = AsyncMock(return_value=_status(state="running", health="unhealthy"))
+    deps["docker_service"].uninstall_docker = AsyncMock()
+
+    with patch.object(svc, "_save", new_callable=AsyncMock):
+        for _ in range(3):
+            await svc._reconcile_instance_models("default", installed)  # pyright: ignore[reportPrivateUsage]
+
+    assert "m1" not in installed.models
+    assert svc.gpu_memory_utilization == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_instance_models_skips_models_currently_installing(svc: VllmService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info()
+    model_info = _make_model_installed_info(model_id="m1", gpu_memory_utilization=0.5)
+    installed.models["m1"] = model_info
+    svc._installing.add(("default", "m1"))  # pyright: ignore[reportPrivateUsage]
+    deps["docker_service"].get_container_status = AsyncMock(return_value=_status(exists=False, state="", health=""))
+
+    await svc._reconcile_instance_models("default", installed)  # pyright: ignore[reportPrivateUsage]
+
+    deps["docker_service"].get_container_status.assert_not_called()
+    assert "m1" in installed.models
+
+
+@pytest.mark.asyncio
+async def test_reconcile_instance_models_skips_model_uninstalled_concurrently(svc: VllmService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info()
+    model_info = _make_model_installed_info(model_id="m1", gpu_memory_utilization=0.5)
+    installed.models["m1"] = model_info
+    svc.gpu_memory_utilization = 0.5
+    deps["docker_service"].get_container_status = AsyncMock(return_value=_status(exists=False, state="", health=""))
+
+    await svc._reconcile_instance_models("default", installed)  # pyright: ignore[reportPrivateUsage]
+    await svc._reconcile_instance_models("default", installed)  # pyright: ignore[reportPrivateUsage]
+    assert svc._crash_poll_state[("default", "m1")] == 2  # pyright: ignore[reportPrivateUsage]
+
+    async def _status_and_uninstall_concurrently(_container_name: str) -> ContainerStatus:
+        # Simulate a concurrent manual uninstall completing while this (3rd) poll is in flight.
+        del installed.models["m1"]
+        return _status(exists=False, state="", health="")
+
+    deps["docker_service"].get_container_status = AsyncMock(side_effect=_status_and_uninstall_concurrently)
+
+    with patch.object(svc, "_save", new_callable=AsyncMock) as mock_save:
+        await svc._reconcile_instance_models("default", installed)  # pyright: ignore[reportPrivateUsage]
+
+    deps["endpoint_registry"].unregister_chat_completion.assert_not_called()
+    mock_save.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_instance_models_releases_reranker_model(svc: VllmService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info()
+    model_info = _make_model_installed_info(model_id="m1", registration_id="reg-1", gpu_memory_utilization=0.5, model_type="reranker")
+    installed.models["m1"] = model_info
+    svc.gpu_memory_utilization = 0.5
+    deps["docker_service"].get_container_status = AsyncMock(return_value=_status(exists=False, state="", health=""))
+    deps["docker_service"].uninstall_docker = AsyncMock()
+
+    with patch.object(svc, "_save", new_callable=AsyncMock):
+        for _ in range(3):
+            await svc._reconcile_instance_models("default", installed)  # pyright: ignore[reportPrivateUsage]
+
+    deps["endpoint_registry"].unregister_rerank.assert_called_once_with("m1", "reg-1")
+    deps["endpoint_registry"].unregister_chat_completion.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_start_reconciliation_task_cancels_existing_and_stop_cancels_it(svc: VllmService) -> None:
+    svc.instances_info["default"].installed = _make_installed_info()
+
+    svc._start_reconciliation_task("default")  # pyright: ignore[reportPrivateUsage]
+    first_task = svc._reconciliation_tasks["default"]  # pyright: ignore[reportPrivateUsage]
+    svc._start_reconciliation_task("default")  # pyright: ignore[reportPrivateUsage]
+    second_task = svc._reconciliation_tasks["default"]  # pyright: ignore[reportPrivateUsage]
+
+    await asyncio.gather(first_task, return_exceptions=True)
+    assert first_task is not second_task
+    assert first_task.cancelled()
+
+    svc._stop_reconciliation_task("default")  # pyright: ignore[reportPrivateUsage]
+    await asyncio.gather(second_task, return_exceptions=True)
+    assert second_task.cancelled()
+    assert "default" not in svc._reconciliation_tasks  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_loop_ticks_and_stops_once_instance_uninstalled(svc: VllmService) -> None:
+    svc.instances_info["default"].installed = _make_installed_info()
+    calls = 0
+
+    async def fake_reconcile(_instance: str, _info: InstalledInfo) -> None:
+        nonlocal calls
+        calls += 1
+        svc.instances_info["default"].installed = None
+
+    with (
+        patch("server.services.vllm_service.asyncio.sleep", new_callable=AsyncMock),
+        patch.object(svc, "_reconcile_instance_models", new=AsyncMock(side_effect=fake_reconcile)),
+    ):
+        svc._start_reconciliation_task("default")  # pyright: ignore[reportPrivateUsage]
+        task = svc._reconciliation_tasks["default"]  # pyright: ignore[reportPrivateUsage]
+        await asyncio.wait_for(task, timeout=1)
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_loop_logs_and_continues_on_tick_exception(svc: VllmService) -> None:
+    svc.instances_info["default"].installed = _make_installed_info()
+    calls = 0
+
+    async def fake_reconcile(_instance: str, _info: InstalledInfo) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("boom")
+        svc.instances_info["default"].installed = None
+
+    with (
+        patch("server.services.vllm_service.asyncio.sleep", new_callable=AsyncMock),
+        patch.object(svc, "_reconcile_instance_models", new=AsyncMock(side_effect=fake_reconcile)),
+    ):
+        svc._start_reconciliation_task("default")  # pyright: ignore[reportPrivateUsage]
+        task = svc._reconciliation_tasks["default"]  # pyright: ignore[reportPrivateUsage]
+        await asyncio.wait_for(task, timeout=1)
+
+    assert calls == 2

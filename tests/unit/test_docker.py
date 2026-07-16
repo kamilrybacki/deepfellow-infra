@@ -21,6 +21,7 @@ from fastapi import HTTPException
 
 import server.docker as docker_mod
 from server.docker import (
+    ContainerStatus,
     DockerImageNameInfo,
     DockerNotInstalledError,
     DockerOptions,
@@ -535,6 +536,89 @@ async def test_remove_image_ignores_404(docker_service: DockerService) -> None:
 
     with patch("server.docker.Docker", return_value=cm):
         await docker_service.remove_image("ubuntu:latest")  # should not raise
+
+
+def _mock_container_show(inspect_data: dict[str, Any]) -> tuple[MagicMock, MagicMock]:
+    """Return (docker_cm, container_mock) with `.containers.container(name).show()` wired to return inspect_data."""
+    cm, instance = _make_docker_mock()
+    container = MagicMock()
+    container.show = AsyncMock(return_value=inspect_data)
+    instance.containers = MagicMock()
+    instance.containers.container = MagicMock(return_value=container)
+    return cm, instance.containers.container
+
+
+@pytest.mark.asyncio
+async def test_get_container_status_running_and_healthy(docker_service: DockerService) -> None:
+    cm, container_fn = _mock_container_show({"State": {"Status": "running", "Health": {"Status": "healthy"}}, "RestartCount": 0})
+
+    with patch("server.docker.Docker", return_value=cm):
+        result = await docker_service.get_container_status("mymodel")
+
+    assert result == ContainerStatus(exists=True, state="running", health="healthy", restart_count=0)
+    container_fn.assert_called_once_with("mymodel")
+
+
+@pytest.mark.asyncio
+async def test_get_container_status_exited(docker_service: DockerService) -> None:
+    cm, _ = _mock_container_show({"State": {"Status": "exited"}, "RestartCount": 2})
+
+    with patch("server.docker.Docker", return_value=cm):
+        result = await docker_service.get_container_status("mymodel")
+
+    assert result == ContainerStatus(exists=True, state="exited", health="", restart_count=2)
+
+
+@pytest.mark.asyncio
+async def test_get_container_status_restarting(docker_service: DockerService) -> None:
+    cm, _ = _mock_container_show({"State": {"Status": "restarting"}, "RestartCount": 5})
+
+    with patch("server.docker.Docker", return_value=cm):
+        result = await docker_service.get_container_status("mymodel")
+
+    assert result == ContainerStatus(exists=True, state="restarting", health="", restart_count=5)
+
+
+@pytest.mark.asyncio
+async def test_get_container_status_running_but_unhealthy(docker_service: DockerService) -> None:
+    cm, _ = _mock_container_show({"State": {"Status": "running", "Health": {"Status": "unhealthy"}}, "RestartCount": 0})
+
+    with patch("server.docker.Docker", return_value=cm):
+        result = await docker_service.get_container_status("mymodel")
+
+    assert result == ContainerStatus(exists=True, state="running", health="unhealthy", restart_count=0)
+
+
+@pytest.mark.asyncio
+async def test_get_container_status_missing_container_returns_not_exists(docker_service: DockerService) -> None:
+    instance = MagicMock()
+    instance.containers = MagicMock()
+    container = MagicMock()
+    container.show = AsyncMock(side_effect=DockerError(status=404, message="no such container"))
+    instance.containers.container = MagicMock(return_value=container)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=instance)
+    cm.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("server.docker.Docker", return_value=cm):
+        result = await docker_service.get_container_status("mymodel")
+
+    assert result == ContainerStatus(exists=False, state="", health="", restart_count=0)
+
+
+@pytest.mark.asyncio
+async def test_get_container_status_reraises_non_404_docker_error(docker_service: DockerService) -> None:
+    instance = MagicMock()
+    instance.containers = MagicMock()
+    container = MagicMock()
+    container.show = AsyncMock(side_effect=DockerError(status=500, message="server error"))
+    instance.containers.container = MagicMock(return_value=container)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=instance)
+    cm.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("server.docker.Docker", return_value=cm), pytest.raises(DockerError):
+        await docker_service.get_container_status("mymodel")
 
 
 @pytest.mark.asyncio
