@@ -35,7 +35,7 @@ def test_check_health_200(status_code: int, result: int) -> None:
     ("side_effect"),
     [
         HTTPError(
-            url="http://localhost:8086/docs",
+            url="http://localhost:8086/health",
             code=500,
             msg="Internal Server Error",
             hdrs=None,  # pyright: ignore[reportArgumentType]

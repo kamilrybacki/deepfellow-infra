@@ -23,7 +23,7 @@ from urllib.request import urlopen
 
 def check_health() -> int:
     """Check if the infra is healthy."""
-    url = "http://localhost:8086/docs"
+    url = "http://localhost:8086/health"
     try:
         # Timeout after 5 seconds
         with urlopen(url, timeout=5) as response:
