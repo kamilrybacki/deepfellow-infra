@@ -135,6 +135,9 @@ def _read_models() -> dict[str, VllmModel]:
         return map
 
 
+_RECONCILE_INTERVAL_SECONDS = 90
+_RECONCILE_DEAD_THRESHOLD = 3
+
 _const = VllmConst(
     images={
         "gpu": DockerImage(name="vllm/vllm-openai:v0.24.0-cu129-ubuntu2404", size="20 GB"),
@@ -195,12 +198,16 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
     gpu_memory_utilization = 0
     _vram_cache: dict[tuple[str, str], float]
     _installing: set[tuple[str, str]]
+    _reconciliation_tasks: dict[str, "asyncio.Task[None]"]
+    _crash_poll_state: dict[tuple[str, str], int]
 
     def _after_init(self) -> None:
         self.models = {}
         self.load_default_models("default")
         self._vram_cache = {}
         self._installing = set()
+        self._reconciliation_tasks: dict[str, asyncio.Task[None]] = {}
+        self._crash_poll_state: dict[tuple[str, str], int] = {}
 
     def load_default_models(self, instance: str) -> None:
         """Load default models to instance."""
@@ -360,11 +367,79 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         async def func(stream: Stream[StreamChunk]) -> InstalledInfo:
             await self._download_image_or_set_progress(stream, image)
             self.service_downloaded = True
+            self._start_reconciliation_task(instance)
             return InstalledInfo(models={}, options=options, parsed_options=parsed_options)
 
         return PromiseWithProgress(func=func)
 
+    def _start_reconciliation_task(self, instance: str) -> None:
+        """Start (or restart) the background task that detects crashed/stopped model containers and releases their bookkeeping."""
+        if instance in self._reconciliation_tasks:
+            self._reconciliation_tasks[instance].cancel()
+
+        async def _reconcile_loop() -> None:
+            while True:
+                await asyncio.sleep(_RECONCILE_INTERVAL_SECONDS)
+                info = self.instances_info.get(instance)
+                if not info or not info.installed:
+                    break
+                try:
+                    await self._reconcile_instance_models(instance, info.installed)
+                except Exception:
+                    logger.exception(f"{self.get_id(instance)} reconciliation tick failed")  # noqa: G004
+
+        self._reconciliation_tasks[instance] = asyncio.create_task(_reconcile_loop())
+
+    def _stop_reconciliation_task(self, instance: str) -> None:
+        if instance in self._reconciliation_tasks:
+            self._reconciliation_tasks[instance].cancel()
+            del self._reconciliation_tasks[instance]
+
+    async def _reconcile_instance_models(self, instance: str, info: InstalledInfo) -> None:
+        """Detect models whose container is no longer running for good and release their VRAM bookkeeping."""
+        for model_id, model_info in info.models.copy().items():
+            key = (instance, model_id)
+            if key in self._installing:
+                self._crash_poll_state.pop(key, None)
+                continue
+
+            container_name = model_info.docker.container_name or model_info.docker.name
+            status = await self.docker_service.get_container_status(container_name)
+            is_bad = not status.exists or status.state != "running" or status.health == "unhealthy"
+
+            if not is_bad:
+                self._crash_poll_state.pop(key, None)
+                continue
+
+            bad_count = self._crash_poll_state.get(key, 0) + 1
+            self._crash_poll_state[key] = bad_count
+            if bad_count < _RECONCILE_DEAD_THRESHOLD:
+                continue
+
+            if key in self._installing or info.models.get(model_id) is not model_info:
+                self._crash_poll_state.pop(key, None)
+                continue  # uninstalled or reinstalled while we were polling
+
+            try:
+                await self.docker_service.uninstall_docker(model_info.docker)
+            except Exception:
+                # Keep bookkeeping intact and retry teardown on the next tick rather than releasing VRAM
+                # for a container we couldn't confirm is actually gone.
+                logger.exception(f"{self.get_id(instance)} failed to tear down dead container for model {model_id}, will retry")  # noqa: G004
+                continue
+
+            self._crash_poll_state.pop(key, None)
+            logger.warning(f"{self.get_id(instance)} model {model_id} container is dead, releasing VRAM bookkeeping")  # noqa: G004
+            self._release_gpu_utilization(model_info.gpu_memory_utilization)
+            info.models.pop(model_id, None)
+            if model_info.model_type == "reranker":
+                self.endpoint_registry.unregister_rerank(model_info.registered_name, model_info.registration_id)
+            else:
+                self.endpoint_registry.unregister_chat_completion(model_info.registered_name, model_info.registration_id)
+            await self._save()
+
     async def _uninstall_instance(self, instance: str, options: UninstallServiceIn) -> None:
+        self._stop_reconciliation_task(instance)
         installed = self.get_instance_info(instance).installed
         installed_images = {model.docker.image for model in installed.models.values()} if installed else set()
         if installed:
@@ -901,6 +976,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
 
     async def stop_instance(self, instance: str) -> None:
         """Stop all the vLLM service Docker containers."""
+        self._stop_reconciliation_task(instance)
         installed = self.get_instance_info(instance).installed
         if not installed:
             return

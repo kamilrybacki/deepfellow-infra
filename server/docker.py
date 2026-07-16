@@ -137,6 +137,14 @@ def get_docker_auths() -> dict[str, str]:
 
 
 @dataclass(frozen=True)
+class ContainerStatus:
+    exists: bool
+    state: str
+    health: str
+    restart_count: int
+
+
+@dataclass(frozen=True)
 class DockerImageNameInfo:
     registry: str
     namespace: str
@@ -697,6 +705,25 @@ class DockerService:
         except Exception as exc:
             uvicorn_logger.warning(f"Error while checking health of docker container {service_name}. Error: {exc}")
             return False
+
+    async def get_container_status(self, container_name: str) -> ContainerStatus:
+        """Return a container's real state (process status, healthcheck status, restart count) for reconciliation checks after install."""
+        try:
+            async with Docker() as docker:
+                info = await docker.containers.container(container_name).show()
+        except DockerError as e:
+            if e.status == 404:
+                return ContainerStatus(exists=False, state="", health="", restart_count=0)
+            raise
+
+        state = info.get("State", {})
+        health = state.get("Health", {})
+        return ContainerStatus(
+            exists=True,
+            state=state.get("Status", ""),
+            health=health.get("Status", ""),
+            restart_count=info.get("RestartCount", 0),
+        )
 
     async def generate_docker_compose_content(self, options: DockerOptions, port: int | None) -> DockerComposeContent:  # noqa: C901
         """Generate docker compose content."""
