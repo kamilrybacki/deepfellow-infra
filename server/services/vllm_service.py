@@ -140,8 +140,8 @@ _RECONCILE_DEAD_THRESHOLD = 3
 
 _const = VllmConst(
     images={
-        "gpu": DockerImage(name="vllm/vllm-openai:v0.24.0-cu129-ubuntu2404", size="20 GB"),
-        "cpu": DockerImage(name="vllm/vllm-openai-cpu:v0.24.0", size="3.7 GB"),
+        "gpu": DockerImage(name="vllm/vllm-openai:v0.25.1-cu129-ubuntu2404", size="11.7 GB"),
+        "cpu": DockerImage(name="vllm/vllm-openai-cpu:v0.25.1", size="1.8 GB"),
     },
     models=_read_models(),
 )
