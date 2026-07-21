@@ -17,10 +17,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 - Container healthcheck (`scripts/healthcheck.py`) now probes `/health` instead of `/docs`, consistent with every other health probe.
-- Bumped bundled Docker image versions for llama.cpp, Ollama, vLLM, and speaches-ai to their latest available releases.
+- Bumped bundled llama.cpp Docker image from `b9894` to `b10068` (latest published image build). Known risk: two upstream vulnerabilities remain unpatched as of this release — CVE-2026-2069 (GBNF grammar stack overflow) and an unpatched GGUF `general.alignment` integer overflow — both were already present in the previous `b9894` pin and are unrelated to this bump; mitigate by not accepting untrusted GGUF files or exposing GBNF grammar sampling to untrusted input until upstream ships a fix.
+- Bumped bundled Ollama Docker image from `0.31.1` to `0.32.1` and vLLM from `v0.24.0` to `v0.25.1` to stay current with upstream releases. No known outstanding security advisories affected the previous pins.
 - Ollama VRAM usage for loaded models is now read directly from Ollama's `/api/ps` response instead of being parsed from container logs.
 
 ### Fixed
+- `scripts/get_ollama_models.py` no longer captures raw scraped HTML markup as a model's `size` when the Ollama library page renders a "usage slot" widget instead of plain size text (seen for at least one cloud-hosted model, `gemini-3-flash-preview`); the captured text is now validated against a size-string pattern and discarded otherwise. Also corrected the already-affected entry in `static/ollama-min.json`.
 - vLLM now detects when an already-installed model's Docker container stops running for good (crash, OOM, manual `docker stop`, hung process reported `unhealthy`) and releases its reserved GPU memory automatically, without requiring a backend restart. Previously the GPU-utilization counter stayed occupied forever for a dead container, blocking further model loads.
 - `config.json` is now written to the storage directory instead of the app directory, so dynamic settings (mesh key, API keys, etc.) survive container recreation instead of resetting on every redeploy.
 - OTEL trace/log exporter endpoint changes now take effect immediately instead of silently keeping the old endpoint until a restart.

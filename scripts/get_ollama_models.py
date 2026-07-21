@@ -55,6 +55,19 @@ class ModelEntry(TypedDict):
     modelfile: NotRequired[str]
 
 
+_SIZE_RE = re.compile(r"^[\d.]+\s*[KMGT]?B$", re.IGNORECASE)
+
+
+def extract_size(raw: str) -> str:
+    """Strip nested HTML from a scraped size cell and validate it looks like a size string.
+
+    The library page renders a "usage slot" widget instead of plain size text for some
+    cloud-hosted models, so the naive capture can contain raw markup instead of e.g. "8.6GB".
+    """
+    text = re.sub(r"<[^>]+>", "", raw).strip()
+    return text if _SIZE_RE.match(text) else ""
+
+
 class MinJson(TypedDict):
     embeddings: list[ModelEntry]
     llms: list[ModelEntry]
@@ -141,12 +154,12 @@ def find_all_between(text: str, attr: str, open_tag: str, close_tag: str) -> lis
 def parse_library(html: str) -> list[ModelInfo]:
     """Parse the Ollama library page and return a list of models with capabilities."""
     models: list[ModelInfo] = []
-    for li_match in re.finditer(r"<li[^>]*x-test-model[^>]*>(.*?)</li>", html, re.DOTALL):
+    for li_match in re.finditer(r'<li\s*class="flex items-baseline border-b border-neutral-200 py-6">(.*?)</li>', html, re.DOTALL):
         li = li_match.group(1)
         name_m = re.search(r'href="/(?:library/)?([^"]+)"', li)
         if not name_m:
             continue
-        capabilities = find_all_between(li, "x-test-capability", ">", "<")
+        capabilities = find_all_between(li, "text-indigo-600", ">", "<")
         models.append({"name": name_m.group(1), "capabilities": capabilities})
     return models
 
@@ -247,7 +260,7 @@ def parse_model_page(html: str, only_tags: list[str] | None) -> list[ModelEntry]
         entries.append(
             {
                 "name": full_name,
-                "size": col_spans[0].strip() if col_spans else "",
+                "size": extract_size(col_spans[0]) if col_spans else "",
                 "hash": "",
                 "context": parse_context(col_spans[1].strip() if len(col_spans) > 1 else None),
             }
@@ -303,7 +316,7 @@ def parse_tags_full(html: str) -> list[ModelEntry]:
         entries.append(
             {
                 "name": name,
-                "size": col_spans[0].strip() if col_spans else "",
+                "size": extract_size(col_spans[0]) if col_spans else "",
                 "hash": hash_m.group(1).strip() if hash_m else "",
                 "context": parse_context(col_spans[1].strip() if len(col_spans) > 1 else None),
             }

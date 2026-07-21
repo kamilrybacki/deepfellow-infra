@@ -231,30 +231,6 @@
             "context": 2048
         },
         {
-            "name": "antoniprzybylik/llama-pllum:70b",
-            "size": "141GB",
-            "hash": "44af87255635",
-            "context": 131072
-        },
-        {
-            "name": "antoniprzybylik/llama-pllum:8b",
-            "size": "16GB",
-            "hash": "3714486b7f3f",
-            "context": 131072
-        },
-        {
-            "name": "antoniprzybylik/pllum:12b",
-            "size": "25GB",
-            "hash": "e35667af71cf",
-            "context": 131072
-        },
-        {
-            "name": "antoniprzybylik/pllum:8x7b",
-            "size": "93GB",
-            "hash": "8e3962e2f742",
-            "context": 32768
-        },
-        {
             "name": "athene-v2",
             "size": "47GB",
             "hash": "d14346ed7d55",
@@ -325,6 +301,60 @@
             "size": "4.7GB",
             "hash": "66607904c165",
             "context": 32768
+        },
+        {
+            "name": "bielik-7b-instruct-v0.1-gguf",
+            "size": "4.1GB",
+            "hash": "",
+            "context": 4096
+        },
+        {
+            "name": "bielik-7b-instruct-v0.1-gguf:Q3_K_L",
+            "size": "3.8GB",
+            "hash": "",
+            "context": 4096
+        },
+        {
+            "name": "bielik-7b-instruct-v0.1-gguf:Q3_K_M",
+            "size": "3.5GB",
+            "hash": "",
+            "context": 4096
+        },
+        {
+            "name": "bielik-7b-instruct-v0.1-gguf:Q3_K_S",
+            "size": "3.2GB",
+            "hash": "",
+            "context": 4096
+        },
+        {
+            "name": "bielik-7b-instruct-v0.1-gguf:Q4_K_S",
+            "size": "4.1GB",
+            "hash": "",
+            "context": 4096
+        },
+        {
+            "name": "bielik-7b-instruct-v0.1-gguf:Q5_K_M",
+            "size": "5.1GB",
+            "hash": "",
+            "context": 4096
+        },
+        {
+            "name": "bielik-7b-instruct-v0.1-gguf:Q5_K_S",
+            "size": "5.0GB",
+            "hash": "",
+            "context": 4096
+        },
+        {
+            "name": "bielik-7b-instruct-v0.1-gguf:Q6_K",
+            "size": "5.9GB",
+            "hash": "",
+            "context": 4096
+        },
+        {
+            "name": "bielik-7b-instruct-v0.1-gguf:Q8_0",
+            "size": "7.7GB",
+            "hash": "",
+            "context": 4096
         },
         {
             "name": "codebooga",
@@ -1048,7 +1078,7 @@
         },
         {
             "name": "gemini-3-flash-preview",
-            "size": "<span x-test-model-tag-usage-slot-active class=\"block h-1 w-4 rounded-full bg-neutral-800\"></span>\n            \n            <span x-test-model-tag-usage-slot-active class=\"block h-1 w-4 rounded-full bg-neutral-800\"></span>\n            \n            <span x-test-model-tag-usage-slot-active class=\"block h-1 w-4 rounded-full bg-neutral-800\"></span>\n            \n            <span x-test-model-tag-usage-slot-active class=\"block h-1 w-4 rounded-full bg-neutral-800\"></span>",
+            "size": "",
             "hash": "ebade0d31690",
             "context": 1048576
         },
@@ -1527,18 +1557,6 @@
             "context": 131072
         },
         {
-            "name": "HammerAI/mythomax-l2",
-            "size": "7.9GB",
-            "hash": "bb07fb50cf6b",
-            "context": 4096
-        },
-        {
-            "name": "HammerAI/mythomax-l2:13b-q4_K_M",
-            "size": "7.9GB",
-            "hash": "bb07fb50cf6b",
-            "context": 4096
-        },
-        {
             "name": "hermes3",
             "size": "4.7GB",
             "hash": "4f6b83f30b62",
@@ -1731,6 +1749,18 @@
             "modelfile": "FROM https://huggingface.co/mradermacher/Llama-PLLuM-8B-instruct-GGUF/resolve/main/Llama-PLLuM-8B-instruct.Q4_K_M.gguf",
             "hash": "",
             "context": null
+        },
+        {
+            "name": "llama-pllum:70b",
+            "size": "141GB",
+            "hash": "",
+            "context": 131072
+        },
+        {
+            "name": "llama-pllum:8b",
+            "size": "16GB",
+            "hash": "",
+            "context": 131072
         },
         {
             "name": "llama-pro",
@@ -2045,12 +2075,6 @@
             "context": 39936
         },
         {
-            "name": "mannix/jan-nano",
-            "size": "2.3GB",
-            "hash": "b48a8b54cc40",
-            "context": 40960
-        },
-        {
             "name": "marco-o1",
             "size": "4.7GB",
             "hash": "4752e62baa0a",
@@ -2349,6 +2373,18 @@
             "size": "1.7GB",
             "hash": "55fc3abd3867",
             "context": 2048
+        },
+        {
+            "name": "mythomax-l2",
+            "size": "7.9GB",
+            "hash": "",
+            "context": 4096
+        },
+        {
+            "name": "mythomax-l2:13b-q4_K_M",
+            "size": "7.9GB",
+            "hash": "",
+            "context": 4096
         },
         {
             "name": "nemotron",
@@ -2897,6 +2933,18 @@
             "modelfile": "FROM https://huggingface.co/mradermacher/PLLuM-12B-instruct-GGUF/resolve/main/PLLuM-12B-instruct.Q8_0.gguf",
             "hash": "",
             "context": null
+        },
+        {
+            "name": "pllum:12b",
+            "size": "25GB",
+            "hash": "",
+            "context": 131072
+        },
+        {
+            "name": "pllum:8x7b",
+            "size": "93GB",
+            "hash": "",
+            "context": 32768
         },
         {
             "name": "qwen",
@@ -3697,60 +3745,6 @@
             "context": 8192
         },
         {
-            "name": "SpeakLeash/bielik-7b-instruct-v0.1-gguf",
-            "size": "4.1GB",
-            "hash": "879e1d63bcee",
-            "context": 4096
-        },
-        {
-            "name": "SpeakLeash/bielik-7b-instruct-v0.1-gguf:Q3_K_L",
-            "size": "3.8GB",
-            "hash": "5e8e01232213",
-            "context": 4096
-        },
-        {
-            "name": "SpeakLeash/bielik-7b-instruct-v0.1-gguf:Q3_K_M",
-            "size": "3.5GB",
-            "hash": "ecd15e3c651a",
-            "context": 4096
-        },
-        {
-            "name": "SpeakLeash/bielik-7b-instruct-v0.1-gguf:Q3_K_S",
-            "size": "3.2GB",
-            "hash": "c62f4ea7f0ab",
-            "context": 4096
-        },
-        {
-            "name": "SpeakLeash/bielik-7b-instruct-v0.1-gguf:Q4_K_S",
-            "size": "4.1GB",
-            "hash": "879e1d63bcee",
-            "context": 4096
-        },
-        {
-            "name": "SpeakLeash/bielik-7b-instruct-v0.1-gguf:Q5_K_M",
-            "size": "5.1GB",
-            "hash": "6836c8a02d48",
-            "context": 4096
-        },
-        {
-            "name": "SpeakLeash/bielik-7b-instruct-v0.1-gguf:Q5_K_S",
-            "size": "5.0GB",
-            "hash": "0447b6b50d04",
-            "context": 4096
-        },
-        {
-            "name": "SpeakLeash/bielik-7b-instruct-v0.1-gguf:Q6_K",
-            "size": "5.9GB",
-            "hash": "2abe6573f5d8",
-            "context": 4096
-        },
-        {
-            "name": "SpeakLeash/bielik-7b-instruct-v0.1-gguf:Q8_0",
-            "size": "7.7GB",
-            "hash": "0a643509f9fb",
-            "context": 4096
-        },
-        {
             "name": "sqlcoder",
             "size": "4.1GB",
             "hash": "77ac14348387",
@@ -4233,39 +4227,39 @@
     ],
     "txt2img": [
         {
-            "name": "x/flux2-klein",
+            "name": "flux2-klein",
             "size": "5.7GB",
-            "hash": "50a0c0ab15ac",
+            "hash": "",
             "context": null
         },
         {
-            "name": "x/flux2-klein:4b",
+            "name": "flux2-klein:4b",
             "size": "5.7GB",
-            "hash": "50a0c0ab15ac",
+            "hash": "",
             "context": null
         },
         {
-            "name": "x/flux2-klein:9b",
+            "name": "flux2-klein:9b",
             "size": "12GB",
-            "hash": "91f22bc541d8",
+            "hash": "",
             "context": null
         },
         {
-            "name": "x/z-image-turbo",
+            "name": "z-image-turbo",
             "size": "13GB",
-            "hash": "77b78ce4e883",
+            "hash": "",
             "context": null
         },
         {
-            "name": "x/z-image-turbo:bf16",
+            "name": "z-image-turbo:bf16",
             "size": "33GB",
-            "hash": "a9a017f804f2",
+            "hash": "",
             "context": null
         },
         {
-            "name": "x/z-image-turbo:fp8",
+            "name": "z-image-turbo:fp8",
             "size": "13GB",
-            "hash": "77b78ce4e883",
+            "hash": "",
             "context": null
         }
     ]

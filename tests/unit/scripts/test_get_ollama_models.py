@@ -26,6 +26,7 @@ from scripts.get_ollama_models import (
     build_min_json,
     capability_to_category,
     deduplicate_by_hash,
+    extract_size,
     fetch,
     fetch_cached,
     fetch_extra_model,
@@ -206,12 +207,14 @@ def test_guess_category(name: str, expected: str) -> None:
 
 _LIBRARY_HTML = """
 <ul>
-  <li x-test-model="1">
-    <a href="/library/llama3">llama3</a>
-    <span x-test-capability class="">tools</span>
+  <li  class="flex items-baseline border-b border-neutral-200 py-6">
+    <a href="/library/llama3" class="group w-full space-y-5">
+      <span class="group-hover:underline truncate">llama3</span>
+      <span class="text-indigo-600">tools</span>
+    </a>
   </li>
-  <li x-test-model="2">
-    <a href="/llama-no-lib">skip</a>
+  <li  class="flex items-baseline border-b border-neutral-200 py-6">
+    <a href="/llama-no-lib" class="group w-full space-y-5">skip</a>
   </li>
   <li no-attr>ignored</li>
 </ul>
@@ -228,16 +231,16 @@ def test_parse_library_parses_capabilities() -> None:
     assert "tools" in llama["capabilities"]
 
 
-def test_parse_library_ignores_li_without_x_test_model() -> None:
-    assert "skip" not in [m["name"] for m in parse_library(_LIBRARY_HTML)]
+def test_parse_library_ignores_li_without_expected_class() -> None:
+    assert "ignored" not in [m["name"] for m in parse_library(_LIBRARY_HTML)]
 
 
 def test_parse_library_empty_html() -> None:
     assert parse_library("") == []
 
 
-def test_parse_library_li_with_x_test_model_but_no_href() -> None:
-    html = '<li x-test-model="1"><span>no href here</span></li>'
+def test_parse_library_li_with_expected_class_but_no_href() -> None:
+    html = '<li  class="flex items-baseline border-b border-neutral-200 py-6"><span>no href here</span></li>'
 
     assert parse_library(html) == []
 
@@ -284,6 +287,20 @@ def test_parse_tags_full_hash_populated() -> None:
     assert entry["hash"] == "abc123"
 
 
+def test_parse_tags_full_size_rejects_usage_slot_widget_markup() -> None:
+    html = """
+    <div class="group px-4 py-3">
+      <a href="/library/cloudmodel:preview">cloudmodel:preview</a>
+      <p class="col-span-2">
+            <span x-test-model-tag-usage-slot-active class="block h-1 w-4 rounded-full bg-neutral-800"></span>
+      </p>
+    </div>
+    """
+    entry = next(e for e in parse_tags_full(html) if e["name"] == "cloudmodel:preview")
+
+    assert entry["size"] == ""
+
+
 @pytest.mark.parametrize(
     "html",
     [
@@ -324,6 +341,39 @@ def test_parse_model_page_size_parsed() -> None:
     entry = next(e for e in parse_model_page(_MODEL_HTML, None) if "7b" in e["name"])
 
     assert entry["size"] == "4.1 GB"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param("4.1 GB", "4.1 GB", id="plain"),
+        pytest.param("292MB", "292MB", id="no_space"),
+        pytest.param("  8.6GB  ", "8.6GB", id="whitespace"),
+        pytest.param(
+            '<span x-test-model-tag-usage-slot-active class="block h-1 w-4 rounded-full bg-neutral-800"></span>',
+            "",
+            id="usage_slot_widget_markup",
+        ),
+        pytest.param("", "", id="empty"),
+        pytest.param("not a size", "", id="garbage_text"),
+    ],
+)
+def test_extract_size(raw: str, expected: str) -> None:
+    assert extract_size(raw) == expected
+
+
+def test_parse_model_page_size_rejects_usage_slot_widget_markup() -> None:
+    html = """
+    <div class="group px-4 py-3">
+      <a class="block something">cloudmodel:preview</a>
+      <p class="col-span-2">
+            <span x-test-model-tag-usage-slot-active class="block h-1 w-4 rounded-full bg-neutral-800"></span>
+      </p>
+    </div>
+    """
+    entry = next(e for e in parse_model_page(html, None) if "preview" in e["name"])
+
+    assert entry["size"] == ""
 
 
 def test_parse_model_page_context_parsed() -> None:
