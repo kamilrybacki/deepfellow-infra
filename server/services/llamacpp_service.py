@@ -215,6 +215,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
         self.load_default_models("default")
         self._vram_cache = {}
         self._installing = set()
+        self._init_reconciliation()
 
     @staticmethod
     def mib_to_gib(mib: float) -> float | None:
@@ -319,11 +320,24 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
         async def func(stream: Stream[StreamChunk]) -> InstalledInfo:
             await self._download_image_or_set_progress(stream, image)
             self.service_downloaded = True
+            self._start_reconciliation_task(instance)
             return InstalledInfo(models={}, options=options, parsed_options=parsed_options)
 
         return PromiseWithProgress(func=func)
 
+    def _reconcile_container_name(self, instance: str, info: InstalledInfo, model_info: ModelInstalledInfo) -> str | None:  # noqa: ARG002
+        return model_info.docker.container_name or model_info.docker.name
+
+    async def _release_dead_model(self, instance: str, info: InstalledInfo, model_id: str, model_info: ModelInstalledInfo) -> None:
+        await self.docker_service.uninstall_docker(model_info.docker)
+        self._log_cache.pop(model_info.docker.container_name or "", None)
+        self._vram_cache.pop((instance, model_id), None)
+        info.models.pop(model_id, None)
+        self.endpoint_registry.unregister_chat_completion(model_info.registered_name, model_info.registration_id)
+        await self._save()
+
     async def _uninstall_instance(self, instance: str, options: UninstallServiceIn) -> None:
+        self._stop_reconciliation_task(instance)
         installed = self.get_instance_info(instance).installed
         installed_images = {model.docker.image for model in installed.models.values()} if installed else set()
         if installed:
@@ -719,6 +733,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
 
     async def stop_instance(self, instance: str) -> None:
         """Stop all the Llamacpp service Docker containers."""
+        self._stop_reconciliation_task(instance)
         installed = self.get_instance_info(instance).installed
         if not installed:
             return

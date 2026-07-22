@@ -2002,7 +2002,7 @@ async def test_reconciliation_loop_ticks_and_stops_once_instance_uninstalled(svc
         svc.instances_info["default"].installed = None
 
     with (
-        patch("server.services.vllm_service.asyncio.sleep", new_callable=AsyncMock),
+        patch("server.services.base2_service.asyncio.sleep", new_callable=AsyncMock),
         patch.object(svc, "_reconcile_instance_models", new=AsyncMock(side_effect=fake_reconcile)),
     ):
         svc._start_reconciliation_task("default")  # pyright: ignore[reportPrivateUsage]
@@ -2025,7 +2025,7 @@ async def test_reconciliation_loop_logs_and_continues_on_tick_exception(svc: Vll
         svc.instances_info["default"].installed = None
 
     with (
-        patch("server.services.vllm_service.asyncio.sleep", new_callable=AsyncMock),
+        patch("server.services.base2_service.asyncio.sleep", new_callable=AsyncMock),
         patch.object(svc, "_reconcile_instance_models", new=AsyncMock(side_effect=fake_reconcile)),
     ):
         svc._start_reconciliation_task("default")  # pyright: ignore[reportPrivateUsage]

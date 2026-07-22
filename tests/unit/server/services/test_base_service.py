@@ -1482,3 +1482,11 @@ async def test_update_instance_on_error_clears_installing(base2_svc: _Base2Impl)
             await result_promise.wait()
 
     assert base2_svc.instances_info["default"].installing is None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_hooks_default_to_not_implemented(base2_svc: _Base2Impl) -> None:
+    with pytest.raises(NotImplementedError):
+        base2_svc._reconcile_container_name("default", None, None)  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(NotImplementedError):
+        await base2_svc._release_dead_model("default", None, "m1", None)  # pyright: ignore[reportPrivateUsage]
