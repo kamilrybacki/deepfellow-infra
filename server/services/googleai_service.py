@@ -101,6 +101,14 @@ _const = RemoteConst(
         "gemini-3.1-pro-preview-customtools": RemoteModel(
             type="llm", context_length=1_048_576, max_context_length=1_048_576, messages=False
         ),
+        "gemini-3-flash-preview": RemoteModel(type="llm", context_length=1_048_576, max_context_length=1_048_576, messages=False),
+        "gemini-3.1-flash-lite": RemoteModel(type="llm", context_length=1_048_576, max_context_length=1_048_576, messages=False),
+        "gemini-3.5-flash": RemoteModel(type="llm", context_length=1_048_576, max_context_length=1_048_576, messages=False),
+        "gemini-3.5-flash-lite": RemoteModel(type="llm", context_length=1_048_576, max_context_length=1_048_576, messages=False),
+        "gemini-3.6-flash": RemoteModel(type="llm", context_length=1_048_576, max_context_length=1_048_576, messages=False),
+        "gemini-3.1-flash-image": RemoteModel(type="txt2img"),  # NOTE: aka Nano Banana 2
+        "gemini-3.1-flash-lite-image": RemoteModel(type="txt2img"),  # NOTE: aka Nano Banana 2 Lite
+        "gemini-3-pro-image": RemoteModel(type="txt2img"),  # NOTE: aka Nano Banana Pro
         "gemini-exp-1206": RemoteModel(type="llm", context_length=2_097_152, max_context_length=2_097_152, responses=False, messages=False),
         "gemma-3-1b-it": RemoteModel(type="llm", context_length=32_768, max_context_length=32_768, responses=False, messages=False),
         "gemma-3-4b-it": RemoteModel(type="llm", context_length=131_072, max_context_length=131_072, responses=False, messages=False),
@@ -108,14 +116,20 @@ _const = RemoteConst(
         "gemma-3-27b-it": RemoteModel(type="llm", context_length=131_072, max_context_length=131_072, responses=False, messages=False),
         "gemma-3n-e4b-it": RemoteModel(type="llm", context_length=32_768, max_context_length=32_768, responses=False, messages=False),
         "gemma-3n-e2b-it": RemoteModel(type="llm", context_length=32_768, max_context_length=32_768, responses=False, messages=False),
+        # Gemma 4 - small variants 128K, medium variants (26B/31B) 256K per Google's own Gemma docs
+        "gemma-4-26b-a4b-it": RemoteModel(type="llm", context_length=262_144, max_context_length=262_144, responses=False, messages=False),
+        "gemma-4-31b-it": RemoteModel(type="llm", context_length=262_144, max_context_length=262_144, responses=False, messages=False),
         "embedding-001": RemoteModel(type="embedding"),
         "text-embedding-004": RemoteModel(type="embedding"),
         "gemini-embedding-exp-03-07": RemoteModel(type="embedding"),
         "gemini-embedding-exp": RemoteModel(type="embedding"),
         "gemini-embedding-001": RemoteModel(type="embedding"),
+        "gemini-embedding-2": RemoteModel(type="embedding"),
         "imagen-3.0-generate-002": RemoteModel(type="txt2img"),
         "imagen-4.0-generate-preview-06-06": RemoteModel(type="txt2img"),
         "imagen-4.0-ultra-generate-preview-06-06": RemoteModel(type="txt2img"),
+        "imagen-4.0-standard-generate-001": RemoteModel(type="txt2img"),
+        "imagen-4.0-ultra-generate-001": RemoteModel(type="txt2img"),
         "learnlm-2.0-flash-experimental": RemoteModel(type="llm", context_length=1_048_576, responses=False, messages=False),
         # TTS Models are not open https://cloud.google.com/text-to-speech/docs/gemini-tts#curl ; speech is not listed here: https://ai.google.dev/gemini-api/docs/openai
         # "gemini-2.5-flash-preview-tts": RemoteModel(type="tts"),
