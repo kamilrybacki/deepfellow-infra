@@ -14,6 +14,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Ollama, llama.cpp, and vLLM service install and edit dialogs now include a searchable **Docker image version** selector populated from the container registry, filtered by the selected hardware variant. Leave the field empty to use the default bundled version.
 - New `GET /admin/services/{id}/docker-tags` API endpoint returns available Docker image tags for a service, with server-side caching (2 h TTL) and optional `?hardware=` filtering.
 - Optional `DOCKER_HUB_TOKEN` environment variable for authenticated Docker Hub access to raise rate limits when fetching image tags.
+- New Claude models: Opus 4.7, Opus 4.8, Sonnet 5 and Fable 5.
+- New OpenAI models: GPT-5.4 Pro, GPT-5.5, GPT-5.5 Pro, and the GPT-5.6 family (Sol, Terra, Luna).
+- New DeepSeek service (`deepseek-v4-flash`, `deepseek-v4-pro`).
+- New Kimi service (`kimi-k2.6`, `kimi-k3`, `kimi-k2.7-code`, `kimi-k2.7-code-highspeed`).
+- DeepSeek V4 (Flash, Pro) and Kimi (K2.6, K2.7 Code) added to the self-hosted vLLM model registry.
+- New Google AI (Gemini) chat models: Gemini 3.6 Flash, Gemini 3.5 Flash, Gemini 3.5 Flash-Lite, Gemini 3.1 Flash-Lite, Gemini 3 Flash (preview), and Gemma 4 (26B-A4B, 31B).
+- New Google AI embedding and image models: Gemini Embedding 2, the Nano Banana 2/2-Lite/Pro image models, and GA Imagen 4.0 Standard/Ultra.
 
 ### Changed
 - Container healthcheck (`scripts/healthcheck.py`) now probes `/health` instead of `/docs`, consistent with every other health probe.

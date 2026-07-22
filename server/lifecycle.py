@@ -32,7 +32,9 @@ from server.serviceprovider import ServiceProvider
 from server.services.claude_service import ClaudeService
 from server.services.coqui_service import CoquiService
 from server.services.custom_service import CustomService
+from server.services.deepseek_service import DeepSeekService
 from server.services.googleai_service import GoogleAIService
+from server.services.kimi_service import KimiService
 from server.services.llamacpp_service import LLamacppService
 from server.services.mcp_service import McpService
 from server.services.ollama_cloud_service import OllamaCloudService
@@ -109,7 +111,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         services_manager.register_service(ClaudeService(*model_input))
         services_manager.register_service(CoquiService(*model_input))
         services_manager.register_service(CustomService(*model_input))
+        services_manager.register_service(DeepSeekService(*model_input))
         services_manager.register_service(GoogleAIService(*model_input))
+        services_manager.register_service(KimiService(*model_input))
         services_manager.register_service(LLamacppService(*model_input))
         services_manager.register_service(McpService(*model_input))
         services_manager.register_service(OllamaCloudService(*model_input))

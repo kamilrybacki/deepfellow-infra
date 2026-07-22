@@ -14,6 +14,48 @@ from server.services.remote_service import BaseServiceOptions, RemoteConst, Remo
 
 _const = RemoteConst(
     models={
+        # Claude 5 - 1M no beta-header needed
+        # Claude Mythos 5 - NOT officially available for public use (Project Glasswing
+        # invitation-only access, no self-serve sign-up). Left commented out until
+        # Anthropic makes it generally available.
+        # 'claude-mythos-5': RemoteModel(
+        #     type="llm",
+        #     context_length=1_048_576,
+        #     max_context_length=1_048_576,
+        #     legacy_completions=False,
+        #     responses=False,
+        # ),
+        "claude-fable-5": RemoteModel(
+            type="llm",
+            context_length=1_048_576,
+            max_context_length=1_048_576,
+            legacy_completions=False,
+            responses=False,
+        ),
+        # Claude Sonnet 5 - 1M no beta-header needed
+        "claude-sonnet-5": RemoteModel(
+            type="llm",
+            context_length=1_048_576,
+            max_context_length=1_048_576,
+            legacy_completions=False,
+            responses=False,
+        ),
+        # Claude 4.8 family - 1M no beta-header needed
+        "claude-opus-4-8": RemoteModel(
+            type="llm",
+            context_length=1_048_576,
+            max_context_length=1_048_576,
+            legacy_completions=False,
+            responses=False,
+        ),
+        # Claude 4.7 family - 1M no beta-header needed
+        "claude-opus-4-7": RemoteModel(
+            type="llm",
+            context_length=1_048_576,
+            max_context_length=1_048_576,
+            legacy_completions=False,
+            responses=False,
+        ),
         # Claude 4.6 - 1M with beta header
         "claude-opus-4-6": RemoteModel(
             type="llm",

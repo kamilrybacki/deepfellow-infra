@@ -86,6 +86,10 @@
         {"name": "google/gemma-2b", "size": "14GB"},
         {"name": "google/gemma-2-9b-it", "size": "17GB"},
         {"name": "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct", "size": "29GB"},
+        {"name": "deepseek-ai/DeepSeek-V4-Flash", "size": "148GB"},
+        {"name": "deepseek-ai/DeepSeek-V4-Pro", "size": "805GB"},
+        {"name": "moonshotai/Kimi-K2.6", "size": "554GB"},
+        {"name": "moonshotai/Kimi-K2.7-Code", "size": "554GB"},
         {"name": "Qwen/Qwen2.5-3B-Instruct-GGUF", "size": "23GB"},
         {"name": "Qwen/Qwen2.5-Coder-14B-Instruct-GGUF", "size": "182GB"}
     ],

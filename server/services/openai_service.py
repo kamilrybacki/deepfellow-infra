@@ -71,6 +71,12 @@ _const = RemoteConst(
         "gpt-5.4": RemoteModel(type="llm", context_length=400_000, max_context_length=400_000, messages=False),
         "gpt-5.4-mini": RemoteModel(type="llm", context_length=400_000, max_context_length=400_000, messages=False),
         "gpt-5.4-nano": RemoteModel(type="llm", context_length=400_000, max_context_length=400_000, messages=False),
+        "gpt-5.4-pro": RemoteModel(type="llm", context_length=1_050_000, max_context_length=1_050_000, messages=False),
+        "gpt-5.5": RemoteModel(type="llm", context_length=1_050_000, max_context_length=1_050_000, messages=False),
+        "gpt-5.5-pro": RemoteModel(type="llm", context_length=1_050_000, max_context_length=1_050_000, messages=False),
+        "gpt-5.6-sol": RemoteModel(type="llm", context_length=1_050_000, max_context_length=1_050_000, messages=False),
+        "gpt-5.6-terra": RemoteModel(type="llm", context_length=1_050_000, max_context_length=1_050_000, messages=False),
+        "gpt-5.6-luna": RemoteModel(type="llm", context_length=1_050_000, max_context_length=1_050_000, messages=False),
         "o1": RemoteModel(type="llm", messages=False),
         "o1-pro": RemoteModel(
             type="llm",

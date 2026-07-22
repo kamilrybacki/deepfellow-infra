@@ -16,7 +16,9 @@ from fastapi import HTTPException
 from server.models.models import InstallModelIn, ListModelsFilters, UninstallModelIn
 from server.models.services import InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import CustomModel, Instance, InstanceConfig
+from server.services.deepseek_service import DeepSeekService
 from server.services.googleai_service import GoogleAIService
+from server.services.kimi_service import KimiService
 from server.services.openai_service import OpenAIService
 from server.services.remote_service import (
     BaseServiceOptions,
@@ -51,7 +53,14 @@ def google_svc(deps: dict[str, Any]) -> GoogleAIService:
     return GoogleAIService(**deps)
 
 
-# --- OpenAIService ---
+@pytest.fixture
+def deepseek_svc(deps: dict[str, Any]) -> DeepSeekService:
+    return DeepSeekService(**deps)
+
+
+@pytest.fixture
+def kimi_svc(deps: dict[str, Any]) -> KimiService:
+    return KimiService(**deps)
 
 
 def test_openai_get_type(openai_svc: OpenAIService) -> None:
@@ -150,6 +159,64 @@ def test_google_default_models_loaded(google_svc: GoogleAIService) -> None:
 
 def test_google_service_has_docker_false(google_svc: GoogleAIService) -> None:
     assert google_svc.service_has_docker() is False
+
+
+def test_deepseek_get_type(deepseek_svc: DeepSeekService) -> None:
+    assert deepseek_svc.get_type() == "deepseek"
+
+
+def test_deepseek_is_cloud(deepseek_svc: DeepSeekService) -> None:
+    assert deepseek_svc.is_cloud is True
+    assert deepseek_svc.is_cloud_service() is True
+
+
+def test_deepseek_get_description(deepseek_svc: DeepSeekService) -> None:
+    assert "DeepSeek" in deepseek_svc.get_description()
+
+
+def test_deepseek_get_default_url(deepseek_svc: DeepSeekService) -> None:
+    assert "deepseek.com" in deepseek_svc.get_default_url()
+
+
+def test_deepseek_models_registry_contains_v4_models(deepseek_svc: DeepSeekService) -> None:
+    registry = deepseek_svc.get_models_registry()
+    assert "deepseek-v4-flash" in registry.models
+    assert "deepseek-v4-pro" in registry.models
+
+
+def test_deepseek_default_models_loaded(deepseek_svc: DeepSeekService) -> None:
+    assert "default" in deepseek_svc.models
+    assert len(deepseek_svc.models["default"]) > 0
+
+
+def test_kimi_get_type(kimi_svc: KimiService) -> None:
+    assert kimi_svc.get_type() == "kimi"
+
+
+def test_kimi_is_cloud(kimi_svc: KimiService) -> None:
+    assert kimi_svc.is_cloud is True
+    assert kimi_svc.is_cloud_service() is True
+
+
+def test_kimi_get_description(kimi_svc: KimiService) -> None:
+    assert "Kimi" in kimi_svc.get_description()
+
+
+def test_kimi_get_default_url(kimi_svc: KimiService) -> None:
+    assert "moonshot.ai" in kimi_svc.get_default_url()
+
+
+def test_kimi_models_registry_contains_k2_and_k3_models(kimi_svc: KimiService) -> None:
+    registry = kimi_svc.get_models_registry()
+    assert "kimi-k2.6" in registry.models
+    assert "kimi-k3" in registry.models
+    assert "kimi-k2.7-code" in registry.models
+    assert "kimi-k2.7-code-highspeed" in registry.models
+
+
+def test_kimi_default_models_loaded(kimi_svc: KimiService) -> None:
+    assert "default" in kimi_svc.models
+    assert len(kimi_svc.models["default"]) > 0
 
 
 def test_default_options_bearer_header() -> None:
