@@ -19,7 +19,7 @@ from abc import abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Protocol, TypeVar, cast
 
 from fastapi import HTTPException
 from pydantic import BaseModel
@@ -81,6 +81,13 @@ class ServiceConfig(BaseModel):
 InstalledInfoType = TypeVar("InstalledInfoType")
 DownloadInfoType = TypeVar("DownloadInfoType")
 
+
+class _HasModels(Protocol):
+    """Structural view of every service's ``InstalledInfo``: it always carries a ``models`` mapping."""
+
+    models: dict[str, Any]
+
+
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -119,6 +126,8 @@ class Instance[InstalledInfoType]:
 
 
 _LOG_CACHE_TTL = 8.0
+_RECONCILE_INTERVAL_SECONDS = 90
+_RECONCILE_DEAD_THRESHOLD = 3
 
 
 class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  # noqa: UP046
@@ -134,6 +143,9 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
     images_download_progress: dict[str, Stream[StreamChunk]]
     models_download_progress: dict[str, Stream[StreamChunk]]
     _log_cache: dict[str, tuple[float, str]]
+    _installing: set[tuple[str, str]]
+    _reconciliation_tasks: dict[str, "asyncio.Task[None]"]
+    _crash_poll_state: dict[tuple[str, str], int]
 
     def __init__(
         self,
@@ -161,6 +173,91 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
 
     def _after_init(self) -> None:
         """Do some custom initialization."""
+
+    def _init_reconciliation(self) -> None:
+        self._reconciliation_tasks = {}
+        self._crash_poll_state = {}
+
+    def _start_reconciliation_task(self, instance: str) -> None:
+        """Start (or restart) the background task that detects crashed/stopped model containers and releases their bookkeeping."""
+        if instance in self._reconciliation_tasks:
+            self._reconciliation_tasks[instance].cancel()
+
+        async def _reconcile_loop() -> None:
+            while True:
+                await asyncio.sleep(_RECONCILE_INTERVAL_SECONDS)
+                info = self.instances_info.get(instance)
+                if not info or not info.installed:
+                    break
+                try:
+                    await self._reconcile_instance_models(instance, info.installed)
+                except Exception:
+                    logger.exception(f"{self.get_id(instance)} reconciliation tick failed")  # noqa: G004
+
+        self._reconciliation_tasks[instance] = asyncio.create_task(_reconcile_loop())
+
+    def _stop_reconciliation_task(self, instance: str) -> None:
+        if instance in self._reconciliation_tasks:
+            self._reconciliation_tasks[instance].cancel()
+            del self._reconciliation_tasks[instance]
+
+    def _reconcile_container_name(self, instance: str, info: InstalledInfoType, model_info: Any) -> str | None:  # noqa: ANN401
+        """Return the container name to inspect for a given model (None => skip this model).
+
+        Per-model-container services (vLLM, llama.cpp) return the model's own container; Ollama returns the
+        single shared instance container so a dead server releases every model loaded into it. Services that
+        never call ``_start_reconciliation_task`` inherit this default, which is not reached in practice.
+        """
+        raise NotImplementedError
+
+    async def _release_dead_model(self, instance: str, info: InstalledInfoType, model_id: str, model_info: Any) -> None:  # noqa: ANN401
+        """Release the bookkeeping of a model whose container was confirmed dead.
+
+        Implementations tear down whatever the service reserved (docker container, VRAM counter/cache),
+        drop the model from ``info.models`` and unregister its endpoint. Raising signals a failed teardown:
+        the caller keeps the crash-poll state and retries on the next tick instead of releasing prematurely.
+        """
+        raise NotImplementedError
+
+    async def _reconcile_instance_models(self, instance: str, info: InstalledInfoType) -> None:
+        """Detect models whose container is no longer running for good and release their VRAM bookkeeping."""
+        for model_id, model_info in cast("_HasModels", info).models.copy().items():
+            key = (instance, model_id)
+            if key in self._installing:
+                self._crash_poll_state.pop(key, None)
+                continue
+
+            container_name = self._reconcile_container_name(instance, info, model_info)
+            if not container_name:
+                self._crash_poll_state.pop(key, None)
+                continue
+
+            status = await self.docker_service.get_container_status(container_name)
+            is_bad = not status.exists or status.state != "running" or status.health == "unhealthy"
+
+            if not is_bad:
+                self._crash_poll_state.pop(key, None)
+                continue
+
+            bad_count = self._crash_poll_state.get(key, 0) + 1
+            self._crash_poll_state[key] = bad_count
+            if bad_count < _RECONCILE_DEAD_THRESHOLD:
+                continue
+
+            if key in self._installing or cast("_HasModels", info).models.get(model_id) is not model_info:
+                self._crash_poll_state.pop(key, None)
+                continue  # uninstalled or reinstalled while we were polling
+
+            try:
+                await self._release_dead_model(instance, info, model_id, model_info)
+            except Exception:
+                # Keep bookkeeping intact and retry teardown on the next tick rather than releasing VRAM
+                # for a container we couldn't confirm is actually gone.
+                logger.exception(f"{self.get_id(instance)} failed to tear down dead container for model {model_id}, will retry")  # noqa: G004
+                continue
+
+            self._crash_poll_state.pop(key, None)
+            logger.warning(f"{self.get_id(instance)} model {model_id} container is dead, released VRAM bookkeeping")  # noqa: G004
 
     async def _get_docker_logs(self, container_name: str) -> str:
         """Return raw docker logs output, with TTL caching per container."""
