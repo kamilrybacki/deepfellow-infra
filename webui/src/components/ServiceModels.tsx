@@ -689,14 +689,13 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
       });
     },
     onError: (error) => {
-      // Clear the abort controller ref
-      testAbortControllerRef.current = null;
-      // If the error is from user cancellation, just close the modal
+      // onCancel already handled all cleanup for user-initiated cancels.
+      // Don't interfere with any subsequent test that may have started since.
       if (error instanceof Error && error.name === "AbortError") {
-        testMutation.reset();
-        modal.close();
         return;
       }
+      // Clear the abort controller ref for genuine errors
+      testAbortControllerRef.current = null;
       queryClient.invalidateQueries({
         queryKey: ["admin", "services", serviceId, "models"],
       });
