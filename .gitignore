@@ -39,10 +39,11 @@ memory
 .claude/skills/create-issue/SKILL.md
 .claude/skills/fill-mr/SKILL.md
 .claude/skills/create-issue
+.claude/skills/daily-report
 .claude/skills/fill-mr
+.claude/skills/release
 .claude/skills/review-and-fix
 .claude/skills/write-docs
-.claude/skills/daily-report
 .claude/skills/write-python-tests
 .claude/skills/release
 .claude/skills/plane-api
