@@ -1319,6 +1319,22 @@ def test_add_body_config_sets_steps_from_quality_low() -> None:
     assert result["steps"] == QualityLevel.low.value  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
 
+def test_add_body_config_sets_steps_from_quality_hd() -> None:
+    body = ImagesRequest(prompt="test", model="sd", quality="hd")
+
+    result = _add_body_config({}, body, "test")
+
+    assert result["steps"] == QualityLevel.high.value  # pyright: ignore[reportTypedDictNotRequiredAccess]
+
+
+def test_add_body_config_sets_steps_from_quality_standard() -> None:
+    body = ImagesRequest(prompt="test", model="sd", quality="standard")
+
+    result = _add_body_config({}, body, "test")
+
+    assert result["steps"] == QualityLevel.medium.value  # pyright: ignore[reportTypedDictNotRequiredAccess]
+
+
 def test_add_body_config_valid_b64_json_response_format_ok() -> None:
     body = ImagesRequest(prompt="test", model="sd", response_format="b64_json")
 
