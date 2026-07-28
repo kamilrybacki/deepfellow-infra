@@ -804,7 +804,9 @@ class StableDiffusionInputSettings(BaseModel):
 
 class QualityLevel(Enum):
     high = 35
+    hd = 35  # noqa: PIE796
     medium = 20
+    standard = 20  # noqa: PIE796
     auto = 20  # noqa: PIE796
     low = 15
 
