@@ -26,6 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Container healthcheck (`scripts/healthcheck.py`) now probes `/health` instead of `/docs`, consistent with every other health probe.
 - Bumped bundled llama.cpp Docker image from `b9894` to `b10068` (latest published image build). Known risk: two upstream vulnerabilities remain unpatched as of this release — CVE-2026-2069 (GBNF grammar stack overflow) and an unpatched GGUF `general.alignment` integer overflow — both were already present in the previous `b9894` pin and are unrelated to this bump; mitigate by not accepting untrusted GGUF files or exposing GBNF grammar sampling to untrusted input until upstream ships a fix.
 - Bumped bundled Ollama Docker image from `0.31.1` to `0.32.1` and vLLM from `v0.24.0` to `v0.25.1` to stay current with upstream releases. No known outstanding security advisories affected the previous pins.
+- Bumped bundled open-websearch MCP Docker image from `v1.2.0` to `v2.1.9` to stay current with upstream releases.
 - Ollama VRAM usage for loaded models is now read directly from Ollama's `/api/ps` response instead of being parsed from container logs.
 
 ### Fixed

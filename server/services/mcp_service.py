@@ -1338,7 +1338,7 @@ _const = McpConst(
                 image_port=3000,
                 name="open-websearch",
                 container_name=mcp_service.docker_service.get_docker_container_name("open-websearch"),
-                image="hub.simplito.com/deepfellow/open-websearch:v1.2.0",
+                image="hub.simplito.com/deepfellow/open-websearch:v2.1.9",
                 env_vars={},
                 subnet=subnet,
             ),
