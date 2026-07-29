@@ -23,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - New Google AI embedding and image models: Gemini Embedding 2, the Nano Banana 2/2-Lite/Pro image models, and GA Imagen 4.0 Standard/Ultra.
 
 ### Changed
+- `OllamaChatMessage.role` is now a free-form string instead of a `Literal`, matching Ollama's native API, which does not validate role names. Required by models that define their own role vocabulary — e.g. Granite Guardian 3.3 passes RAG documents as `document` (and `document <id>` for multiple documents) when checking groundedness and context relevance.
 - Container healthcheck (`scripts/healthcheck.py`) now probes `/health` instead of `/docs`, consistent with every other health probe.
 - Bumped bundled llama.cpp Docker image from `b9894` to `b10068` (latest published image build). Known risk: two upstream vulnerabilities remain unpatched as of this release — CVE-2026-2069 (GBNF grammar stack overflow) and an unpatched GGUF `general.alignment` integer overflow — both were already present in the previous `b9894` pin and are unrelated to this bump; mitigate by not accepting untrusted GGUF files or exposing GBNF grammar sampling to untrusted input until upstream ships a fix.
 - Bumped bundled Ollama Docker image from `0.31.1` to `0.32.1` and vLLM from `v0.24.0` to `v0.25.1` to stay current with upstream releases. No known outstanding security advisories affected the previous pins.
