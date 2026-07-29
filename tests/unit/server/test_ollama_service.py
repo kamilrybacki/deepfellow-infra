@@ -340,8 +340,8 @@ async def test_get_loaded_models_returns_models(mock_fetch: AsyncMock):
         result = await svc._get_loaded_models("default")  # pyright: ignore[reportPrivateUsage]
 
     assert result == {
-        "llama3:latest": LoadedModelInfo(context_length=4096, vram_gb=None),
-        "mistral:latest": LoadedModelInfo(context_length=0, vram_gb=None),
+        "llama3": LoadedModelInfo(context_length=4096, vram_gb=None),
+        "mistral": LoadedModelInfo(context_length=0, vram_gb=None),
     }
 
 
@@ -363,8 +363,8 @@ async def test_get_loaded_models_reports_measured_vram(mock_fetch: AsyncMock):
         result = await svc._get_loaded_models("default")  # pyright: ignore[reportPrivateUsage]
 
     assert result is not None
-    assert result["llama3:latest"].vram_gb == pytest.approx(4.7, abs=0.01)
-    assert result["mistral:latest"].vram_gb is None
+    assert result["llama3"].vram_gb == pytest.approx(4.7, abs=0.01)
+    assert result["mistral"].vram_gb is None
     # _get_loaded_models no longer mutates _vram_cache directly — _resolve_vram_info owns that.
     assert svc._vram_cache == {}  # pyright: ignore[reportPrivateUsage]
 
@@ -406,7 +406,7 @@ async def test_get_loaded_model_info_maps_to_context_length_for_base_contract(mo
     with patch.object(svc, "get_instance_installed_info", return_value=_make_installed_info()):
         result = await svc.get_loaded_model_info("default")
 
-    assert result == {"llama3:latest": 4096}
+    assert result == {"llama3": 4096}
 
 
 @pytest.mark.asyncio

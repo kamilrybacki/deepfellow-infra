@@ -30,6 +30,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Ollama VRAM usage for loaded models is now read directly from Ollama's `/api/ps` response instead of being parsed from container logs.
 
 ### Fixed
+- Infra not resolving `:latest` tags from /api/ps Ollama endpoint for VRAM calculations.
 - `scripts/get_ollama_models.py` no longer captures raw scraped HTML markup as a model's `size` when the Ollama library page renders a "usage slot" widget instead of plain size text (seen for at least one cloud-hosted model, `gemini-3-flash-preview`); the captured text is now validated against a size-string pattern and discarded otherwise. Also corrected the already-affected entry in `static/ollama-min.json`.
 - vLLM now detects when an already-installed model's Docker container stops running for good (crash, OOM, manual `docker stop`, hung process reported `unhealthy`) and releases its reserved GPU memory automatically, without requiring a backend restart. Previously the GPU-utilization counter stayed occupied forever for a dead container, blocking further model loads.
 - llama.cpp now detects a crashed/killed model container (crash, OOM, `docker stop`, `unhealthy`) and releases its VRAM automatically, without a backend restart — matching the vLLM fix. Previously the model stayed reported as loaded, blocking further installs.
