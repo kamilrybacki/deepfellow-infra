@@ -1568,7 +1568,7 @@ class OllamaChatToolCall(BaseModel):
 
 
 class OllamaChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant", "tool"]
+    role: str  # Ollama native API accepts arbitrary roles (e.g. "document"), not just the well-known ones
     content: str  # Ollama native API supports list content for multimodal; str-only is a known limitation here
     images: list[str] | None = None
     tool_calls: list[OllamaChatToolCall] | None = None
