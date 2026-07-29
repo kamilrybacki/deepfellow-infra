@@ -793,7 +793,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             data = json.loads(result.data)
             models = data.get("models", [])
             return {
-                m["name"]: LoadedModelInfo(
+                m["name"].removesuffix(":latest"): LoadedModelInfo(
                     context_length=m.get("context_length", 0),
                     vram_gb=round(size_vram / GIB, 2) if (size_vram := m.get("size_vram")) else None,
                 )
