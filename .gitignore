@@ -49,3 +49,4 @@ memory
 .claude/skills/plane-api
 .claude/skills/create-work-item
 /BASE_WORKFLOW.md
+.claude/skills/review-mr
