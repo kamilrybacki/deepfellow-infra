@@ -30,11 +30,13 @@ from server.endpointregistry import (
     ProxyOptions,
     RegisteredModel,
     RegistrationOptions,
+    ResponseItemStore,
     SimpleEndpoint,
     _classify_error,  # pyright: ignore[reportPrivateUsage]
     _rewrite_sse_endpoint_events,  # pyright: ignore[reportPrivateUsage]
     post_form,
     post_json,
+    post_json_responses,
 )
 from server.models.api import (
     ChatCompletionRequest,
@@ -43,11 +45,13 @@ from server.models.api import (
     CreateTranscriptionRequest,
     EmbeddingRequest,
     ImagesRequest,
+    ItemReference,
     McpToolInfo,
     MessagesRequest,
     Model,
     ModelProps,
     OllamaChatRequest,
+    Reasoning,
     RerankRequest,
     ResponsesRequest,
 )
@@ -473,6 +477,37 @@ def test_get_models_aggregates_multiple_models():
     models = ep.get_models()
 
     assert len(models) == 2
+
+
+def test_get_models_sets_real_created_timestamp():
+    ep = make_endpoint()
+    before = int(time.time())
+    ep.add_model("gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local"))
+    after = int(time.time())
+
+    models = ep.get_models()
+
+    assert before <= models[0].created <= after
+
+
+def test_get_models_sets_owned_by_from_registration_options():
+    ep = make_endpoint()
+    ep.add_model(
+        "gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local", owned_by="ollama")
+    )
+
+    models = ep.get_models()
+
+    assert models[0].owned_by == "ollama"
+
+
+def test_get_models_owned_by_defaults_to_local():
+    ep = make_endpoint()
+    ep.add_model("gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", None)
+
+    models = ep.get_models()
+
+    assert models[0].owned_by == "local"
 
 
 def test_list_models_returns_registered_model_entries():
@@ -1014,6 +1049,16 @@ def test_update_models_removes_old_models():
     assert not reg.chat_completion_endpoints.has_model("gpt-4")
 
 
+def test_update_models_registers_new_models_with_mesh_owned_by():
+    reg = make_registry()
+    new_model = Model(id="new-id", name="gpt-4", type="llm", props=make_props(), usage=0)
+
+    reg.update_models([], [new_model], "http://api.example.com/", "mykey")
+
+    model = reg.get_model("gpt-4")
+    assert model.owned_by == "mesh"
+
+
 def test_update_models_sends_models_list_when_changed():
     reg = make_registry()
     new_model = Model(id="new-id", name="gpt-4", type="llm", props=make_props(), usage=0)
@@ -1187,6 +1232,7 @@ async def test_execute_responses_success():
 
     body = MagicMock(spec=ResponsesRequest)
     body.model = "resp-model"
+    body.input = None
     body.model_dump_json.return_value = "{}"
 
     with patch.object(reg, "with_usage", new_callable=AsyncMock, return_value=response):
@@ -1200,6 +1246,7 @@ async def test_execute_responses_raises_404_when_not_registered():
     reg = make_registry()
     body = MagicMock(spec=ResponsesRequest)
     body.model = "unknown"
+    body.input = None
     body.model_dump_json.return_value = "{}"
 
     with pytest.raises(HTTPException) as exc_info:
@@ -1217,6 +1264,7 @@ async def test_execute_responses_raises_400_when_model_has_no_responses_support(
 
     body = MagicMock(spec=ResponsesRequest)
     body.model = "gpt-4"
+    body.input = None
     body.model_dump_json.return_value = "{}"
 
     with pytest.raises(HTTPException) as exc_info:
@@ -1871,7 +1919,7 @@ async def test_register_chat_completion_as_proxy_responses_callback():
     ep = reg.chat_completion_endpoints.get_model("gpt-4")
     mock_resp = MagicMock(spec=StreamingResponse)
 
-    with patch("server.endpointregistry.post_json", new_callable=AsyncMock, return_value=mock_resp):
+    with patch("server.endpointregistry.post_json_responses", new_callable=AsyncMock, return_value=mock_resp):
         body = MagicMock(spec=ResponsesRequest)
         result = await ep.endpoint.on_responses(body, None)  # pyright: ignore[reportOptionalMemberAccess, reportOptionalCall]
 
@@ -2112,6 +2160,7 @@ async def test_execute_responses_with_log_payload():
     reg.register_chat_completion("resp-model", make_props(), ep, RegistrationOptions(origin="local"))
     body = MagicMock(spec=ResponsesRequest)
     body.model = "resp-model"
+    body.input = None
     body.model_dump_json.return_value = "{}"
 
     with patch.object(reg, "with_usage", new_callable=AsyncMock, return_value=response):
@@ -2187,7 +2236,9 @@ async def test_execute_rerank_with_log_payload():
 
 def _make_registered_model_with_endpoint(ep: ChatCompletionEndpoint) -> Any:
     """Build a RegisteredModel whose endpoint is `ep` but has no on_messages/etc."""
-    return RegisteredModel(id="fake-id", name="gpt-4", origin="local", props=make_props(), type="llm", endpoint=ep, usage=0)
+    return RegisteredModel(
+        id="fake-id", name="gpt-4", origin="local", props=make_props(), type="llm", endpoint=ep, usage=0, created=0, owned_by="local"
+    )
 
 
 @pytest.mark.asyncio
@@ -2214,6 +2265,7 @@ async def test_execute_responses_includes_supported_endpoints_in_error():
     reg.register_chat_completion("gpt-4", make_props(), ep, RegistrationOptions(origin="local"))
     body = MagicMock(spec=ResponsesRequest)
     body.model = "gpt-4"
+    body.input = None
     body.model_dump_json.return_value = "{}"
 
     with patch.object(reg.chat_completion_endpoints, "get_model", return_value=fake), pytest.raises(HTTPException) as exc_info:
@@ -2293,6 +2345,7 @@ async def test_execute_responses_calls_on_responses_directly():
     reg.register_chat_completion("resp-model", make_props(), ep, RegistrationOptions(origin="remote"))
     body = MagicMock(spec=ResponsesRequest)
     body.model = "resp-model"
+    body.input = None
     body.model_dump_json.return_value = "{}"
 
     result = await reg.execute_responses(body)
@@ -2560,6 +2613,7 @@ async def test_execute_responses_error_with_no_supported_endpoints():
     reg.register_chat_completion("gpt-4", make_props(), ep, RegistrationOptions(origin="local"))
     body = MagicMock(spec=ResponsesRequest)
     body.model = "gpt-4"
+    body.input = None
     body.model_dump_json.return_value = "{}"
 
     with patch.object(reg.chat_completion_endpoints, "get_model", return_value=fake), pytest.raises(HTTPException) as exc_info:
@@ -3172,3 +3226,238 @@ def test_registry_get_models_includes_custom_models() -> None:
     ids = [m.id for m in reg.get_models().data]
 
     assert "my-custom" in ids
+
+
+def test_response_item_store_put_and_get() -> None:
+    store = ResponseItemStore()
+    store.put({"id": "rs_1", "type": "reasoning", "summary": []})
+    assert store.get("rs_1") == {"id": "rs_1", "type": "reasoning", "summary": []}
+
+
+def test_response_item_store_get_unknown_returns_none() -> None:
+    store = ResponseItemStore()
+    assert store.get("nonexistent") is None
+
+
+def test_response_item_store_put_ignores_item_without_id() -> None:
+    store = ResponseItemStore()
+    store.put({"type": "reasoning", "summary": []})
+    assert store.get("rs_1") is None
+
+
+def test_response_item_store_evicts_expired(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = ResponseItemStore(ttl_seconds=10)
+    real_now = time.monotonic()
+    store.put({"id": "rs_1", "type": "reasoning", "summary": []})
+    monkeypatch.setattr(_er_module.time, "monotonic", lambda: real_now + 20)
+    assert store.get("rs_1") is None
+
+
+def test_response_item_store_put_prunes_expired_entries(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = ResponseItemStore(ttl_seconds=10)
+    real_now = time.monotonic()
+    store.put({"id": "rs_1", "type": "reasoning", "summary": []})
+    monkeypatch.setattr(_er_module.time, "monotonic", lambda: real_now + 20)
+    store.put({"id": "rs_2", "type": "reasoning", "summary": []})
+    assert "rs_1" not in store._items  # pyright: ignore[reportPrivateUsage]
+
+
+def test_response_item_store_evicts_oldest_when_at_capacity() -> None:
+    store = ResponseItemStore(max_items=2)
+    store.put({"id": "rs_1", "type": "reasoning", "summary": []})
+    store.put({"id": "rs_2", "type": "reasoning", "summary": []})
+    store.put({"id": "rs_3", "type": "reasoning", "summary": []})
+    assert store.get("rs_1") is None  # evicted
+    assert store.get("rs_2") is not None
+    assert store.get("rs_3") is not None
+
+
+@pytest.mark.asyncio
+async def test_post_json_responses_captures_output_items_and_returns_body_unchanged() -> None:
+    response_body = json.dumps({"id": "resp_1", "output": [{"id": "rs_871851", "type": "reasoning", "summary": []}]}).encode()
+
+    async def content_gen():  # type: ignore[return]
+        yield response_body
+
+    mock_http_response = MagicMock()
+    mock_http_response.response.content_type = "application/json"
+    mock_http_response.response.status = 200
+    mock_http_response.response.headers = {}
+    mock_http_response.content = content_gen()
+
+    store = ResponseItemStore()
+    opts = ProxyOptions(url="http://example.com/v1/responses")
+
+    with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response):
+        result = await post_json_responses(ResponsesRequest(model="gemma4:e4b", stream=False), opts, store)
+
+    assert store.get("rs_871851") == {"id": "rs_871851", "type": "reasoning", "summary": []}
+    assert await _collect(result.body_iterator) == response_body
+
+
+@pytest.mark.asyncio
+async def test_post_json_responses_skips_capture_when_streaming() -> None:
+    mock_http_response = MagicMock()
+    mock_streaming = MagicMock(spec=StreamingResponse)
+    mock_http_response.as_streaming_response.return_value = mock_streaming
+
+    store = ResponseItemStore()
+    opts = ProxyOptions(url="http://example.com/v1/responses")
+
+    with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response):
+        result = await post_json_responses(ResponsesRequest(model="gemma4:e4b", stream=True), opts, store)
+
+    assert result is mock_streaming
+    mock_http_response.as_streaming_response.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_post_json_responses_logs_and_passes_through_on_invalid_json(caplog: pytest.LogCaptureFixture) -> None:
+    async def content_gen():  # type: ignore[return]
+        yield b"not json"
+
+    mock_http_response = MagicMock()
+    mock_http_response.response.content_type = "application/json"
+    mock_http_response.response.status = 200
+    mock_http_response.response.headers = {}
+    mock_http_response.content = content_gen()
+
+    store = ResponseItemStore()
+    opts = ProxyOptions(url="http://example.com/v1/responses")
+
+    with (
+        caplog.at_level(logging.WARNING, logger="uvicorn.error"),
+        patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response),
+    ):
+        result = await post_json_responses(ResponsesRequest(model="gemma4:e4b", stream=False), opts, store)
+
+    assert await _collect(result.body_iterator) == b"not json"
+    assert "Failed to parse" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_execute_responses_resolves_item_reference_from_store() -> None:
+    reg = make_registry()
+    reg.response_item_store.put({"id": "rs_871851", "type": "reasoning", "summary": []})
+    ep = make_chat_endpoint(on_responses=True)
+    ep.on_responses = AsyncMock(return_value=MagicMock())
+    reg.register_chat_completion("gemma4:e4b", make_props(), ep, RegistrationOptions(origin="local"))
+
+    body = ResponsesRequest(model="gemma4:e4b", input=[ItemReference(id="rs_871851")])
+
+    await reg.execute_responses(body)
+
+    forwarded_input = ep.on_responses.call_args.args[0].input  # pyright: ignore[reportOptionalMemberAccess]
+    assert len(forwarded_input) == 1
+    assert isinstance(forwarded_input[0], Reasoning)
+    assert forwarded_input[0].id == "rs_871851"
+
+
+@pytest.mark.asyncio
+async def test_execute_responses_leaves_unresolved_item_reference_untouched() -> None:
+    reg = make_registry()
+    ep = make_chat_endpoint(on_responses=True)
+    ep.on_responses = AsyncMock(return_value=MagicMock())
+    reg.register_chat_completion("gpt-5.4-nano", make_props(), ep, RegistrationOptions(origin="remote"))
+
+    body = ResponsesRequest(model="gpt-5.4-nano", input=[ItemReference(id="rs_unknown")])
+
+    await reg.execute_responses(body)
+
+    forwarded_input = ep.on_responses.call_args.args[0].input  # pyright: ignore[reportOptionalMemberAccess]
+    assert len(forwarded_input) == 1
+    assert isinstance(forwarded_input[0], ItemReference)
+    assert forwarded_input[0].id == "rs_unknown"
+
+
+def test_resolve_item_reference_leaves_non_reference_items_unchanged() -> None:
+    reg = make_registry()
+    item = Reasoning(summary=[])
+
+    result = reg._resolve_item_reference(item)  # pyright: ignore[reportPrivateUsage]
+
+    assert result is item
+
+
+def test_resolve_item_reference_falls_back_when_cached_item_fails_validation() -> None:
+    reg = make_registry()
+    reg.response_item_store.put({"id": "rs_bad", "type": "reasoning"})  # missing required "summary" field
+
+    reference = ItemReference(id="rs_bad")
+    result = reg._resolve_item_reference(reference)  # pyright: ignore[reportPrivateUsage]
+
+    assert result is reference
+
+
+@pytest.mark.asyncio
+async def test_post_json_responses_removes_model_when_requested() -> None:
+    mock_http_response = MagicMock()
+    mock_http_response.response.content_type = "application/json"
+    mock_http_response.response.status = 200
+    mock_http_response.response.headers = {}
+
+    async def content_gen():  # type: ignore[return]
+        yield json.dumps({"output": []}).encode()
+
+    mock_http_response.content = content_gen()
+    opts = ProxyOptions(url="http://example.com/v1/responses", remove_model=True)
+    store = ResponseItemStore()
+
+    with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response) as mock_req:
+        await post_json_responses(ResponsesRequest(model="gemma4:e4b", stream=False), opts, store)
+
+    called_data = mock_req.call_args.kwargs["data"]
+    assert "model" not in json.loads(called_data._value)
+
+
+@pytest.mark.asyncio
+async def test_post_json_responses_rewrites_model_when_requested() -> None:
+    mock_http_response = MagicMock()
+    mock_http_response.response.content_type = "application/json"
+    mock_http_response.response.status = 200
+    mock_http_response.response.headers = {}
+
+    async def content_gen():  # type: ignore[return]
+        yield json.dumps({"output": []}).encode()
+
+    mock_http_response.content = content_gen()
+    opts = ProxyOptions(url="http://example.com/v1/responses", rewrite_model_to="gemma4:internal")
+    store = ResponseItemStore()
+
+    with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response) as mock_req:
+        await post_json_responses(ResponsesRequest(model="gemma4:e4b", stream=False), opts, store)
+
+    called_data = mock_req.call_args.kwargs["data"]
+    assert json.loads(called_data._value)["model"] == "gemma4:internal"
+
+
+@pytest.mark.asyncio
+async def test_post_json_responses_captures_only_dict_items_from_output_list() -> None:
+    response_body = json.dumps(
+        {
+            "id": "resp_1",
+            "output": [
+                "not-a-dict-item",
+                {"id": "rs_871851", "type": "reasoning", "summary": []},
+                {"id": "fc_1", "type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+            ],
+        }
+    ).encode()
+
+    async def content_gen():  # type: ignore[return]
+        yield response_body
+
+    mock_http_response = MagicMock()
+    mock_http_response.response.content_type = "application/json"
+    mock_http_response.response.status = 200
+    mock_http_response.response.headers = {}
+    mock_http_response.content = content_gen()
+
+    store = ResponseItemStore()
+    opts = ProxyOptions(url="http://example.com/v1/responses")
+
+    with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response):
+        await post_json_responses(ResponsesRequest(model="gemma4:e4b", stream=False), opts, store)
+
+    assert store.get("rs_871851") is not None
+    assert store.get("fc_1") is not None

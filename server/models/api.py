@@ -19,7 +19,7 @@ from fastapi import File as FastApiFile
 from fastapi import UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 
-LLM_ENDPOINTS = ["v1/completions, v1/chat/completions", "v1/responses", "v1/messages", "api/chat"]
+LLM_ENDPOINTS = ["/v1/completions", "/v1/chat/completions", "/v1/responses", "/v1/messages", "/api/chat"]
 LLM_SUFFIX_MAP: tuple[tuple[str, str], ...] = (
     ("on_completion", "v1"),
     ("on_chat_completion", "v2"),
@@ -820,7 +820,7 @@ class FunctionDef(BaseModel):
     type: Literal["function"] = "function"
     name: str
     parameters: dict[str, Any]
-    strict: bool = True
+    strict: bool = False
     description: str = ""
 
 
@@ -1046,7 +1046,7 @@ class Refusal(BaseModel):
 
 
 class OutputMessage(BaseModel):
-    id: str = str(uuid4())
+    id: str | None = None
     type: Literal["message"] = "message"
     status: Literal["in_progress", "completed", "incomplete"] = "completed"
     content: list[OutputText | Refusal] = []
@@ -1067,7 +1067,7 @@ class FileSearchResult(BaseModel):
 
 
 class FileSearchToolCall(BaseModel):
-    id: str = str(uuid4())
+    id: str = Field(default_factory=lambda: str(uuid4()))
     type: Literal["file_search_call"] = "file_search_call"
     status: Literal["in_progress", "searching", "incomplete", "failed"] = "searching"
     queries: list[str]
@@ -1075,10 +1075,10 @@ class FileSearchToolCall(BaseModel):
 
 
 class FunctionToolCall(BaseModel):
-    id: str = str(uuid4())
+    id: str | None = None
     type: Literal["function_call"] = "function_call"
     status: Literal["in_progress", "completed", "incomplete"] = "completed"
-    call_id: str = str(uuid4())
+    call_id: str | None = None
     name: str
     arguments: str
 
@@ -1103,7 +1103,7 @@ class Reasoning(BaseModel):
 
 
 class ImageGenerationCall(BaseModel):
-    id: str = str(uuid4())
+    id: str = Field(default_factory=lambda: str(uuid4()))
     type: Literal["image_generation_call"] = "image_generation_call"
     result: str = ""
     status: str = "completed"
@@ -1117,7 +1117,7 @@ class ToolResponse(BaseModel):
 
 
 class McpListTools(BaseModel):
-    id: str = str(uuid4())
+    id: str = Field(default_factory=lambda: str(uuid4()))
     type: Literal["mcp_list_tools"] = "mcp_list_tools"
     server_label: str
     tools: list[ToolResponse] = []
@@ -1125,7 +1125,7 @@ class McpListTools(BaseModel):
 
 
 class McpApprovalRequest(BaseModel):
-    id: str = str(uuid4())
+    id: str = Field(default_factory=lambda: str(uuid4()))
     type: Literal["mcp_approval_request"] = "mcp_approval_request"
     server_label: str
     name: str
@@ -1133,7 +1133,7 @@ class McpApprovalRequest(BaseModel):
 
 
 class McpApprovalResponse(BaseModel):
-    id: str = str(uuid4())
+    id: str = Field(default_factory=lambda: str(uuid4()))
     type: Literal["mcp_approval_response"] = "mcp_approval_response"
     approval_request_id: str
     approve: bool
@@ -1141,7 +1141,7 @@ class McpApprovalResponse(BaseModel):
 
 
 class McpToolCall(BaseModel):
-    id: str = str(uuid4())
+    id: str = Field(default_factory=lambda: str(uuid4()))
     type: Literal["mcp_call"] = "mcp_call"
     server_label: str
     name: str
@@ -1151,7 +1151,7 @@ class McpToolCall(BaseModel):
 
 
 class Prompt(BaseModel):
-    id: str = str(uuid4())
+    id: str = Field(default_factory=lambda: str(uuid4()))
     variables: dict[str, Any] = {}
     version: str = ""
 
@@ -1205,10 +1205,10 @@ class TextConfig(BaseModel):
 
 
 class CustomToolCall(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid4()))
-    type: Literal["function_call"] = "function_call"
+    id: str | None = None
+    type: Literal["custom_tool_call"] = "custom_tool_call"
     status: Literal["in_progress", "completed", "incomplete"] = "completed"
-    call_id: str = Field(default_factory=lambda: str(uuid4()))
+    call_id: str | None = None
     namespace: str | None
     name: str
     input: str
@@ -1235,7 +1235,7 @@ class FunctionCallOutputFileInput(BaseModel):
 
 
 class FunctionCallOutput(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid4()))
+    id: str | None = None
     type: Literal["function_call_output"] = "function_call_output"
     status: Literal["in_progress", "completed", "incomplete"] = "completed"
     call_id: str
@@ -1243,9 +1243,9 @@ class FunctionCallOutput(BaseModel):
 
 
 class CustomToolCallOutput(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid4()))
+    id: str | None = None
     type: Literal["custom_tool_call_output"] = "custom_tool_call_output"
-    call_id: str = Field(default_factory=lambda: str(uuid4()))
+    call_id: str | None = None
     status: Literal["in_progress", "completed", "incomplete"] = "completed"
     created_by: str | None = None
     output: str | list[FunctionCallOutputTextInput | FunctionCallOutputImageInput | FunctionCallOutputFileInput]

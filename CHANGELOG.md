@@ -42,6 +42,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - A transient failure to reach Ollama's `/api/ps` no longer reports a still-loaded model as unloaded with a lower-fidelity VRAM estimate.
 - Installing an MCP server without a required API key/header (e.g. brave-search without `BRAVE_API_KEY`, ollama-websearch without `OLLAMA_API_KEY`) no longer shows a fake download that runs to completion without installing anything. The missing field is now flagged inline in the install form before submit, and the backend rejects the request with a clear error listing the missing keys.
 - The Cancel button for an in-progress model installation in the WebUI now appears in the model's table row, so it stays available after refreshing the page. Previously cancelling was only possible from the bottom progress toast, which disappeared on refresh and left the installation with no way to cancel.
+- API errors now return an OpenAI-style `invalid_request_error` body with `message` and `param` identifying the offending field, instead of a bare `{"detail":"Bad Request"}` with no diagnostic detail.
+- `/v1/models` now reports each model's real registration timestamp and owning service in `created`/`owned_by` instead of always `0`/`"unknown"`.
+- `/v1/responses` now resolves `item_reference` inputs pointing at a stateful item (e.g. a reasoning item) this gateway emitted earlier in the conversation, instead of rejecting it (Ollama-backed models) or crashing with a 500 (OpenAI-backed models).
+- `/v1/responses` no longer rejects function tools whose parameter schema has an optional (not-`required`) property — `strict` now defaults to `false` instead of `true`.
+- `/v1/responses` no longer rejects `function_call`/`function_call_output` history items on the OpenAI-backed path: a duplicated `type` discriminator on `CustomToolCall` was colliding with `FunctionToolCall`'s, making the union ambiguous for every `function_call` item. `id`/`call_id` also no longer share one value generated once per process, so tool-call history replays byte-for-byte.
+- `/v1/models?additional_data=true` now reports the correct endpoint list for Ollama, llama.cpp, and vLLM models; a malformed `LLM_ENDPOINTS` entry had merged two endpoint paths into one string and dropped the leading `/` used by every other endpoint.
 
 ### Changed
 - Stable Diffusion service to Stable Diffusion Next

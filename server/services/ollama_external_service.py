@@ -19,7 +19,7 @@ from packaging import version
 from pydantic import BaseModel, Field, StringConstraints
 
 from server.config import get_main_dir
-from server.endpointregistry import ProxyOptions, RegistrationId
+from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
 from server.models.api import EMBEDDINGS_ENDPOINTS, ModelProps
 from server.models.models import (
     CustomModelField,
@@ -377,7 +377,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                     ProxyOptions(url=f"{installed_info.base_url}/v1/messages", rewrite_model_to=model_id) if self.support_messages else None
                 ),
                 ollama_chat=ProxyOptions(url=f"{installed_info.base_url}/api/chat", rewrite_model_to=model_id),
-                registration_options=None,
+                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
             )
         if model_type == "embedding":
             model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
@@ -390,7 +390,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                     max_context_window=context_length,
                 ),
                 options=ProxyOptions(url=f"{installed_info.base_url}/v1/embeddings", rewrite_model_to=model_id),
-                registration_options=None,
+                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
             )
         installed_info.models[model_id] = model_info
 
@@ -645,7 +645,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 else None
                             ),
                             ollama_chat=ProxyOptions(url=f"{info.base_url}/api/chat", rewrite_model_to=model_id),
-                            registration_options=None,
+                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
                     if model.type == "embedding":
                         model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
@@ -658,7 +658,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 max_context_window=context_length,
                             ),
                             options=ProxyOptions(url=f"{info.base_url}/v1/embeddings", rewrite_model_to=model_id),
-                            registration_options=None,
+                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
                     stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
                     self.models_downloaded[model_id] = DownloadedInfo()

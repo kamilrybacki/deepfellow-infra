@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from server.applicationcontext import get_base_url
 from server.docker import DockerImage, DockerOptions
-from server.endpointregistry import ProxyOptions, RegistrationId
+from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
 from server.models.api import ModelProps
 from server.models.models import (
     CustomModelField,
@@ -1165,12 +1165,13 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
             allowed_request_headers=["accept", "mcp-session-id"],
             allowed_response_headers=["accept", "mcp-session-id"],
         )
+        registration_options = RegistrationOptions(origin="local", owned_by=self.get_type())
         if model.proxy_transport == "sse":
             return self.endpoint_registry.register_mcp_sse_endpoint_as_proxy(
-                url=parsed_options.prefix, props=model.model_props, options=proxy_options, registration_options=None
+                url=parsed_options.prefix, props=model.model_props, options=proxy_options, registration_options=registration_options
             )
         return self.endpoint_registry.register_mcp_endpoint_as_proxy(
-            url=parsed_options.prefix, props=model.model_props, options=proxy_options, registration_options=None
+            url=parsed_options.prefix, props=model.model_props, options=proxy_options, registration_options=registration_options
         )
 
     async def _install_model(  # noqa: C901
@@ -1273,7 +1274,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 allowed_response_headers=["accept", "mcp-session-id"],
                                 headers=model.headers | parsed_model_options.headers if model.headers else parsed_model_options.headers,
                             ),
-                            registration_options=None,
+                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
                     else:
                         model_info.registration_id = self.endpoint_registry.register_mcp_endpoint_as_proxy(
@@ -1285,7 +1286,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 allowed_response_headers=["accept", "mcp-session-id"],
                                 headers=model.headers | parsed_model_options.headers if model.headers else parsed_model_options.headers,
                             ),
-                            registration_options=None,
+                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
                     self.models_downloaded[model_id] = DownloadedInfo(docker_options.image)
                     task = asyncio.create_task(self._fetch_tools_background(instance, model_id))

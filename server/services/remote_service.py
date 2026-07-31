@@ -18,7 +18,7 @@ from urllib.parse import urljoin
 from fastapi import HTTPException
 from pydantic import BaseModel
 
-from server.endpointregistry import ProxyOptions, RegistrationId
+from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
 from server.models.api import ModelProps
 from server.models.models import (
     CustomModelField,
@@ -485,7 +485,7 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
                             if model.legacy_completions
                             else None,
                             ollama_chat=None,
-                            registration_options=None,
+                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
                     if model.type == "tts":
                         url = urljoin(url_base, "audio/speech")
@@ -497,7 +497,7 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
                                 rewrite_model_to=model.real_model_name or model_id,
                                 headers=headers,
                             ),
-                            registration_options=None,
+                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
                     if model.type == "stt":
                         url = urljoin(url_base, "audio/transcriptions")
@@ -509,7 +509,7 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
                                 rewrite_model_to=model.real_model_name or model_id,
                                 headers=headers,
                             ),
-                            registration_options=None,
+                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
                     if model.type == "txt2img":
                         url = urljoin(url_base, "images/generations")
@@ -521,7 +521,7 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
                                 rewrite_model_to=model.real_model_name or model_id,
                                 headers=headers,
                             ),
-                            registration_options=None,
+                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
                     if model.type == "embedding":
                         url = urljoin(url_base, "embeddings")
@@ -533,7 +533,7 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
                                 rewrite_model_to=model.real_model_name or model_id,
                                 headers=headers,
                             ),
-                            registration_options=None,
+                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
                     stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
                     self.models_downloaded[model_id] = DownloadedInfo()

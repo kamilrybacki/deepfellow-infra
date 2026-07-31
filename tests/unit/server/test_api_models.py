@@ -22,7 +22,9 @@ from server.models.api import (
     CreateSpeechRequest,
     CreateTranscriptionRequest,
     EmbeddingRequest,
+    FunctionToolCall,
     ImagesRequest,
+    McpToolCall,
     Reasoning,
     ReasoningConfig,
     ReasoningContentItem,
@@ -444,3 +446,18 @@ def test_reasoning_input_item_forwards_content() -> None:
     raw = item.model_dump(exclude_none=True)
     assert raw["id"] == "rs_abc123"
     assert raw["content"] == [{"type": "reasoning_text", "text": "raw reasoning text"}]
+
+
+def test_function_call_omits_id_and_call_id_when_not_supplied() -> None:
+    item = FunctionToolCall(name="f", arguments="{}")
+
+    raw = item.model_dump(exclude_none=True)
+    assert "id" not in raw
+    assert "call_id" not in raw
+
+
+def test_mcp_tool_call_generates_unique_ids_per_instance() -> None:
+    first = McpToolCall(server_label="s", name="f")
+    second = McpToolCall(server_label="s", name="f")
+
+    assert first.id != second.id

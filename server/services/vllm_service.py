@@ -29,7 +29,7 @@ from server.docker import (
     DockerImage,
     DockerOptions,
 )
-from server.endpointregistry import ProxyOptions, RegistrationId
+from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
 from server.models.api import LLM_ENDPOINTS, ModelProps
 from server.models.models import (
     CustomModelField,
@@ -640,7 +640,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                 model=registered_name,
                 props=ModelProps(private=True, type="rerank", endpoints=["/v1/rerank"]),
                 options=ProxyOptions(url=f"{model_info.base_url}/v1/rerank", rewrite_model_to=model_id),
-                registration_options=None,
+                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
             )
         return self.endpoint_registry.register_chat_completion_as_proxy(
             model=registered_name,
@@ -656,7 +656,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             responses=ProxyOptions(url=f"{model_info.base_url}/v1/responses", rewrite_model_to=model_id),
             messages=ProxyOptions(url=f"{model_info.base_url}/v1/messages", rewrite_model_to=model_id),
             ollama_chat=None,
-            registration_options=None,
+            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
         )
 
     async def _install_model(  # noqa: C901

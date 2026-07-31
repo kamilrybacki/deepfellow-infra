@@ -49,7 +49,11 @@ async def on_models(
     endpoint_registry: Annotated[EndpointRegistry, Depends(get_endpoint_registry)],
     additional_data: Annotated[bool, Query()] = False,
 ) -> ApiModels | ApiModelsCompatible:
-    """Process models request."""
+    """Process models request.
+
+    Set `additional_data=true` to also get `props` (context window, type, endpoints) per model —
+    omitted by default for strict OpenAI-compatibility, so plain OpenAI SDK clients never see it.
+    """
     models = endpoint_registry.get_models()
     return models if additional_data else ApiModelsCompatible(**models.model_dump())
 
@@ -61,7 +65,11 @@ async def on_model(
     endpoint_registry: Annotated[EndpointRegistry, Depends(get_endpoint_registry)],
     additional_data: Annotated[bool, Query()] = False,
 ) -> ApiModel | ApiModelCompatible:
-    """Process model request."""
+    """Process model request.
+
+    Set `additional_data=true` to also get `props` (context window, type, endpoints) —
+    omitted by default for strict OpenAI-compatibility, so plain OpenAI SDK clients never see it.
+    """
     model = endpoint_registry.get_model(model_id)
     return model if additional_data else ApiModelCompatible(**model.model_dump())
 

@@ -32,7 +32,7 @@ from server.docker import (
     DockerImage,
     DockerOptions,
 )
-from server.endpointregistry import EndpointCallback, ProxyOptions, RegistrationId, SimpleEndpoint
+from server.endpointregistry import EndpointCallback, ProxyOptions, RegistrationId, RegistrationOptions, SimpleEndpoint
 from server.models.api import IMG_ENDPOINTS, ImagesRequest, ModelProps
 from server.models.models import (
     CustomModelField,
@@ -436,7 +436,7 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
                     parsed_options.expose_api_at_prefix,
                     ModelProps(private=False, type="txt2img", endpoints=[f"/custom/{parsed_options.expose_api_at_prefix}/"]),
                     ProxyOptions(get_base_url(host, port)),
-                    registration_options=None,
+                    registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                 )
                 if parsed_options.expose_api_at_prefix
                 else None
@@ -706,7 +706,7 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
                             model=registered_name,
                             props=ModelProps(private=True, type=model.type, endpoints=IMG_ENDPOINTS),
                             endpoint=SimpleEndpoint(on_request=_stable_diffusion_handler(info.base_url, model_filename)),
-                            registration_options=None,
+                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
 
                     await self.refresh_models(instance)

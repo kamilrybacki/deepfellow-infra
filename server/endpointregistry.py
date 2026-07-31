@@ -10,6 +10,7 @@
 """Endpoint registry holds callbacks for given endpoints and models."""
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -22,7 +23,7 @@ import aiohttp
 from aiohttp import JsonPayload
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from server.config import AppSettings
 from server.metrics_registry import MetricsRegistry
@@ -38,6 +39,8 @@ from server.models.api import (
     EmbeddingRequest,
     FormSerializable,
     ImagesRequest,
+    Input,
+    ItemReference,
     McpToolInfo,
     MessagesRequest,
     Model,
@@ -92,6 +95,8 @@ class RegisteredModel[T](BaseModel):
     type: str
     endpoint: T
     usage: int
+    created: int
+    owned_by: str
     healthy: bool = False
 
 
@@ -100,6 +105,7 @@ class RegistrationOptions(NamedTuple):
     id: RegistrationId | None = None
     usage: int | None = None
     send_notification: bool = True
+    owned_by: str = "local"
 
 
 class RegistryEntry(NamedTuple):
@@ -130,6 +136,8 @@ class Endpoint[T]:
             endpoint=endpoint,
             type=type,
             usage=options.usage if options and options.usage is not None else 0,
+            created=int(time.time()),
+            owned_by=options.owned_by if options else "local",
         )
         if model_id not in self.models:
             self.models[model_id] = {}
@@ -188,6 +196,14 @@ class Endpoint[T]:
         """Return unique model types."""
         return next(iter({item.type for item in model.values()}))
 
+    def get_model_created(self, model: dict[RegistrationId, RegisteredModel[T]]) -> int:
+        """Return the earliest registration timestamp for a model."""
+        return min(item.created for item in model.values())
+
+    def get_model_owned_by(self, model: dict[RegistrationId, RegisteredModel[T]]) -> str:
+        """Return the owning service type for a model."""
+        return next(iter(model.values())).owned_by
+
     def get_model_available_endpoints(self, model: dict[RegistrationId, RegisteredModel[T]]) -> list[str]:
         """Get model available endpoints."""
         return list({endpoint for item in model.values() for endpoint in item.props.endpoints})
@@ -226,8 +242,8 @@ class Endpoint[T]:
         return ApiModel(
             id=model_id,
             object="model",
-            created=0,
-            owned_by="unknown",
+            created=self.get_model_created(model),
+            owned_by=self.get_model_owned_by(model),
             props=ModelProps(
                 private=self.is_model_private(model),
                 type=self.get_model_type(model),
@@ -311,6 +327,54 @@ class McpSseSessionStore:
     def remove(self, session_id: str) -> None:
         """Remove a session mapping."""
         self._sessions.pop(session_id, None)
+
+
+_input_item_adapter = TypeAdapter(Input)
+
+
+class ResponseItemStore:
+    """Caches stateful output items (e.g. reasoning) from this gateway's own /v1/responses replies.
+
+    Backends like Ollama mint an id on stateful output items but have no real storage to resolve an
+    `item_reference` to that id against, since this gateway does not implement `store`/`previous_response_id`.
+    This lets a later request's `item_reference` be resolved locally (splicing the full item back into the
+    outgoing request) instead of forwarding an unresolvable reference upstream.
+
+    Same no-lock reasoning as McpSseSessionStore: plain dict mutations, no await points inside them.
+    """
+
+    def __init__(self, ttl_seconds: int = 600, max_items: int = 512) -> None:
+        self._items: dict[str, tuple[dict[str, Any], float]] = {}
+        self._ttl = ttl_seconds
+        self._max = max_items
+
+    def _evict_expired(self) -> None:
+        now = time.monotonic()
+        expired = [item_id for item_id, (_, ts) in self._items.items() if now - ts >= self._ttl]
+        for item_id in expired:
+            del self._items[item_id]
+
+    def put(self, item: dict[str, Any]) -> None:
+        """Store an output item by its id, evicting expired/oldest if at capacity."""
+        item_id = item.get("id")
+        if not isinstance(item_id, str):
+            return
+        self._evict_expired()
+        if len(self._items) >= self._max and item_id not in self._items:
+            oldest = next(iter(self._items))
+            del self._items[oldest]
+        self._items[item_id] = (item, time.monotonic())
+
+    def get(self, item_id: str) -> dict[str, Any] | None:
+        """Return a stored item, or None if unknown or expired."""
+        entry = self._items.get(item_id)
+        if entry is None:
+            return None
+        item, ts = entry
+        if time.monotonic() - ts >= self._ttl:
+            del self._items[item_id]
+            return None
+        return item
 
 
 async def _rewrite_sse_endpoint_events(
@@ -401,6 +465,7 @@ class EndpointRegistry:
         self.images_generations_endpoints = Endpoint[SimpleEndpoint[ImagesRequest]](self.registry, self.parent_infra)
         self.rerank_endpoints = Endpoint[SimpleEndpoint[RerankRequest]](self.registry, self.parent_infra)
         self.mcp_endpoints = Endpoint[McpEndpoint](self.registry, self.parent_infra)
+        self.response_item_store = ResponseItemStore()
 
     def get_models(self) -> ApiModels:
         """Get models for api."""
@@ -501,7 +566,7 @@ class EndpointRegistry:
         if responses:
 
             async def on_responses_request(body: ResponsesRequest, request: Request | None) -> StreamingResponse:
-                return await post_json(body, responses, request)
+                return await post_json_responses(body, responses, self.response_item_store, request)
 
             endpoint.on_responses = on_responses_request
 
@@ -833,6 +898,7 @@ class EndpointRegistry:
                         origin=api_url,
                         usage=model.usage,
                         send_notification=False,
+                        owned_by="mesh",
                     ),
                 )
         for model in prev_list:
@@ -990,6 +1056,9 @@ class EndpointRegistry:
         registration_id: RegistrationId | None = None,
     ) -> StarletteResponse:
         """Process responses request."""
+        if isinstance(body.input, list):
+            body.input = [self._resolve_item_reference(item) for item in body.input]
+
         if self.config.is_log_payloads_enabled():
             logger.info(f"DUMP REQUEST PAYLOAD /v1/responses {body.model_dump_json(exclude_none=True)}")  # noqa: G004
 
@@ -1020,6 +1089,19 @@ class EndpointRegistry:
             return await on_responses(body, request)
 
         return await self.with_usage(endpoint, func, self.config.is_log_payloads_enabled())
+
+    def _resolve_item_reference(self, item: Input) -> Input:
+        """Splice a cached item in place of an `item_reference`, if this gateway produced it earlier."""
+        if not isinstance(item, ItemReference):
+            return item
+        stored = self.response_item_store.get(item.id)
+        if stored is None:
+            return item
+        try:
+            return _input_item_adapter.validate_python(stored)
+        except ValidationError:
+            logger.warning("Cached item for id=%s failed to validate as an Input item", item.id)
+            return item
 
     async def execute_chat_completion(
         self,
@@ -1341,6 +1423,47 @@ async def post_json(data: BaseModel, options: ProxyOptions, request: Request | N
             headers=options.get_request_headers(request),
         )
     ).as_streaming_response(options.allowed_response_headers)
+
+
+async def post_json_responses(
+    data: ResponsesRequest, options: ProxyOptions, store: ResponseItemStore, request: Request | None = None
+) -> StreamingResponse:
+    """Make HTTP POST request for /v1/responses, caching stateful output items for later item_reference resolution."""
+    raw = data.model_dump(exclude_none=True)
+    if options.remove_model:
+        del raw["model"]
+    if options.rewrite_model_to:
+        raw["model"] = options.rewrite_model_to
+    http_response = await make_http_request(
+        url=options.url,
+        method="POST",
+        data=JsonPayload(raw),
+        headers=options.get_request_headers(request),
+    )
+    if data.stream or not (http_response.response.content_type or "").startswith("application/json"):
+        return http_response.as_streaming_response(options.allowed_response_headers)
+
+    body = b"".join([chunk async for chunk in http_response.content])
+    try:
+        parsed = json.loads(body)
+        for item in parsed.get("output", []):
+            if isinstance(item, dict):
+                store.put(item)
+    except json.JSONDecodeError:
+        logger.warning("Failed to parse /v1/responses body for item_reference caching", exc_info=True)
+
+    allowed_response_headers = options.allowed_response_headers or []
+    response_headers = {k: v for k, v in dict(http_response.response.headers).items() if k in allowed_response_headers}
+
+    async def replay() -> AsyncGenerator[bytes]:
+        yield body
+
+    return StreamingResponse(
+        replay(),
+        media_type=http_response.response.content_type,
+        status_code=http_response.response.status,
+        headers=response_headers,
+    )
 
 
 async def post_form(data: FormSerializable, options: ProxyOptions, request: Request | None = None) -> StreamingResponse:

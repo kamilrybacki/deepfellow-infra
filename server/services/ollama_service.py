@@ -27,7 +27,7 @@ from pydantic import BaseModel, StringConstraints
 from server.applicationcontext import get_base_url
 from server.config import get_main_dir
 from server.docker import DockerImage, DockerOptions, DockerPath
-from server.endpointregistry import ProxyOptions, RegistrationId
+from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
 from server.models.api import EMBEDDINGS_ENDPOINTS, IMG_ENDPOINTS, LLM_ENDPOINTS, ModelProps
 from server.models.models import (
     CustomModelField,
@@ -1278,7 +1278,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                             responses=ProxyOptions(url=f"{info.base_url}/v1/responses", rewrite_model_to=rewrite_model_to),
                             messages=ProxyOptions(url=f"{info.base_url}/v1/messages", rewrite_model_to=rewrite_model_to),
                             ollama_chat=ProxyOptions(url=f"{info.base_url}/api/chat", rewrite_model_to=rewrite_model_to),
-                            registration_options=None,
+                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
                     if model.type == "embedding":
                         model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
@@ -1291,7 +1291,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 max_context_window=max_context_window,
                             ),
                             options=ProxyOptions(url=f"{info.base_url}/v1/embeddings", rewrite_model_to=rewrite_model_to),
-                            registration_options=None,
+                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
                     if model.type == "txt2img":
                         model_info.registration_id = self.endpoint_registry.register_image_generations_as_proxy(
@@ -1304,7 +1304,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 max_context_window=max_context_window,
                             ),
                             options=ProxyOptions(url=f"{info.base_url}/v1/images/generations", rewrite_model_to=rewrite_model_to),
-                            registration_options=None,
+                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
                     input_stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
 
