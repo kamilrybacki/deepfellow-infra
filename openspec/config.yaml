@@ -10,7 +10,7 @@ context: |
   Testing: pytest async strict mode, per-function scope, real DB (no mocks).
 
   Code conventions:
-  - Python line length: 140 chars; all .py files need DeepFellow Free License header.
+  - Python line length: 140 chars; all .py files need MIT License Header.
   - Prefer Pydantic models over plain dicts; prefer TS types over plain objects.
   - Commits: conventional commits format.
   - Branch naming: <gitlab-issue-id>-<short-description>.

@@ -1,11 +1,4 @@
-# DeepFellow Software Framework.
-# Copyright © 2026 Simplito sp. z o.o.
-#
-# This file is part of the DeepFellow Software Framework (https://deepfellow.ai).
-# This software is Licensed under the DeepFellow Free License.
-#
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: MIT
 
 """Tests for check_license_header.py module."""
 
@@ -16,18 +9,17 @@ from unittest.mock import patch
 import pytest
 
 from scripts.check_license_header import (
+    LICENSE_HEADER,
     apply_fixes,
     build_excludes,
     check_file_header,
     classify_files,
     create_parser,
     extract_content_after_preamble,
-    extract_header_year,
     find_python_files,
     fix_file_header,
-    get_current_year,
     get_files_to_check,
-    get_license_header,
+    has_license_header,
     main,
     normalize_header,
     parse_gitignore,
@@ -35,41 +27,40 @@ from scripts.check_license_header import (
     should_exclude,
 )
 
+OLD_DFFL_HEADER = (
+    "# DeepFellow Software Framework.\n"
+    "# Copyright © 2020 Simplito sp. z o.o.\n"
+    "#\n"
+    "# This file is part of the DeepFellow Software Framework (https://deepfellow.ai).\n"
+    "# This software is Licensed under the DeepFellow Free License.\n"
+    "#\n"
+    "# See the License for the specific language governing permissions and\n"
+    "# limitations under the License.\n"
+)
+
 
 @pytest.fixture
-def current_year() -> int:
-    """Current year for tests."""
-    return get_current_year()
-
-
-@pytest.fixture
-def license_header(current_year: int) -> str:
-    """License header with current year."""
-    return get_license_header(current_year)
-
-
-@pytest.fixture
-def valid_content(license_header: str) -> str:
+def valid_content() -> str:
     """Valid Python file content with license header."""
-    return f"{license_header}\n\nimport sys\n"
+    return f"{LICENSE_HEADER}\n\nimport sys\n"
 
 
 @pytest.fixture
-def valid_with_shebang(license_header: str) -> str:
+def valid_with_shebang() -> str:
     """Valid Python file with shebang and license header."""
-    return f"#!/usr/bin/env python3\n\n{license_header}\n\nimport sys\n"
+    return f"#!/usr/bin/env python3\n\n{LICENSE_HEADER}\n\nimport sys\n"
 
 
 @pytest.fixture
-def valid_with_encoding(license_header: str) -> str:
+def valid_with_encoding() -> str:
     """Valid Python file with encoding declaration and license header."""
-    return f"# -*- coding: utf-8 -*-\n\n{license_header}\n\nimport sys\n"
+    return f"# -*- coding: utf-8 -*-\n\n{LICENSE_HEADER}\n\nimport sys\n"
 
 
 @pytest.fixture
-def valid_with_both(license_header: str) -> str:
+def valid_with_both() -> str:
     """Valid Python file with shebang, encoding, and license header."""
-    return f"#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n\n{license_header}\n\nimport sys\n"
+    return f"#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n\n{LICENSE_HEADER}\n\nimport sys\n"
 
 
 @pytest.fixture
@@ -93,30 +84,16 @@ def gitignore_path(tmp_path: Path):
     return tmp_path / ".gitignore"
 
 
-@pytest.mark.parametrize(("current_year", "ending"), [(None, ""), (2020, "2020")])
-def test_get_license_header_uses_current_year(current_year: int | None, ending: str) -> None:
-    header = get_license_header(current_year)
-
-    assert " ".join(("Copyright ©", ending)) in header
+def test_has_license_header_present() -> None:
+    assert has_license_header(f"{LICENSE_HEADER}\nimport sys\n") is True
 
 
-def test_extract_header_year_finds_old_year() -> None:
-    header = get_license_header(2020)
-    content = f"{header}\nimport sys\n"
-
-    assert extract_header_year(content) == 2020
+def test_has_license_header_absent() -> None:
+    assert has_license_header("import sys\n") is False
 
 
-def test_extract_header_year_no_header() -> None:
-    content = "import sys\n"
-
-    assert extract_header_year(content) is None
-
-
-def test_extract_header_year_with_shebang(current_year: int, license_header: str) -> None:
-    content = f"#!/usr/bin/env python3\n\n{license_header}\nimport sys\n"
-
-    assert extract_header_year(content) == current_year
+def test_has_license_header_old_dffl_header_not_recognized() -> None:
+    assert has_license_header(f"{OLD_DFFL_HEADER}\nimport sys\n") is False
 
 
 @pytest.mark.parametrize(
@@ -202,176 +179,142 @@ def test_check_file_header_valid(tmp_path: Path, valid_content: str) -> None:
     file = tmp_path / "valid.py"
     file.write_text(valid_content)
 
-    has_valid, year = check_file_header(file)
-
-    assert has_valid is True
-    assert year == get_current_year()
+    assert check_file_header(file) is True
 
 
 def test_check_file_header_valid_with_shebang(tmp_path: Path, valid_with_shebang: str) -> None:
     file = tmp_path / "with_shebang.py"
     file.write_text(valid_with_shebang)
 
-    has_valid, _year = check_file_header(file)
-
-    assert has_valid is True
+    assert check_file_header(file) is True
 
 
 def test_check_file_header_valid_with_encoding(tmp_path: Path, valid_with_encoding: str) -> None:
     file = tmp_path / "with_encoding.py"
     file.write_text(valid_with_encoding)
 
-    has_valid, _year = check_file_header(file)
-
-    assert has_valid is True
+    assert check_file_header(file) is True
 
 
 def test_check_file_header_valid_with_shebang_and_encoding(tmp_path: Path, valid_with_both: str) -> None:
     file = tmp_path / "with_both.py"
     file.write_text(valid_with_both)
 
-    has_valid, _year = check_file_header(file)
-
-    assert has_valid is True
+    assert check_file_header(file) is True
 
 
 def test_check_file_header_invalid_no_header(tmp_path: Path) -> None:
     file = tmp_path / "no_header.py"
     file.write_text("import sys\n")
 
-    has_valid, year = check_file_header(file)
-
-    assert has_valid is False
-    assert year is None
+    assert check_file_header(file) is False
 
 
 def test_check_file_header_invalid_wrong_header(tmp_path: Path) -> None:
     file = tmp_path / "wrong_header.py"
     file.write_text("# MIT License\nimport sys\n")
 
-    has_valid, year = check_file_header(file)
-
-    assert has_valid is False
-    assert year is None
+    assert check_file_header(file) is False
 
 
-def test_check_file_header_invalid_old_year(tmp_path: Path) -> None:
-    """File with valid header but outdated year."""
-    old_header = get_license_header(2020)
-    file = tmp_path / "old_year.py"
-    file.write_text(f"{old_header}\nimport sys\n")
+def test_check_file_header_invalid_old_dffl_header(tmp_path: Path) -> None:
+    """A file still carrying the old DFFL header is not considered valid."""
+    file = tmp_path / "old_dffl.py"
+    file.write_text(f"{OLD_DFFL_HEADER}\nimport sys\n")
 
-    has_valid, year = check_file_header(file)
-
-    assert has_valid is False
-    assert year == 2020
+    assert check_file_header(file) is False
 
 
 def test_check_file_header_empty_file(tmp_path: Path) -> None:
     file = tmp_path / "empty.py"
     file.write_text("")
 
-    has_valid, year = check_file_header(file)
-
-    assert has_valid is True
-    assert year is None
+    assert check_file_header(file) is True
 
 
 def test_check_file_header_whitespace_only(tmp_path: Path) -> None:
     file = tmp_path / "whitespace.py"
     file.write_text("   \n\n")
 
-    has_valid, _year = check_file_header(file)
-
-    assert has_valid is True
+    assert check_file_header(file) is True
 
 
 def test_check_file_header_nonexistent_file(tmp_path: Path) -> None:
-    has_valid, year = check_file_header(tmp_path / "nonexistent.py")
-
-    assert has_valid is False
-    assert year is None
+    assert check_file_header(tmp_path / "nonexistent.py") is False
 
 
-def test_fix_file_header_without_header(tmp_path: Path, current_year: int) -> None:
+def test_fix_file_header_without_header(tmp_path: Path) -> None:
     file = tmp_path / "no_header.py"
     file.write_text("import sys\n\ndef main():\n    pass\n")
 
     result = fix_file_header(file)
 
     assert result is True
-    has_valid, _year = check_file_header(file)
-    assert has_valid is True
+    assert check_file_header(file) is True
     content = file.read_text()
-    assert f"Copyright © {current_year}" in content
+    assert "# SPDX-License-Identifier: MIT" in content
     assert "import sys" in content
 
 
-def test_fix_file_header_with_shebang(tmp_path: Path, current_year: int) -> None:
+def test_fix_file_header_with_shebang(tmp_path: Path) -> None:
     file = tmp_path / "with_shebang.py"
     file.write_text("#!/usr/bin/env python3\n\nimport sys\n")
 
     fix_file_header(file)
 
-    has_valid, _ = check_file_header(file)
-    assert has_valid is True
+    assert check_file_header(file) is True
     content = file.read_text()
     assert content.startswith("#!/usr/bin/env python3\n")
-    assert f"Copyright © {current_year}" in content
+    assert "# SPDX-License-Identifier: MIT" in content
     assert "import sys" in content
 
 
-def test_fix_file_header_with_encoding(tmp_path: Path, current_year: int) -> None:
+def test_fix_file_header_with_encoding(tmp_path: Path) -> None:
     file = tmp_path / "with_encoding.py"
     file.write_text("# -*- coding: utf-8 -*-\n\nimport sys\n")
 
     fix_file_header(file)
 
-    has_valid, _ = check_file_header(file)
-    assert has_valid is True
+    assert check_file_header(file) is True
     content = file.read_text()
     assert content.startswith("# -*- coding: utf-8 -*-\n")
-    assert f"Copyright © {current_year}" in content
+    assert "# SPDX-License-Identifier: MIT" in content
 
 
-def test_fix_file_header_with_shebang_and_encoding(tmp_path: Path, current_year: int) -> None:
+def test_fix_file_header_with_shebang_and_encoding(tmp_path: Path) -> None:
     file = tmp_path / "with_both.py"
     file.write_text("#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n\nimport sys\n")
 
     fix_file_header(file)
 
-    has_valid, _ = check_file_header(file)
-    assert has_valid is True
+    assert check_file_header(file) is True
     content = file.read_text()
     assert content.startswith("#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n")
-    assert f"Copyright © {current_year}" in content
+    assert "# SPDX-License-Identifier: MIT" in content
 
 
-def test_fix_file_header_empty_file(tmp_path: Path, current_year: int) -> None:
+def test_fix_file_header_empty_file(tmp_path: Path) -> None:
     file = tmp_path / "empty.py"
     file.write_text("")
 
     fix_file_header(file)
 
     content = file.read_text()
-    assert f"Copyright © {current_year}" in content
+    assert "# SPDX-License-Identifier: MIT" in content
 
 
-def test_fix_file_header_updates_old_year(tmp_path: Path, current_year: int) -> None:
-    """Fix should update year in existing header."""
-    old_header = get_license_header(2020)
-    file = tmp_path / "old_year.py"
-    file.write_text(f"{old_header}\nimport sys\n")
+def test_fix_file_header_migrates_old_dffl_header(tmp_path: Path) -> None:
+    """Fix should strip the old DFFL header and add the SPDX header instead."""
+    file = tmp_path / "old_dffl.py"
+    file.write_text(f"{OLD_DFFL_HEADER}\nimport sys\n")
 
     result = fix_file_header(file)
 
     assert result is True
-    has_valid, year = check_file_header(file)
-    assert has_valid is True
-    assert year == current_year
+    assert check_file_header(file) is True
     content = file.read_text()
-    assert f"Copyright © {current_year}" in content
-    assert "Copyright © 2020" not in content
+    assert "# SPDX-License-Identifier: MIT" in content
+    assert "DeepFellow Software Framework" not in content
     assert "import sys" in content
 
 
@@ -391,18 +334,15 @@ def test_fix_file_header_nonexistent_file(tmp_path: Path) -> None:
     assert fix_file_header(tmp_path / "nonexistent.py") is False
 
 
-def test_fix_file_header_idempotent(tmp_path: Path, valid_content: str, current_year: int) -> None:
+def test_fix_file_header_idempotent(tmp_path: Path, valid_content: str) -> None:
     file = tmp_path / "already_valid.py"
     file.write_text(valid_content)
 
-    has_valid, _ = check_file_header(file)
-    assert has_valid is True
+    assert check_file_header(file) is True
 
     fix_file_header(file)
 
-    has_valid, year = check_file_header(file)
-    assert has_valid is True
-    assert year == current_year
+    assert check_file_header(file) is True
 
 
 def test_find_python_files_finds_all(project_dir: Path) -> None:
@@ -460,50 +400,7 @@ def test_find_python_files_respects_gitignore(project_dir: Path) -> None:
     assert {f.name for f in files} == {"main.py", "utils.py", "test_main.py"}
 
 
-def test_check_file_header_valid_year(tmp_path: Path) -> None:
-    """Test that check_file_header succeeds when the header matches the current year."""
-    test_year = 2024
-    header = get_license_header(test_year)
-    file = tmp_path / "valid_header.py"
-    file.write_text(f"{header}\nimport sys\n")
-
-    with patch("scripts.check_license_header.get_current_year", return_value=test_year):
-        has_valid, year = check_file_header(file)
-
-    assert has_valid is True
-    assert year == test_year
-
-
-def test_check_file_header_invalid_year(tmp_path: Path) -> None:
-    """Test that check_file_header fails when the header year is outdated."""
-    header_year = 2020
-    current_year = 2024
-
-    header = get_license_header(header_year)
-    file = tmp_path / "invalid_header.py"
-    file.write_text(f"{header}\nimport sys\n")
-
-    with patch("scripts.check_license_header.get_current_year", return_value=current_year):
-        has_valid, year = check_file_header(file)
-
-    assert has_valid is False
-    assert year == header_year
-
-
-def test_fix_file_header_updates_to_current_year_mocked(tmp_path: Path) -> None:
-    """Test that fix updates to whatever the current year is."""
-    header_2020 = get_license_header(2020)
-    file = tmp_path / "old.py"
-    file.write_text(f"{header_2020}\nimport sys\n")
-
-    with patch("scripts.check_license_header.get_current_year", return_value=2030):
-        fix_file_header(file)
-        content = file.read_text()
-        assert "Copyright © 2030" in content
-        assert "Copyright © 2020" not in content
-
-
-def test_fix_file_header_no_trailing_newline(tmp_path: Path, current_year: int) -> None:
+def test_fix_file_header_no_trailing_newline(tmp_path: Path) -> None:
     file = tmp_path / "no_newline.py"
     file.write_text("import sys")
 
@@ -512,11 +409,11 @@ def test_fix_file_header_no_trailing_newline(tmp_path: Path, current_year: int) 
     assert result is True
     content = file.read_text()
     assert content.endswith("\n")
-    assert f"Copyright © {current_year}" in content
+    assert "# SPDX-License-Identifier: MIT" in content
     assert "import sys" in content
 
 
-def test_fix_file_header_only_preamble_lines(tmp_path: Path, current_year: int) -> None:
+def test_fix_file_header_only_preamble_lines(tmp_path: Path) -> None:
     file = tmp_path / "only_shebang.py"
     file.write_text("#!/usr/bin/env python3\n")
 
@@ -525,10 +422,10 @@ def test_fix_file_header_only_preamble_lines(tmp_path: Path, current_year: int) 
     assert result is True
     content = file.read_text()
     assert content.startswith("#!/usr/bin/env python3\n")
-    assert f"Copyright © {current_year}" in content
+    assert "# SPDX-License-Identifier: MIT" in content
 
 
-def test_fix_file_header_preamble_only_no_trailing_newline(tmp_path: Path, current_year: int) -> None:
+def test_fix_file_header_preamble_only_no_trailing_newline(tmp_path: Path) -> None:
     """All lines are preamble (no trailing newline), so the for loop exhausts without break."""
     file = tmp_path / "preamble_only.py"
     file.write_text("#!/usr/bin/env python3\n# coding: utf-8")
@@ -538,7 +435,7 @@ def test_fix_file_header_preamble_only_no_trailing_newline(tmp_path: Path, curre
     assert result is True
     content = file.read_text()
     assert content.startswith("#!/usr/bin/env python3\n# coding: utf-8\n")
-    assert f"Copyright © {current_year}" in content
+    assert "# SPDX-License-Identifier: MIT" in content
 
 
 def test_parse_gitignore_skips_slash_only_lines(tmp_path: Path) -> None:
@@ -654,37 +551,31 @@ def test_classify_files_missing_header(tmp_path: Path) -> None:
     f = tmp_path / "no_header.py"
     f.write_text("import sys\n")
 
-    missing, invalid = classify_files([f])
+    missing = classify_files([f])
 
     assert f in missing
-    assert f not in invalid
 
 
-def test_classify_files_invalid_year(tmp_path: Path) -> None:
-    f = tmp_path / "old_year.py"
-    f.write_text(f"{get_license_header(2020)}\nimport sys\n")
+def test_classify_files_old_dffl_header_counts_as_missing(tmp_path: Path) -> None:
+    f = tmp_path / "old_dffl.py"
+    f.write_text(f"{OLD_DFFL_HEADER}\nimport sys\n")
 
-    missing, invalid = classify_files([f])
+    missing = classify_files([f])
 
-    assert f not in missing
-    assert f in invalid
+    assert f in missing
 
 
 def test_classify_files_valid(tmp_path: Path, valid_content: str) -> None:
     f = tmp_path / "valid.py"
     f.write_text(valid_content)
 
-    missing, invalid = classify_files([f])
+    missing = classify_files([f])
 
     assert f not in missing
-    assert f not in invalid
 
 
 def test_classify_files_empty() -> None:
-    missing, invalid = classify_files([])
-
-    assert missing == []
-    assert invalid == []
+    assert classify_files([]) == []
 
 
 def test_apply_fixes_successful(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -705,7 +596,7 @@ def test_apply_fixes_failed(tmp_path: Path, capsys: pytest.CaptureFixture[str]) 
 
 
 def test_report_issues_no_issues(capsys: pytest.CaptureFixture[str]) -> None:
-    report_issues([], [], verbose=False)
+    report_issues([], verbose=False)
 
     assert capsys.readouterr().out == ""
 
@@ -713,7 +604,7 @@ def test_report_issues_no_issues(capsys: pytest.CaptureFixture[str]) -> None:
 def test_report_issues_missing_non_verbose(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     f = tmp_path / "missing.py"
 
-    report_issues([f], [], verbose=False)
+    report_issues([f], verbose=False)
 
     out = capsys.readouterr().out
     assert "Missing license header in 1 files" in out
@@ -723,25 +614,7 @@ def test_report_issues_missing_non_verbose(tmp_path: Path, capsys: pytest.Captur
 def test_report_issues_missing_verbose(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     f = tmp_path / "missing.py"
 
-    report_issues([f], [], verbose=True)
-
-    assert str(f) in capsys.readouterr().out
-
-
-def test_report_issues_invalid_year_non_verbose(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    f = tmp_path / "old.py"
-
-    report_issues([], [f], verbose=False)
-
-    out = capsys.readouterr().out
-    assert "Invalid year in 1 files" in out
-    assert "Use --verbose" in out
-
-
-def test_report_issues_invalid_year_verbose(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    f = tmp_path / "old.py"
-
-    report_issues([], [f], verbose=True)
+    report_issues([f], verbose=True)
 
     assert str(f) in capsys.readouterr().out
 

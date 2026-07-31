@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 
-# DeepFellow Software Framework.
-# Copyright © 2026 Simplito sp. z o.o.
-#
-# This file is part of the DeepFellow Software Framework (https://deepfellow.ai).
-# This software is Licensed under the DeepFellow Free License.
-#
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: MIT
 
 """Scrapes Ollama library pages and produces static/ollama-min.json.
 
