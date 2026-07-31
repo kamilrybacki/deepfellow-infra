@@ -1,0 +1,27 @@
+meta {
+  name: List Services
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{host}}/admin/services
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{process.env.ADMIN_TOKEN}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+
+  // Deliberately not asserting the list is non-empty: how many services are
+  // installed depends on the environment.
+  test("list is an array", function() {
+    expect(res.getBody().list).to.be.an("array");
+  });
+}

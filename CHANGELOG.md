@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Read-only smoke test suite (`tests/bruno/`) that checks availability, docs, reported version, the admin and OpenAI-compatible read endpoints, and auth rejections over real HTTP against a running instance. It runs after every deploy to dev (main, hotfix branches and release tags); on a release tag it is a blocking gate, so a tagged build that fails it is never published to GitHub. Run it locally with `tests/bruno/run-local.sh`.
 - New `GET /info` endpoint, authorized with the server key (`DF_INFRA_API_KEY`), returns the running Infra version (`{"version": "..."}`) read from `pyproject.toml`.
 - Ollama service now has a "↻ Refresh catalog" button that fetches trending models from the Ollama library and merges them into the model list as a dynamic overlay, so newly released models show up without waiting for an app update. Each click always fetches fresh results; the 6-hour cache only applies to callers that don't pass `force=true`.
 - Ollama Cloud support with cached model list.

@@ -1,0 +1,29 @@
+meta {
+  name: List Models
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{host}}/v1/models
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{process.env.API_TOKEN}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+
+  test("object is list", function() {
+    expect(res.getBody().object).to.equal("list");
+  });
+
+  test("data is an array", function() {
+    expect(res.getBody().data).to.be.an("array");
+  });
+}

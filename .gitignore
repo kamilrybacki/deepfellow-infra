@@ -50,3 +50,6 @@ memory
 .claude/skills/create-work-item
 /BASE_WORKFLOW.md
 .claude/skills/review-mr
+
+# Bruno smoke tests — local auth tokens
+/tests/bruno/.env

@@ -1,0 +1,21 @@
+meta {
+  name: Models rejects invalid token
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{host}}/v1/models
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: definitely-not-a-valid-token
+}
+
+tests {
+  test("status is 401", function() {
+    expect(res.getStatus()).to.equal(401);
+  });
+}

@@ -1,0 +1,19 @@
+meta {
+  name: Models rejects missing token
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{host}}/v1/models
+  body: none
+  auth: none
+}
+
+tests {
+  // HTTPBearer (server/core/dependencies.py:29) raises 401 for a missing
+  // Authorization header — exactly 401, not 403, since FastAPI 0.116.
+  test("status is 401", function() {
+    expect(res.getStatus()).to.equal(401);
+  });
+}
