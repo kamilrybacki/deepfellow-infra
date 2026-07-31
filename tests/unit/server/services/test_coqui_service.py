@@ -192,8 +192,8 @@ def test_build_coqui_command_cuda_flag_when_true(svc: CoquiService) -> None:
         CoquiCmdOptions(model_name="any-model", model_path=None, cuda=True, language=None)
     )
 
-    assert "--use_cuda" in cmd[1]
-    assert "true" in cmd[1]
+    assert "--device" in cmd[1]
+    assert "cuda" in cmd[1]
 
 
 def test_build_coqui_command_no_cuda_when_false(svc: CoquiService) -> None:
@@ -201,7 +201,7 @@ def test_build_coqui_command_no_cuda_when_false(svc: CoquiService) -> None:
         CoquiCmdOptions(model_name="any-model", model_path=None, cuda=False, language=None)
     )
 
-    assert "--use_cuda" not in cmd[1]
+    assert "--device" not in cmd[1]
 
 
 def test_build_coqui_command_language_included(svc: CoquiService) -> None:

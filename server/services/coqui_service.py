@@ -73,8 +73,8 @@ class CoquiConst(BaseModel):
 
 _const = CoquiConst(
     images={
-        "cpu": DockerImage(name="ghcr.io/coqui-ai/tts:dbf1a08a0d4e47fdad6172e433eeb34bc6b13b4e", size="11.0 GB"),
-        "gpu": DockerImage(name="ghcr.io/coqui-ai/tts-cpu:dbf1a08a0d4e47fdad6172e433eeb34bc6b13b4e", size="11.0 GB"),
+        "cpu": DockerImage(name="ghcr.io/idiap/coqui-tts-cpu:ca2cf5155bca892ea820ad384400efbfac41b178", size="3.9 GB"),
+        "gpu": DockerImage(name="ghcr.io/idiap/coqui-tts:ca2cf5155bca892ea820ad384400efbfac41b178", size="14.5 GB"),
     },
     models={
         "tts_models/en/vctk/vits": CoquiModel(
@@ -441,7 +441,7 @@ class CoquiService(Base2Service[InstalledInfo, DownloadedInfo]):
         cmd_args.extend(["--port", "5002"])
 
         if options.cuda:
-            cmd_args.extend(["--use_cuda", "true"])
+            cmd_args.extend(["--device", "cuda"])
 
         if options.language:
             cmd_args.extend(["--language", options.language])
