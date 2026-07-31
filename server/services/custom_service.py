@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 from server.applicationcontext import get_base_url
 from server.docker import DockerImage, DockerOptions
-from server.endpointregistry import ProxyOptions, RegistrationId
+from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
 from server.models.api import ModelProps
 from server.models.models import (
     CustomModelField,
@@ -448,7 +448,7 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
                         url=model_info.prefix,
                         props=model.model_props,
                         options=ProxyOptions(url=model_info.base_url),
-                        registration_options=None,
+                        registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                     )
                     self.models_downloaded[model_id] = DownloadedInfo(image.name)
                     stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))

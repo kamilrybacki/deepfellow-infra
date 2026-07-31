@@ -22,7 +22,7 @@ from pydantic import BaseModel
 
 from server.applicationcontext import get_base_url
 from server.docker import DockerImage, DockerOptions
-from server.endpointregistry import ProxyOptions, RegistrationId, SimpleEndpoint, post_json
+from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions, SimpleEndpoint, post_json
 from server.models.api import STT_ENDPOINTS, TTS_ENDPOINTS, CreateSpeechRequest, ModelId, ModelProps
 from server.models.models import (
     CustomModelField,
@@ -903,14 +903,14 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
                             model=registered_name,
                             props=ModelProps(private=True, type=model.type, endpoints=TTS_ENDPOINTS),
                             endpoint=SimpleEndpoint(on_request=on_request),
-                            registration_options=None,
+                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
                     if model.type == "stt":
                         model_info.registration_id = self.endpoint_registry.register_audio_transcriptions_as_proxy(
                             model=registered_name,
                             props=ModelProps(private=True, type=model.type, endpoints=STT_ENDPOINTS),
                             options=ProxyOptions(url=f"{info.base_url}/v1/audio/transcriptions", rewrite_model_to=model_id),
-                            registration_options=None,
+                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
                     stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
                     self.models_downloaded[model_id] = DownloadedInfo(model_path=str(model_dir))

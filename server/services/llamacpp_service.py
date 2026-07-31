@@ -22,7 +22,7 @@ from pydantic import BaseModel
 
 from server.applicationcontext import get_base_url
 from server.docker import DockerImage, DockerOptions
-from server.endpointregistry import ProxyOptions, RegistrationId
+from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
 from server.models.api import LLM_ENDPOINTS, ModelProps
 from server.models.models import (
     CustomModelField,
@@ -658,7 +658,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
                         responses=ProxyOptions(url=f"{model_info.base_url}/v1/responses", rewrite_model_to=model_id),
                         messages=ProxyOptions(url=f"{model_info.base_url}/v1/messages", rewrite_model_to=model_id),
                         ollama_chat=None,
-                        registration_options=None,
+                        registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                     )
                     stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
                     self.models_downloaded[model_id] = DownloadedInfo(str(local_model_path))

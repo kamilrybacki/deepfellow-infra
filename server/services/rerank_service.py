@@ -21,7 +21,7 @@ from pydantic import BaseModel
 
 from server.applicationcontext import get_base_url
 from server.docker import DockerImage, DockerOptions
-from server.endpointregistry import ProxyOptions, RegistrationId
+from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
 from server.models.api import ModelProps
 from server.models.models import (
     CustomModelField,
@@ -477,7 +477,7 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 endpoints=["/v1/rerank"],
                             ),
                             options=ProxyOptions(url=f"{info.base_url}/v1/rerank", rewrite_model_to=model_id),
-                            registration_options=None,
+                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
                     stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
 

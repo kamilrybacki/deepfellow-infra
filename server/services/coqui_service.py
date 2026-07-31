@@ -26,7 +26,7 @@ from server.docker import (
     DockerImage,
     DockerOptions,
 )
-from server.endpointregistry import EndpointCallback, RegistrationId, SimpleEndpoint
+from server.endpointregistry import EndpointCallback, RegistrationId, RegistrationOptions, SimpleEndpoint
 from server.ffmpeg import ffmpeg_audio_convert_async_gen
 from server.models.api import TTS_ENDPOINTS, CreateSpeechRequest, ModelProps
 from server.models.models import (
@@ -405,7 +405,7 @@ class CoquiService(Base2Service[InstalledInfo, DownloadedInfo]):
                     model=registered_name,
                     props=ModelProps(private=True, type="tts", endpoints=TTS_ENDPOINTS),
                     endpoint=SimpleEndpoint(on_request=_create_handler(model_info.base_url, model.default_speaker, model.response_format)),
-                    registration_options=None,
+                    registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                 )
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
                 self.models_downloaded[model_id] = DownloadedInfo()

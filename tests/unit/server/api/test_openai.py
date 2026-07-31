@@ -10,15 +10,17 @@
 """Tests for server/api/openai.py endpoints."""
 
 from collections.abc import Generator
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from starlette.testclient import TestClient
 
 from server.api.openai import router
 from server.core.dependencies import auth_server, get_endpoint_registry
+from server.error_handlers import register_exception_handlers
 from server.models.api import ApiModel, ApiModels, ModelProps
 
 
@@ -50,6 +52,7 @@ def registry() -> MagicMock:
 
 def _make_app(registry: MagicMock) -> FastAPI:
     app = FastAPI()
+    register_exception_handlers(app)
     app.include_router(router)
     app.dependency_overrides[auth_server] = lambda: "test-key"
     app.dependency_overrides[get_endpoint_registry] = lambda: registry
@@ -64,6 +67,7 @@ def client(registry: MagicMock) -> Generator[TestClient]:
 
 def test_auth_required_returns_403_without_token() -> None:
     app = FastAPI()
+    register_exception_handlers(app)
     app.include_router(router)
     # No dependency overrides — auth_server will reject missing token
     with TestClient(app, raise_server_exceptions=False) as client:
@@ -201,6 +205,115 @@ def test_post_responses_with_reasoning_omits_temperature_and_top_p(
     assert raw["reasoning"] == {"effort": "high"}
     assert "temperature" not in raw
     assert "top_p" not in raw
+
+
+def _make_function_tool(strict: bool | None = None) -> dict[str, Any]:
+    tool: dict[str, Any] = {
+        "type": "function",
+        "name": "f",
+        "description": "d",
+        "parameters": {
+            "type": "object",
+            "properties": {"q": {"type": "string"}, "n": {"type": "integer"}},
+            "required": ["q"],
+            "additionalProperties": False,
+        },
+    }
+    if strict is not None:
+        tool["strict"] = strict
+    return tool
+
+
+def test_post_responses_with_optional_tool_param_defaults_strict_to_false(
+    registry: MagicMock, client: TestClient, auth_header: dict[str, str]
+) -> None:
+    client.post(
+        "/v1/responses",
+        json={**RESPONSES_BODY, "tools": [_make_function_tool()]},
+        headers=auth_header,
+    )
+
+    body = registry.execute_responses.call_args.args[0]
+    raw = body.model_dump(exclude_none=True)
+    assert raw["tools"][0]["strict"] is False
+
+
+def test_post_responses_with_explicit_strict_tool_is_preserved(
+    registry: MagicMock, client: TestClient, auth_header: dict[str, str]
+) -> None:
+    client.post(
+        "/v1/responses",
+        json={**RESPONSES_BODY, "tools": [_make_function_tool(strict=True)]},
+        headers=auth_header,
+    )
+
+    body = registry.execute_responses.call_args.args[0]
+    raw = body.model_dump(exclude_none=True)
+    assert raw["tools"][0]["strict"] is True
+
+
+FUNCTION_CALL_HISTORY_INPUT = [
+    {"role": "user", "content": "hi"},
+    {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{}"},
+    {"type": "function_call_output", "call_id": "call_1", "output": "{}"},
+]
+
+
+def test_post_responses_with_function_call_history_accepted(registry: MagicMock, client: TestClient, auth_header: dict[str, str]) -> None:
+    resp = client.post(
+        "/v1/responses",
+        json={**RESPONSES_BODY, "input": FUNCTION_CALL_HISTORY_INPUT},
+        headers=auth_header,
+    )
+
+    assert resp.status_code == 200
+    body = registry.execute_responses.call_args.args[0]
+    raw = body.model_dump(exclude_none=True)
+    function_call, function_call_output = raw["input"][1], raw["input"][2]
+    assert function_call == {"type": "function_call", "status": "completed", "call_id": "call_1", "name": "f", "arguments": "{}"}
+    assert function_call_output == {"type": "function_call_output", "status": "completed", "call_id": "call_1", "output": "{}"}
+
+
+def test_post_responses_with_function_call_history_preserves_explicit_id_and_status(
+    registry: MagicMock, client: TestClient, auth_header: dict[str, str]
+) -> None:
+    input_with_ids = [
+        {"role": "user", "content": "hi"},
+        {
+            "id": "fc_1",
+            "type": "function_call",
+            "status": "in_progress",
+            "call_id": "call_1",
+            "name": "f",
+            "arguments": "{}",
+        },
+        {"id": "fco_1", "type": "function_call_output", "call_id": "call_1", "output": "{}"},
+    ]
+
+    client.post("/v1/responses", json={**RESPONSES_BODY, "input": input_with_ids}, headers=auth_header)
+
+    body = registry.execute_responses.call_args.args[0]
+    raw = body.model_dump(exclude_none=True)
+    assert raw["input"][1]["id"] == "fc_1"
+    assert raw["input"][1]["status"] == "in_progress"
+    assert raw["input"][2]["id"] == "fco_1"
+
+
+def test_post_responses_with_custom_tool_call_accepted(registry: MagicMock, client: TestClient, auth_header: dict[str, str]) -> None:
+    input_with_custom_call = [
+        {"type": "custom_tool_call", "call_id": "call_1", "namespace": None, "name": "run", "input": "echo hi"},
+    ]
+
+    resp = client.post(
+        "/v1/responses",
+        json={**RESPONSES_BODY, "input": input_with_custom_call},
+        headers=auth_header,
+    )
+
+    assert resp.status_code == 200
+    body = registry.execute_responses.call_args.args[0]
+    raw = body.model_dump(exclude_none=True)
+    assert raw["input"][0]["type"] == "custom_tool_call"
 
 
 CHAT_BODY = {
@@ -412,7 +525,7 @@ def test_custom_endpoint_rejects_path_traversal(registry: MagicMock, auth_header
     with TestClient(_make_app(registry), raise_server_exceptions=False) as client:
         resp = client.get("/custom/foo%2F..%2Fetc%2Fpasswd", headers=auth_header)
 
-    assert resp.status_code in (400, 422)
+    assert resp.status_code == 400
     assert registry.execute_custom_endpoints.call_count == 0
 
 
@@ -458,5 +571,26 @@ def test_mcp_endpoint_rejects_path_traversal(registry: MagicMock, auth_header: d
     with TestClient(_make_app(registry), raise_server_exceptions=False) as client:
         resp = client.get("/mcp/foo%2F..%2Fetc%2Fpasswd", headers=auth_header)
 
-    assert resp.status_code in (400, 422)
+    assert resp.status_code == 400
     assert registry.execute_mcp_endpoints.call_count == 0
+
+
+def test_http_exception_returns_openai_style_error_body(registry: MagicMock, client: TestClient, auth_header: dict[str, str]) -> None:
+    registry.execute_chat_completion = AsyncMock(side_effect=HTTPException(400, "Model not found"))
+
+    resp = client.post("/v1/chat/completions", json=CHAT_BODY, headers=auth_header)
+
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "Model not found", "type": "invalid_request_error", "param": None, "code": None}}
+
+
+def test_validation_error_returns_openai_style_error_body_with_param(
+    registry: MagicMock, client: TestClient, auth_header: dict[str, str]
+) -> None:
+    resp = client.post("/v1/chat/completions", json={"model": "gpt-4"}, headers=auth_header)
+
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["error"]["type"] == "invalid_request_error"
+    assert body["error"]["param"] == "messages"
+    assert registry.execute_chat_completion.call_count == 0
