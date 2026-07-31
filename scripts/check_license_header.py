@@ -1,20 +1,34 @@
 #!/usr/bin/env python3
 
 # SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
 
 """License header validation script for Python files."""
 
 import argparse
 import re
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 # ruff: noqa: T201
 
-LICENSE_HEADER = "# SPDX-License-Identifier: MIT\n"
+LICENSE_LINE = "# SPDX-License-Identifier: MIT"
+COPYRIGHT_LINE_TEMPLATE = "# SPDX-FileCopyrightText: {year} Simplito sp. z o.o."
 
-# Pattern to match the license header
+
+def get_current_year() -> int:
+    """Get the current year, used to stamp a new copyright line (never used to re-validate an existing one)."""
+    return datetime.now(UTC).year
+
+
+LICENSE_HEADER = f"{LICENSE_LINE}\n{COPYRIGHT_LINE_TEMPLATE.format(year=get_current_year())}\n"
+
+# Pattern to match the license identifier line
 LICENSE_HEADER_PATTERN = re.compile(r"# SPDX-License-Identifier: MIT\s*$", re.MULTILINE)
+
+# Pattern to match the copyright line with any year - once set, the year is never checked or bumped
+COPYRIGHT_HEADER_PATTERN = re.compile(r"# SPDX-FileCopyrightText: \d{4} Simplito sp\. z o\.o\.\s*$", re.MULTILINE)
 
 # Pattern to match the old DFFL prose header, so `--fix` can migrate files to the SPDX header
 OLD_LICENSE_HEADER_PATTERN = re.compile(
@@ -75,13 +89,19 @@ def extract_content_after_preamble(content: str) -> str:
 
 
 def has_license_header(content: str) -> bool:
-    """Check whether the license header is present in the file content."""
+    """Check whether the SPDX-License-Identifier line is present in the file content."""
     remaining = extract_content_after_preamble(content)
     return LICENSE_HEADER_PATTERN.search(remaining) is not None
 
 
+def has_copyright_header(content: str) -> bool:
+    """Check whether the SPDX-FileCopyrightText line is present in the file content."""
+    remaining = extract_content_after_preamble(content)
+    return COPYRIGHT_HEADER_PATTERN.search(remaining) is not None
+
+
 def check_file_header(filepath: Path) -> bool:
-    """Check if a file contains the required license header."""
+    """Check if a file contains both required SPDX header lines."""
     try:
         content = filepath.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
@@ -90,27 +110,11 @@ def check_file_header(filepath: Path) -> bool:
     if not content.strip():
         return True
 
-    return has_license_header(content)
+    return has_license_header(content) and has_copyright_header(content)
 
 
-def fix_file_header(filepath: Path) -> bool:
-    """Remove a stale DFFL header if present and add the SPDX header if missing."""
-    try:
-        content = filepath.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return False
-
-    content = OLD_LICENSE_HEADER_PATTERN.sub("", content, count=1)
-
-    if not content.strip():
-        filepath.write_text(LICENSE_HEADER, encoding="utf-8")
-        return True
-
-    if has_license_header(content):
-        filepath.write_text(content, encoding="utf-8")
-        return True
-
-    # No header present - add new one
+def insert_header_lines(content: str, header_lines: list[str]) -> str:
+    """Insert header_lines after any shebang/encoding preamble, ahead of the rest of the content."""
     lines = content.split("\n")
     preamble_lines: list[str] = []
     start_idx = 0
@@ -124,7 +128,6 @@ def fix_file_header(filepath: Path) -> bool:
         else:
             break
 
-    # Build new content
     rest = "\n".join(lines[start_idx:]).lstrip("\n")
     parts: list[str] = []
 
@@ -132,7 +135,7 @@ def fix_file_header(filepath: Path) -> bool:
         parts.append("\n".join(preamble_lines))
         parts.append("")
 
-    parts.append(LICENSE_HEADER.rstrip())
+    parts.append("\n".join(header_lines))
 
     if rest:
         parts.append("")
@@ -142,7 +145,49 @@ def fix_file_header(filepath: Path) -> bool:
     if not new_content.endswith("\n"):
         new_content += "\n"
 
-    filepath.write_text(new_content, encoding="utf-8")
+    return new_content
+
+
+def fix_file_header(filepath: Path) -> bool:
+    """Remove a stale DFFL header if present and add whichever SPDX line(s) are missing."""
+    try:
+        content = filepath.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+
+    content = OLD_LICENSE_HEADER_PATTERN.sub("", content, count=1)
+
+    if not content.strip():
+        filepath.write_text(LICENSE_HEADER, encoding="utf-8")
+        return True
+
+    has_license = has_license_header(content)
+    has_copyright = has_copyright_header(content)
+
+    if has_license and has_copyright:
+        filepath.write_text(content, encoding="utf-8")
+        return True
+
+    if has_license and not has_copyright:
+        # License line already present somewhere - add the copyright line right after it.
+        copyright_line = COPYRIGHT_LINE_TEMPLATE.format(year=get_current_year())
+        new_content = content.replace(LICENSE_LINE, f"{LICENSE_LINE}\n{copyright_line}", 1)
+        filepath.write_text(new_content, encoding="utf-8")
+        return True
+
+    if has_copyright and not has_license:
+        # Copyright line already present somewhere - add the license line right before it.
+        match = COPYRIGHT_HEADER_PATTERN.search(content)
+        if match is None:
+            return False
+        pos = match.start()
+        new_content = content[:pos] + LICENSE_LINE + "\n" + content[pos:]
+        filepath.write_text(new_content, encoding="utf-8")
+        return True
+
+    # Neither line present - insert the full header block after any shebang/encoding preamble.
+    header_lines = [LICENSE_LINE, COPYRIGHT_LINE_TEMPLATE.format(year=get_current_year())]
+    filepath.write_text(insert_header_lines(content, header_lines), encoding="utf-8")
     return True
 
 

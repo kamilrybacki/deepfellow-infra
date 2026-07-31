@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
 
 """Tests for user-defined MCP server (kind="user") and proxy MCP server (kind="proxy") support."""
 

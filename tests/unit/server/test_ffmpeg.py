@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
 
 import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
 
 """Tests for check_license_header.py module."""
 
@@ -9,7 +10,9 @@ from unittest.mock import patch
 import pytest
 
 from scripts.check_license_header import (
+    COPYRIGHT_LINE_TEMPLATE,
     LICENSE_HEADER,
+    LICENSE_LINE,
     apply_fixes,
     build_excludes,
     check_file_header,
@@ -18,7 +21,9 @@ from scripts.check_license_header import (
     extract_content_after_preamble,
     find_python_files,
     fix_file_header,
+    get_current_year,
     get_files_to_check,
+    has_copyright_header,
     has_license_header,
     main,
     normalize_header,
@@ -94,6 +99,19 @@ def test_has_license_header_absent() -> None:
 
 def test_has_license_header_old_dffl_header_not_recognized() -> None:
     assert has_license_header(f"{OLD_DFFL_HEADER}\nimport sys\n") is False
+
+
+def test_has_copyright_header_present() -> None:
+    assert has_copyright_header(f"{COPYRIGHT_LINE_TEMPLATE.format(year=2024)}\nimport sys\n") is True
+
+
+def test_has_copyright_header_absent() -> None:
+    assert has_copyright_header("import sys\n") is False
+
+
+def test_has_copyright_header_any_year_accepted() -> None:
+    """The copyright year is never re-validated once set - any 4-digit year matches."""
+    assert has_copyright_header(f"{COPYRIGHT_LINE_TEMPLATE.format(year=1999)}\n") is True
 
 
 @pytest.mark.parametrize(
@@ -225,6 +243,22 @@ def test_check_file_header_invalid_old_dffl_header(tmp_path: Path) -> None:
     assert check_file_header(file) is False
 
 
+def test_check_file_header_missing_copyright_only(tmp_path: Path) -> None:
+    """License line alone is not enough - the copyright line is also required."""
+    file = tmp_path / "license_only.py"
+    file.write_text(f"{LICENSE_LINE}\nimport sys\n")
+
+    assert check_file_header(file) is False
+
+
+def test_check_file_header_missing_license_only(tmp_path: Path) -> None:
+    """Copyright line alone is not enough - the license line is also required."""
+    file = tmp_path / "copyright_only.py"
+    file.write_text(f"{COPYRIGHT_LINE_TEMPLATE.format(year=2024)}\nimport sys\n")
+
+    assert check_file_header(file) is False
+
+
 def test_check_file_header_empty_file(tmp_path: Path) -> None:
     file = tmp_path / "empty.py"
     file.write_text("")
@@ -316,6 +350,59 @@ def test_fix_file_header_migrates_old_dffl_header(tmp_path: Path) -> None:
     assert "# SPDX-License-Identifier: MIT" in content
     assert "DeepFellow Software Framework" not in content
     assert "import sys" in content
+
+
+def test_fix_file_header_adds_missing_copyright_only(tmp_path: Path) -> None:
+    """A file with only the license line gets just the copyright line appended."""
+    file = tmp_path / "license_only.py"
+    file.write_text(f"{LICENSE_LINE}\nimport sys\n")
+
+    result = fix_file_header(file)
+
+    assert result is True
+    assert check_file_header(file) is True
+    content = file.read_text()
+    assert content.count("SPDX-License-Identifier") == 1
+    assert "SPDX-FileCopyrightText" in content
+
+
+def test_fix_file_header_adds_missing_license_only(tmp_path: Path) -> None:
+    """A file with only the copyright line gets just the license line appended."""
+    file = tmp_path / "copyright_only.py"
+    file.write_text(f"{COPYRIGHT_LINE_TEMPLATE.format(year=2024)}\nimport sys\n")
+
+    result = fix_file_header(file)
+
+    assert result is True
+    assert check_file_header(file) is True
+    content = file.read_text()
+    assert "SPDX-License-Identifier: MIT" in content
+    assert content.count("SPDX-FileCopyrightText") == 1
+
+
+def test_fix_file_header_copyright_only_no_match_returns_false(tmp_path: Path) -> None:
+    """Defensive guard: if the copyright pattern search unexpectedly returns None, fix_file_header bails out."""
+    file = tmp_path / "copyright_only.py"
+    file.write_text(f"{COPYRIGHT_LINE_TEMPLATE.format(year=2024)}\nimport sys\n")
+
+    with patch("scripts.check_license_header.COPYRIGHT_HEADER_PATTERN") as mock_pattern:
+        mock_pattern.search.side_effect = [object(), None]
+
+        result = fix_file_header(file)
+
+    assert result is False
+
+
+def test_fix_file_header_pins_year_never_bumped(tmp_path: Path) -> None:
+    """An existing copyright year is left untouched by --fix, even if it's stale."""
+    file = tmp_path / "stale_year.py"
+    file.write_text(f"{LICENSE_LINE}\n{COPYRIGHT_LINE_TEMPLATE.format(year=2020)}\nimport sys\n")
+
+    fix_file_header(file)
+
+    content = file.read_text()
+    assert "SPDX-FileCopyrightText: 2020 Simplito sp. z o.o." in content
+    assert f"SPDX-FileCopyrightText: {get_current_year()} Simplito sp. z o.o." not in content
 
 
 def test_fix_file_header_preserves_code(tmp_path: Path) -> None:

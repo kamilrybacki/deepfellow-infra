@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
 
 """Docker registry tag fetching clients for Docker Hub, GHCR, and ECR Public."""
 
