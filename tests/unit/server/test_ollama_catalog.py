@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
 
 """Unit tests for server/utils/ollama_catalog.py."""
 

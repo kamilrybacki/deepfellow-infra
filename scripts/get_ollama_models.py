@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 # SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
 
 """Scrapes Ollama library pages and produces static/ollama-min.json.
 

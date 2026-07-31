@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
 
 """Utilities for auto-fetching model sizes from remote sources."""
 

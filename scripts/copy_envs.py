@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
 
 """Copy .env files from infra created by DeepFellow CLI, replacing docker hosts with localhost."""
 

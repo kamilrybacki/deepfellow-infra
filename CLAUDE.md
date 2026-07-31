@@ -35,7 +35,7 @@ WebUI (from `webui/` directory):
 - Line length: 140 characters
 - Formatter: `ruff format`; linter: `ruff check`
 - Type checker: pyright (strict); all code must be fully annotated
-- All `.py` files require an `SPDX-License-Identifier: MIT` header — run `just license-check` to verify
+- All `.py` files require an `SPDX-License-Identifier: MIT` header and a `SPDX-FileCopyrightText {year} Simplito sp. z o.o.` header — run `just license-check` to verify
 - Prefer Pydantic models over plain dicts
 
 **TypeScript/React (`webui/`):**
