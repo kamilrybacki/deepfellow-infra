@@ -1,0 +1,19 @@
+meta {
+  name: Metrics rejects missing auth
+  type: http
+  seq: 5
+}
+
+get {
+  url: {{host}}/metrics
+  body: none
+  auth: none
+}
+
+tests {
+  // /metrics uses HTTP Basic (auth_metrics), not bearer — still 401 when the
+  // Authorization header is absent.
+  test("status is 401", function() {
+    expect(res.getStatus()).to.equal(401);
+  });
+}

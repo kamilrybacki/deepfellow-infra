@@ -1,0 +1,23 @@
+meta {
+  name: GPU Stats
+  type: http
+  seq: 6
+}
+
+get {
+  url: {{host}}/admin/settings/hardware/gpu-stats
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{process.env.ADMIN_TOKEN}}
+}
+
+tests {
+  // Returns GpuStats | None — null on a host without a GPU, so only the call
+  // itself can be asserted here.
+  test("status is 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+}

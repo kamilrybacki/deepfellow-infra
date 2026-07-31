@@ -1,0 +1,25 @@
+meta {
+  name: Get Settings
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{host}}/admin/settings
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{process.env.ADMIN_TOKEN}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+
+  test("has cloud_enabled flag", function() {
+    expect(res.getBody().cloud_enabled).to.be.a("boolean");
+  });
+}

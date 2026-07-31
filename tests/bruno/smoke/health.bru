@@ -1,0 +1,24 @@
+meta {
+  name: Health Check
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{host}}/health
+  body: none
+  auth: none
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+
+  // Asserting the body matters: server/api/fallback.py serves index.html with
+  // status 200 for any unmatched path, so a bare status check would also pass
+  // if /health stopped being routed at all.
+  test("body is OK", function() {
+    expect(res.getBody()).to.equal("OK");
+  });
+}

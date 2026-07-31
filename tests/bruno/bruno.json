@@ -1,0 +1,9 @@
+{
+  "version": "1",
+  "name": "deepfellow-infra",
+  "type": "collection",
+  "ignore": [
+    "node_modules",
+    ".git"
+  ]
+}

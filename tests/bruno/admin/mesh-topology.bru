@@ -1,0 +1,25 @@
+meta {
+  name: Mesh Topology
+  type: http
+  seq: 8
+}
+
+get {
+  url: {{host}}/admin/mesh/topology
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{process.env.ADMIN_TOKEN}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+
+  test("body is an array of nodes", function() {
+    expect(res.getBody()).to.be.an("array");
+  });
+}

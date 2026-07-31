@@ -1,0 +1,29 @@
+meta {
+  name: Swagger Docs
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{host}}/docs
+  body: none
+  auth: none
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+
+  test("content type is HTML", function() {
+    expect(res.getHeader("content-type")).to.include("text/html");
+  });
+
+  // The SPA fallback (server/api/fallback.py) answers unmatched paths with
+  // index.html and status 200, so status alone proves nothing here — if the
+  // docs route were disabled, /docs would still return 200. Check that what
+  // came back is actually Swagger UI.
+  test("body is Swagger UI, not the SPA fallback", function() {
+    expect(res.getBody()).to.include("swagger-ui");
+  });
+}

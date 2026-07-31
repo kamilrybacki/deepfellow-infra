@@ -1,0 +1,17 @@
+meta {
+  name: Admin rejects missing token
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{host}}/admin/settings
+  body: none
+  auth: none
+}
+
+tests {
+  test("status is 401", function() {
+    expect(res.getStatus()).to.equal(401);
+  });
+}

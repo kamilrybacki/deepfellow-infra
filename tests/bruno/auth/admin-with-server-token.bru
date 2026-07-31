@@ -1,0 +1,25 @@
+meta {
+  name: Admin rejects server token
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{host}}/admin/settings
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{process.env.API_TOKEN}}
+}
+
+tests {
+  // Privilege separation: the server key authenticates /v1/* and /info, but
+  // auth_admin (server/core/dependencies.py:108) compares against the admin key
+  // only, so /admin/* must reject it. A regression here would silently widen
+  // every admin endpoint to any holder of the server key.
+  test("status is 401", function() {
+    expect(res.getStatus()).to.equal(401);
+  });
+}

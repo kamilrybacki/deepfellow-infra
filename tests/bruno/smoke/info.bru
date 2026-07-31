@@ -1,0 +1,37 @@
+meta {
+  name: Instance Info
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{host}}/info
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{process.env.API_TOKEN}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+
+  test("reports a version", function() {
+    expect(res.getBody().version).to.be.a("string").and.not.empty;
+  });
+
+  // The point of the release gate: prove the environment is really serving the
+  // build being released, not a stale one left over from a half-finished
+  // rollout. CI sets EXPECTED_VERSION from the release tag; local runs that
+  // leave it unset get the shape checks above only.
+  test("version matches the expected release", function() {
+    const expected = bru.getProcessEnv("EXPECTED_VERSION");
+    if (!expected) {
+      return;
+    }
+    expect(res.getBody().version).to.equal(expected);
+  });
+}

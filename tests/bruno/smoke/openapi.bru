@@ -1,0 +1,30 @@
+meta {
+  name: OpenAPI Schema
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{host}}/openapi.json
+  body: none
+  auth: none
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+
+  test("is a valid openapi document", function() {
+    expect(res.getBody()).to.have.property("openapi");
+    expect(res.getBody()).to.have.property("paths");
+  });
+
+  // Guards against the schema being served but empty, and against the SPA
+  // fallback returning index.html under a 200.
+  test("exposes the core routes", function() {
+    expect(res.getBody().paths).to.have.property("/health");
+    expect(res.getBody().paths).to.have.property("/info");
+    expect(res.getBody().paths).to.have.property("/v1/models");
+  });
+}
