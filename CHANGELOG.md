@@ -32,6 +32,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Bumped bundled Ollama Docker image from `0.31.1` to `0.32.1` and vLLM from `v0.24.0` to `v0.25.1` to stay current with upstream releases. No known outstanding security advisories affected the previous pins.
 - Bumped bundled open-websearch MCP Docker image from `v1.2.0` to `v2.1.9` to stay current with upstream releases.
 - Ollama VRAM usage for loaded models is now read directly from Ollama's `/api/ps` response instead of being parsed from container logs.
+<<<<<<< CHANGELOG.md
+- Python files under `ee/` now require an `SPDX-License-Identifier: LicenseRef-DeepFellow-Free` header instead of MIT; `just license-check` rejects a stray MIT header in `ee/`, and `--fix` migrates it automatically.
 - Coqui TTS now runs from `idiap/coqui-ai-TTS`, an actively maintained community fork, instead of the original `coqui-ai/TTS` repo, which has had no upstream activity since August 2024. Also fixes the bundled CPU/GPU Docker images being swapped (the "CPU" option was pulling the GPU-capable image and vice versa).
 
 ### Fixed
