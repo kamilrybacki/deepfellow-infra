@@ -13,7 +13,8 @@ from pathlib import Path
 
 # ruff: noqa: T201
 
-LICENSE_LINE = "# SPDX-License-Identifier: MIT"
+LICENSE_LINE_MIT = "# SPDX-License-Identifier: MIT"
+LICENSE_LINE_EE = "# SPDX-License-Identifier: LicenseRef-DeepFellow-Free"
 COPYRIGHT_LINE_TEMPLATE = "# SPDX-FileCopyrightText: {year} Simplito sp. z o.o."
 
 
@@ -22,10 +23,35 @@ def get_current_year() -> int:
     return datetime.now(UTC).year
 
 
-LICENSE_HEADER = f"{LICENSE_LINE}\n{COPYRIGHT_LINE_TEMPLATE.format(year=get_current_year())}\n"
+def is_ee_path(filepath: Path, root: Path | None = None) -> bool:
+    """Check whether a file lives under the repo's top-level ee/ directory."""
+    base = (root or Path.cwd()).resolve() / "ee"
+    return filepath.resolve().is_relative_to(base)
 
-# Pattern to match the license identifier line
-LICENSE_HEADER_PATTERN = re.compile(r"# SPDX-License-Identifier: MIT\s*$", re.MULTILINE)
+def license_line_for(filepath: Path, root: Path | None = None) -> str:
+    """Return the SPDX license line required for the given file's location."""
+    return LICENSE_LINE_EE if is_ee_path(filepath, root) else LICENSE_LINE_MIT
+
+
+def license_header_for(filepath: Path, root: Path | None = None) -> str:
+    """Return the full license header (license + copyright line) for a brand-new file at this path."""
+    return f"{license_line_for(filepath, root)}\n{COPYRIGHT_LINE_TEMPLATE.format(year=get_current_year())}\n"
+
+
+def license_pattern(license_line: str) -> re.Pattern[str]:
+    """Build a pattern matching a specific SPDX license identifier line."""
+    return re.compile(rf"{re.escape(license_line)}\s*$", re.MULTILINE)
+
+
+# Pattern to match the MIT license identifier line
+LICENSE_HEADER_PATTERN = license_pattern(LICENSE_LINE_MIT)
+
+# Pattern to match the ee/ (enterprise) license identifier line
+EE_LICENSE_HEADER_PATTERN = license_pattern(LICENSE_LINE_EE)
+
+# Backward-compat aliases: the default (non-ee) license line/header, as used throughout most of the repo.
+LICENSE_LINE = LICENSE_LINE_MIT
+LICENSE_HEADER = f"{LICENSE_LINE_MIT}\n{COPYRIGHT_LINE_TEMPLATE.format(year=get_current_year())}\n"
 
 # Pattern to match the copyright line with any year - once set, the year is never checked or bumped
 COPYRIGHT_HEADER_PATTERN = re.compile(r"# SPDX-FileCopyrightText: \d{4} Simplito sp\. z o\.o\.\s*$", re.MULTILINE)
@@ -88,10 +114,10 @@ def extract_content_after_preamble(content: str) -> str:
     return "\n".join(lines[start_idx:])
 
 
-def has_license_header(content: str) -> bool:
-    """Check whether the SPDX-License-Identifier line is present in the file content."""
+def has_license_header(content: str, pattern: re.Pattern[str] = LICENSE_HEADER_PATTERN) -> bool:
+    """Check whether the given SPDX-License-Identifier pattern is present in the file content."""
     remaining = extract_content_after_preamble(content)
-    return LICENSE_HEADER_PATTERN.search(remaining) is not None
+    return pattern.search(remaining) is not None
 
 
 def has_copyright_header(content: str) -> bool:
@@ -100,8 +126,8 @@ def has_copyright_header(content: str) -> bool:
     return COPYRIGHT_HEADER_PATTERN.search(remaining) is not None
 
 
-def check_file_header(filepath: Path) -> bool:
-    """Check if a file contains both required SPDX header lines."""
+def check_file_header(filepath: Path, root: Path | None = None) -> bool:
+    """Check if a file contains both required SPDX header lines, and the correct license for its location."""
     try:
         content = filepath.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
@@ -110,7 +136,14 @@ def check_file_header(filepath: Path) -> bool:
     if not content.strip():
         return True
 
-    return has_license_header(content) and has_copyright_header(content)
+    if is_ee_path(filepath, root):
+        if has_license_header(content, LICENSE_HEADER_PATTERN):
+            return False  # ee/ files must never carry the MIT identifier
+        expected_pattern = EE_LICENSE_HEADER_PATTERN
+    else:
+        expected_pattern = LICENSE_HEADER_PATTERN
+
+    return has_license_header(content, expected_pattern) and has_copyright_header(content)
 
 
 def insert_header_lines(content: str, header_lines: list[str]) -> str:
@@ -148,7 +181,7 @@ def insert_header_lines(content: str, header_lines: list[str]) -> str:
     return new_content
 
 
-def fix_file_header(filepath: Path) -> bool:
+def fix_file_header(filepath: Path, root: Path | None = None) -> bool:
     """Remove a stale DFFL header if present and add whichever SPDX line(s) are missing."""
     try:
         content = filepath.read_text(encoding="utf-8")
@@ -157,11 +190,18 @@ def fix_file_header(filepath: Path) -> bool:
 
     content = OLD_LICENSE_HEADER_PATTERN.sub("", content, count=1)
 
+    expected_line = license_line_for(filepath, root)
+    expected_pattern = EE_LICENSE_HEADER_PATTERN if is_ee_path(filepath, root) else LICENSE_HEADER_PATTERN
+
+    if is_ee_path(filepath, root) and has_license_header(content, LICENSE_HEADER_PATTERN):
+        # ee/ files must never carry the MIT identifier - swap it for the enterprise one.
+        content = LICENSE_HEADER_PATTERN.sub(expected_line, content, count=1)
+
     if not content.strip():
-        filepath.write_text(LICENSE_HEADER, encoding="utf-8")
+        filepath.write_text(license_header_for(filepath, root), encoding="utf-8")
         return True
 
-    has_license = has_license_header(content)
+    has_license = has_license_header(content, expected_pattern)
     has_copyright = has_copyright_header(content)
 
     if has_license and has_copyright:
@@ -171,7 +211,7 @@ def fix_file_header(filepath: Path) -> bool:
     if has_license and not has_copyright:
         # License line already present somewhere - add the copyright line right after it.
         copyright_line = COPYRIGHT_LINE_TEMPLATE.format(year=get_current_year())
-        new_content = content.replace(LICENSE_LINE, f"{LICENSE_LINE}\n{copyright_line}", 1)
+        new_content = content.replace(expected_line, f"{expected_line}\n{copyright_line}", 1)
         filepath.write_text(new_content, encoding="utf-8")
         return True
 
@@ -181,12 +221,12 @@ def fix_file_header(filepath: Path) -> bool:
         if match is None:
             return False
         pos = match.start()
-        new_content = content[:pos] + LICENSE_LINE + "\n" + content[pos:]
+        new_content = content[:pos] + expected_line + "\n" + content[pos:]
         filepath.write_text(new_content, encoding="utf-8")
         return True
 
     # Neither line present - insert the full header block after any shebang/encoding preamble.
-    header_lines = [LICENSE_LINE, COPYRIGHT_LINE_TEMPLATE.format(year=get_current_year())]
+    header_lines = [expected_line, COPYRIGHT_LINE_TEMPLATE.format(year=get_current_year())]
     filepath.write_text(insert_header_lines(content, header_lines), encoding="utf-8")
     return True
 

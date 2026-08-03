@@ -11,8 +11,10 @@ import pytest
 
 from scripts.check_license_header import (
     COPYRIGHT_LINE_TEMPLATE,
+    EE_LICENSE_HEADER_PATTERN,
     LICENSE_HEADER,
     LICENSE_LINE,
+    LICENSE_LINE_EE,
     apply_fixes,
     build_excludes,
     check_file_header,
@@ -25,6 +27,7 @@ from scripts.check_license_header import (
     get_files_to_check,
     has_copyright_header,
     has_license_header,
+    is_ee_path,
     main,
     normalize_header,
     parse_gitignore,
@@ -419,6 +422,102 @@ def test_fix_file_header_preserves_code(tmp_path: Path) -> None:
 
 def test_fix_file_header_nonexistent_file(tmp_path: Path) -> None:
     assert fix_file_header(tmp_path / "nonexistent.py") is False
+
+
+def test_check_file_header_ee_valid(tmp_path: Path) -> None:
+    ee_dir = tmp_path / "ee"
+    ee_dir.mkdir()
+    file = ee_dir / "module.py"
+    file.write_text(f"{LICENSE_LINE_EE}\n{COPYRIGHT_LINE_TEMPLATE.format(year=2024)}\nimport sys\n")
+
+    assert check_file_header(file, root=tmp_path) is True
+
+
+def test_check_file_header_ee_rejects_mit(tmp_path: Path) -> None:
+    """ee/ files must never carry the MIT identifier, even alongside a copyright line."""
+    ee_dir = tmp_path / "ee"
+    ee_dir.mkdir()
+    file = ee_dir / "module.py"
+    file.write_text(f"{LICENSE_LINE}\n{COPYRIGHT_LINE_TEMPLATE.format(year=2024)}\nimport sys\n")
+
+    assert check_file_header(file, root=tmp_path) is False
+
+
+def test_check_file_header_non_ee_rejects_ee_license(tmp_path: Path) -> None:
+    file = tmp_path / "module.py"
+    file.write_text(f"{LICENSE_LINE_EE}\n{COPYRIGHT_LINE_TEMPLATE.format(year=2024)}\nimport sys\n")
+
+    assert check_file_header(file, root=tmp_path) is False
+
+
+def test_fix_file_header_ee_uses_ee_license(tmp_path: Path) -> None:
+    ee_dir = tmp_path / "ee"
+    ee_dir.mkdir()
+    file = ee_dir / "module.py"
+    file.write_text("import sys\n")
+
+    result = fix_file_header(file, root=tmp_path)
+
+    assert result is True
+    content = file.read_text()
+    assert LICENSE_LINE_EE in content
+    assert LICENSE_LINE not in content
+    assert check_file_header(file, root=tmp_path) is True
+
+
+def test_fix_file_header_ee_swaps_mit_for_ee_license(tmp_path: Path) -> None:
+    ee_dir = tmp_path / "ee"
+    ee_dir.mkdir()
+    file = ee_dir / "module.py"
+    file.write_text(f"{LICENSE_LINE}\n{COPYRIGHT_LINE_TEMPLATE.format(year=2020)}\nimport sys\n")
+
+    result = fix_file_header(file, root=tmp_path)
+
+    assert result is True
+    content = file.read_text()
+    assert content.count("SPDX-License-Identifier") == 1
+    assert EE_LICENSE_HEADER_PATTERN.search(content) is not None
+    assert check_file_header(file, root=tmp_path) is True
+
+
+def test_fix_file_header_ee_empty_file(tmp_path: Path) -> None:
+    ee_dir = tmp_path / "ee"
+    ee_dir.mkdir()
+    file = ee_dir / "__init__.py"
+    file.write_text("")
+
+    result = fix_file_header(file, root=tmp_path)
+
+    assert result is True
+    content = file.read_text()
+    assert LICENSE_LINE_EE in content
+
+
+def test_is_ee_path_ignores_ee_segment_outside_root(tmp_path: Path) -> None:
+    """A repo checked out under a path that happens to contain an 'ee' segment (e.g. ~/ee/project) must not
+    make every file in the repo look like an ee/ file - only files under <root>/ee/ count."""
+    repo_root = tmp_path / "ee" / "deepfellow-infra"
+    (repo_root / "server").mkdir(parents=True)
+    file = repo_root / "server" / "foo.py"
+    file.write_text("import sys\n")
+
+    assert is_ee_path(file, root=repo_root) is False
+
+
+def test_fix_file_header_ee_does_not_corrupt_unrelated_mit_substring(tmp_path: Path) -> None:
+    """The MIT->EE swap must only touch the actual header line, not any string containing the same substring."""
+    ee_dir = tmp_path / "ee"
+    ee_dir.mkdir()
+    file = ee_dir / "module.py"
+    file.write_text(
+        f'{LICENSE_LINE}\n{COPYRIGHT_LINE_TEMPLATE.format(year=2024)}\nMSG = "# SPDX-License-Identifier: MIT is the old identifier"\n'
+    )
+
+    fix_file_header(file, root=tmp_path)
+
+    content = file.read_text()
+    assert 'MSG = "# SPDX-License-Identifier: MIT is the old identifier"' in content
+    assert check_file_header(file, root=tmp_path) is True
 
 
 def test_fix_file_header_idempotent(tmp_path: Path, valid_content: str) -> None:
