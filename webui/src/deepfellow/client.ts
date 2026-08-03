@@ -14,6 +14,8 @@ import type {
   ConfigRevealOut,
   GpuStats,
   InfraSettings,
+  McpOAuthStartOut,
+  McpOAuthStatus,
   MeshTopologyNode,
   Service,
   ServiceListResponse,
@@ -455,6 +457,25 @@ export class DeepFellowClient {
         method: "PUT",
         body: JSON.stringify({ spec }),
       },
+    );
+  }
+
+  async startMcpOAuth(
+    serviceId: string,
+    modelId: string,
+  ): Promise<McpOAuthStartOut> {
+    return this.makeRequest<McpOAuthStartOut>(
+      `/admin/services/${serviceId}/models/${encodeURIComponent(modelId)}/oauth/start`,
+      { method: "POST" },
+    );
+  }
+
+  async getMcpOAuthStatus(
+    serviceId: string,
+    modelId: string,
+  ): Promise<McpOAuthStatus> {
+    return this.makeRequest<McpOAuthStatus>(
+      `/admin/services/${serviceId}/models/${encodeURIComponent(modelId)}/oauth/status`,
     );
   }
 

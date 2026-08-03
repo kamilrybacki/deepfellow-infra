@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -16,14 +17,24 @@ from server.models.api import McpToolInfo
 from server.models.models import InstallModelIn, ListModelsFilters, McpHealthCheckResult, UninstallModelIn
 from server.models.services import InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import CustomModel, Instance, InstanceConfig
+from server.services.mcp_oauth import (
+    AuthorizationServerMetadata,
+    DcrResponse,
+    McpOAuthConfig,
+    McpOAuthError,
+    PendingOAuthFlow,
+    TokenResponse,
+)
 from server.services.mcp_service import (
     DownloadedInfo,
     InstalledInfo,
     McpModelOptions,
+    McpOAuthStatusOut,
     McpService,
     ModelInstalledInfo,
     SrvMcpCustomModel,
     SrvMcpModel,
+    SrvMcpProxyModel,
     _dispatch_sse_event,  # pyright: ignore[reportPrivateUsage]
     _fetch_tools_from_mcp_endpoint,  # pyright: ignore[reportPrivateUsage]
     _fetch_tools_from_sse_endpoint,  # pyright: ignore[reportPrivateUsage]
@@ -943,9 +954,62 @@ async def test_install_model_sse_transport_uses_sse_proxy(svc: McpService, deps:
     assert info.models[model_id].registration_id == "sse-reg-id"
 
 
-# ---------------------------------------------------------------------------
-# _parse_mcp_tools
-# ---------------------------------------------------------------------------
+@mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
+@pytest.mark.asyncio
+async def test_install_model_proxy_healthy_probe_skips_background_retry(mock_fetch: AsyncMock, svc: McpService) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    svc._add_custom_model("default", _make_proxy_custom())  # pyright: ignore[reportPrivateUsage]
+    mock_fetch.return_value = McpHealthCheckResult(healthy=True, transport="streamable_http", tools=[])
+
+    promise = await svc._install_model("default", "my-remote-mcp", InstallModelIn())  # pyright: ignore[reportPrivateUsage]
+    result = await promise.wait()
+    await asyncio.sleep(0)
+
+    assert result.status == "OK"
+    assert result.details == "Installed"
+    assert result.requires_oauth is False
+    assert len(svc._background_tasks) == 0  # pyright: ignore[reportPrivateUsage]
+
+
+@mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
+@pytest.mark.asyncio
+async def test_install_model_proxy_401_auto_detects_oauth_before_returning(mock_fetch: AsyncMock, svc: McpService) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    svc._add_custom_model("default", _make_proxy_custom())  # pyright: ignore[reportPrivateUsage]
+    mock_fetch.return_value = McpHealthCheckResult(healthy=False, requires_oauth=True, error="401")
+
+    with (
+        patch("server.services.mcp_service.discover_authorization_server_for_resource", new=AsyncMock(return_value=None)),
+        patch.object(svc, "_save", new=AsyncMock()),
+    ):
+        promise = await svc._install_model("default", "my-remote-mcp", InstallModelIn())  # pyright: ignore[reportPrivateUsage]
+        result = await promise.wait()
+        await asyncio.sleep(0)
+
+    assert result.status == "OK"
+    assert "authorization required" in result.details.lower()
+    assert result.requires_oauth is True
+    assert len(svc._background_tasks) == 0  # pyright: ignore[reportPrivateUsage]
+    updated = svc.models["default"]["my-remote-mcp"]
+    assert updated.oauth is not None
+    assert updated.oauth.enabled is True
+
+
+@mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
+@pytest.mark.asyncio
+async def test_install_model_proxy_probe_error_still_starts_background_retry(mock_fetch: AsyncMock, svc: McpService) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    svc._add_custom_model("default", _make_proxy_custom())  # pyright: ignore[reportPrivateUsage]
+    mock_fetch.return_value = McpHealthCheckResult(healthy=False, error="connection refused")
+
+    with patch.object(svc, "_fetch_tools_background", new=AsyncMock()) as mock_bg:  # pyright: ignore[reportPrivateUsage]
+        promise = await svc._install_model("default", "my-remote-mcp", InstallModelIn())  # pyright: ignore[reportPrivateUsage]
+        result = await promise.wait()
+        await asyncio.sleep(0)
+
+    assert result.status == "OK"
+    assert result.details == "Installed"
+    mock_bg.assert_awaited_once_with("default", "my-remote-mcp")
 
 
 def test_parse_mcp_tools_empty_list_returns_empty() -> None:
@@ -980,11 +1044,6 @@ def test_parse_mcp_tools_uses_input_schema_fallback() -> None:
     result = _parse_mcp_tools(raw)
 
     assert result[0].input_schema == {"type": "string"}
-
-
-# ---------------------------------------------------------------------------
-# _read_first_sse_json
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -1025,11 +1084,6 @@ async def test_read_first_sse_json_empty_stream_returns_none() -> None:
     result = await _read_first_sse_json(mock_resp)
 
     assert result is None
-
-
-# ---------------------------------------------------------------------------
-# _dispatch_sse_event
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -1102,11 +1156,6 @@ def test_dispatch_sse_event_invalid_json_is_ignored() -> None:
     _dispatch_sse_event("message", "not valid json", state)
 
 
-# ---------------------------------------------------------------------------
-# _run_sse_reader
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_run_sse_reader_dispatches_endpoint_event() -> None:
     state = _SseState(asyncio.Event(), [], {})
@@ -1141,11 +1190,6 @@ async def test_run_sse_reader_skips_unicode_error_line() -> None:
     await _run_sse_reader(mock_resp, state)
 
     assert state.endpoint_ready.is_set()
-
-
-# ---------------------------------------------------------------------------
-# _sse_rpc
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -1192,11 +1236,6 @@ async def test_sse_rpc_exception_cancels_future_and_reraises() -> None:
         await _sse_rpc(mock_client, "http://example.com/session", payload, state)
 
     assert state.response_futures[42].cancelled()
-
-
-# ---------------------------------------------------------------------------
-# _fetch_tools_from_mcp_endpoint
-# ---------------------------------------------------------------------------
 
 
 @mock.patch("server.services.mcp_service.aiohttp.ClientSession")
@@ -1331,9 +1370,33 @@ async def test_fetch_tools_from_mcp_endpoint_generic_exception(mock_cls: MagicMo
     assert "RuntimeError" in (result.error or "")
 
 
-# ---------------------------------------------------------------------------
-# _fetch_tools_from_sse_endpoint
-# ---------------------------------------------------------------------------
+@mock.patch("server.services.mcp_service.aiohttp.ClientSession")
+@pytest.mark.asyncio
+async def test_fetch_tools_from_mcp_endpoint_401_sets_requires_oauth(mock_cls: MagicMock) -> None:
+    init_resp = _make_mock_resp(401)
+    mock_client = MagicMock()
+    mock_client.post.return_value = _make_acm(init_resp)
+    mock_cls.return_value = _make_acm(mock_client)
+
+    result = await _fetch_tools_from_mcp_endpoint("http://example.com/mcp", {})
+
+    assert result.healthy is False
+    assert result.requires_oauth is True
+    assert mock_client.post.call_count == 1  # doesn't try notify/tools-list after a 401
+
+
+@mock.patch("server.services.mcp_service.aiohttp.ClientSession")
+@pytest.mark.asyncio
+async def test_fetch_tools_from_sse_endpoint_401_sets_requires_oauth(mock_cls: MagicMock) -> None:
+    sse_resp = _make_mock_resp(401)
+    mock_client = MagicMock()
+    mock_client.get.return_value = _make_acm(sse_resp)
+    mock_cls.return_value = _make_acm(mock_client)
+
+    result = await _fetch_tools_from_sse_endpoint("http://example.com/sse", {})
+
+    assert result.healthy is False
+    assert result.requires_oauth is True
 
 
 @mock.patch("server.services.mcp_service.aiohttp.ClientSession")
@@ -1524,11 +1587,6 @@ async def test_fetch_tools_from_sse_endpoint_generic_exception(mock_cls: MagicMo
     assert "RuntimeError" in (result.error or "")
 
 
-# ---------------------------------------------------------------------------
-# _persist_custom_model_size
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_persist_custom_model_size_no_custom_returns_early(svc: McpService) -> None:
     model = MagicMock(spec=SrvMcpModel)
@@ -1585,11 +1643,6 @@ async def test_persist_custom_model_size_skips_non_matching_before_match(svc: Mc
     assert entry_b.data["size"] == "3 GB"
 
 
-# ---------------------------------------------------------------------------
-# _fetch_tools_background
-# ---------------------------------------------------------------------------
-
-
 @mock.patch("server.services.mcp_service.asyncio.sleep", new=AsyncMock())
 @pytest.mark.asyncio
 async def test_fetch_tools_background_returns_early_when_healthy(svc: McpService) -> None:
@@ -1618,6 +1671,17 @@ async def test_fetch_tools_background_swallows_exceptions(svc: McpService) -> No
 
 @mock.patch("server.services.mcp_service.asyncio.sleep", new=AsyncMock())
 @pytest.mark.asyncio
+async def test_fetch_tools_background_returns_early_when_requires_oauth(svc: McpService) -> None:
+    requires_oauth_result = McpHealthCheckResult(healthy=False, requires_oauth=True, error="401")
+
+    with patch.object(svc, "healthcheck_model", new=AsyncMock(return_value=requires_oauth_result)) as mock_hc:
+        await svc._fetch_tools_background("default", "open-websearch")  # pyright: ignore[reportPrivateUsage]
+
+    assert mock_hc.await_count == 1
+
+
+@mock.patch("server.services.mcp_service.asyncio.sleep", new=AsyncMock())
+@pytest.mark.asyncio
 async def test_fetch_tools_background_exhausts_all_retries(svc: McpService) -> None:
     unhealthy_result = McpHealthCheckResult(healthy=False, error="err")
 
@@ -1625,11 +1689,6 @@ async def test_fetch_tools_background_exhausts_all_retries(svc: McpService) -> N
         await svc._fetch_tools_background("default", "open-websearch")  # pyright: ignore[reportPrivateUsage]
 
     assert mock_hc.await_count == 5
-
-
-# ---------------------------------------------------------------------------
-# _apply_healthcheck_result
-# ---------------------------------------------------------------------------
 
 
 def test_apply_healthcheck_result_updates_model_props_and_registry(svc: McpService) -> None:
@@ -1660,11 +1719,6 @@ def test_apply_healthcheck_result_no_transport_skips_transport_update(svc: McpSe
 
     assert model.model_props.tools == []
     assert not hasattr(model.model_props, "transport") or model.model_props.transport != "streamable_http"
-
-
-# ---------------------------------------------------------------------------
-# healthcheck_model
-# ---------------------------------------------------------------------------
 
 
 def _make_installed_model_info(base_url: str = "http://172.20.0.2:3000", prefix: str = "mymcp") -> MagicMock:
@@ -1734,6 +1788,59 @@ async def test_healthcheck_model_proxy_streamable_http(mock_fetch: AsyncMock, sv
     assert mock_fetch.call_count == 1
     assert mock_fetch.call_args[0][0] == "http://172.20.0.2:3000"
     assert result.healthy is False
+
+
+@mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
+@pytest.mark.asyncio
+async def test_healthcheck_model_proxy_401_triggers_auto_detect_oauth(mock_fetch: AsyncMock, svc: McpService) -> None:
+    installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    installed.models["open-websearch"] = _make_installed_model_info()
+    svc.instances_info["default"].installed = installed
+    srv_model = svc.models["default"]["open-websearch"]
+    srv_model.kind = "proxy"
+    srv_model.proxy_transport = "streamable_http"
+    mock_fetch.return_value = McpHealthCheckResult(healthy=False, requires_oauth=True, error="401")
+
+    with patch.object(svc, "_auto_detect_oauth", new=AsyncMock()) as mock_detect:
+        result = await svc.healthcheck_model("default", "open-websearch")
+
+    assert result.requires_oauth is True
+    mock_detect.assert_awaited_once_with("default", "open-websearch")
+
+
+@mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
+@pytest.mark.asyncio
+async def test_healthcheck_model_proxy_already_oauth_enabled_skips_auto_detect(mock_fetch: AsyncMock, svc: McpService) -> None:
+    installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    installed.models["open-websearch"] = _make_installed_model_info()
+    svc.instances_info["default"].installed = installed
+    srv_model = svc.models["default"]["open-websearch"]
+    srv_model.kind = "proxy"
+    srv_model.proxy_transport = "streamable_http"
+    srv_model.oauth = McpOAuthConfig(enabled=True)
+    mock_fetch.return_value = McpHealthCheckResult(healthy=False, requires_oauth=True, error="401")
+
+    with patch.object(svc, "_auto_detect_oauth", new=AsyncMock()) as mock_detect:
+        await svc.healthcheck_model("default", "open-websearch")
+
+    mock_detect.assert_not_awaited()
+
+
+@mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
+@pytest.mark.asyncio
+async def test_healthcheck_model_proxy_attaches_live_oauth_bearer_token(mock_fetch: AsyncMock, svc: McpService) -> None:
+    installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    installed.models["open-websearch"] = _make_installed_model_info()
+    svc.instances_info["default"].installed = installed
+    srv_model = svc.models["default"]["open-websearch"]
+    srv_model.kind = "proxy"
+    srv_model.proxy_transport = "streamable_http"
+    srv_model.oauth = McpOAuthConfig(enabled=True, access_token="tok-123")
+    mock_fetch.return_value = McpHealthCheckResult(healthy=True)
+
+    await svc.healthcheck_model("default", "open-websearch")
+
+    assert mock_fetch.call_args[0][1]["Authorization"] == "Bearer tok-123"
 
 
 @mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
@@ -2067,3 +2174,1235 @@ async def test_install_model_registration_failure_skips_rollback_when_already_re
 
     info = svc.get_instance_installed_info("default")
     assert model_id not in info.models
+
+
+def _make_proxy_custom(
+    custom_id: str = "uuid-proxy-1",
+    model_id: str = "my-remote-mcp",
+    oauth: dict[str, Any] | None = None,
+) -> CustomModel:
+    data: dict[str, Any] = {
+        "kind": "proxy",
+        "id": model_id,
+        "name": model_id,
+        "server_url": "http://mcp.example.com/mcp",
+        "default_prefix": model_id,
+    }
+    if oauth is not None:
+        data["oauth"] = oauth
+    return CustomModel(id=custom_id, data=data)
+
+
+def test_get_custom_spec_proxy_with_oauth_redacts_secrets_and_tokens(svc: McpService) -> None:
+    model = MagicMock(spec=SrvMcpModel)
+    model.custom = "uuid-proxy"
+    model.kind = "proxy"
+    model.proxy_url = "http://remote-mcp.example.com/mcp"
+    model.proxy_transport = "streamable_http"
+    model.default_prefix = "remote-mcp"
+    model.headers = None
+    model.description = ""
+    model.repository_url = None
+    model.oauth = McpOAuthConfig(
+        enabled=True,
+        client_id="client-1",
+        client_secret="super-secret",
+        scope="tools:read",
+        access_token="access-tok",
+        refresh_token="refresh-tok",
+    )
+
+    spec = svc._get_custom_spec("remote-mcp", model)  # pyright: ignore[reportPrivateUsage]
+
+    assert spec is not None
+    assert spec["oauth"] == {"enabled": True, "client_id": "client-1", "scope": "tools:read"}
+    assert "client_secret" not in spec["oauth"]
+    assert "access_token" not in spec["oauth"]
+    assert "refresh_token" not in spec["oauth"]
+
+
+def test_srv_mcp_proxy_model_without_oauth_key_round_trips_to_none() -> None:
+    parsed = SrvMcpProxyModel(id="m1", name="m1", server_url="http://mcp.example.com/mcp")
+
+    assert parsed.oauth is None
+
+
+@pytest.mark.asyncio
+async def test_update_custom_model_proxy_preserves_oauth_secrets_and_tokens(svc: McpService) -> None:
+    old = _make_proxy_custom(
+        oauth={
+            "enabled": True,
+            "client_id": "client-1",
+            "client_secret": "super-secret",
+            "access_token": "access-tok",
+            "refresh_token": "refresh-tok",
+            "token_expires_at": 12345.0,
+        }
+    )
+    svc._add_custom_model("default", old)  # pyright: ignore[reportPrivateUsage]
+    new_data = dict(old.data)
+    new_data["oauth"] = {"enabled": True, "client_id": "client-1", "scope": "tools:read"}
+
+    await svc._update_custom_model("default", old, new_data)  # pyright: ignore[reportPrivateUsage]
+
+    updated = svc.models["default"]["my-remote-mcp"]
+    assert updated.oauth is not None
+    assert updated.oauth.client_secret == "super-secret"
+    assert updated.oauth.access_token == "access-tok"
+    assert updated.oauth.refresh_token == "refresh-tok"
+    assert updated.oauth.token_expires_at == 12345.0
+    assert updated.oauth.scope == "tools:read"
+
+
+@pytest.mark.asyncio
+async def test_update_custom_model_proxy_preserves_oauth_when_new_data_omits_it(svc: McpService) -> None:
+    old = _make_proxy_custom(
+        oauth={
+            "enabled": True,
+            "client_id": "client-1",
+            "client_secret": "super-secret",
+            "access_token": "access-tok",
+            "refresh_token": "refresh-tok",
+            "token_expires_at": 12345.0,
+        }
+    )
+    svc._add_custom_model("default", old)  # pyright: ignore[reportPrivateUsage]
+    new_data = dict(old.data)
+    del new_data["oauth"]
+
+    await svc._update_custom_model("default", old, new_data)  # pyright: ignore[reportPrivateUsage]
+
+    updated = svc.models["default"]["my-remote-mcp"]
+    assert updated.oauth is not None
+    assert updated.oauth.client_secret == "super-secret"
+    assert updated.oauth.access_token == "access-tok"
+    assert updated.oauth.refresh_token == "refresh-tok"
+
+
+@pytest.mark.asyncio
+async def test_update_custom_model_proxy_raises_when_oauth_flow_pending(svc: McpService) -> None:
+    old = _make_proxy_custom()
+    svc._add_custom_model("default", old)  # pyright: ignore[reportPrivateUsage]
+    svc._oauth_state_store.add(  # pyright: ignore[reportPrivateUsage]
+        "state-1",
+        PendingOAuthFlow(instance="default", model_id="my-remote-mcp", code_verifier="v", redirect_uri="http://x", resource="http://y"),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await svc._update_custom_model("default", old, dict(old.data))  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+
+
+def test_remove_custom_model_proxy_raises_when_oauth_flow_pending(svc: McpService) -> None:
+    custom = _make_proxy_custom()
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    svc._oauth_state_store.add(  # pyright: ignore[reportPrivateUsage]
+        "state-1",
+        PendingOAuthFlow(instance="default", model_id="my-remote-mcp", code_verifier="v", redirect_uri="http://x", resource="http://y"),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        svc._remove_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_start_oauth_flow_raises_when_oauth_disabled(svc: McpService) -> None:
+    custom = _make_proxy_custom(oauth={"enabled": False})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(HTTPException) as exc_info:
+        await svc.start_oauth_flow("default", "my-remote-mcp")
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_start_oauth_flow_raises_when_no_registration_endpoint(svc: McpService) -> None:
+    svc.config.infra_url = "http://infra.example"  # pyright: ignore[reportAttributeAccessIssue]
+    custom = _make_proxy_custom(oauth={"enabled": True})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    metadata = AuthorizationServerMetadata(
+        issuer="http://as.example",
+        authorization_endpoint="http://as.example/authorize",
+        token_endpoint="http://as.example/token",
+        registration_endpoint=None,
+    )
+
+    with (
+        patch("server.services.mcp_service.discover_authorization_server_for_resource", new=AsyncMock(return_value=metadata)),
+        patch.object(svc, "_save", new=AsyncMock()),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc.start_oauth_flow("default", "my-remote-mcp")
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_start_oauth_flow_dynamic_client_registration_persists_client_id(svc: McpService) -> None:
+    svc.config.infra_url = "http://infra.example"  # pyright: ignore[reportAttributeAccessIssue]
+    custom = _make_proxy_custom(oauth={"enabled": True})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    metadata = AuthorizationServerMetadata(
+        issuer="http://as.example",
+        authorization_endpoint="http://as.example/authorize",
+        token_endpoint="http://as.example/token",
+        registration_endpoint="http://as.example/register",
+    )
+    dcr = DcrResponse(client_id="dcr-client-1", client_secret="dcr-secret-1")
+
+    with (
+        patch("server.services.mcp_service.discover_authorization_server_for_resource", new=AsyncMock(return_value=metadata)),
+        patch("server.services.mcp_service.register_dynamic_client", new=AsyncMock(return_value=dcr)),
+        patch.object(svc, "_save", new=AsyncMock()),
+    ):
+        authorize_url = await svc.start_oauth_flow("default", "my-remote-mcp")
+
+    assert "client_id=dcr-client-1" in authorize_url
+    updated = svc.models["default"]["my-remote-mcp"]
+    assert updated.oauth is not None
+    assert updated.oauth.client_id == "dcr-client-1"
+    assert updated.oauth.client_secret == "dcr-secret-1"
+
+
+@pytest.mark.asyncio
+async def test_complete_oauth_callback_unknown_state_returns_invalid_message(svc: McpService) -> None:
+    result = await svc.complete_oauth_callback("unknown-state", "code-1", None)
+
+    assert "invalid or has expired" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_complete_oauth_callback_error_param_persists_last_error(svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={
+            "enabled": True,
+            "client_id": "client-1",
+            "token_endpoint": "http://as.example/token",
+            "authorization_endpoint": "http://as.example/authorize",
+        }
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    svc._oauth_state_store.add(  # pyright: ignore[reportPrivateUsage]
+        "state-1",
+        PendingOAuthFlow(
+            instance="default",
+            model_id="my-remote-mcp",
+            code_verifier="v",
+            redirect_uri="http://infra.example/mcp-oauth/callback",
+            resource="http://mcp.example.com/mcp",
+        ),
+    )
+
+    with patch.object(svc, "_save", new=AsyncMock()):
+        result = await svc.complete_oauth_callback("state-1", None, "access_denied")
+
+    assert "failed" in result.lower()
+    updated = svc.models["default"]["my-remote-mcp"]
+    assert updated.oauth is not None
+    assert updated.oauth.last_error == "access_denied"
+
+
+@pytest.mark.asyncio
+async def test_complete_oauth_callback_success_persists_tokens(svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={
+            "enabled": True,
+            "client_id": "client-1",
+            "token_endpoint": "http://as.example/token",
+            "authorization_endpoint": "http://as.example/authorize",
+        }
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    svc._oauth_state_store.add(  # pyright: ignore[reportPrivateUsage]
+        "state-1",
+        PendingOAuthFlow(
+            instance="default",
+            model_id="my-remote-mcp",
+            code_verifier="v",
+            redirect_uri="http://infra.example/mcp-oauth/callback",
+            resource="http://mcp.example.com/mcp",
+        ),
+    )
+    token = TokenResponse(access_token="new-access", refresh_token="new-refresh", expires_in=3600)
+
+    with (
+        patch("server.services.mcp_service.exchange_code_for_token", new=AsyncMock(return_value=token)),
+        patch.object(svc, "_save", new=AsyncMock()),
+        patch.object(svc, "_start_oauth_refresh_background"),  # pyright: ignore[reportPrivateUsage]
+    ):
+        result = await svc.complete_oauth_callback("state-1", "code-1", None)
+
+    assert "complete" in result.lower()
+    updated = svc.models["default"]["my-remote-mcp"]
+    assert updated.oauth is not None
+    assert updated.oauth.access_token == "new-access"
+    assert updated.oauth.refresh_token == "new-refresh"
+    assert updated.oauth.token_expires_at is not None
+
+
+@pytest.mark.asyncio
+async def test_complete_oauth_callback_duplicate_with_valid_token_returns_already_authorized(svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={
+            "enabled": True,
+            "client_id": "client-1",
+            "token_endpoint": "http://as.example/token",
+            "authorization_endpoint": "http://as.example/authorize",
+            "access_token": "already-valid",
+            "token_expires_at": None,
+        }
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    svc._oauth_state_store.add(  # pyright: ignore[reportPrivateUsage]
+        "state-1",
+        PendingOAuthFlow(
+            instance="default",
+            model_id="my-remote-mcp",
+            code_verifier="v",
+            redirect_uri="http://infra.example/mcp-oauth/callback",
+            resource="http://mcp.example.com/mcp",
+        ),
+    )
+
+    with (
+        patch("server.services.mcp_service.exchange_code_for_token", new=AsyncMock(side_effect=McpOAuthError("invalid_grant"))),
+        patch.object(svc, "_save", new=AsyncMock()),
+    ):
+        result = await svc.complete_oauth_callback("state-1", "code-1", None)
+
+    assert "already authorized" in result.lower()
+
+
+def test_get_oauth_status_disabled_when_oauth_none(svc: McpService) -> None:
+    custom = _make_proxy_custom(oauth=None)
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    status = svc.get_oauth_status("default", "my-remote-mcp")
+
+    assert status.status == "disabled"
+    assert status.enabled is False
+
+
+def test_get_oauth_status_authorized_when_valid_token(svc: McpService) -> None:
+    custom = _make_proxy_custom(oauth={"enabled": True, "access_token": "tok", "token_expires_at": None})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    status = svc.get_oauth_status("default", "my-remote-mcp")
+
+    assert status.status == "authorized"
+
+
+def test_get_oauth_status_expired_when_token_past_expiry(svc: McpService) -> None:
+    custom = _make_proxy_custom(oauth={"enabled": True, "access_token": "tok", "token_expires_at": 1.0})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    status = svc.get_oauth_status("default", "my-remote-mcp")
+
+    assert status.status == "expired"
+
+
+def test_get_oauth_status_pending_when_flow_live(svc: McpService) -> None:
+    custom = _make_proxy_custom(oauth={"enabled": True})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    svc._oauth_state_store.add(  # pyright: ignore[reportPrivateUsage]
+        "state-1",
+        PendingOAuthFlow(instance="default", model_id="my-remote-mcp", code_verifier="v", redirect_uri="http://x", resource="http://y"),
+    )
+
+    status = svc.get_oauth_status("default", "my-remote-mcp")
+
+    assert status.status == "pending"
+
+
+def test_get_oauth_status_never_includes_secret_or_token_fields() -> None:
+    field_names = set(McpOAuthStatusOut.model_fields.keys())
+
+    assert "client_secret" not in field_names
+    assert "access_token" not in field_names
+    assert "refresh_token" not in field_names
+
+
+@pytest.mark.asyncio
+async def test_auto_detect_oauth_skips_when_already_enabled(svc: McpService) -> None:
+    custom = _make_proxy_custom(oauth={"enabled": True, "client_id": "client-1"})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    with patch("server.services.mcp_service.discover_authorization_server_for_resource", new=AsyncMock()) as mock_discover:
+        await svc._auto_detect_oauth("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    mock_discover.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auto_detect_oauth_discovery_success_enables_and_persists(svc: McpService) -> None:
+    custom = _make_proxy_custom()
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    metadata = AuthorizationServerMetadata(
+        issuer="http://as.example",
+        authorization_endpoint="http://as.example/authorize",
+        token_endpoint="http://as.example/token",
+        registration_endpoint="http://as.example/register",
+    )
+
+    with (
+        patch("server.services.mcp_service.discover_authorization_server_for_resource", new=AsyncMock(return_value=metadata)),
+        patch.object(svc, "_save", new=AsyncMock()),
+        patch.object(svc, "_reregister_installed_proxy", new=AsyncMock()) as mock_reregister,  # pyright: ignore[reportPrivateUsage]
+    ):
+        await svc._auto_detect_oauth("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    updated = svc.models["default"]["my-remote-mcp"]
+    assert updated.oauth is not None
+    assert updated.oauth.enabled is True
+    assert updated.oauth.authorization_endpoint == "http://as.example/authorize"
+    assert updated.oauth.token_endpoint == "http://as.example/token"
+    assert updated.oauth.registration_endpoint == "http://as.example/register"
+    assert updated.oauth.resource == "http://mcp.example.com/mcp"
+    assert updated.oauth.last_error is None
+    mock_reregister.assert_awaited_once_with("default", "my-remote-mcp")
+
+
+@pytest.mark.asyncio
+async def test_auto_detect_oauth_discovery_failure_still_flags_required(svc: McpService) -> None:
+    custom = _make_proxy_custom()
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    with (
+        patch("server.services.mcp_service.discover_authorization_server_for_resource", new=AsyncMock(return_value=None)),
+        patch.object(svc, "_save", new=AsyncMock()),
+        patch.object(svc, "_reregister_installed_proxy", new=AsyncMock()),  # pyright: ignore[reportPrivateUsage]
+    ):
+        await svc._auto_detect_oauth("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    updated = svc.models["default"]["my-remote-mcp"]
+    assert updated.oauth is not None
+    assert updated.oauth.enabled is True
+    assert updated.oauth.authorization_endpoint is None
+    assert updated.oauth.last_error is not None
+
+
+@pytest.mark.asyncio
+async def test_auto_detect_oauth_not_a_proxy_model_is_noop(svc: McpService) -> None:
+    with patch("server.services.mcp_service.discover_authorization_server_for_resource", new=AsyncMock()) as mock_discover:
+        await svc._auto_detect_oauth("default", "open-websearch")  # pyright: ignore[reportPrivateUsage]
+
+    mock_discover.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auto_detect_oauth_concurrent_calls_only_discover_once(svc: McpService) -> None:
+    """Two healthchecks racing on the same 401 must not double-discover/re-register (the TOCTOU fix)."""
+    custom = _make_proxy_custom()
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    release = asyncio.Event()
+
+    async def slow_discover(_resource: str) -> None:
+        await release.wait()
+
+    with (
+        patch(
+            "server.services.mcp_service.discover_authorization_server_for_resource", new=AsyncMock(side_effect=slow_discover)
+        ) as mock_discover,
+        patch.object(svc, "_save", new=AsyncMock()),
+        patch.object(svc, "_reregister_installed_proxy", new=AsyncMock()) as mock_reregister,  # pyright: ignore[reportPrivateUsage]
+    ):
+        first = asyncio.create_task(svc._auto_detect_oauth("default", "my-remote-mcp"))  # pyright: ignore[reportPrivateUsage]
+        await asyncio.sleep(0)  # let `first` pass the pre-lock check and start waiting inside the lock
+        second = asyncio.create_task(svc._auto_detect_oauth("default", "my-remote-mcp"))  # pyright: ignore[reportPrivateUsage]
+        await asyncio.sleep(0)  # let `second` pass the pre-lock check too, then block on the lock
+        release.set()
+        await asyncio.gather(first, second)
+
+    mock_discover.assert_awaited_once()
+    mock_reregister.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_complete_oauth_callback_success_refreshes_tools_when_installed(svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={
+            "enabled": True,
+            "client_id": "client-1",
+            "token_endpoint": "http://as.example/token",
+            "authorization_endpoint": "http://as.example/authorize",
+        }
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    installed.models["my-remote-mcp"] = _make_installed_model_info()
+    svc.instances_info["default"].installed = installed
+    svc._oauth_state_store.add(  # pyright: ignore[reportPrivateUsage]
+        "state-1",
+        PendingOAuthFlow(
+            instance="default",
+            model_id="my-remote-mcp",
+            code_verifier="v",
+            redirect_uri="http://infra.example/mcp-oauth/callback",
+            resource="http://mcp.example.com/mcp",
+        ),
+    )
+    token = TokenResponse(access_token="new-access", expires_in=3600)
+
+    with (
+        patch("server.services.mcp_service.exchange_code_for_token", new=AsyncMock(return_value=token)),
+        patch.object(svc, "_save", new=AsyncMock()),
+        patch.object(svc, "_reregister_installed_proxy", new=AsyncMock()),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_fetch_tools_background", new=AsyncMock()) as mock_fetch_bg,  # pyright: ignore[reportPrivateUsage]
+    ):
+        await svc.complete_oauth_callback("state-1", "code-1", None)
+        await asyncio.sleep(0)  # let the fire-and-forget task run
+
+    mock_fetch_bg.assert_awaited_once_with("default", "my-remote-mcp")
+
+
+@mock.patch("server.services.mcp_service.asyncio.sleep", new_callable=AsyncMock)
+@pytest.mark.asyncio
+async def test_oauth_refresh_background_gives_up_after_max_consecutive_failures(mock_sleep: AsyncMock, svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={"enabled": True, "client_id": "client-1", "refresh_token": "rtok", "token_expires_at": time.time() + 3600}
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    with patch.object(svc, "_refresh_oauth_token", new=AsyncMock(return_value=None)) as mock_refresh:  # pyright: ignore[reportPrivateUsage]
+        await svc._oauth_refresh_background("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    assert mock_refresh.await_count == McpService._OAUTH_REFRESH_MAX_CONSECUTIVE_FAILURES  # pyright: ignore[reportPrivateUsage]
+    sleep_values = [call.args[0] for call in mock_sleep.call_args_list]
+    # sleep_values[0] is the initial near-expiry wait; sleep_values[1:] are the failure backoffs,
+    # which must grow between consecutive failures rather than retrying at a fixed short interval forever.
+    backoffs = sleep_values[1:]
+    assert backoffs == sorted(backoffs)
+    assert backoffs[0] < backoffs[-1]
+    assert all(v <= McpService._OAUTH_REFRESH_MAX_BACKOFF_SECONDS for v in backoffs)  # pyright: ignore[reportPrivateUsage]
+
+
+@mock.patch("server.services.mcp_service.asyncio.sleep", new_callable=AsyncMock)
+@pytest.mark.asyncio
+async def test_oauth_refresh_background_resets_backoff_after_success(mock_sleep: AsyncMock, svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={"enabled": True, "client_id": "client-1", "refresh_token": "rtok", "token_expires_at": time.time() + 3600}
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    refreshed = McpOAuthConfig(enabled=True, refresh_token="rtok", access_token="new-tok", token_expires_at=time.time() + 3600)
+
+    # fail, fail, succeed, fail-and-stop: the backoff before the 3rd attempt (after two failures)
+    # must be bigger than the backoff before the 2nd (after one failure); the wait scheduled right
+    # after the success (4th attempt) must jump back to the near-expiry wait, not continue growing.
+    call_results: list[McpOAuthConfig | None] = [None, None, refreshed, None]
+
+    async def fake_refresh(_instance: str, _model_id: str) -> McpOAuthConfig | None:
+        result = call_results.pop(0)
+        if not call_results:
+            # Stop the infinite loop after the final iteration by disabling refresh.
+            model = svc.models["default"]["my-remote-mcp"]
+            assert model.oauth is not None
+            model.oauth.refresh_token = None
+        return result
+
+    with patch.object(svc, "_refresh_oauth_token", new=AsyncMock(side_effect=fake_refresh)):  # pyright: ignore[reportPrivateUsage]
+        await svc._oauth_refresh_background("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    sleep_values = [call.args[0] for call in mock_sleep.call_args_list]
+    assert len(sleep_values) == 4
+    initial_wait, first_backoff, second_backoff, post_success_wait = sleep_values
+    assert second_backoff > first_backoff
+    # Reset wait is driven by expiry again, not a continuation of the backoff sequence.
+    assert post_success_wait > second_backoff * 2
+    assert post_success_wait == pytest.approx(initial_wait, rel=0.05)
+
+
+def test_remove_custom_model_proxy_drops_oauth_refresh_lock(svc: McpService) -> None:
+    custom = _make_proxy_custom()
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    svc._oauth_refresh_locks[("default", "my-remote-mcp")] = asyncio.Lock()  # pyright: ignore[reportPrivateUsage]
+
+    svc._remove_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    assert ("default", "my-remote-mcp") not in svc._oauth_refresh_locks  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_persist_proxy_oauth_model_missing_is_noop(svc: McpService) -> None:
+    await svc._persist_proxy_oauth("default", "missing-model", McpOAuthConfig())  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_persist_proxy_oauth_writes_to_matching_custom_model(svc: McpService) -> None:
+    other = _make_proxy_custom(custom_id="uuid-proxy-other", model_id="other-remote-mcp")
+    custom = _make_proxy_custom()
+    svc._add_custom_model("default", other)  # pyright: ignore[reportPrivateUsage]
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    svc.get_instance_info("default").config.custom = [other, custom]
+    oauth = McpOAuthConfig(enabled=True, access_token="tok-123")
+
+    with patch.object(svc, "_save", new=AsyncMock()) as mock_save:
+        await svc._persist_proxy_oauth("default", "my-remote-mcp", oauth)  # pyright: ignore[reportPrivateUsage]
+
+    mock_save.assert_awaited_once()
+    assert custom.data["oauth"]["access_token"] == "tok-123"
+    assert "oauth" not in other.data
+    assert svc.models["default"]["my-remote-mcp"].oauth is oauth
+
+
+def test_get_oauth_lock_creates_and_reuses_lock(svc: McpService) -> None:
+    lock1 = svc._get_oauth_lock("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+    lock2 = svc._get_oauth_lock("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    assert lock1 is lock2
+    assert isinstance(lock1, asyncio.Lock)
+
+
+@pytest.mark.asyncio
+async def test_refresh_oauth_token_model_missing_returns_none(svc: McpService) -> None:
+    result = await svc._refresh_oauth_token("default", "missing-model")  # pyright: ignore[reportPrivateUsage]
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_oauth_token_no_refresh_token_returns_oauth_unchanged(svc: McpService) -> None:
+    custom = _make_proxy_custom(oauth={"enabled": True, "client_id": "client-1"})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    result = await svc._refresh_oauth_token("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    assert result is not None
+    assert result.access_token is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_oauth_token_already_valid_skips_refresh_call(svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={
+            "enabled": True,
+            "client_id": "client-1",
+            "refresh_token": "rtok",
+            "token_endpoint": "http://as.example/token",
+            "access_token": "still-valid",
+            "token_expires_at": None,
+        }
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    with patch("server.services.mcp_service.refresh_access_token", new=AsyncMock()) as mock_refresh:
+        result = await svc._refresh_oauth_token("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    mock_refresh.assert_not_awaited()
+    assert result is not None
+    assert result.access_token == "still-valid"
+
+
+@pytest.mark.asyncio
+async def test_refresh_oauth_token_no_client_id_returns_oauth_unchanged(svc: McpService) -> None:
+    custom = _make_proxy_custom(oauth={"enabled": True, "refresh_token": "rtok", "token_endpoint": "http://as.example/token"})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    result = await svc._refresh_oauth_token("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    assert result is not None
+    assert result.access_token is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_oauth_token_success_persists_new_tokens(svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={"enabled": True, "client_id": "client-1", "refresh_token": "rtok", "token_endpoint": "http://as.example/token"}
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    token = TokenResponse(access_token="new-access", refresh_token="new-refresh", expires_in=3600)
+
+    with (
+        patch("server.services.mcp_service.refresh_access_token", new=AsyncMock(return_value=token)),
+        patch.object(svc, "_save", new=AsyncMock()),
+    ):
+        result = await svc._refresh_oauth_token("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    assert result is not None
+    assert result.access_token == "new-access"
+    assert result.refresh_token == "new-refresh"
+    assert result.token_expires_at is not None
+    assert result.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_oauth_token_success_without_new_refresh_token_keeps_existing(svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={
+            "enabled": True,
+            "client_id": "client-1",
+            "refresh_token": "original-rtok",
+            "token_endpoint": "http://as.example/token",
+        }
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    token = TokenResponse(access_token="new-access", refresh_token=None, expires_in=3600)
+
+    with (
+        patch("server.services.mcp_service.refresh_access_token", new=AsyncMock(return_value=token)),
+        patch.object(svc, "_save", new=AsyncMock()),
+    ):
+        result = await svc._refresh_oauth_token("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    assert result is not None
+    assert result.access_token == "new-access"
+    assert result.refresh_token == "original-rtok"
+
+
+@pytest.mark.asyncio
+async def test_refresh_oauth_token_error_persists_last_error_and_returns_none(svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={"enabled": True, "client_id": "client-1", "refresh_token": "rtok", "token_endpoint": "http://as.example/token"}
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    with (
+        patch("server.services.mcp_service.refresh_access_token", new=AsyncMock(side_effect=McpOAuthError("invalid_grant"))),
+        patch.object(svc, "_save", new=AsyncMock()),
+    ):
+        result = await svc._refresh_oauth_token("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    assert result is None
+    updated = svc.models["default"]["my-remote-mcp"]
+    assert updated.oauth is not None
+    assert updated.oauth.last_error == "invalid_grant"
+
+
+@pytest.mark.asyncio
+async def test_oauth_header_provider_no_oauth_returns_empty_headers(svc: McpService) -> None:
+    svc._add_custom_model("default", _make_proxy_custom(oauth=None))  # pyright: ignore[reportPrivateUsage]
+    provider = svc._make_oauth_header_provider("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    headers = await provider()
+
+    assert headers == {}
+
+
+@pytest.mark.asyncio
+async def test_oauth_header_provider_valid_token_returns_bearer_header(svc: McpService) -> None:
+    custom = _make_proxy_custom(oauth={"enabled": True, "access_token": "tok-123", "token_expires_at": None})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    provider = svc._make_oauth_header_provider("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    headers = await provider()
+
+    assert headers == {"Authorization": "Bearer tok-123"}
+
+
+@pytest.mark.asyncio
+async def test_oauth_header_provider_expired_token_refreshes_before_returning(svc: McpService) -> None:
+    custom = _make_proxy_custom(oauth={"enabled": True, "access_token": "old-tok", "refresh_token": "rtok", "token_expires_at": 1.0})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    refreshed = McpOAuthConfig(enabled=True, access_token="fresh-tok")
+
+    with patch.object(svc, "_refresh_oauth_token", new=AsyncMock(return_value=refreshed)) as mock_refresh:  # pyright: ignore[reportPrivateUsage]
+        provider = svc._make_oauth_header_provider("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+        headers = await provider()
+
+    mock_refresh.assert_awaited_once_with("default", "my-remote-mcp")
+    assert headers == {"Authorization": "Bearer fresh-tok"}
+
+
+@pytest.mark.asyncio
+async def test_oauth_refresh_callback_success_returns_bearer_header(svc: McpService) -> None:
+    refreshed = McpOAuthConfig(enabled=True, access_token="fresh-tok")
+    svc._add_custom_model("default", _make_proxy_custom())  # pyright: ignore[reportPrivateUsage]
+
+    with patch.object(svc, "_refresh_oauth_token", new=AsyncMock(return_value=refreshed)):  # pyright: ignore[reportPrivateUsage]
+        on_reauth = svc._make_oauth_refresh_callback("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+        headers = await on_reauth()
+
+    assert headers == {"Authorization": "Bearer fresh-tok"}
+
+
+@pytest.mark.asyncio
+async def test_oauth_refresh_callback_failure_returns_none(svc: McpService) -> None:
+    svc._add_custom_model("default", _make_proxy_custom())  # pyright: ignore[reportPrivateUsage]
+
+    with patch.object(svc, "_refresh_oauth_token", new=AsyncMock(return_value=None)):  # pyright: ignore[reportPrivateUsage]
+        on_reauth = svc._make_oauth_refresh_callback("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+        headers = await on_reauth()
+
+    assert headers is None
+
+
+@mock.patch("server.services.mcp_service.asyncio.sleep", new_callable=AsyncMock)
+@pytest.mark.asyncio
+async def test_oauth_refresh_background_stops_if_refresh_token_cleared_during_sleep(mock_sleep: AsyncMock, svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={"enabled": True, "client_id": "client-1", "refresh_token": "rtok", "token_expires_at": time.time() + 3600}
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    async def clear_refresh_token(_seconds: float) -> None:
+        model = svc.models["default"]["my-remote-mcp"]
+        assert model.oauth is not None
+        model.oauth.refresh_token = None
+
+    mock_sleep.side_effect = clear_refresh_token
+
+    with patch.object(svc, "_refresh_oauth_token", new=AsyncMock()) as mock_refresh:  # pyright: ignore[reportPrivateUsage]
+        await svc._oauth_refresh_background("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    mock_refresh.assert_not_awaited()
+
+
+@mock.patch("server.services.mcp_service.asyncio.sleep", new_callable=AsyncMock)
+@pytest.mark.asyncio
+async def test_oauth_refresh_background_logs_and_continues_on_exception(mock_sleep: AsyncMock, svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={"enabled": True, "client_id": "client-1", "refresh_token": "rtok", "token_expires_at": time.time() + 3600}
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    with patch.object(svc, "_refresh_oauth_token", new=AsyncMock(side_effect=RuntimeError("boom"))) as mock_refresh:  # pyright: ignore[reportPrivateUsage]
+        await svc._oauth_refresh_background("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    assert mock_refresh.await_count == McpService._OAUTH_REFRESH_MAX_CONSECUTIVE_FAILURES  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_start_oauth_refresh_background_creates_tracked_task(svc: McpService) -> None:
+    svc._start_oauth_refresh_background("default", "no-such-model")  # pyright: ignore[reportPrivateUsage]
+
+    assert len(svc._background_tasks) == 1  # pyright: ignore[reportPrivateUsage]
+
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert len(svc._background_tasks) == 0  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_start_oauth_refresh_background_skips_spawn_when_task_already_running(svc: McpService) -> None:
+    svc._start_oauth_refresh_background("default", "no-such-model")  # pyright: ignore[reportPrivateUsage]
+    first_task = svc._oauth_refresh_tasks[("default", "no-such-model")]  # pyright: ignore[reportPrivateUsage]
+
+    svc._start_oauth_refresh_background("default", "no-such-model")  # pyright: ignore[reportPrivateUsage]
+
+    assert svc._oauth_refresh_tasks[("default", "no-such-model")] is first_task  # pyright: ignore[reportPrivateUsage]
+    assert len(svc._background_tasks) == 1  # pyright: ignore[reportPrivateUsage]
+
+    first_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_remove_custom_model_proxy_cancels_running_refresh_task(svc: McpService) -> None:
+    custom = _make_proxy_custom()
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    svc._start_oauth_refresh_background("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+    task = svc._oauth_refresh_tasks[("default", "my-remote-mcp")]  # pyright: ignore[reportPrivateUsage]
+
+    svc._remove_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    assert ("default", "my-remote-mcp") not in svc._oauth_refresh_tasks  # pyright: ignore[reportPrivateUsage]
+
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert task.cancelled()
+
+
+def test_get_oauth_model_raises_when_not_proxy(svc: McpService) -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        svc._get_oauth_model("default", "open-websearch")  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_discover_oauth_endpoints_metadata_none_skips_persist(svc: McpService) -> None:
+    custom = _make_proxy_custom(oauth={"enabled": True})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    model = svc.models["default"]["my-remote-mcp"]
+
+    with (
+        patch("server.services.mcp_service.discover_authorization_server_for_resource", new=AsyncMock(return_value=None)),
+        patch.object(svc, "_persist_proxy_oauth", new=AsyncMock()) as mock_persist,  # pyright: ignore[reportPrivateUsage]
+    ):
+        await svc._discover_oauth_endpoints("default", "my-remote-mcp", model)  # pyright: ignore[reportPrivateUsage]
+
+    mock_persist.assert_not_awaited()
+    assert model.oauth is not None
+    assert model.oauth.authorization_endpoint is None
+
+
+@pytest.mark.asyncio
+async def test_reregister_installed_proxy_model_not_in_installed_info_is_noop(svc: McpService) -> None:
+    svc._add_custom_model("default", _make_proxy_custom())  # pyright: ignore[reportPrivateUsage]
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+
+    await svc._reregister_installed_proxy("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    svc.endpoint_registry.unregister_mcp_endpoint.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@pytest.mark.asyncio
+async def test_start_oauth_flow_raises_when_discovery_finds_no_endpoints(svc: McpService) -> None:
+    svc.config.infra_url = "http://infra.example"  # pyright: ignore[reportAttributeAccessIssue]
+    custom = _make_proxy_custom(oauth={"enabled": True})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    with (
+        patch("server.services.mcp_service.discover_authorization_server_for_resource", new=AsyncMock(return_value=None)),
+        patch.object(svc, "_save", new=AsyncMock()),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc.start_oauth_flow("default", "my-remote-mcp")
+
+    assert exc_info.value.status_code == 400
+    assert "could not discover" in str(exc_info.value.detail).lower()
+
+
+@pytest.mark.asyncio
+async def test_start_oauth_flow_raises_when_dynamic_registration_fails(svc: McpService) -> None:
+    svc.config.infra_url = "http://infra.example"  # pyright: ignore[reportAttributeAccessIssue]
+    custom = _make_proxy_custom(oauth={"enabled": True})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    metadata = AuthorizationServerMetadata(
+        issuer="http://as.example",
+        authorization_endpoint="http://as.example/authorize",
+        token_endpoint="http://as.example/token",
+        registration_endpoint="http://as.example/register",
+    )
+
+    with (
+        patch("server.services.mcp_service.discover_authorization_server_for_resource", new=AsyncMock(return_value=metadata)),
+        patch("server.services.mcp_service.register_dynamic_client", new=AsyncMock(return_value=None)),
+        patch.object(svc, "_save", new=AsyncMock()),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc.start_oauth_flow("default", "my-remote-mcp")
+
+    assert exc_info.value.status_code == 400
+    assert "registration failed" in str(exc_info.value.detail).lower()
+
+
+@pytest.mark.asyncio
+async def test_start_oauth_flow_skips_discovery_and_dcr_when_already_configured(svc: McpService) -> None:
+    svc.config.infra_url = "http://infra.example"  # pyright: ignore[reportAttributeAccessIssue]
+    custom = _make_proxy_custom(
+        oauth={
+            "enabled": True,
+            "client_id": "existing-client",
+            "authorization_endpoint": "http://as.example/authorize",
+            "token_endpoint": "http://as.example/token",
+        }
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    with (
+        patch("server.services.mcp_service.discover_authorization_server_for_resource", new=AsyncMock()) as mock_discover,
+        patch("server.services.mcp_service.register_dynamic_client", new=AsyncMock()) as mock_register,
+    ):
+        authorize_url = await svc.start_oauth_flow("default", "my-remote-mcp")
+
+    mock_discover.assert_not_awaited()
+    mock_register.assert_not_awaited()
+    assert authorize_url.startswith("http://as.example/authorize?")
+    assert "client_id=existing-client" in authorize_url
+
+
+@pytest.mark.asyncio
+async def test_start_oauth_flow_raises_when_infra_url_unconfigured(svc: McpService) -> None:
+    svc.config.infra_url = ""  # pyright: ignore[reportAttributeAccessIssue]
+    custom = _make_proxy_custom(
+        oauth={
+            "enabled": True,
+            "client_id": "existing-client",
+            "authorization_endpoint": "http://as.example/authorize",
+            "token_endpoint": "http://as.example/token",
+        }
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(HTTPException) as exc_info:
+        await svc.start_oauth_flow("default", "my-remote-mcp")
+
+    assert exc_info.value.status_code == 400
+    assert "infra_url" in str(exc_info.value.detail).lower()
+
+
+@pytest.mark.asyncio
+async def test_start_oauth_flow_redirect_uri_preserves_infra_url_path_prefix(svc: McpService) -> None:
+    svc.config.infra_url = "https://host.example/reverse-proxy-prefix/"  # pyright: ignore[reportAttributeAccessIssue]
+    custom = _make_proxy_custom(
+        oauth={
+            "enabled": True,
+            "client_id": "existing-client",
+            "authorization_endpoint": "http://as.example/authorize",
+            "token_endpoint": "http://as.example/token",
+        }
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    authorize_url = await svc.start_oauth_flow("default", "my-remote-mcp")
+
+    assert "redirect_uri=https%3A%2F%2Fhost.example%2Freverse-proxy-prefix%2Fmcp-oauth%2Fcallback" in authorize_url
+
+
+@pytest.mark.asyncio
+async def test_complete_oauth_callback_model_gone_returns_message(svc: McpService) -> None:
+    svc._oauth_state_store.add(  # pyright: ignore[reportPrivateUsage]
+        "state-1",
+        PendingOAuthFlow(instance="default", model_id="removed-model", code_verifier="v", redirect_uri="http://x", resource="http://y"),
+    )
+
+    result = await svc.complete_oauth_callback("state-1", "code-1", None)
+
+    assert "no longer exists" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_complete_oauth_callback_missing_code_returns_message(svc: McpService) -> None:
+    custom = _make_proxy_custom(oauth={"enabled": True})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    svc._oauth_state_store.add(  # pyright: ignore[reportPrivateUsage]
+        "state-1",
+        PendingOAuthFlow(instance="default", model_id="my-remote-mcp", code_verifier="v", redirect_uri="http://x", resource="http://y"),
+    )
+
+    result = await svc.complete_oauth_callback("state-1", None, None)
+
+    assert "no authorization code" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_complete_oauth_callback_discovery_fails_returns_message(svc: McpService) -> None:
+    custom = _make_proxy_custom(oauth={"enabled": True, "client_id": "client-1"})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    svc._oauth_state_store.add(  # pyright: ignore[reportPrivateUsage]
+        "state-1",
+        PendingOAuthFlow(
+            instance="default",
+            model_id="my-remote-mcp",
+            code_verifier="v",
+            redirect_uri="http://infra.example/mcp-oauth/callback",
+            resource="http://mcp.example.com/mcp",
+        ),
+    )
+
+    with patch("server.services.mcp_service.discover_authorization_server_for_resource", new=AsyncMock(return_value=None)):
+        result = await svc.complete_oauth_callback("state-1", "code-1", None)
+
+    assert "could not discover" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_complete_oauth_callback_discovery_succeeds_mid_flow(svc: McpService) -> None:
+    custom = _make_proxy_custom(oauth={"enabled": True, "client_id": "client-1"})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    svc._oauth_state_store.add(  # pyright: ignore[reportPrivateUsage]
+        "state-1",
+        PendingOAuthFlow(
+            instance="default",
+            model_id="my-remote-mcp",
+            code_verifier="v",
+            redirect_uri="http://infra.example/mcp-oauth/callback",
+            resource="http://mcp.example.com/mcp",
+        ),
+    )
+    metadata = AuthorizationServerMetadata(
+        issuer="http://as.example",
+        authorization_endpoint="http://as.example/authorize",
+        token_endpoint="http://as.example/token",
+    )
+    token = TokenResponse(access_token="new-access", expires_in=3600)
+
+    with (
+        patch("server.services.mcp_service.discover_authorization_server_for_resource", new=AsyncMock(return_value=metadata)),
+        patch("server.services.mcp_service.exchange_code_for_token", new=AsyncMock(return_value=token)),
+        patch.object(svc, "_save", new=AsyncMock()),
+        patch.object(svc, "_start_oauth_refresh_background"),  # pyright: ignore[reportPrivateUsage]
+    ):
+        result = await svc.complete_oauth_callback("state-1", "code-1", None)
+
+    assert "complete" in result.lower()
+    updated = svc.models["default"]["my-remote-mcp"]
+    assert updated.oauth is not None
+    assert updated.oauth.token_endpoint == "http://as.example/token"
+    assert updated.oauth.access_token == "new-access"
+
+
+@pytest.mark.asyncio
+async def test_complete_oauth_callback_dynamic_registration_fails_returns_message(svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={
+            "enabled": True,
+            "token_endpoint": "http://as.example/token",
+            "authorization_endpoint": "http://as.example/authorize",
+            "registration_endpoint": "http://as.example/register",
+        }
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    svc._oauth_state_store.add(  # pyright: ignore[reportPrivateUsage]
+        "state-1",
+        PendingOAuthFlow(
+            instance="default",
+            model_id="my-remote-mcp",
+            code_verifier="v",
+            redirect_uri="http://infra.example/mcp-oauth/callback",
+            resource="http://mcp.example.com/mcp",
+        ),
+    )
+
+    with patch("server.services.mcp_service.register_dynamic_client", new=AsyncMock(return_value=None)):
+        result = await svc.complete_oauth_callback("state-1", "code-1", None)
+
+    assert "no longer configured" in result.lower()
+    updated = svc.models["default"]["my-remote-mcp"]
+    assert updated.oauth is not None
+    assert updated.oauth.client_id is None
+
+
+@pytest.mark.asyncio
+async def test_complete_oauth_callback_registers_dynamic_client_when_missing(svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={
+            "enabled": True,
+            "token_endpoint": "http://as.example/token",
+            "authorization_endpoint": "http://as.example/authorize",
+            "registration_endpoint": "http://as.example/register",
+        }
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    svc._oauth_state_store.add(  # pyright: ignore[reportPrivateUsage]
+        "state-1",
+        PendingOAuthFlow(
+            instance="default",
+            model_id="my-remote-mcp",
+            code_verifier="v",
+            redirect_uri="http://infra.example/mcp-oauth/callback",
+            resource="http://mcp.example.com/mcp",
+        ),
+    )
+    dcr = DcrResponse(client_id="dcr-client-1", client_secret="dcr-secret-1")
+    token = TokenResponse(access_token="new-access", expires_in=3600)
+
+    with (
+        patch("server.services.mcp_service.register_dynamic_client", new=AsyncMock(return_value=dcr)),
+        patch("server.services.mcp_service.exchange_code_for_token", new=AsyncMock(return_value=token)),
+        patch.object(svc, "_save", new=AsyncMock()),
+        patch.object(svc, "_start_oauth_refresh_background"),  # pyright: ignore[reportPrivateUsage]
+    ):
+        result = await svc.complete_oauth_callback("state-1", "code-1", None)
+
+    assert "complete" in result.lower()
+    updated = svc.models["default"]["my-remote-mcp"]
+    assert updated.oauth is not None
+    assert updated.oauth.client_id == "dcr-client-1"
+
+
+@pytest.mark.asyncio
+async def test_complete_oauth_callback_no_client_id_and_no_registration_returns_message(svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={
+            "enabled": True,
+            "token_endpoint": "http://as.example/token",
+            "authorization_endpoint": "http://as.example/authorize",
+        }
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    svc._oauth_state_store.add(  # pyright: ignore[reportPrivateUsage]
+        "state-1",
+        PendingOAuthFlow(
+            instance="default",
+            model_id="my-remote-mcp",
+            code_verifier="v",
+            redirect_uri="http://infra.example/mcp-oauth/callback",
+            resource="http://mcp.example.com/mcp",
+        ),
+    )
+
+    result = await svc.complete_oauth_callback("state-1", "code-1", None)
+
+    assert "no longer configured" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_complete_oauth_callback_token_exchange_failure_persists_error(svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={
+            "enabled": True,
+            "client_id": "client-1",
+            "token_endpoint": "http://as.example/token",
+            "authorization_endpoint": "http://as.example/authorize",
+        }
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    svc._oauth_state_store.add(  # pyright: ignore[reportPrivateUsage]
+        "state-1",
+        PendingOAuthFlow(
+            instance="default",
+            model_id="my-remote-mcp",
+            code_verifier="v",
+            redirect_uri="http://infra.example/mcp-oauth/callback",
+            resource="http://mcp.example.com/mcp",
+        ),
+    )
+
+    with (
+        patch("server.services.mcp_service.exchange_code_for_token", new=AsyncMock(side_effect=McpOAuthError("invalid_grant"))),
+        patch.object(svc, "_save", new=AsyncMock()),
+    ):
+        result = await svc.complete_oauth_callback("state-1", "code-1", None)
+
+    assert "failed" in result.lower()
+    updated = svc.models["default"]["my-remote-mcp"]
+    assert updated.oauth is not None
+    assert updated.oauth.last_error == "invalid_grant"
+
+
+def test_get_oauth_status_error_when_last_error_set_without_token(svc: McpService) -> None:
+    custom = _make_proxy_custom(oauth={"enabled": True, "last_error": "boom"})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    status = svc.get_oauth_status("default", "my-remote-mcp")
+
+    assert status.status == "error"
+    assert status.last_error == "boom"
+
+
+def test_get_oauth_status_not_started_when_nothing_set(svc: McpService) -> None:
+    custom = _make_proxy_custom(oauth={"enabled": True})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    status = svc.get_oauth_status("default", "my-remote-mcp")
+
+    assert status.status == "not_started"
+
+
+@pytest.mark.asyncio
+async def test_install_model_proxy_healthcheck_exception_treated_as_unhealthy(svc: McpService) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    svc._add_custom_model("default", _make_proxy_custom())  # pyright: ignore[reportPrivateUsage]
+
+    with (
+        patch.object(svc, "healthcheck_model", new=AsyncMock(side_effect=RuntimeError("boom"))),
+        patch.object(svc, "_fetch_tools_background", new=AsyncMock()) as mock_bg,  # pyright: ignore[reportPrivateUsage]
+    ):
+        promise = await svc._install_model("default", "my-remote-mcp", InstallModelIn())  # pyright: ignore[reportPrivateUsage]
+        result = await promise.wait()
+        await asyncio.sleep(0)
+
+    assert result.status == "OK"
+    mock_bg.assert_awaited_once_with("default", "my-remote-mcp")
+
+
+@mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
+@pytest.mark.asyncio
+async def test_install_model_proxy_with_refresh_token_starts_background_refresh(mock_fetch: AsyncMock, svc: McpService) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    custom = _make_proxy_custom(oauth={"enabled": True, "client_id": "client-1", "refresh_token": "rtok", "access_token": "tok"})
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    mock_fetch.return_value = McpHealthCheckResult(healthy=True, transport="streamable_http", tools=[])
+
+    with patch.object(svc, "_start_oauth_refresh_background") as mock_start:  # pyright: ignore[reportPrivateUsage]
+        promise = await svc._install_model("default", "my-remote-mcp", InstallModelIn())  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+        await asyncio.sleep(0)
+
+    mock_start.assert_called_once_with("default", "my-remote-mcp")

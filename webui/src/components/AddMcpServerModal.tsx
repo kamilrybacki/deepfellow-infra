@@ -12,6 +12,12 @@ limitations under the License.
 import { ListInput } from "@/components/ListInput";
 import { MapInput } from "@/components/MapInput";
 import {
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger,
+} from "@/components/ui/accordion";
+import {
   AlertDialog,
   AlertDialogAction,
   AlertDialogCancel,
@@ -44,6 +50,8 @@ import type { SpecField } from "@/deepfellow/types";
 import {
   type McpVariant,
   type NodeVersion,
+  type ParsedMcpOAuth,
+  type ProxyMcpServerOAuthSpec,
   type ProxyMcpServerSpec,
   type PythonVersion,
   detectRuntime,
@@ -59,7 +67,10 @@ export type {
   NodeVersion,
   PythonVersion,
 } from "@/hooks/use-mcp-server-form";
-export type { ProxyMcpServerSpec } from "@/hooks/use-mcp-server-form";
+export type {
+  ProxyMcpServerOAuthSpec,
+  ProxyMcpServerSpec,
+} from "@/hooks/use-mcp-server-form";
 
 const MCP_VARIANTS = [
   { value: "node-headless", label: "Node.js — headless (default)" },
@@ -120,6 +131,7 @@ export type AddMcpServerPayload =
       headers?: Record<string, string>;
       repository_url?: string;
       description?: string;
+      oauth?: ProxyMcpServerOAuthSpec;
     };
 
 interface AddMcpServerModalProps {
@@ -257,6 +269,7 @@ type ParsedMcpConfig =
       server_url: string;
       transport: "streamable_http" | "sse";
       headers: Record<string, string>;
+      oauth?: ParsedMcpOAuth;
     }
   | {
       kind: "docker";
@@ -266,6 +279,22 @@ type ParsedMcpConfig =
       volumes: string[];
       envs: Record<string, string>;
     };
+
+function parseOauthField(raw: unknown): ParsedMcpOAuth | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const o = raw as Record<string, unknown>;
+  const clientId = o.client_id ?? o.clientId;
+  const clientSecret = o.client_secret ?? o.clientSecret;
+  const scope = o.scope;
+  const oauth: ParsedMcpOAuth = {
+    client_id: typeof clientId === "string" ? clientId : undefined,
+    client_secret: typeof clientSecret === "string" ? clientSecret : undefined,
+    scope: typeof scope === "string" ? scope : undefined,
+  };
+  return oauth.client_id || oauth.client_secret || oauth.scope
+    ? oauth
+    : undefined;
+}
 
 export function parseMcpJsonConfig(text: string): ParsedMcpConfig {
   const json = JSON.parse(text) as unknown;
@@ -293,6 +322,7 @@ export function parseMcpJsonConfig(text: string): ParsedMcpConfig {
     url,
     transport: rawTransport,
     headers: rawHeaders,
+    oauth: rawOauth,
   } = config as Record<string, unknown>;
 
   if (serverUrl || url) {
@@ -320,7 +350,15 @@ export function parseMcpJsonConfig(text: string): ParsedMcpConfig {
       rawTransport === "sse" || resolvedUrl.endsWith("/sse")
         ? "sse"
         : "streamable_http";
-    return { kind: "proxy", name, server_url: resolvedUrl, transport, headers };
+    const oauth = parseOauthField(rawOauth);
+    return {
+      kind: "proxy",
+      name,
+      server_url: resolvedUrl,
+      transport,
+      headers,
+      ...(oauth ? { oauth } : {}),
+    };
   }
 
   if (typeof rawCommand !== "string" || !rawCommand)
@@ -496,6 +534,14 @@ export function AddMcpServerModal({
         headers: Object.keys(url.headers).length > 0 ? url.headers : undefined,
         repository_url: url.repositoryUrl.trim() || undefined,
         description: url.description.trim() || undefined,
+        oauth: url.oauthEnabled
+          ? {
+              enabled: true,
+              client_id: url.oauthClientId.trim() || undefined,
+              client_secret: url.oauthClientSecret.trim() || undefined,
+              scope: url.oauthScope.trim() || undefined,
+            }
+          : undefined,
       });
       return;
     }
@@ -735,6 +781,94 @@ export function AddMcpServerModal({
                   </Label>
                   <MapInput value={url.headers} onChange={url.setHeaders} />
                 </div>
+                {(!isEditMode || url.oauthEnabled) && (
+                  <Accordion
+                    type="single"
+                    collapsible
+                    className="rounded-md border px-3"
+                    {...(isEditMode
+                      ? { defaultValue: "oauth" }
+                      : {
+                          value: url.oauthEnabled ? "oauth" : "",
+                          onValueChange: (v: string) =>
+                            url.setOauthEnabled(v === "oauth"),
+                        })}
+                  >
+                    <AccordionItem value="oauth" className="border-b-0">
+                      <AccordionTrigger className="items-center bg-transparent py-3 text-sm font-medium hover:no-underline">
+                        {isEditMode
+                          ? "OAuth authorization required"
+                          : "Pre-register OAuth client credentials (advanced)"}
+                      </AccordionTrigger>
+                      <AccordionContent className="space-y-3 pb-3">
+                        <p className="text-xs text-muted-foreground">
+                          {isEditMode
+                            ? "Detected automatically when this server responded with 401 Unauthorized. Use the \"Authorize\" action on the server's row to complete the flow. Only fill in a client ID/secret below if dynamic client registration didn't work."
+                            : "Pre-registered with the authorization server ahead of time. Leave Client ID empty to attempt dynamic client registration automatically once the server requires authorization."}
+                        </p>
+                        <div className="space-y-1">
+                          <Label htmlFor="url-oauth-client-id">
+                            Client ID{" "}
+                            <span className="text-muted-foreground text-sm font-normal">
+                              (optional — leave empty to attempt dynamic
+                              registration)
+                            </span>
+                          </Label>
+                          <Input
+                            id="url-oauth-client-id"
+                            placeholder="client-id"
+                            autoComplete="off"
+                            value={url.oauthClientId}
+                            onChange={(e) =>
+                              url.setOauthClientId(e.target.value)
+                            }
+                            disabled={isSubmitting}
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <Label htmlFor="url-oauth-client-secret">
+                            Client Secret{" "}
+                            <span className="text-muted-foreground text-sm font-normal">
+                              (optional)
+                            </span>
+                          </Label>
+                          <Input
+                            id="url-oauth-client-secret"
+                            type="password"
+                            placeholder="client-secret"
+                            // Stop browsers/password managers from suggesting the
+                            // saved DeepFellow Infra login for this unrelated secret.
+                            autoComplete="new-password"
+                            data-1p-ignore
+                            data-lpignore="true"
+                            data-bwignore="true"
+                            value={url.oauthClientSecret}
+                            onChange={(e) =>
+                              url.setOauthClientSecret(e.target.value)
+                            }
+                            disabled={isSubmitting}
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <Label htmlFor="url-oauth-scope">
+                            Scope{" "}
+                            <span className="text-muted-foreground text-sm font-normal">
+                              (optional)
+                            </span>
+                          </Label>
+                          <Input
+                            id="url-oauth-scope"
+                            placeholder="tools:read"
+                            autoComplete="off"
+                            value={url.oauthScope}
+                            onChange={(e) => url.setOauthScope(e.target.value)}
+                            disabled={isSubmitting}
+                          />
+                        </div>
+                      </AccordionContent>
+                    </AccordionItem>
+                  </Accordion>
+                )}
                 <div className="space-y-1">
                   <Label htmlFor="url-repository-url">
                     Repository URL{" "}

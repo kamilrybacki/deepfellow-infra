@@ -28,7 +28,7 @@ function RouteComponent() {
   return (
     <SidebarProvider>
       <AppSidebar variant="inset" onLogout={handleLogout} />
-      <SidebarInset>
+      <SidebarInset className="min-w-0">
         <Outlet />
       </SidebarInset>
     </SidebarProvider>

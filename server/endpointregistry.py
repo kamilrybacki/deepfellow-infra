@@ -45,7 +45,7 @@ from server.models.api import (
     ResponsesRequest,
 )
 from server.models.common import JsonSerializable, StarletteResponse
-from server.utils.core import HttpClientError, Utils, make_http_request
+from server.utils.core import HttpClientError, HttpResponse, Utils, make_http_request
 from server.websockets.models import RegistrationId, UsageChangeRequest
 from server.websockets.parent_infra_group import ParentInfraGroup
 
@@ -58,6 +58,9 @@ T = TypeVar("T")
 type EndpointCallback[T] = Callable[[T, Request | None], Awaitable[StarletteResponse]]
 type CustomEndpointCallback = Callable[[Request], Awaitable[StarletteResponse]]
 type McpEndpointCallback = Callable[[Request], Awaitable[StarletteResponse]]
+
+
+_MCP_PROXY_MAX_BODY_BYTES = 10 * 1024 * 1024  # generous for MCP JSON-RPC payloads; bounds the buffering needed for a 401-retry replay
 
 
 class SimpleEndpoint[T](NamedTuple):
@@ -420,15 +423,55 @@ class ProxyOptions:
     headers: dict[str, str] | None = None
     allowed_response_headers: list[str] | None = None
     allowed_request_headers: list[str] | None = None
+    dynamic_headers: Callable[[], Awaitable[dict[str, str]]] | None = None
+    on_reauth: Callable[[], Awaitable[dict[str, str] | None]] | None = None
 
-    def get_request_headers(self, request: Request | None) -> dict[str, str]:
-        """Get request headers."""
-        headers = self.headers or {}
-        if not request:
-            return headers
-        allowed_request_headers = self.allowed_request_headers or []
-        request_headers = {k: v for k, v in dict(request.headers).items() if k in allowed_request_headers}
-        return request_headers | headers
+    async def get_request_headers(self, request: Request | None) -> dict[str, str]:
+        """Get request headers, merging in freshly-computed dynamic headers (e.g. a live OAuth token) last."""
+        static_headers = self.headers or {}
+        if request:
+            allowed_request_headers = self.allowed_request_headers or []
+            request_headers = {k: v for k, v in dict(request.headers).items() if k in allowed_request_headers}
+            headers = request_headers | static_headers
+        else:
+            headers = dict(static_headers)
+        if self.dynamic_headers:
+            headers |= await self.dynamic_headers()
+        return headers
+
+
+async def _make_request_with_reauth(
+    url: str,
+    method: str,
+    data: bytes | None,
+    headers: dict[str, str],
+    options: ProxyOptions,
+) -> HttpResponse:
+    """Issue a request; on a 401 with `on_reauth` configured, refresh headers and retry once.
+
+    If `on_reauth` isn't set, or returns None (nothing to refresh, e.g. no refresh token),
+    the original 401 response is returned untouched so it streams through to the client.
+    """
+    response = await make_http_request(url=url, method=method, data=data, headers=headers)
+    if response.response.status != 401 or not options.on_reauth:
+        return response
+    new_headers = await options.on_reauth()
+    if new_headers is None:
+        return response
+    await response.discard()
+    return await make_http_request(url=url, method=method, data=data, headers=headers | new_headers)
+
+
+async def _read_body_with_limit(request: Request, max_bytes: int) -> bytes:
+    """Buffer `request`'s body, raising 413 instead of growing past `max_bytes`."""
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(413, f"Request body exceeds the {max_bytes}-byte limit for this MCP proxy endpoint.")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 class ModelInfo(NamedTuple):
@@ -743,7 +786,7 @@ class EndpointRegistry:
         """Register custom endpoint as a proxy."""
 
         async def on_request(request: Request) -> StreamingResponse:
-            headers = options.get_request_headers(request)
+            headers = await options.get_request_headers(request)
             headers["content-type"] = request.headers.get("content-type") or "application/octet-stream"
             _, _, sub_path = request.path_params["full_path"].partition("/")
             full_url = Utils.join_url(options.url, sub_path) if sub_path else options.url
@@ -784,13 +827,19 @@ class EndpointRegistry:
         """Register mcp endpoint as a proxy."""
 
         async def on_request(request: Request) -> StreamingResponse:
-            headers = options.get_request_headers(request)
+            headers = await options.get_request_headers(request)
             headers["content-type"] = request.headers.get("content-type") or "application/octet-stream"
             full_url = options.url
             if request.url.query:
                 full_url = f"{full_url}?{request.url.query}"
             logger.debug("MCP proxy: %s %s -> %s", request.method, request.path_params["full_path"], full_url)
-            response = await make_http_request(url=full_url, method=request.method, data=request.stream(), headers=headers)
+            if options.on_reauth:
+                # Buffered (not streamed) so a 401-triggered retry can replay the body; size-capped to bound memory use.
+                # Only needed for OAuth-enabled proxies — everything else keeps streaming the body straight through.
+                body = await _read_body_with_limit(request, _MCP_PROXY_MAX_BODY_BYTES)
+                response = await _make_request_with_reauth(full_url, request.method, body, headers, options)
+            else:
+                response = await make_http_request(url=full_url, method=request.method, data=request.stream(), headers=headers)
             logger.debug("MCP proxy response: %s", response.response.status)
             return response.as_streaming_response(options.allowed_response_headers)
 
@@ -816,13 +865,17 @@ class EndpointRegistry:
         )
 
         async def on_request(request: Request) -> StreamingResponse:
-            headers = options.get_request_headers(request)
+            headers = await options.get_request_headers(request)
 
             if request.method == "GET":
                 headers["accept"] = "text/event-stream"
                 headers.pop("content-type", None)
                 proxy_endpoint_url = str(request.url).split("?")[0]
-                upstream_response = await make_http_request(url=options.url, method="GET", headers=headers)
+                # A mid-SSE-stream token expiry can't be transparently retried (no client body to
+                # replay mid-stream); only this initial GET goes through the reauth helper. Proactive
+                # background refresh (see McpService) mitigates the gap; the client must reconnect
+                # if the token expires after the stream is already established.
+                upstream_response = await _make_request_with_reauth(options.url, "GET", None, headers, options)
 
                 async def rewritten() -> AsyncGenerator[bytes]:
                     session_id: str | None = None
@@ -1413,7 +1466,7 @@ async def post_json(data: BaseModel, options: ProxyOptions, request: Request | N
             url=options.url,
             method="POST",
             data=JsonPayload(raw),
-            headers=options.get_request_headers(request),
+            headers=await options.get_request_headers(request),
         )
     ).as_streaming_response(options.allowed_response_headers)
 
@@ -1466,6 +1519,6 @@ async def post_form(data: FormSerializable, options: ProxyOptions, request: Requ
             url=options.url,
             method="POST",
             data=await data.to_form(options.remove_model, options.rewrite_model_to),
-            headers=options.get_request_headers(request),
+            headers=await options.get_request_headers(request),
         )
     ).as_streaming_response(options.allowed_response_headers)

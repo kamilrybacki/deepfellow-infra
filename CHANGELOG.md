@@ -21,6 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - DeepSeek V4 (Flash, Pro) and Kimi (K2.6, K2.7 Code) added to the self-hosted vLLM model registry.
 - New Google AI (Gemini) chat models: Gemini 3.6 Flash, Gemini 3.5 Flash, Gemini 3.5 Flash-Lite, Gemini 3.1 Flash-Lite, Gemini 3 Flash (preview), and Gemma 4 (26B-A4B, 31B).
 - New Google AI embedding and image models: Gemini Embedding 2, the Nano Banana 2/2-Lite/Pro image models, and GA Imagen 4.0 Standard/Ultra.
+- Remote (proxy) MCP servers now support OAuth 2.1 authorization (PKCE): DeepFellow auto-detects when a server requires OAuth, walks discovery/registration per the MCP Authorization spec, and exposes an "Authorize" action in the WebUI; tokens are refreshed automatically in the background.
 
 ### Changed
 - The project now licenses under the MIT License. Python files require an `SPDX-License-Identifier: MIT` header instead of the previous DeepFellow Free License copyright block; `just license-check --fix` migrates old headers automatically.

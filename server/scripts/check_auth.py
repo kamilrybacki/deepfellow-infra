@@ -24,6 +24,9 @@ AUTH_DEPENDENCIES = {"auth_admin", "auth_server", "auth_metrics"}
 PUBLIC_WHITELIST: dict[str, set[str] | None] = {
     "/health": {"GET"},
     "/admin/mesh/check": {"POST"},
+    # The OAuth authorization server's browser redirect must reach this unauthenticated —
+    # it never carries a DeepFellow admin API key. See server/api/mcp_oauth.py's module docstring.
+    "/mcp-oauth/callback": {"GET"},
 }
 
 

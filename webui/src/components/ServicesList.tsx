@@ -345,7 +345,14 @@ export function ServicesList() {
                   sim.stop();
                   delete simulationStopFnsRef.current[serviceId];
                   clearServiceInstallProgress(serviceId);
-                  reject(new Error(event.details || "Installation failed"));
+                  // Failure events always carry a plain string (see `ProgressEvent`).
+                  reject(
+                    new Error(
+                      typeof event.details === "string"
+                        ? event.details
+                        : "Installation failed",
+                    ),
+                  );
                 }
               }
             },
