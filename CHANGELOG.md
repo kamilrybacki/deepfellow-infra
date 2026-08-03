@@ -23,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - New Google AI embedding and image models: Gemini Embedding 2, the Nano Banana 2/2-Lite/Pro image models, and GA Imagen 4.0 Standard/Ultra.
 
 ### Changed
+- Direct (non-dev) dependencies still in the `0.x` series are now pinned with `~=` instead of `>=` in `pyproject.toml`, so `uv lock` can only pick up patch-level updates for them, not minor bumps that may break compatibility.
 - The project now licenses under the MIT License. Python files require an `SPDX-License-Identifier: MIT` header instead of the previous DeepFellow Free License copyright block; `just license-check --fix` migrates old headers automatically.
 - `OllamaChatMessage.role` is now a free-form string instead of a `Literal`, matching Ollama's native API, which does not validate role names. Required by models that define their own role vocabulary — e.g. Granite Guardian 3.3 passes RAG documents as `document` (and `document <id>` for multiple documents) when checking groundedness and context relevance.
 - Container healthcheck (`scripts/healthcheck.py`) now probes `/health` instead of `/docs`, consistent with every other health probe.
