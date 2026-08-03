@@ -157,12 +157,33 @@ async def test_get_gguf_arch_params_valid(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_get_gguf_arch_params_missing_head_count_kv_returns_params_with_none(tmp_path: Path):
+    path = _write_gguf(
+        tmp_path,
+        [
+            _kv_string("general.architecture", "llama"),
+            _kv_uint32("llama.embedding_length", 4096),
+            _kv_uint32("llama.attention.head_count", 32),
+            _kv_uint32("llama.block_count", 32),
+        ],
+    )
+
+    result = await get_gguf_arch_params(path)
+
+    assert result == ArchParams(
+        hidden_size=4096,
+        num_attention_heads=32,
+        num_key_value_heads=None,
+        num_hidden_layers=32,
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "missing_key",
     [
         "llama.embedding_length",
         "llama.attention.head_count",
-        "llama.attention.head_count_kv",
         "llama.block_count",
     ],
 )

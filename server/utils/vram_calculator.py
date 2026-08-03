@@ -70,7 +70,7 @@ MIB = 2**20
 class ArchParams:
     hidden_size: int
     num_attention_heads: int
-    num_key_value_heads: int
+    num_key_value_heads: int | None
     num_hidden_layers: int
     sliding_window: int | None = None
 
@@ -129,7 +129,8 @@ def cal_kv_cache_bytes(arch: ArchParams, num_ctx: int, cache_bit: int = 16, num_
         kv_cache   = 2 * n_elements * (cache_bit / 8) * num_parallel
           Factor 2 accounts for both K and V tensors.
     """
-    n_gqa = arch.num_attention_heads / arch.num_key_value_heads
+    kv_heads = arch.num_key_value_heads or arch.num_attention_heads or 1
+    n_gqa = (arch.num_attention_heads or 1) / kv_heads
     n_embd_gqa = arch.hidden_size / n_gqa
     n_elements = n_embd_gqa * arch.num_hidden_layers * num_ctx
     size = 2 * n_elements
@@ -199,7 +200,7 @@ def estimate_vram_gb(
     overhead_factor: float = 1.0,
 ) -> float | None:
     """Return estimated VRAM usage per model."""
-    if not num_ctx:
+    if not num_ctx or not arch.hidden_size or not arch.num_hidden_layers:
         return None
 
     model_size = cal_model_size_bytes(weights_bytes, parameters, bits_per_weight)

@@ -63,7 +63,7 @@ import type { SimulationHandle } from "@/utils/progress-simulation";
 import type { ProgressEvent } from "@/utils/sse-stream";
 import { getStageLabel } from "@/utils/sse-stream";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ExternalLink, Info, MoreVertical } from "lucide-react";
+import { AlertCircle, ExternalLink, Info, MoreVertical } from "lucide-react";
 import {
   type ReactNode,
   type RefObject,
@@ -188,6 +188,11 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
   });
 
   const modelsData = modelsQuery.data;
+
+  const { refetch: refetchModels } = modelsQuery;
+  const handleRetryLoadModels = useCallback(() => {
+    void refetchModels();
+  }, [refetchModels]);
 
   const gpuStatsQuery = useQuery<GpuStats | null>({
     queryKey: ["admin", "settings", "hardware", "gpu-stats"],
@@ -1485,6 +1490,8 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
 
       <ModelsTable
         models={filteredModels}
+        loadFailed={modelsQuery.isError && !modelsData}
+        onRetryLoad={handleRetryLoadModels}
         serviceId={serviceId}
         isCpuOnly={isCpuOnly}
         installingModelId={installingModelId}
@@ -1548,6 +1555,8 @@ const EMPTY_SPEC: Record<string, unknown> = {};
 
 type ModelsTableProps = {
   models: ServiceModel[];
+  loadFailed: boolean;
+  onRetryLoad: () => void;
   serviceId: string;
   isCpuOnly: boolean;
   installingModelId: string | null;
@@ -1571,6 +1580,8 @@ type ModelsTableProps = {
 
 const ModelsTable = memo(function ModelsTable({
   models,
+  loadFailed,
+  onRetryLoad,
   serviceId,
   isCpuOnly,
   installingModelId,
@@ -1622,7 +1633,22 @@ const ModelsTable = memo(function ModelsTable({
           </TableRow>
         </TableHeader>
         <TableBody>
-          {models.length === 0 ? (
+          {loadFailed ? (
+            <TableRow>
+              <TableCell
+                colSpan={serviceId === "mcp" ? 6 : 7}
+                className="text-center text-muted-foreground"
+              >
+                <div className="flex flex-col items-center justify-center gap-2 py-4">
+                  <AlertCircle className="h-6 w-6" />
+                  <p className="text-sm">Failed to load models</p>
+                  <Button variant="outline" size="sm" onClick={onRetryLoad}>
+                    Retry
+                  </Button>
+                </div>
+              </TableCell>
+            </TableRow>
+          ) : models.length === 0 ? (
             <TableRow>
               <TableCell
                 colSpan={serviceId === "mcp" ? 6 : 7}

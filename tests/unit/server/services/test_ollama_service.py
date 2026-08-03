@@ -2188,14 +2188,37 @@ async def test_resolve_vram_info_not_loaded_estimate_none(svc: OllamaService) ->
 
 
 @pytest.mark.asyncio
-async def test_get_vram_estimate_returns_none_when_estimate_raises(svc: OllamaService) -> None:
-    arch = ArchParams(hidden_size=4096, num_attention_heads=32, num_key_value_heads=0, num_hidden_layers=32)
+@patch("server.services.ollama_service.logger")
+@patch("server.services.ollama_service.estimate_vram_gb")
+async def test_get_vram_estimate_returns_none_when_estimate_raises(
+    mock_estimate_vram_gb: MagicMock, mock_logger: MagicMock, svc: OllamaService
+) -> None:
+    arch = ArchParams(hidden_size=4096, num_attention_heads=32, num_key_value_heads=8, num_hidden_layers=32)
+    mock_estimate_vram_gb.side_effect = TypeError("unsupported operand type(s) for /: 'int' and 'NoneType'")
+
     with patch.object(svc, "_get_arch_params", new_callable=AsyncMock, return_value=arch):
         result = await svc._get_vram_estimate(  # pyright: ignore[reportPrivateUsage]
             "default", "http://localhost:11434", "gemma4", 0, num_ctx=4096
         )
 
     assert result is None
+    assert mock_logger.debug.call_count == 1
+    assert mock_logger.warning.call_count == 0
+    assert "gemma4" in mock_logger.debug.call_args.args
+    assert mock_logger.debug.call_args.kwargs == {"exc_info": True}
+
+
+@pytest.mark.asyncio
+async def test_get_vram_estimate_missing_kv_heads_returns_estimate(svc: OllamaService) -> None:
+    arch = ArchParams(hidden_size=4096, num_attention_heads=32, num_key_value_heads=None, num_hidden_layers=32)
+
+    with patch.object(svc, "_get_arch_params", new_callable=AsyncMock, return_value=arch):
+        result = await svc._get_vram_estimate(  # pyright: ignore[reportPrivateUsage]
+            "default", "http://localhost:11434", "gemma4", 0, num_ctx=4096
+        )
+
+    assert result is not None
+    assert result > 0
 
 
 @pytest.mark.asyncio

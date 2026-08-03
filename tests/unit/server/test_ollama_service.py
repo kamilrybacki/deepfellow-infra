@@ -83,6 +83,23 @@ async def test_get_arch_params_returns_arch(mock_fetch: AsyncMock):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kv_value", [None, 0])
+@patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock)
+async def test_get_arch_params_null_head_count_kv_is_not_masked(mock_fetch: AsyncMock, kv_value: int | None):
+    # Masking a missing head_count_kv as 1 would understate the KV cache by the GQA ratio,
+    # so the raw value is passed through and the calculator picks the MHA fallback.
+    info = {**_LLAMA3_INFO, "llama.attention.head_count_kv": kv_value}
+    mock_fetch.return_value = _make_fetch_result(200, {"model_info": info})
+    svc = _make_service()
+
+    result = await svc._get_arch_params("default", "http://localhost:11434", "llama3:latest")  # pyright: ignore[reportPrivateUsage]
+
+    assert result is not None
+    assert result.num_key_value_heads == kv_value
+    assert result.num_attention_heads == 32
+
+
+@pytest.mark.asyncio
 @patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock)
 async def test_get_arch_params_cached(mock_fetch: AsyncMock):
     cached = ArchParams(hidden_size=4096, num_attention_heads=32, num_key_value_heads=8, num_hidden_layers=32)

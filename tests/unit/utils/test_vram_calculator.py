@@ -125,6 +125,24 @@ def test_kv_cache_bytes_mha_larger_than_gqa():
     assert result == gqa * 4
 
 
+@pytest.mark.parametrize("kv_heads", [None, 0])
+def test_kv_cache_bytes_missing_kv_heads_falls_back_to_mha(kv_heads: int | None):
+    # llama.cpp defaults head_count_kv to head_count when the GGUF metadata omits it
+    arch = ArchParams(hidden_size=4096, num_attention_heads=32, num_key_value_heads=kv_heads, num_hidden_layers=32)
+
+    result = cal_kv_cache_bytes(arch, num_ctx=2048)
+
+    assert result == cal_kv_cache_bytes(MHA_ARCH, num_ctx=2048)
+
+
+def test_kv_cache_bytes_missing_attention_heads_does_not_raise():
+    arch = ArchParams(hidden_size=4096, num_attention_heads=0, num_key_value_heads=None, num_hidden_layers=32)
+
+    result = cal_kv_cache_bytes(arch, num_ctx=2048)
+
+    assert result > 0
+
+
 def test_kv_cache_bytes_scales_with_context():
     ctx_2k = cal_kv_cache_bytes(LLAMA3_8B, num_ctx=2048)
 
@@ -189,6 +207,35 @@ def test_estimate_vram_gb_invalid_context_returns_none(num_ctx: int | None):
     result = estimate_vram_gb(LLAMA3_8B, weights_bytes=4_000_000_000, num_ctx=num_ctx)
 
     assert result is None
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "num_hidden_layers"),
+    [
+        (0, 32),
+        (4096, 0),
+        (0, 0),
+    ],
+)
+def test_estimate_vram_gb_incomplete_arch_returns_none(hidden_size: int, num_hidden_layers: int):
+    arch = ArchParams(
+        hidden_size=hidden_size,
+        num_attention_heads=32,
+        num_key_value_heads=None,
+        num_hidden_layers=num_hidden_layers,
+    )
+
+    result = estimate_vram_gb(arch, weights_bytes=4_000_000_000, num_ctx=2048)
+
+    assert result is None
+
+
+def test_estimate_vram_gb_missing_kv_heads_matches_mha_estimate():
+    arch = ArchParams(hidden_size=4096, num_attention_heads=32, num_key_value_heads=None, num_hidden_layers=32)
+
+    result = estimate_vram_gb(arch, weights_bytes=4_000_000_000, num_ctx=2048)
+
+    assert result == estimate_vram_gb(MHA_ARCH, weights_bytes=4_000_000_000, num_ctx=2048)
 
 
 def test_estimate_vram_gb_uses_weights_bytes_when_no_parameters():
