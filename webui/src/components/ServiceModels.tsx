@@ -8,6 +8,16 @@ This software is Licensed under the DeepFellow Free License.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -43,7 +53,7 @@ import {
 } from "@/components/ui/tooltip";
 import { apiClient } from "@/deepfellow/client";
 import type { GpuCardStats, GpuStats } from "@/deepfellow/types";
-import type { ServiceModel } from "@/deepfellow/types";
+import type { McpOAuthStatusValue, ServiceModel } from "@/deepfellow/types";
 import { InstallationWarningsError } from "@/deepfellow/types";
 import { MODEL_TYPES } from "@/deepfellow/types";
 import { useModal } from "@/hooks/use-modal";
@@ -141,6 +151,9 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
   const [mcpApiError, setMcpApiError] = useState<string | null>(null);
   const [showEntrySkeleton, setShowEntrySkeleton] = useState(true);
   const [installingModelId, setInstallingModelId] = useState<string | null>(
+    null,
+  );
+  const [oauthPromptModelId, setOauthPromptModelId] = useState<string | null>(
     null,
   );
   const pendingInstallationRef = useRef<{
@@ -500,6 +513,12 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
                   syncProgressToast(modelId);
                 } else if (event.type === "finish") {
                   if (event.status === "ok") {
+                    // On success `event.details` is the backend's full install-result
+                    // object (not a string) — see `ProgressEvent`.
+                    const installResult =
+                      typeof event.details === "object"
+                        ? event.details
+                        : undefined;
                     sim.smoothComplete(
                       Math.max(
                         COMPLETION_SMOOTH_MIN_MS,
@@ -522,6 +541,12 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
                           );
                           delete toastIdsRef.current[modelId];
                         }
+                        if (
+                          serviceId === "mcp" &&
+                          installResult?.requires_oauth
+                        ) {
+                          setOauthPromptModelId(modelId);
+                        }
                         resolve();
                       },
                       getSnapshot().models[simKey]?.value,
@@ -529,7 +554,14 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
                   } else {
                     sim.stop();
                     delete simulationStopFnsRef.current[simKey];
-                    reject(new Error(event.details || "Installation failed"));
+                    // Failure events always carry a plain string (see `ProgressEvent`).
+                    reject(
+                      new Error(
+                        typeof event.details === "string"
+                          ? event.details
+                          : "Installation failed",
+                      ),
+                    );
                   }
                 }
               },
@@ -624,6 +656,30 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
       if (!hasWarningsRef.current) {
         setInstallingModelId(null);
       }
+    },
+  });
+
+  const startOauthAfterInstallMutation = useMutation({
+    mutationFn: (modelId: string) =>
+      apiClient.startMcpOAuth(serviceId, modelId),
+    onSuccess: (data, modelId) => {
+      // Triggered by a direct click on the modal's "Authorize" button, so this is a
+      // same-gesture window.open — browsers won't treat it as an unsolicited popup.
+      window.open(data.authorize_url, "_blank", "noopener,noreferrer");
+      queryClient.invalidateQueries({
+        queryKey: [
+          "admin",
+          "services",
+          serviceId,
+          "models",
+          modelId,
+          "oauth-status",
+        ],
+      });
+      setOauthPromptModelId(null);
+    },
+    onError: (error) => {
+      toast.error(`Failed to start authorization: ${error.message}`);
     },
   });
 
@@ -1222,6 +1278,7 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
               ? String(rawSpec.default_prefix)
               : undefined,
           headers: rawSpec?.headers as Record<string, string> | undefined,
+          oauth: rawSpec?.oauth as ProxyMcpServerSpec["oauth"] | undefined,
         },
       });
     } else {
@@ -1547,6 +1604,40 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
           apiError={mcpApiError}
         />
       )}
+
+      <AlertDialog
+        open={oauthPromptModelId !== null}
+        onOpenChange={(open) => {
+          if (!open) setOauthPromptModelId(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Authorization required</AlertDialogTitle>
+            <AlertDialogDescription>
+              "{oauthPromptModelId}" requires OAuth authorization before it can
+              be used. Authorize now, or use the "Authorize" action on its row
+              later.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Later</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                if (oauthPromptModelId) {
+                  startOauthAfterInstallMutation.mutate(oauthPromptModelId);
+                }
+              }}
+              disabled={startOauthAfterInstallMutation.isPending}
+            >
+              {startOauthAfterInstallMutation.isPending
+                ? "Opening…"
+                : "Authorize"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
@@ -1713,6 +1804,22 @@ type ModelRowProps = {
   onUninstallClick: (modelId: string) => void;
 };
 
+function OAuthStatusBadge({ status }: { status: McpOAuthStatusValue }) {
+  if (status === "authorized") {
+    return <Badge variant="default">OAuth: authorized</Badge>;
+  }
+  if (status === "pending") {
+    return <Badge variant="outline">OAuth: pending</Badge>;
+  }
+  if (status === "expired") {
+    return <Badge variant="destructive">OAuth: expired</Badge>;
+  }
+  if (status === "error") {
+    return <Badge variant="destructive">OAuth: error</Badge>;
+  }
+  return <Badge variant="secondary">OAuth: not authorized</Badge>;
+}
+
 const ModelRow = memo(function ModelRow({
   model,
   serviceId,
@@ -1748,6 +1855,37 @@ const ModelRow = memo(function ModelRow({
   const hasProgressStage =
     !!installedInfo?.stage && installedInfo?.value !== undefined;
   const isInstallingCurrent = isInstallingAny && installingModelId === model.id;
+
+  const oauthConfig = (
+    model.custom_spec as { oauth?: { enabled?: boolean } } | null
+  )?.oauth;
+  const oauthEnabled = serviceId === "mcp" && !!oauthConfig?.enabled;
+
+  const oauthStatusQuery = useQuery({
+    queryKey: [
+      "admin",
+      "services",
+      serviceId,
+      "models",
+      model.id,
+      "oauth-status",
+    ],
+    queryFn: () => apiClient.getMcpOAuthStatus(serviceId, model.id),
+    enabled: oauthEnabled,
+    refetchInterval: (query) =>
+      query.state.data?.status === "pending" ? 2000 : false,
+  });
+
+  const startOauthMutation = useMutation({
+    mutationFn: () => apiClient.startMcpOAuth(serviceId, model.id),
+    onSuccess: (data) => {
+      window.open(data.authorize_url, "_blank", "noopener,noreferrer");
+      oauthStatusQuery.refetch();
+    },
+    onError: (error) => {
+      toast.error(`Failed to start authorization: ${error.message}`);
+    },
+  });
 
   const installedSpecEntries = useMemo(() => {
     if (!isInstalled || hasProgressStage)
@@ -1833,6 +1971,9 @@ const ModelRow = memo(function ModelRow({
                 {isCpuOnly ? "In RAM" : "In VRAM"}
               </Badge>
             )}
+            {oauthEnabled && oauthStatusQuery.data && (
+              <OAuthStatusBadge status={oauthStatusQuery.data.status} />
+            )}
           </div>
         )}
       </TableCell>
@@ -1912,6 +2053,17 @@ const ModelRow = memo(function ModelRow({
                     <DropdownMenuSeparator />
                   </>
                 )}
+                {oauthEnabled && (
+                  <>
+                    <DropdownMenuItem
+                      onClick={() => startOauthMutation.mutate()}
+                      disabled={startOauthMutation.isPending}
+                    >
+                      {startOauthMutation.isPending ? "Opening…" : "Authorize"}
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                  </>
+                )}
                 <DropdownMenuItem
                   onClick={() => onPurgeClick(model.id)}
                   disabled={!isDownloaded || isPurgePending}
@@ -1936,6 +2088,14 @@ const ModelRow = memo(function ModelRow({
               >
                 {isTestPending ? "Testing..." : "Test"}
               </DropdownMenuItem>
+              {oauthEnabled && (
+                <DropdownMenuItem
+                  onClick={() => startOauthMutation.mutate()}
+                  disabled={startOauthMutation.isPending}
+                >
+                  {startOauthMutation.isPending ? "Opening…" : "Authorize"}
+                </DropdownMenuItem>
+              )}
               {model.has_docker && (
                 <>
                   <DropdownMenuSeparator />

@@ -209,3 +209,25 @@ export interface MeshTopologyNode {
   children: MeshTopologyNode[];
   you_are_here: boolean;
 }
+
+// MCP OAuth types
+export type McpOAuthStatusValue =
+  | "disabled"
+  | "not_started"
+  | "pending"
+  | "authorized"
+  | "expired"
+  | "error";
+
+export interface McpOAuthStatus {
+  enabled: boolean;
+  status: McpOAuthStatusValue;
+  has_client_id: boolean;
+  has_client_secret: boolean;
+  expires_at?: number | null;
+  last_error?: string | null;
+}
+
+export interface McpOAuthStartOut {
+  authorize_url: string;
+}

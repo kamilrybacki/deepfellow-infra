@@ -530,9 +530,10 @@ def get_cpu_architecture() -> str:
 
 
 class HttpResponse:
-    def __init__(self, response: ClientResponse, content: AsyncGenerator[bytes]):
+    def __init__(self, response: ClientResponse, content: AsyncGenerator[bytes], session: ClientSession):
         self.response = response
         self.content = content
+        self._session = session
 
     def as_streaming_response(self, allowed_response_headers: list[str] | None = None) -> StreamingResponse:
         """Return as StreamingResponse."""
@@ -541,6 +542,16 @@ class HttpResponse:
         return StreamingResponse(
             self.content, media_type=self.response.content_type, status_code=self.response.status, headers=response_headers
         )
+
+    async def discard(self) -> None:
+        """Release the response and close its session without ever consuming `content`.
+
+        `content`'s own release+close (in its `finally`) only runs once the generator has started
+        iterating — closing it before that is a no-op, so a response that's discarded unread (e.g.
+        after a 401-triggered reauth retry) must be cleaned up through this method instead.
+        """
+        await self.response.release()
+        await self._session.close()
 
 
 async def make_http_request(
@@ -566,7 +577,7 @@ async def make_http_request(
                 await response.release()
                 await session.close()
 
-        return HttpResponse(response=response, content=generator())
+        return HttpResponse(response=response, content=generator(), session=session)
 
     except Exception:
         if response is not None:

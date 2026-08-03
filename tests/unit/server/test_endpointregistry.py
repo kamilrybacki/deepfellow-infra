@@ -27,6 +27,8 @@ from server.endpointregistry import (
     ResponseItemStore,
     SimpleEndpoint,
     _classify_error,  # pyright: ignore[reportPrivateUsage]
+    _make_request_with_reauth,  # pyright: ignore[reportPrivateUsage]
+    _read_body_with_limit,  # pyright: ignore[reportPrivateUsage]
     _rewrite_sse_endpoint_events,  # pyright: ignore[reportPrivateUsage]
     post_form,
     post_json,
@@ -102,6 +104,11 @@ def make_registry() -> EndpointRegistry:
         model_tester=model_tester,
         metrics_registry=metrics_registry,
     )
+
+
+async def _async_byte_stream(data: bytes):
+    if data:
+        yield data
 
 
 def make_endpoint() -> "Endpoint[Any]":
@@ -538,15 +545,17 @@ def test_list_models_returns_multiple_registrations_for_same_model():
     assert len(items) == 2
 
 
-def test_proxy_options_get_request_headers_no_request():
+@pytest.mark.asyncio
+async def test_proxy_options_get_request_headers_no_request():
     opts = ProxyOptions(url="http://example.com", headers={"Authorization": "Bearer tok"})
 
-    headers = opts.get_request_headers(None)
+    headers = await opts.get_request_headers(None)
 
     assert headers == {"Authorization": "Bearer tok"}
 
 
-def test_proxy_options_get_request_headers_merges_allowed_request_headers():
+@pytest.mark.asyncio
+async def test_proxy_options_get_request_headers_merges_allowed_request_headers():
     opts = ProxyOptions(
         url="http://example.com",
         headers={"Authorization": "Bearer tok"},
@@ -555,22 +564,36 @@ def test_proxy_options_get_request_headers_merges_allowed_request_headers():
     request = MagicMock()
     request.headers = {"x-custom": "val", "x-other": "ignored"}
 
-    headers = opts.get_request_headers(request)
+    headers = await opts.get_request_headers(request)
 
     assert headers["x-custom"] == "val"
     assert headers["Authorization"] == "Bearer tok"
     assert "x-other" not in headers
 
 
-def test_proxy_options_get_request_headers_no_allowed_headers_returns_static():
+@pytest.mark.asyncio
+async def test_proxy_options_get_request_headers_no_allowed_headers_returns_static():
     opts = ProxyOptions(url="http://example.com", headers={"Authorization": "Bearer tok"})
     request = MagicMock()
     request.headers = {"x-forward": "val"}
 
-    headers = opts.get_request_headers(request)
+    headers = await opts.get_request_headers(request)
 
     assert "x-forward" not in headers
     assert headers["Authorization"] == "Bearer tok"
+
+
+@pytest.mark.asyncio
+async def test_proxy_options_get_request_headers_dynamic_headers_override_static():
+    opts = ProxyOptions(
+        url="http://example.com",
+        headers={"Authorization": "Bearer static"},
+        dynamic_headers=AsyncMock(return_value={"Authorization": "Bearer live"}),
+    )
+
+    headers = await opts.get_request_headers(None)
+
+    assert headers["Authorization"] == "Bearer live"
 
 
 def test_endpoint_registry_init_sets_attributes():
@@ -2077,7 +2100,7 @@ async def test_register_mcp_endpoint_as_proxy_callback_invokes_make_http_request
     request.headers = {"content-type": "application/json"}
     request.method = "POST"
     request.path_params = {"full_path": "mcp-svc/sub/path"}
-    request.stream.return_value = AsyncMock()
+    request.stream = lambda: _async_byte_stream(b"{}")
 
     with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response):
         result = await ep.endpoint.on_request(request)  # pyright: ignore[reportOptionalMemberAccess]
@@ -2119,13 +2142,149 @@ async def test_register_mcp_endpoint_as_proxy_callback_no_query_string():
     request.headers = {"content-type": "application/json"}
     request.method = "GET"
     request.path_params = {"full_path": "mcp-svc/sub/path"}
-    request.stream.return_value = AsyncMock()
+    request.stream = lambda: _async_byte_stream(b"")
     request.url.query = ""
 
     with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response) as mock_req:
         await ep.endpoint.on_request(request)  # pyright: ignore[reportOptionalMemberAccess]
 
     assert "?" not in mock_req.call_args.kwargs["url"]
+
+
+@pytest.mark.asyncio
+async def test_register_mcp_endpoint_as_proxy_streams_body_when_no_on_reauth():
+    """Without `on_reauth` (the common, non-OAuth case) the request body must stream straight through, not buffer."""
+    reg = make_registry()
+    opts = ProxyOptions(url="http://example.com/mcp/")
+    reg.register_mcp_endpoint_as_proxy("mcp-svc", make_props(), opts, None)
+    ep = reg.mcp_endpoints.get_model("mcp-svc")
+    mock_http_response = MagicMock()
+    mock_http_response.as_streaming_response.return_value = MagicMock(spec=StreamingResponse)
+    stream = _async_byte_stream(b"{}")
+    request = MagicMock()
+    request.headers = {"content-type": "application/json"}
+    request.method = "POST"
+    request.path_params = {"full_path": "mcp-svc"}
+    request.stream = MagicMock(return_value=stream)
+    request.url.query = ""
+
+    with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response) as mock_req:
+        await ep.endpoint.on_request(request)  # pyright: ignore[reportOptionalMemberAccess]
+
+    assert mock_req.call_args.kwargs["data"] is stream
+    request.stream.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_register_mcp_endpoint_as_proxy_buffers_body_when_on_reauth_set():
+    """With `on_reauth` configured (OAuth-enabled proxies) the body must be buffered so a 401 retry can replay it."""
+    reg = make_registry()
+    opts = ProxyOptions(url="http://example.com/mcp/", on_reauth=AsyncMock())
+    reg.register_mcp_endpoint_as_proxy("mcp-svc", make_props(), opts, None)
+    ep = reg.mcp_endpoints.get_model("mcp-svc")
+    mock_http_response = MagicMock()
+    mock_http_response.response.status = 200
+    mock_http_response.as_streaming_response.return_value = MagicMock(spec=StreamingResponse)
+    request = MagicMock()
+    request.headers = {"content-type": "application/json"}
+    request.method = "POST"
+    request.path_params = {"full_path": "mcp-svc"}
+    request.stream = lambda: _async_byte_stream(b'{"jsonrpc":"2.0"}')
+    request.url.query = ""
+
+    with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response) as mock_req:
+        await ep.endpoint.on_request(request)  # pyright: ignore[reportOptionalMemberAccess]
+
+    assert mock_req.call_args.kwargs["data"] == b'{"jsonrpc":"2.0"}'
+
+
+@pytest.mark.asyncio
+async def test_make_request_with_reauth_passes_through_non_401():
+    on_reauth = AsyncMock()
+    opts = ProxyOptions(url="http://example.com/mcp/", on_reauth=on_reauth)
+    ok_response = MagicMock()
+    ok_response.response.status = 200
+
+    with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=ok_response) as mock_req:
+        result = await _make_request_with_reauth("http://example.com/mcp/", "POST", b"{}", {}, opts)
+
+    assert result is ok_response
+    assert mock_req.await_count == 1
+    assert on_reauth.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_make_request_with_reauth_401_without_on_reauth_passes_through():
+    opts = ProxyOptions(url="http://example.com/mcp/")
+    unauthorized_response = MagicMock()
+    unauthorized_response.response.status = 401
+    unauthorized_response.discard = AsyncMock()
+
+    with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=unauthorized_response) as mock_req:
+        result = await _make_request_with_reauth("http://example.com/mcp/", "POST", b"{}", {}, opts)
+
+    assert result is unauthorized_response
+    mock_req.assert_awaited_once()
+    unauthorized_response.discard.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_make_request_with_reauth_401_on_reauth_returns_none_passes_through():
+    opts = ProxyOptions(url="http://example.com/mcp/", on_reauth=AsyncMock(return_value=None))
+    unauthorized_response = MagicMock()
+    unauthorized_response.response.status = 401
+    unauthorized_response.discard = AsyncMock()
+
+    with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=unauthorized_response) as mock_req:
+        result = await _make_request_with_reauth("http://example.com/mcp/", "POST", b"{}", {"x": "1"}, opts)
+
+    assert result is unauthorized_response
+    mock_req.assert_awaited_once()
+    unauthorized_response.discard.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_make_request_with_reauth_401_retries_with_refreshed_headers():
+    opts = ProxyOptions(url="http://example.com/mcp/", on_reauth=AsyncMock(return_value={"Authorization": "Bearer new"}))
+    unauthorized_response = MagicMock()
+    unauthorized_response.response.status = 401
+    unauthorized_response.discard = AsyncMock()
+    retried_response = MagicMock()
+    retried_response.response.status = 200
+
+    with patch(
+        "server.endpointregistry.make_http_request",
+        new_callable=AsyncMock,
+        side_effect=[unauthorized_response, retried_response],
+    ) as mock_req:
+        result = await _make_request_with_reauth("http://example.com/mcp/", "POST", b"{}", {"Authorization": "Bearer old"}, opts)
+
+    assert result is retried_response
+    assert mock_req.await_count == 2
+    unauthorized_response.discard.assert_awaited_once()
+    second_call_headers = mock_req.call_args_list[1].kwargs["headers"]
+    assert second_call_headers["Authorization"] == "Bearer new"
+
+
+@pytest.mark.asyncio
+async def test_read_body_with_limit_returns_full_body_under_limit():
+    request = MagicMock()
+    request.stream = lambda: _async_byte_stream(b"hello world")
+
+    body = await _read_body_with_limit(request, 1024)
+
+    assert body == b"hello world"
+
+
+@pytest.mark.asyncio
+async def test_read_body_with_limit_raises_413_over_limit():
+    request = MagicMock()
+    request.stream = lambda: _async_byte_stream(b"way too much body")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _read_body_with_limit(request, 4)
+
+    assert exc_info.value.status_code == 413
 
 
 @pytest.mark.asyncio

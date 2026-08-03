@@ -1099,7 +1099,7 @@ def test_register_proxy_model_without_proxy_url_raises_400(svc: McpService) -> N
     model = _make_srv_mcp_model(kind="proxy", proxy_url=None)
     parsed_options = McpModelOptions(prefix="test", envs={}, headers={})
     with pytest.raises(HTTPException) as exc_info:
-        svc._register_proxy_model(model, parsed_options)  # pyright: ignore[reportPrivateUsage]
+        svc._register_proxy_model(model, parsed_options, "default", "test-model")  # pyright: ignore[reportPrivateUsage]
     assert exc_info.value.status_code == 400
     assert "proxy_url" in exc_info.value.detail
 

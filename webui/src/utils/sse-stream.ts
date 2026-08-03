@@ -14,7 +14,11 @@ export interface ProgressEvent {
   stage?: "install" | "download";
   value?: number; // 0.0 to 1.0
   status?: "ok" | "error";
-  details?: string;
+  // On failure this is a plain error string. On success it's the backend's full
+  // install-result object (e.g. `{ status, details, requires_oauth }`), dumped as-is.
+  details?:
+    | string
+    | { status?: string; details?: string; requires_oauth?: boolean };
 }
 
 class SSEStream {

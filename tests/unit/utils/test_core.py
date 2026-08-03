@@ -584,13 +584,30 @@ async def test_http_response_as_streaming_response():
     async def gen():
         yield b"body"
 
-    http_response = HttpResponse(response=mock_client_response, content=gen())
+    http_response = HttpResponse(response=mock_client_response, content=gen(), session=MagicMock())
     streaming = http_response.as_streaming_response(allowed_response_headers=["Content-Type"])
 
     assert isinstance(streaming, StreamingResponse)
     assert streaming.status_code == 200
     assert streaming.headers.get("content-type", "").startswith("application/json")
     assert "x-custom" not in streaming.headers
+
+
+@pytest.mark.asyncio
+async def test_http_response_discard_releases_response_and_closes_session():
+    async def gen():
+        yield b"unread"
+
+    mock_client_response = MagicMock()
+    mock_client_response.release = AsyncMock()
+    mock_session = MagicMock()
+    mock_session.close = AsyncMock()
+
+    http_response = HttpResponse(response=mock_client_response, content=gen(), session=mock_session)
+    await http_response.discard()
+
+    mock_client_response.release.assert_awaited_once()
+    mock_session.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio

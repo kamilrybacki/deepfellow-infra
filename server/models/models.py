@@ -67,6 +67,7 @@ class ModelInfo(BaseModel):
 class InstallModelOut(BaseModel):
     status: Literal["OK"]
     details: str
+    requires_oauth: bool = False
 
 
 class UninstallModelIn(BaseModel):
@@ -139,3 +140,4 @@ class McpHealthCheckResult(BaseModel):
     transport: Literal["streamable_http", "sse"] | None = None
     tools: list[McpToolInfo] = []
     error: str | None = None
+    requires_oauth: bool = False

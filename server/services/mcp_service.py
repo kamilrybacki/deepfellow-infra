@@ -4,11 +4,14 @@
 """Mcp service."""
 
 import asyncio
+import html
 import json
 import logging
+import secrets
 import shlex
 import shutil
-from collections.abc import Callable
+import time
+from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -17,10 +20,12 @@ from typing import Annotated, Any, Literal
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
+from fastapi import Path as ApiPath
 from pydantic import BaseModel, Field, field_validator
 
 from server.applicationcontext import get_base_url
+from server.core.dependencies import get_services_manager
 from server.docker import DockerImage, DockerOptions
 from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
 from server.models.api import ModelProps
@@ -49,11 +54,26 @@ from server.models.services import (
     UninstallServiceIn,
 )
 from server.services.base2_service import Base2Service, CustomModel, Instance, InstanceConfig, ModelConfig
+from server.services.mcp_oauth import (
+    McpOAuthConfig,
+    McpOAuthError,
+    McpOAuthStateStore,
+    PendingOAuthFlow,
+    build_authorize_url,
+    discover_authorization_server_for_resource,
+    exchange_code_for_token,
+    generate_pkce_pair,
+    has_valid_access_token,
+    refresh_access_token,
+    register_dynamic_client,
+)
+from server.services_manager import ServicesManager
 from server.utils.core import (
     PromiseWithProgress,
     Stream,
     StreamChunk,
     StreamChunkProgress,
+    Utils,
     normalize_name,
     try_parse_pydantic,
 )
@@ -141,6 +161,7 @@ class SrvMcpModel:
     proxy_transport: str = field(default="streamable_http")
     description: str = field(default="")
     repository_url: str | None = field(default=None)
+    oauth: McpOAuthConfig | None = field(default=None)
 
 
 class SrvMcpCustomModel(BaseModel):
@@ -196,6 +217,7 @@ class SrvMcpProxyModel(BaseModel):
     required_headers: dict[str, str] | None = None
     description: str = ""
     repository_url: str | None = None
+    oauth: McpOAuthConfig | None = None
 
 
 @dataclass
@@ -215,6 +237,40 @@ class McpModelOptions(BaseModel):
         if v == "":
             return {}
         return v
+
+
+class McpOAuthStatusOut(BaseModel):
+    """Non-secret OAuth status for a proxy model, returned to the WebUI."""
+
+    enabled: bool
+    status: Literal["disabled", "not_started", "pending", "authorized", "expired", "error"]
+    has_client_id: bool = False
+    has_client_secret: bool = False
+    expires_at: float | None = None
+    last_error: str | None = None
+
+
+def get_mcp_service_instance(
+    service_id: Annotated[str, ApiPath(description="The ID of the MCP service instance to use.")],
+    services_manager: Annotated[ServicesManager, Depends(get_services_manager)],
+) -> tuple["McpService", str]:
+    """Resolve `service_id` to the MCP service and its instance name."""
+    service_type, instance = services_manager.split_service_type_and_instance(service_id)
+    service = services_manager.services.get(service_type)
+    if not isinstance(service, McpService):
+        raise HTTPException(404, f"Service {service_id} is not an MCP service")
+    return service, instance
+
+
+def render_oauth_callback_page(message: str) -> str:
+    """Render the HTML page shown to the admin's browser after an OAuth redirect."""
+    return f"""<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>DeepFellow — MCP Authorization</title></head>
+<body style="font-family: system-ui, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
+  <p style="max-width: 32rem; text-align: center;">{html.escape(message)}</p>
+</body>
+</html>"""
 
 
 @dataclass
@@ -301,6 +357,7 @@ async def _fetch_tools_from_mcp_endpoint(mcp_url: str, extra_headers: dict[str, 
     try:
         conn_timeout = aiohttp.ClientTimeout(total=15, connect=5)
         session_id: str | None = None
+        unauthorized = False
 
         async with aiohttp.ClientSession() as client:
 
@@ -315,10 +372,13 @@ async def _fetch_tools_from_mcp_endpoint(mcp_url: str, extra_headers: dict[str, 
                 return h
 
             async def _post(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
-                nonlocal session_id
+                nonlocal session_id, unauthorized
                 async with client.post(mcp_url, json=payload, headers=_req_headers(), timeout=conn_timeout) as resp:
                     if sid := resp.headers.get("Mcp-Session-Id"):
                         session_id = sid
+                    if resp.status == 401:
+                        unauthorized = True
+                        return None, "HTTP 401"
                     if resp.status == 202:
                         return None, None
                     if resp.status != 200:
@@ -332,6 +392,8 @@ async def _fetch_tools_from_mcp_endpoint(mcp_url: str, extra_headers: dict[str, 
                     return data.get("result"), None
 
             _, init_err = await _post(_MCP_INIT_PAYLOAD)
+            if unauthorized:
+                return McpHealthCheckResult(healthy=False, requires_oauth=True, error="initialize: HTTP 401 Unauthorized")
             if init_err:
                 return McpHealthCheckResult(healthy=False, error=f"initialize: {init_err}")
 
@@ -433,6 +495,8 @@ async def _fetch_tools_from_sse_endpoint(sse_url: str, extra_headers: dict[str, 
         state = _SseState(asyncio.Event(), [], {})
 
         async with aiohttp.ClientSession() as client, client.get(sse_url, headers=sse_headers, timeout=timeout) as sse_resp:
+            if sse_resp.status == 401:
+                return McpHealthCheckResult(healthy=False, requires_oauth=True, error="SSE GET returned HTTP 401 Unauthorized")
             if sse_resp.status != 200:
                 return McpHealthCheckResult(healthy=False, error=f"SSE GET returned HTTP {sse_resp.status}")
             ct = sse_resp.headers.get("Content-Type", "")
@@ -488,6 +552,9 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
         self._background_tasks: set[asyncio.Task[None]] = set()
         self.load_default_models("default")
         self._installing = set()
+        self._oauth_state_store = McpOAuthStateStore()
+        self._oauth_refresh_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._oauth_refresh_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
 
     def load_default_models(self, instance: str) -> None:
         """Load default models to instance."""
@@ -640,6 +707,26 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                 custom_model.data["size"] = model.size
                 await self._save()
                 break
+
+    async def _persist_proxy_oauth(self, instance: str, model_id: str, oauth: McpOAuthConfig) -> None:
+        """Persist updated OAuth config/tokens for a proxy model back to services.json."""
+        model = (self.models.get(instance) or {}).get(model_id)
+        if model is None or not model.custom:
+            return
+        model.oauth = oauth
+        config = self.get_instance_info(instance).config
+        for custom_model in config.custom or []:
+            if custom_model.id == model.custom:
+                custom_model.data["oauth"] = oauth.model_dump(mode="json", exclude_none=True)
+                await self._save()
+                break
+        else:
+            logger.warning(
+                "No custom model entry matching %s found for %s/%s; OAuth token update was not persisted to disk.",
+                model.custom,
+                instance,
+                model_id,
+            )
 
     def get_installed_info(self, instance: str) -> bool | InstallServiceProgress | ServiceOptions:
         """Get service installed info."""
@@ -869,6 +956,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
             proxy_transport=parsed.transport,
             description=parsed.description,
             repository_url=parsed.repository_url,
+            oauth=parsed.oauth,
         )
 
     def _check_prefix_collision(self, instance: str, prefix: str, exclude_model_id: str | None) -> None:
@@ -876,18 +964,45 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
             if mid != exclude_model_id and m.default_prefix == prefix:
                 raise HTTPException(400, f"Prefix '{prefix}' is already in use by model '{mid}'.")
 
-    async def _update_custom_model(self, instance: str, model: CustomModel, new_data: dict[str, Any]) -> None:
+    async def _update_custom_model(self, instance: str, model: CustomModel, new_data: dict[str, Any]) -> None:  # noqa: C901
         kind = model.data.get("kind")
         if kind == "proxy":
             parsed_old = try_parse_pydantic(SrvMcpProxyModel, model.data)
             parsed_new = try_parse_pydantic(SrvMcpProxyModel, new_data)
             if parsed_new.id != parsed_old.id:
                 raise HTTPException(400, "Cannot change the server ID.")
+            if self._oauth_state_store.find_for_model(instance, parsed_old.id):
+                raise HTTPException(400, "Cannot edit this MCP server while an OAuth authorization is pending.")
             installed = self.get_instance_info(instance).installed
             if installed and parsed_old.id in installed.models:
                 raise HTTPException(400, "Cannot update an installed server. Uninstall it first.")
             new_prefix = parsed_new.default_prefix or normalize_name(parsed_new.id)
             self._check_prefix_collision(instance, new_prefix, exclude_model_id=parsed_old.id)
+            if parsed_old.oauth and parsed_new.oauth:
+                # The WebUI never round-trips secrets/tokens (they're scrubbed from custom_spec, see
+                # `_get_custom_spec`), so an edit must preserve them rather than silently wiping them out.
+                merged_oauth = parsed_new.oauth.model_copy(
+                    update={
+                        "client_secret": parsed_new.oauth.client_secret or parsed_old.oauth.client_secret,
+                        "access_token": parsed_old.oauth.access_token,
+                        "refresh_token": parsed_old.oauth.refresh_token,
+                        "token_expires_at": parsed_old.oauth.token_expires_at,
+                        "authorization_endpoint": parsed_new.oauth.authorization_endpoint or parsed_old.oauth.authorization_endpoint,
+                        "token_endpoint": parsed_new.oauth.token_endpoint or parsed_old.oauth.token_endpoint,
+                        "registration_endpoint": parsed_new.oauth.registration_endpoint or parsed_old.oauth.registration_endpoint,
+                        "resource": parsed_new.oauth.resource or parsed_old.oauth.resource,
+                        "last_error": parsed_old.oauth.last_error,
+                    }
+                )
+                new_data = {**new_data, "oauth": merged_oauth.model_dump(mode="json", exclude_none=True)}
+            elif parsed_old.oauth and not parsed_new.oauth:
+                logger.warning(
+                    "Edit request for MCP server %s/%s omitted the oauth field while an OAuth config existed; "
+                    "preserving the existing OAuth config instead of erasing it.",
+                    instance,
+                    parsed_old.id,
+                )
+                new_data = {**new_data, "oauth": parsed_old.oauth.model_dump(mode="json", exclude_none=True)}
             if instance in self.models and parsed_old.id in self.models[instance]:
                 del self.models[instance][parsed_old.id]
             self._add_proxy_model(instance, CustomModel(id=model.id, data=new_data))
@@ -935,8 +1050,11 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
             parsed_proxy = try_parse_pydantic(SrvMcpProxyModel, model.data)
             if installed and parsed_proxy.id in installed.models:
                 raise HTTPException(400, "Cannot remove custom model, it is in use, uninstall it first.")
+            if self._oauth_state_store.find_for_model(instance, parsed_proxy.id):
+                raise HTTPException(400, "Cannot remove this MCP server while an OAuth authorization is pending.")
             if instance in self.models and parsed_proxy.id in self.models[instance]:
                 del self.models[instance][parsed_proxy.id]
+            self._clear_oauth_refresh_state(instance, parsed_proxy.id)
         else:
             parsed_custom = try_parse_pydantic(SrvMcpCustomModel, model.data)
             if installed and parsed_custom.id in installed.models:
@@ -958,6 +1076,14 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
             }
             if model.headers:
                 spec["headers"] = model.headers
+            if model.oauth:
+                # Client secret / access / refresh tokens are never sent to the WebUI — only enough
+                # to prefill an edit form and show a status badge. See `McpOAuthConfig`.
+                spec["oauth"] = {
+                    "enabled": model.oauth.enabled,
+                    "client_id": model.oauth.client_id,
+                    "scope": model.oauth.scope,
+                }
             if model.description:
                 spec["description"] = model.description
             if model.repository_url:
@@ -1064,7 +1190,9 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
             await asyncio.sleep(delay)
             try:
                 result = await self.healthcheck_model(instance, model_id)
-                if result.healthy:
+                # Once OAuth is required, further retries can't succeed until the admin
+                # authorizes — that completion path (`complete_oauth_callback`) restarts this.
+                if result.healthy or result.requires_oauth:
                     return
             except Exception:
                 pass
@@ -1080,7 +1208,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
             if result.transport:
                 reg_model.props.transport = result.transport
 
-    async def healthcheck_model(self, instance: str, model_id: str) -> McpHealthCheckResult:
+    async def healthcheck_model(self, instance: str, model_id: str) -> McpHealthCheckResult:  # noqa: C901
         """Probe an installed MCP server: check liveness, detect transport, and fetch tool list."""
         info = self.get_instance_installed_info(instance)
         if model_id not in info.models:
@@ -1095,11 +1223,15 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
         transport = model.proxy_transport  # "streamable_http" | "sse"
 
         if model.kind == "proxy":
+            if model.oauth and model.oauth.enabled and has_valid_access_token(model.oauth):
+                headers = {**headers, "Authorization": f"Bearer {model.oauth.access_token}"}
             # proxy_url is already the full endpoint URL (may end with /mcp or /sse)
             if transport == "sse":
                 result = await _fetch_tools_from_sse_endpoint(base_url, headers)
             else:
                 result = await _fetch_tools_from_mcp_endpoint(base_url, headers)
+            if result.requires_oauth and not (model.oauth and model.oauth.enabled):
+                await self._auto_detect_oauth(instance, model_id)
         else:
             # Docker / user model — base_url is http://host:port, transport path appended separately
             if transport == "sse":
@@ -1148,16 +1280,23 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
         if empty_keys:
             raise HTTPException(status_code=422, detail=f"The following headers are present but have no value: {', '.join(empty_keys)}")
 
-    def _register_proxy_model(self, model: SrvMcpModel, parsed_options: McpModelOptions) -> RegistrationId:
+    def _register_proxy_model(self, model: SrvMcpModel, parsed_options: McpModelOptions, instance: str, model_id: str) -> RegistrationId:
         """Register a proxy model endpoint, choosing SSE or Streamable HTTP transport."""
         if model.proxy_url is None:
             raise HTTPException(400, "proxy_url is required for proxy models")
         merged_headers = {**(model.headers or {}), **parsed_options.headers}
+        dynamic_headers = None
+        on_reauth = None
+        if model.oauth and model.oauth.enabled:
+            dynamic_headers = self._make_oauth_header_provider(instance, model_id)
+            on_reauth = self._make_oauth_refresh_callback(instance, model_id)
         proxy_options = ProxyOptions(
             url=model.proxy_url,
             headers=merged_headers if merged_headers else None,
             allowed_request_headers=["accept", "mcp-session-id"],
-            allowed_response_headers=["accept", "mcp-session-id"],
+            allowed_response_headers=["accept", "mcp-session-id", "www-authenticate"],
+            dynamic_headers=dynamic_headers,
+            on_reauth=on_reauth,
         )
         registration_options = RegistrationOptions(origin="local", owned_by=self.get_type())
         if model.proxy_transport == "sse":
@@ -1166,6 +1305,376 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
             )
         return self.endpoint_registry.register_mcp_endpoint_as_proxy(
             url=parsed_options.prefix, props=model.model_props, options=proxy_options, registration_options=registration_options
+        )
+
+    def _get_oauth_lock(self, instance: str, model_id: str) -> asyncio.Lock:
+        key = (instance, model_id)
+        if key not in self._oauth_refresh_locks:
+            self._oauth_refresh_locks[key] = asyncio.Lock()
+        return self._oauth_refresh_locks[key]
+
+    async def _refresh_oauth_token(self, instance: str, model_id: str) -> McpOAuthConfig | None:
+        """Refresh the access token for a proxy model's OAuth config, persisting the result."""
+        async with self._get_oauth_lock(instance, model_id):
+            model = (self.models.get(instance) or {}).get(model_id)
+            if model is None or model.oauth is None or not model.oauth.refresh_token or not model.oauth.token_endpoint:
+                return model.oauth if model else None
+            if has_valid_access_token(model.oauth):
+                return model.oauth  # a concurrent caller already refreshed it while we waited for the lock
+            if not model.oauth.client_id:
+                return model.oauth
+            try:
+                token = await refresh_access_token(
+                    model.oauth.token_endpoint,
+                    model.oauth.refresh_token,
+                    model.oauth.client_id,
+                    model.oauth.client_secret,
+                    model.oauth.resource or model.proxy_url or "",
+                )
+            except McpOAuthError as exc:
+                model.oauth.last_error = str(exc)
+                await self._persist_proxy_oauth(instance, model_id, model.oauth)
+                return None
+            model.oauth.access_token = token.access_token
+            if token.refresh_token:
+                model.oauth.refresh_token = token.refresh_token
+            model.oauth.token_expires_at = time.time() + token.expires_in if token.expires_in else None
+            model.oauth.last_error = None
+            await self._persist_proxy_oauth(instance, model_id, model.oauth)
+            return model.oauth
+
+    def _make_oauth_header_provider(self, instance: str, model_id: str) -> Callable[[], Awaitable[dict[str, str]]]:
+        """Build a `ProxyOptions.dynamic_headers` provider reading live token state off `self.models`."""
+
+        async def provider() -> dict[str, str]:
+            model = (self.models.get(instance) or {}).get(model_id)
+            oauth = model.oauth if model else None
+            if oauth is None or not oauth.access_token:
+                return {}
+            if not has_valid_access_token(oauth) and oauth.refresh_token:
+                oauth = await self._refresh_oauth_token(instance, model_id) or oauth
+            return {"Authorization": f"Bearer {oauth.access_token}"} if oauth.access_token else {}
+
+        return provider
+
+    def _make_oauth_refresh_callback(self, instance: str, model_id: str) -> Callable[[], Awaitable[dict[str, str] | None]]:
+        """Build a `ProxyOptions.on_reauth` callback for the reactive 401-retry path."""
+
+        async def on_reauth() -> dict[str, str] | None:
+            oauth = await self._refresh_oauth_token(instance, model_id)
+            if oauth and oauth.access_token:
+                return {"Authorization": f"Bearer {oauth.access_token}"}
+            return None
+
+        return on_reauth
+
+    _OAUTH_REFRESH_LEAD_SECONDS = 60
+    _OAUTH_REFRESH_MIN_BACKOFF_SECONDS = 5.0
+    _OAUTH_REFRESH_MAX_BACKOFF_SECONDS = 3600.0
+    _OAUTH_REFRESH_MAX_CONSECUTIVE_FAILURES = 8
+
+    async def _oauth_refresh_background(self, instance: str, model_id: str) -> None:
+        """Background task: proactively refresh an OAuth access token shortly before it expires.
+
+        Supplements (does not replace) the reactive 401-retry path wired through `on_reauth` — a 401
+        can still happen regardless (revocation, clock skew), which that path handles independently.
+
+        A refresh failure (e.g. a revoked refresh token) backs off exponentially instead of retrying
+        every few seconds forever, and this task gives up after too many consecutive failures — the
+        reactive path and `last_error`/status badge remain available for the admin to notice and fix.
+        """
+        consecutive_failures = 0
+        while True:
+            model = (self.models.get(instance) or {}).get(model_id)
+            oauth = model.oauth if model else None
+            if oauth is None or not oauth.enabled or not oauth.refresh_token or oauth.token_expires_at is None:
+                return
+            if consecutive_failures:
+                sleep_for = min(
+                    self._OAUTH_REFRESH_MIN_BACKOFF_SECONDS * (2**consecutive_failures),
+                    self._OAUTH_REFRESH_MAX_BACKOFF_SECONDS,
+                )
+            else:
+                sleep_for = max(
+                    oauth.token_expires_at - time.time() - self._OAUTH_REFRESH_LEAD_SECONDS,
+                    self._OAUTH_REFRESH_MIN_BACKOFF_SECONDS,
+                )
+            await asyncio.sleep(sleep_for)
+            still_live = (self.models.get(instance) or {}).get(model_id)
+            if still_live is None or still_live.oauth is None or not still_live.oauth.refresh_token:
+                return
+            try:
+                refreshed = await self._refresh_oauth_token(instance, model_id)
+            except Exception:
+                logger.exception("Proactive OAuth refresh failed for %s/%s", instance, model_id)
+                refreshed = None
+            if refreshed is not None and has_valid_access_token(refreshed):
+                consecutive_failures = 0
+                continue
+            consecutive_failures += 1
+            if consecutive_failures >= self._OAUTH_REFRESH_MAX_CONSECUTIVE_FAILURES:
+                logger.warning(
+                    "Giving up on proactive OAuth refresh for %s/%s after %d consecutive failures",
+                    instance,
+                    model_id,
+                    consecutive_failures,
+                )
+                return
+
+    def _start_oauth_refresh_background(self, instance: str, model_id: str) -> None:
+        key = (instance, model_id)
+        existing = self._oauth_refresh_tasks.get(key)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(self._oauth_refresh_background(instance, model_id))
+        self._oauth_refresh_tasks[key] = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        task.add_done_callback(lambda t: self._oauth_refresh_tasks.pop(key, None) if self._oauth_refresh_tasks.get(key) is t else None)
+
+    def _clear_oauth_refresh_state(self, instance: str, model_id: str) -> None:
+        """Drop the refresh lock and cancel any running proactive-refresh task for a removed proxy model."""
+        self._oauth_refresh_locks.pop((instance, model_id), None)
+        refresh_task = self._oauth_refresh_tasks.pop((instance, model_id), None)
+        if refresh_task is not None:
+            refresh_task.cancel()
+
+    def _get_oauth_model(self, instance: str, model_id: str) -> SrvMcpModel:
+        model = (self.models.get(instance) or {}).get(model_id)
+        if model is None or model.kind != "proxy":
+            raise HTTPException(404, "Proxy MCP model not found")
+        return model
+
+    async def _discover_oauth_endpoints(self, instance: str, model_id: str, model: SrvMcpModel) -> None:
+        """Discover and cache the AS endpoints protecting a proxy model's remote MCP server."""
+        assert model.oauth is not None
+        assert model.proxy_url is not None
+        metadata = await discover_authorization_server_for_resource(model.proxy_url)
+        if metadata is None:
+            return
+        model.oauth.authorization_endpoint = metadata.authorization_endpoint
+        model.oauth.token_endpoint = metadata.token_endpoint
+        model.oauth.registration_endpoint = metadata.registration_endpoint
+        await self._persist_proxy_oauth(instance, model_id, model.oauth)
+
+    async def _auto_detect_oauth(self, instance: str, model_id: str) -> None:
+        """Auto-enable OAuth for a proxy model after a health check surfaced a 401.
+
+        The admin never has to pre-declare that a remote MCP server needs OAuth: this runs the
+        same RFC 9728/8414 discovery as `_discover_oauth_endpoints`, but also flips `oauth.enabled`
+        on (creating the config if none existed) and re-registers the live endpoint so it's ready
+        to attach a token as soon as the admin authorizes. If discovery itself fails, OAuth is still
+        marked required so the WebUI can prompt for a manually-configured client_id.
+        """
+        model = (self.models.get(instance) or {}).get(model_id)
+        if model is None or model.kind != "proxy" or model.proxy_url is None or (model.oauth and model.oauth.enabled):
+            return
+        async with self._get_oauth_lock(instance, model_id):
+            # Re-check after acquiring the lock: a concurrent healthcheck may have already run this.
+            model = (self.models.get(instance) or {}).get(model_id)
+            if model is None or model.kind != "proxy" or model.proxy_url is None or (model.oauth and model.oauth.enabled):
+                return
+            metadata = await discover_authorization_server_for_resource(model.proxy_url)
+            oauth = model.oauth or McpOAuthConfig()
+            oauth.enabled = True
+            oauth.resource = oauth.resource or model.proxy_url
+            if metadata:
+                oauth.authorization_endpoint = metadata.authorization_endpoint
+                oauth.token_endpoint = metadata.token_endpoint
+                oauth.registration_endpoint = metadata.registration_endpoint
+                oauth.last_error = None
+            else:
+                oauth.last_error = (
+                    "This server responded with 401 Unauthorized, but its OAuth authorization server could not be "
+                    "auto-discovered. Edit this server to provide a client_id manually."
+                )
+            model.oauth = oauth
+            logger.info("Auto-detected OAuth requirement for MCP proxy model %s/%s", instance, model_id)
+            await self._persist_proxy_oauth(instance, model_id, oauth)
+            await self._reregister_installed_proxy(instance, model_id)
+
+    async def _reregister_installed_proxy(self, instance: str, model_id: str) -> None:
+        """Re-register a proxy model's endpoint so a live install picks up freshly authorized tokens."""
+        installed = self.instances_info.get(instance)
+        installed_info = installed.installed if installed else None
+        if installed_info is None:
+            return
+        model_info = installed_info.models.get(model_id)
+        model = (self.models.get(instance) or {}).get(model_id)
+        if model_info is None or model is None:
+            return
+        self.endpoint_registry.unregister_mcp_endpoint(model_info.prefix, model_info.registration_id)
+        parsed_options = McpModelOptions(prefix=model_info.prefix, headers=model_info.headers)
+        model_info.registration_id = self._register_proxy_model(model, parsed_options, instance, model_id)
+
+    def _build_oauth_redirect_uri(self) -> str:
+        """Build the OAuth callback redirect_uri from `infra_url`, preserving any reverse-proxy path prefix."""
+        parsed = urlparse(self.config.infra_url)
+        if not parsed.scheme or not parsed.netloc:
+            raise HTTPException(
+                400,
+                "DF_INFRA_URL is not configured. Set the infra URL (Settings) to this server's externally-reachable "
+                "address before starting an OAuth flow — it's needed to build the OAuth callback redirect_uri.",
+            )
+        return Utils.join_url(self.config.infra_url, "mcp-oauth/callback")
+
+    async def start_oauth_flow(self, instance: str, model_id: str) -> str:
+        """Begin an OAuth authorization-code flow for a proxy model; returns the authorize URL to open."""
+        model = self._get_oauth_model(instance, model_id)
+        if model.oauth is None or not model.oauth.enabled:
+            raise HTTPException(400, "OAuth is not enabled for this model")
+        assert model.proxy_url is not None
+
+        if not model.oauth.authorization_endpoint or not model.oauth.token_endpoint:
+            await self._discover_oauth_endpoints(instance, model_id, model)
+            model = self._get_oauth_model(instance, model_id)
+
+        assert model.oauth is not None
+        if not model.oauth.authorization_endpoint or not model.oauth.token_endpoint:
+            raise HTTPException(400, "Could not discover an OAuth authorization server for this MCP server.")
+
+        redirect_uri = self._build_oauth_redirect_uri()
+
+        if not model.oauth.client_id:
+            if not model.oauth.registration_endpoint:
+                raise HTTPException(
+                    400,
+                    "No client_id configured and this server does not support dynamic client registration. Provide a client_id manually.",
+                )
+            dcr = await register_dynamic_client(model.oauth.registration_endpoint, redirect_uri, "DeepFellow Infra")
+            if dcr is None:
+                raise HTTPException(400, "No client_id configured and dynamic client registration failed. Provide a client_id manually.")
+            model.oauth.client_id = dcr.client_id
+            model.oauth.client_secret = dcr.client_secret
+            await self._persist_proxy_oauth(instance, model_id, model.oauth)
+            model = self._get_oauth_model(instance, model_id)
+
+        oauth = model.oauth
+        assert oauth is not None
+        assert oauth.client_id is not None
+        assert oauth.authorization_endpoint is not None
+        assert model.proxy_url is not None
+        code_verifier, code_challenge = generate_pkce_pair()
+        state = secrets.token_urlsafe(32)
+        resource = oauth.resource or model.proxy_url
+        self._oauth_state_store.add(
+            state,
+            PendingOAuthFlow(
+                instance=instance, model_id=model_id, code_verifier=code_verifier, redirect_uri=redirect_uri, resource=resource
+            ),
+        )
+        return build_authorize_url(
+            oauth.authorization_endpoint,
+            oauth.client_id,
+            redirect_uri,
+            state,
+            code_challenge,
+            resource,
+            oauth.scope,
+        )
+
+    async def complete_oauth_callback(self, state: str, code: str | None, error: str | None) -> str:  # noqa: C901
+        """Handle the OAuth redirect callback. Returns a short human-readable status message."""
+        flow = self._oauth_state_store.pop(state)
+        if flow is None:
+            return "This authorization link is invalid or has expired. Please try again from DeepFellow."
+
+        model = (self.models.get(flow.instance) or {}).get(flow.model_id)
+        if model is None or model.oauth is None or not model.oauth.enabled:
+            return "This MCP server no longer exists or OAuth was disabled. You can close this tab."
+
+        if error:
+            model.oauth.last_error = error
+            await self._persist_proxy_oauth(flow.instance, flow.model_id, model.oauth)
+            return f"Authorization failed: {error}. You can close this tab and try again."
+
+        if code is None:
+            return "No authorization code was returned. You can close this tab and try again."
+
+        if not model.oauth.authorization_endpoint or not model.oauth.token_endpoint:
+            await self._discover_oauth_endpoints(flow.instance, flow.model_id, model)
+            model = (self.models.get(flow.instance) or {}).get(flow.model_id)
+            if model is None or model.oauth is None or not model.oauth.token_endpoint:
+                return "Could not discover this server's OAuth token endpoint. You can close this tab and try again."
+
+        if not model.oauth.client_id:
+            if model.oauth.registration_endpoint:
+                dcr = await register_dynamic_client(model.oauth.registration_endpoint, flow.redirect_uri, "DeepFellow Infra")
+                if dcr:
+                    model.oauth.client_id = dcr.client_id
+                    model.oauth.client_secret = dcr.client_secret
+                    await self._persist_proxy_oauth(flow.instance, flow.model_id, model.oauth)
+            if not model.oauth.client_id:
+                return "This MCP server's OAuth client is no longer configured. You can close this tab and try again."
+
+        try:
+            token = await exchange_code_for_token(
+                model.oauth.token_endpoint,
+                code,
+                flow.redirect_uri,
+                model.oauth.client_id,
+                model.oauth.client_secret,
+                flow.code_verifier,
+                flow.resource,
+            )
+        except McpOAuthError as exc:
+            if has_valid_access_token(model.oauth):
+                # `state` is single-use (popped above), so a resubmission of this exact callback URL
+                # would already have hit the "invalid or expired" branch, not this one. Getting here
+                # with a valid token already in place means a *different* flow for this model (e.g. two
+                # "Authorize" attempts started back-to-back) finished first — report success instead of
+                # surfacing a confusing error for something that already worked.
+                return "Already authorized. You can close this tab."
+            model.oauth.last_error = str(exc)
+            await self._persist_proxy_oauth(flow.instance, flow.model_id, model.oauth)
+            return f"Authorization failed: {exc}. You can close this tab and try again."
+
+        model.oauth.access_token = token.access_token
+        if token.refresh_token:
+            model.oauth.refresh_token = token.refresh_token
+        model.oauth.token_expires_at = time.time() + token.expires_in if token.expires_in else None
+        model.oauth.last_error = None
+        await self._persist_proxy_oauth(flow.instance, flow.model_id, model.oauth)
+
+        await self._reregister_installed_proxy(flow.instance, flow.model_id)
+        if model.oauth.refresh_token:
+            self._start_oauth_refresh_background(flow.instance, flow.model_id)
+
+        installed = self.instances_info.get(flow.instance)
+        if installed and installed.installed and flow.model_id in installed.installed.models:
+            # Refresh the tool list now that the model can authenticate, instead of waiting on
+            # the admin to click "Test" — this mirrors the retry task kicked off at install time.
+            task = asyncio.create_task(self._fetch_tools_background(flow.instance, flow.model_id))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+        return "Authorization complete. You can close this tab."
+
+    def get_oauth_status(self, instance: str, model_id: str) -> McpOAuthStatusOut:
+        """Return non-secret OAuth status for the WebUI: never a client_secret, access_token, or refresh_token."""
+        model = self._get_oauth_model(instance, model_id)
+        oauth = model.oauth
+        if oauth is None or not oauth.enabled:
+            return McpOAuthStatusOut(enabled=False, status="disabled")
+
+        if self._oauth_state_store.find_for_model(instance, model_id):
+            status: Literal["pending", "authorized", "expired", "error", "not_started"] = "pending"
+        elif has_valid_access_token(oauth):
+            status = "authorized"
+        elif oauth.access_token:
+            status = "expired"
+        elif oauth.last_error:
+            status = "error"
+        else:
+            status = "not_started"
+
+        return McpOAuthStatusOut(
+            enabled=True,
+            status=status,
+            has_client_id=bool(oauth.client_id),
+            has_client_secret=bool(oauth.client_secret),
+            expires_at=oauth.token_expires_at,
+            last_error=oauth.last_error,
         )
 
     async def _install_model(  # noqa: C901
@@ -1192,7 +1701,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
             self.check_headers(model.required_headers, parsed_model_options.headers)
 
             if model.kind == "proxy":
-                registration_id = self._register_proxy_model(model, parsed_model_options)
+                registration_id = self._register_proxy_model(model, parsed_model_options, instance, model_id)
                 assert model.proxy_url is not None
                 info.models[model_id] = ModelInstalledInfo(
                     id=model_id,
@@ -1207,11 +1716,23 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                     headers=parsed_model_options.headers,
                     envs={},
                 )
-                task = asyncio.create_task(self._fetch_tools_background(instance, model_id))
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
+                # Probe synchronously so an OAuth requirement (or any other startup error) is
+                # reflected in this response, rather than only surfacing later via the background
+                # retry loop — the admin shouldn't have to wait around and notice a badge appear.
+                try:
+                    probe = await self.healthcheck_model(instance, model_id)
+                except Exception:
+                    probe = None
+                if probe is None or not (probe.healthy or probe.requires_oauth):
+                    task = asyncio.create_task(self._fetch_tools_background(instance, model_id))
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+                if model.oauth and model.oauth.enabled and model.oauth.refresh_token:
+                    self._start_oauth_refresh_background(instance, model_id)
                 self._installing.discard(key)
-                return PromiseWithProgress(value=InstallModelOut(status="OK", details="Installed"))
+                requires_oauth = bool(probe and probe.requires_oauth)
+                details = "Installed. OAuth authorization required — use the Authorize action." if requires_oauth else "Installed"
+                return PromiseWithProgress(value=InstallModelOut(status="OK", details=details, requires_oauth=requires_oauth))
 
             if model.options is None:
                 raise HTTPException(400, "options are required for this model kind.")  # noqa: TRY301

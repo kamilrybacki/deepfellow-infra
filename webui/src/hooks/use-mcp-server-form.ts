@@ -97,6 +97,7 @@ export type ParsedMcpConfig =
       server_url: string;
       transport: "streamable_http" | "sse";
       headers: Record<string, string>;
+      oauth?: ParsedMcpOAuth;
     }
   | {
       kind: "docker";
@@ -106,6 +107,12 @@ export type ParsedMcpConfig =
       volumes: string[];
       envs: Record<string, string>;
     };
+
+export interface ParsedMcpOAuth {
+  client_id?: string;
+  client_secret?: string;
+  scope?: string;
+}
 
 export interface DockerFormState {
   data: Record<string, unknown>;
@@ -231,14 +238,30 @@ export interface UrlFormState {
   setRepositoryUrl: (v: string) => void;
   description: string;
   setDescription: (v: string) => void;
+  oauthEnabled: boolean;
+  setOauthEnabled: (v: boolean) => void;
+  oauthClientId: string;
+  setOauthClientId: (v: string) => void;
+  oauthClientSecret: string;
+  setOauthClientSecret: (v: string) => void;
+  oauthScope: string;
+  setOauthScope: (v: string) => void;
   errors: Record<string, string | undefined>;
   populate: (parsed: {
     name: string;
     server_url: string;
     transport: "streamable_http" | "sse";
     headers: Record<string, string>;
+    oauth?: ParsedMcpOAuth;
   }) => void;
   validate: () => Record<string, string | undefined>;
+}
+
+export interface ProxyMcpServerOAuthSpec {
+  enabled: boolean;
+  client_id?: string;
+  client_secret?: string;
+  scope?: string;
 }
 
 export interface ProxyMcpServerSpec {
@@ -251,6 +274,7 @@ export interface ProxyMcpServerSpec {
   headers?: Record<string, string>;
   repository_url?: string;
   description?: string;
+  oauth?: ProxyMcpServerOAuthSpec;
 }
 
 export function useUrlForm(
@@ -275,6 +299,18 @@ export function useUrlForm(
   const [description, setDescription] = useState(
     initialValues?.description ?? "",
   );
+  const [oauthEnabled, setOauthEnabled] = useState(
+    initialValues?.oauth?.enabled ?? false,
+  );
+  const [oauthClientId, setOauthClientId] = useState(
+    initialValues?.oauth?.client_id ?? "",
+  );
+  const [oauthClientSecret, setOauthClientSecret] = useState(
+    initialValues?.oauth?.client_secret ?? "",
+  );
+  const [oauthScope, setOauthScope] = useState(
+    initialValues?.oauth?.scope ?? "",
+  );
   const [errors, setErrors] = useState<Record<string, string | undefined>>({});
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: open is the reset trigger; initialValues is read at reset time via closure
@@ -288,6 +324,10 @@ export function useUrlForm(
     setHeaders(initialValues?.headers ?? {});
     setRepositoryUrl(initialValues?.repository_url ?? "");
     setDescription(initialValues?.description ?? "");
+    setOauthEnabled(initialValues?.oauth?.enabled ?? false);
+    setOauthClientId(initialValues?.oauth?.client_id ?? "");
+    setOauthClientSecret(initialValues?.oauth?.client_secret ?? "");
+    setOauthScope(initialValues?.oauth?.scope ?? "");
     setErrors({});
   }, [open]);
 
@@ -306,12 +346,22 @@ export function useUrlForm(
     server_url: string;
     transport: "streamable_http" | "sse";
     headers: Record<string, string>;
+    oauth?: ParsedMcpOAuth;
   }) => {
     setName(parsed.name);
     if (!prefixIsManual) setPrefix(proposePrefix(parsed.name));
     setServerUrl(parsed.server_url);
     setTransport(parsed.transport);
     setHeaders(parsed.headers);
+    const hasOauth = !!(
+      parsed.oauth?.client_id ||
+      parsed.oauth?.client_secret ||
+      parsed.oauth?.scope
+    );
+    setOauthEnabled(hasOauth);
+    setOauthClientId(parsed.oauth?.client_id ?? "");
+    setOauthClientSecret(parsed.oauth?.client_secret ?? "");
+    setOauthScope(parsed.oauth?.scope ?? "");
     setErrors({});
   };
 
@@ -345,6 +395,14 @@ export function useUrlForm(
     setRepositoryUrl,
     description,
     setDescription,
+    oauthEnabled,
+    setOauthEnabled,
+    oauthClientId,
+    setOauthClientId,
+    oauthClientSecret,
+    setOauthClientSecret,
+    oauthScope,
+    setOauthScope,
     errors,
     populate,
     validate,
@@ -414,6 +472,7 @@ export function useStdioForm(
     server_url: string;
     transport: "streamable_http" | "sse";
     headers: Record<string, string>;
+    oauth?: ParsedMcpOAuth;
   }) => void,
   /** Called when JSON paste is detected as a docker config. Component switches to Custom Image mode. */
   onDockerParsed: (parsed: {
