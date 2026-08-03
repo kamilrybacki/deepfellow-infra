@@ -6,6 +6,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import shutil
 from collections.abc import Sequence
 from contextlib import suppress
@@ -74,6 +75,8 @@ from server.utils.vram_calculator import (
     parse_cache_type_bits,
     parse_parameter_count,
 )
+
+logger = logging.getLogger("uvicorn.error")
 
 type Quantization = Literal[
     "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q3_K_S", "q3_K_M", "q3_K_L", "q4_K_S", "q4_K_M", "q5_K_S", "q5_K_M", "q6_K"
@@ -710,7 +713,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                 params = ArchParams(
                     hidden_size=info.get(f"{arch}.embedding_length") or 0,
                     num_attention_heads=info.get(f"{arch}.attention.head_count") or 1,
-                    num_key_value_heads=info.get(f"{arch}.attention.head_count_kv") or 1,
+                    num_key_value_heads=info.get(f"{arch}.attention.head_count_kv"),
                     num_hidden_layers=info.get(f"{arch}.block_count") or 0,
                     sliding_window=info.get(f"{arch}.attention.sliding_window"),
                 )
@@ -756,7 +759,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         if arch is None or num_ctx is None:
             return None
 
-        with suppress(Exception):
+        try:
             cache_bit = parse_cache_type_bits(self.config.ollama_kv_cache_type)
             num_parallel = num_parallel or self.config.ollama_num_parallel
             quant_overhead = get_quant_overhead(quantization_level)
@@ -765,8 +768,10 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                 arch, size_bytes, num_ctx, cache_bit, num_parallel, parameters, bytes_weight, overhead_factor=quant_overhead
             )
             return round(estimate * env_margin, 2) if estimate is not None else None
-
-        return None
+        except Exception:
+            # Polled every few seconds per model, so debug — a broken estimate must not break the model list.
+            logger.debug("VRAM estimate failed for Ollama model %r on instance %r (arch=%r)", model_name, instance, arch, exc_info=True)
+            return None
 
     async def get_loaded_model_info(self, instance: str) -> dict[str, int] | None:
         """Return {model_name: context_length} for models currently loaded in VRAM. None if not applicable."""

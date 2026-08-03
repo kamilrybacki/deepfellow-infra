@@ -131,6 +131,30 @@ async def test_get_vram_estimate_no_arch_returns_none(mock_arch: AsyncMock):
 
 
 @pytest.mark.asyncio
+@patch("server.services.llamacpp_service.logger")
+@patch("server.services.llamacpp_service.get_gguf_arch_params", new_callable=AsyncMock)
+@patch("server.services.llamacpp_service.estimate_vram_gb")
+async def test_get_vram_estimate_returns_none_and_logs_when_estimate_raises(
+    mock_estimate: MagicMock,
+    mock_arch: AsyncMock,
+    mock_logger: MagicMock,
+):
+    model_path = MagicMock(spec=Path)
+    model_path.stat.return_value.st_size = 8 * 1024**3
+    mock_arch.return_value = ARCH
+    mock_estimate.side_effect = TypeError("unsupported operand type(s) for /: 'int' and 'NoneType'")
+    svc = _make_service_with_model(model_path)
+
+    result = await svc._get_vram_estimate("inst", "my-model")  # pyright: ignore[reportPrivateUsage]
+
+    assert result is None
+    assert mock_logger.debug.call_count == 1
+    assert mock_logger.warning.call_count == 0
+    assert "my-model" in mock_logger.debug.call_args.args
+    assert mock_logger.debug.call_args.kwargs == {"exc_info": True}
+
+
+@pytest.mark.asyncio
 @patch("server.services.llamacpp_service.get_gguf_arch_params", new_callable=AsyncMock)
 async def test_get_vram_estimate_missing_file_returns_none(mock_arch: AsyncMock):
     model_path = MagicMock(spec=Path)

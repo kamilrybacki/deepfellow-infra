@@ -117,7 +117,7 @@ async def get_gguf_arch_params(file_path: Path | str) -> ArchParams | None:
         num_kv_heads = find_int(".attention.head_count_kv")
         num_layers = find_int(".block_count")
 
-        if hidden_size is not None and num_heads is not None and num_kv_heads is not None and num_layers is not None:
+        if hidden_size is not None and num_heads is not None and num_layers is not None:
             return ArchParams(
                 hidden_size=hidden_size,
                 num_attention_heads=num_heads,

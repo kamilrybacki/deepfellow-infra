@@ -4,9 +4,9 @@
 """Llamacpp service."""
 
 import asyncio
+import logging
 import re
 from collections.abc import Sequence
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -60,6 +60,8 @@ from server.utils.loading import Progress
 from server.utils.registry_client import image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fetch_file_size_from_url
 from server.utils.vram_calculator import estimate_vram_gb, parse_cache_type_bits
+
+logger = logging.getLogger("uvicorn.error")
 
 
 class LlamacppModel(BaseModel):
@@ -414,8 +416,11 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
             num_ctx = model_info.context_window or llamacpp_default_context_window
             cache_bit = parse_cache_type_bits(info.parsed_options.kv_cache_type)
             num_parallel = info.parsed_options.num_parallel
-            with suppress(Exception):
+            try:
                 return estimate_vram_gb(arch, weights_bytes, num_ctx, cache_bit, num_parallel)
+            except Exception:
+                # Polled every few seconds per model, so debug — a broken estimate must not break the model list.
+                logger.debug("VRAM estimate failed for llama.cpp model %r on %r (arch=%r)", model_id, instance, arch, exc_info=True)
 
         return None
 
