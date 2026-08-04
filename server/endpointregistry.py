@@ -1485,7 +1485,7 @@ async def post_json_responses(
         url=options.url,
         method="POST",
         data=JsonPayload(raw),
-        headers=options.get_request_headers(request),
+        headers=await options.get_request_headers(request),
     )
     if data.stream or not (http_response.response.content_type or "").startswith("application/json"):
         return http_response.as_streaming_response(options.allowed_response_headers)

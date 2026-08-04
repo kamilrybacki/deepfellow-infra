@@ -39,6 +39,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Coqui TTS now runs from `idiap/coqui-ai-TTS`, an actively maintained community fork, instead of the original `coqui-ai/TTS` repo, which has had no upstream activity since August 2024. Also fixes the bundled CPU/GPU Docker images being swapped (the "CPU" option was pulling the GPU-capable image and vice versa).
 
 ### Fixed
+- `/v1/responses` no longer fails a pyright type check by passing an unawaited coroutine as request headers.
 - vLLM model install no longer fails outright when a model's default context length needs more KV cache than is actually free (e.g. `ValueError: ... estimated maximum model length is 110256`). If the user didn't request a specific `max_model_length`, install now retries once with the length vLLM itself suggests instead of leaving the model unusable.
 - Infra not resolving `:latest` tags from /api/ps Ollama endpoint for VRAM calculations.
 - `scripts/get_ollama_models.py` no longer captures raw scraped HTML markup as a model's `size` when the Ollama library page renders a "usage slot" widget instead of plain size text (seen for at least one cloud-hosted model, `gemini-3-flash-preview`); the captured text is now validated against a size-string pattern and discarded otherwise. Also corrected the already-affected entry in `static/ollama-min.json`.
