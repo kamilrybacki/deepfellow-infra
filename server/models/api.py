@@ -352,10 +352,12 @@ class ChatCompletionRequest(BaseModel):
 
 
 class EmbeddingRequest(BaseModel):
-    input: Annotated[str | list[str], Field(description="The input text(s) to embed")]
+    input: Annotated[str | list[str] | list[int] | list[list[int]], Field(description="The input text(s) to embed")]
     model: Annotated[str, Field(description="ID of the model to use for embedding", examples=["llama3"])]
     dimensions: Annotated[int | None, Field(ge=1, description="The number of dimensions to return for each embedding")] = None
-    encoding_format: Annotated[str | None, Field(description="The encoding format of the embeddings", examples=["float"])] = None
+    encoding_format: Annotated[
+        Literal["base64", "float"] | None, Field(description="The encoding format of the embeddings", examples=["float"])
+    ] = None
     user: Annotated[str | None, Field(description="A unique identifier for the end-user", examples=["user123"])] = None
 
     model_config = {"json_schema_extra": {"examples": [{"input": "Hello, how are you?", "model": "llama3", "encoding_format": "float"}]}}
