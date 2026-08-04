@@ -108,6 +108,19 @@ def test_create_error_msg_json_without_message_key_returns_string() -> None:
     assert isinstance(result, str)
 
 
+def test_create_error_msg_restricted_model_embeds_markdown_link() -> None:
+    """The WebUI renders [text](url) as a clickable link — plain text URLs are not clickable."""
+    dl = _make_hf_repo_dl("key")
+
+    result = dl.create_error_msg(
+        "is restricted. You must have access to it and be authenticated to access it. Please log in.",
+        model_page_url="https://huggingface.co/meta-llama/Llama-3.2-1B",
+    )
+
+    assert isinstance(result, str)
+    assert "[the model page](https://huggingface.co/meta-llama/Llama-3.2-1B)" in result
+
+
 def test_standard_downloader_check_url_always_true() -> None:
     dl = StandardModelDownloader()
 
@@ -833,3 +846,50 @@ async def test_model_downloader_download_routes_huggingface_gguf_url_to_hf_model
         pass
 
     assert routed_to == ["hf_model"]
+
+
+@pytest.mark.asyncio
+async def test_model_downloader_download_logs_progress_percentage(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    config = make_mock_config(tmp_path)
+    md = ModelDownloader(config)
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+
+    async def mock_standard_download(url: str, model_dir: Path, temp_dir: Path, filename: str | None = None):
+        yield PreDownloadPacket(100)
+        yield DownloadedPacket(5)  # below the 10% log step, should not log yet
+        yield DownloadedPacket(45)  # crosses 50%, should log
+        yield DownloadedPacket(50)  # crosses 100%, should log
+        yield SuccessDownloadPacket(model_dir)
+
+    md.standard_downloader.download = mock_standard_download
+
+    with caplog.at_level("INFO", logger="uvicorn.error"):
+        async for _ in md.download("https://example.com/model.gguf", model_dir):
+            pass
+
+    assert "5%" not in caplog.text
+    assert "50%" in caplog.text
+    assert "100%" in caplog.text
+    assert "Downloaded https://example.com/model.gguf" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_model_downloader_download_does_not_log_progress_when_size_unknown(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    config = make_mock_config(tmp_path)
+    md = ModelDownloader(config)
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+
+    async def mock_standard_download(url: str, model_dir: Path, temp_dir: Path, filename: str | None = None):
+        yield PreDownloadPacket(0)
+        yield DownloadedPacket(50)
+        yield SuccessDownloadPacket(model_dir)
+
+    md.standard_downloader.download = mock_standard_download
+
+    with caplog.at_level("INFO", logger="uvicorn.error"):
+        async for _ in md.download("https://example.com/model.gguf", model_dir):
+            pass
+
+    assert "%" not in caplog.text

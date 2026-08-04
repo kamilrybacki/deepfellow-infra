@@ -78,6 +78,9 @@ from server.utils.vram_calculator import (
 
 logger = logging.getLogger("uvicorn.error")
 
+_PROGRESS_LOG_STEP = 0.1  # log every ~10% of progress so the console isn't flooded with updates
+
+
 type Quantization = Literal[
     "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q3_K_S", "q3_K_M", "q3_K_L", "q4_K_S", "q4_K_M", "q5_K_S", "q5_K_M", "q6_K"
 ]
@@ -948,6 +951,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
     async def _download_with_ollama(self, stream: Stream[StreamChunk], base_url: str, model_id: str, model_size: str) -> None:
         progress = Progress(convert_size_to_bytes(model_size) or 0)
         last_values: dict[str, int] = {}
+        last_logged_percentage = 0.0
 
         stream.emit(StreamChunkProgress(type="progress", stage="download", value=0, data={}))
         async for ollama_stream in stream_fetch_from(f"{base_url}/api/pull", "POST", {"model": model_id}, timeout=24 * 60 * 60):
@@ -968,7 +972,12 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                     elif record.get("status") == "success":
                         progress.set_actual_value(progress.max)
 
-                    stream.emit(StreamChunkProgress(type="progress", stage="download", value=progress.get_percentage(), data={}))
+                    percentage = progress.get_percentage()
+                    if last_logged_percentage < 1 and (percentage - last_logged_percentage >= _PROGRESS_LOG_STEP or percentage >= 1):
+                        logger.info("Downloading model %s: %.0f%%", model_id, percentage * 100)
+                        last_logged_percentage = percentage
+
+                    stream.emit(StreamChunkProgress(type="progress", stage="download", value=percentage, data={}))
 
         stream.emit(StreamChunkProgress(type="progress", stage="download", value=1, data={}))
 

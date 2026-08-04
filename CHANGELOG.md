@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- New `just get-vllm-models` recipe generates `static/vllm-min.json`, a curated registry of top HuggingFace LLM, reranker, and embedding models for the vLLM backend, mirroring the existing `get-ollama-models` tooling. Retries with backoff when the HuggingFace API rate-limits requests. Reranker candidates are filtered to models with a `*ForSequenceClassification` architecture, the only kind vLLM can serve as a cross-encoder — models merely named "reranker" but built as generative or custom-ranking architectures (e.g. Qwen3-Reranker, jina-reranker-v3) are excluded since they fail to load in vLLM.
 - Read-only smoke test suite (`tests/bruno/`) that checks availability, docs, reported version, the admin and OpenAI-compatible read endpoints, and auth rejections over real HTTP against a running instance. It runs after every deploy to dev (main, hotfix branches and release tags); on a release tag it is a blocking gate, so a tagged build that fails it is never published to GitHub. Run it locally with `tests/bruno/run-local.sh`.
 - New `GET /info` endpoint, authorized with the server key (`DF_INFRA_API_KEY`), returns the running Infra version (`{"version": "..."}`) read from `pyproject.toml`.
 - Ollama service now has a "↻ Refresh catalog" button that fetches trending models from the Ollama library and merges them into the model list as a dynamic overlay, so newly released models show up without waiting for an app update. Each click always fetches fresh results; the 6-hour cache only applies to callers that don't pass `force=true`.
@@ -15,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Ollama, llama.cpp, and vLLM service install and edit dialogs now include a searchable **Docker image version** selector populated from the container registry, filtered by the selected hardware variant. Leave the field empty to use the default bundled version.
 - New `GET /admin/services/{id}/docker-tags` API endpoint returns available Docker image tags for a service, with server-side caching (2 h TTL) and optional `?hardware=` filtering.
 - Optional `DOCKER_HUB_TOKEN` environment variable for authenticated Docker Hub access to raise rate limits when fetching image tags.
+- Model download progress is now logged server-side (every ~10%), covering both the generic model downloader (HuggingFace, Civitai, adapter registry, direct URLs) and Ollama's native `/api/pull`, so real download progress is visible in the console instead of only the UI.
 - New Claude models: Opus 4.7, Opus 4.8, Sonnet 5 and Fable 5.
 - New OpenAI models: GPT-5.4 Pro, GPT-5.5, GPT-5.5 Pro, and the GPT-5.6 family (Sol, Terra, Luna).
 - New DeepSeek service (`deepseek-v4-flash`, `deepseek-v4-pro`).
@@ -33,11 +35,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Bumped bundled Ollama Docker image from `0.31.1` to `0.32.1` and vLLM from `v0.24.0` to `v0.25.1` to stay current with upstream releases. No known outstanding security advisories affected the previous pins.
 - Bumped bundled open-websearch MCP Docker image from `v1.2.0` to `v2.1.9` to stay current with upstream releases.
 - Ollama VRAM usage for loaded models is now read directly from Ollama's `/api/ps` response instead of being parsed from container logs.
-<<<<<<< CHANGELOG.md
 - Python files under `ee/` now require an `SPDX-License-Identifier: LicenseRef-DeepFellow-Free` header instead of MIT; `just license-check` rejects a stray MIT header in `ee/`, and `--fix` migrates it automatically.
 - Coqui TTS now runs from `idiap/coqui-ai-TTS`, an actively maintained community fork, instead of the original `coqui-ai/TTS` repo, which has had no upstream activity since August 2024. Also fixes the bundled CPU/GPU Docker images being swapped (the "CPU" option was pulling the GPU-capable image and vice versa).
 
 ### Fixed
+- vLLM model install no longer fails outright when a model's default context length needs more KV cache than is actually free (e.g. `ValueError: ... estimated maximum model length is 110256`). If the user didn't request a specific `max_model_length`, install now retries once with the length vLLM itself suggests instead of leaving the model unusable.
 - Infra not resolving `:latest` tags from /api/ps Ollama endpoint for VRAM calculations.
 - `scripts/get_ollama_models.py` no longer captures raw scraped HTML markup as a model's `size` when the Ollama library page renders a "usage slot" widget instead of plain size text (seen for at least one cloud-hosted model, `gemini-3-flash-preview`); the captured text is now validated against a size-string pattern and discarded otherwise. Also corrected the already-affected entry in `static/ollama-min.json`.
 - vLLM now detects when an already-installed model's Docker container stops running for good (crash, OOM, manual `docker stop`, hung process reported `unhealthy`) and releases its reserved GPU memory automatically, without requiring a backend restart. Previously the GPU-utilization counter stayed occupied forever for a dead container, blocking further model loads.

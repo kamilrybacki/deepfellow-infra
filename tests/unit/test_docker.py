@@ -22,6 +22,7 @@ from server.docker import (
     DockerPath,
     DockerService,
     _diagnose_gpu_error,  # type: ignore[reportPrivateUsage]
+    _extract_error_excerpt,  # type: ignore[reportPrivateUsage]
     _is_container_name_conflict,  # type: ignore[reportPrivateUsage]
     create_docker_service,
     get_docker_auths,
@@ -1577,6 +1578,38 @@ def test_is_container_name_conflict_matches_collision_messages(text: str, expect
     assert result is expected
 
 
+# _extract_error_excerpt
+
+
+def test_extract_error_excerpt_picks_error_lines_out_of_noisy_logs() -> None:
+    logs = "\n".join(
+        [
+            "Starting container...",
+            "Pulling layer 1/4",
+            "Pulling layer 2/4",
+            'Traceback (most recent call last): raise RuntimeError("model weights not found")',
+            "Pulling layer 3/4",
+        ]
+    )
+
+    result = _extract_error_excerpt(logs)
+
+    assert "model weights not found" in result
+    assert "Pulling layer" not in result
+
+
+def test_extract_error_excerpt_falls_back_to_tail_snippet_when_no_error_line() -> None:
+    logs = "\n".join(f"Pulling layer {i}/500" for i in range(500))
+
+    result = _extract_error_excerpt(logs)
+
+    assert result.endswith(logs[-500:])
+
+
+def test_extract_error_excerpt_empty_logs_returns_empty() -> None:
+    assert _extract_error_excerpt("") == ""
+
+
 # start_docker_compose
 
 
@@ -1676,6 +1709,81 @@ async def test_ensure_compose_running_name_conflict_raises_http_409(docker_servi
     assert "ollama" in exc_info.value.detail
 
 
+@pytest.mark.asyncio
+async def test_ensure_compose_running_name_conflict_phrase_in_logs_only_is_not_treated_as_conflict(
+    docker_service: DockerService, tmp_path: Path
+) -> None:
+    """A container log line like "port is already in use" must not be mistaken for a name collision."""
+    options = _opts(name="ollama")
+    compose_file = tmp_path / "compose.yaml"
+
+    with (
+        patch.object(docker_service, "create_compose_file", new_callable=AsyncMock, return_value=11434),
+        patch.object(
+            docker_service,
+            "start_docker_compose",
+            new_callable=AsyncMock,
+            side_effect=DockerComposeStartError("out", "err"),
+        ),
+        patch.object(docker_service, "get_docker_compose_logs", new_callable=AsyncMock, return_value="port is already in use"),
+        pytest.raises(AppError, match="Failed to start"),
+    ):
+        await docker_service._ensure_compose_running(compose_file, options, is_running=False, has_difference=True, port=None)  # type: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_ensure_compose_running_short_message_but_logs_full_output(
+    docker_service: DockerService, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    options = _opts(name="ollama")
+    compose_file = tmp_path / "compose.yaml"
+    long_logs = "x" * 10_000
+
+    with (
+        patch.object(docker_service, "create_compose_file", new_callable=AsyncMock, return_value=11434),
+        patch.object(
+            docker_service,
+            "start_docker_compose",
+            new_callable=AsyncMock,
+            side_effect=DockerComposeStartError("out", "err"),
+        ),
+        patch.object(docker_service, "get_docker_compose_logs", new_callable=AsyncMock, return_value=long_logs),
+        caplog.at_level("ERROR", logger="uvicorn.error"),
+        pytest.raises(AppError, match="Failed to start") as exc_info,
+    ):
+        await docker_service._ensure_compose_running(compose_file, options, is_running=False, has_difference=True, port=None)  # type: ignore[reportPrivateUsage]
+
+    assert len(str(exc_info.value)) < len(long_logs)
+    assert long_logs in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ensure_compose_running_bounds_pathologically_large_logs_in_server_log(
+    docker_service: DockerService, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A runaway container (e.g. a stuck download progress stream) must not flood the server log."""
+    options = _opts(name="ollama")
+    compose_file = tmp_path / "compose.yaml"
+    huge_logs = "x" * 100_000
+
+    with (
+        patch.object(docker_service, "create_compose_file", new_callable=AsyncMock, return_value=11434),
+        patch.object(
+            docker_service,
+            "start_docker_compose",
+            new_callable=AsyncMock,
+            side_effect=DockerComposeStartError("out", "err"),
+        ),
+        patch.object(docker_service, "get_docker_compose_logs", new_callable=AsyncMock, return_value=huge_logs),
+        caplog.at_level("ERROR", logger="uvicorn.error"),
+        pytest.raises(AppError, match="Failed to start"),
+    ):
+        await docker_service._ensure_compose_running(compose_file, options, is_running=False, has_difference=True, port=None)  # type: ignore[reportPrivateUsage]
+
+    assert huge_logs not in caplog.text
+    assert len(caplog.text) < len(huge_logs)
+
+
 # _assert_compose_healthy
 
 
@@ -1707,6 +1815,26 @@ async def test_assert_compose_healthy_gpu_no_known_error_raises_generic_app_erro
         pytest.raises(AppError, match="failed to become healthy"),
     ):
         await docker_service._assert_compose_healthy(compose_file, options, start_output=None)  # type: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_assert_compose_healthy_short_message_but_logs_full_output(
+    docker_service: DockerService, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    options = _opts(name="ollama")
+    compose_file = tmp_path / "compose.yaml"
+    long_logs = "x" * 10_000
+
+    with (
+        patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock, return_value=False),
+        patch.object(docker_service, "get_docker_compose_logs", new_callable=AsyncMock, return_value=long_logs),
+        caplog.at_level("ERROR", logger="uvicorn.error"),
+        pytest.raises(AppError, match="failed to become healthy") as exc_info,
+    ):
+        await docker_service._assert_compose_healthy(compose_file, options, start_output=None)  # type: ignore[reportPrivateUsage]
+
+    assert len(str(exc_info.value)) < len(long_logs)
+    assert long_logs in caplog.text
 
 
 def test_get_docker_compose_dir_creates_dir_when_missing(tmp_path: Path) -> None:

@@ -24,7 +24,7 @@ from server.docker import (
     DockerOptions,
 )
 from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
-from server.models.api import LLM_ENDPOINTS, ModelProps
+from server.models.api import EMBEDDINGS_ENDPOINTS, LLM_ENDPOINTS, ModelProps
 from server.models.models import (
     CustomModelField,
     CustomModelId,
@@ -78,17 +78,17 @@ class VllmModel(BaseModel):
     shm_size: str = "16gb"
     ulimits: dict[str, str] | None = None
     max_model_len: int | None = None
-    gpu_memory_utilization: float = 0.9
+    gpu_memory_utilization: float | None = None
     size: str
     custom: CustomModelId | None = None
-    model_type: Literal["llm", "reranker"] = "llm"
+    model_type: Literal["llm", "reranker", "embedding"] = "llm"
 
 
 class VllmCustomModel(BaseModel):
     id: str
     hf_id: str
     size: str
-    model_type: Literal["llm", "reranker"] = "llm"
+    model_type: Literal["llm", "reranker", "embedding"] = "llm"
 
 
 type ImageTypes = Literal["cpu", "gpu"]
@@ -102,6 +102,7 @@ class VllmRegistryEntry(TypedDict):
 class VllmRegistry(TypedDict, total=False):
     llms: list[VllmRegistryEntry]
     rerankers: list[VllmRegistryEntry]
+    embeddings: list[VllmRegistryEntry]
 
 
 class VllmConst(BaseModel):
@@ -125,6 +126,12 @@ def _read_models() -> dict[str, VllmModel]:
                 hf_id=entry["name"],
                 size=entry["size"],
                 model_type="reranker",
+            )
+        for entry in registry.get("embeddings", []):
+            map[entry["name"]] = VllmModel(
+                hf_id=entry["name"],
+                size=entry["size"],
+                model_type="embedding",
             )
         return map
 
@@ -151,7 +158,7 @@ class ModelInstalledInfo:
     model_path: Path
     base_url: str
     gpu_memory_utilization: float | None
-    model_type: Literal["llm", "reranker"] = "llm"
+    model_type: Literal["llm", "reranker", "embedding"] = "llm"
 
     def get_info(self) -> ModelInfo:
         """Get info."""
@@ -187,6 +194,8 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
     hugging_face_cache_path = "/mnt/hf"
     models: dict[str, dict[str, VllmModel]]
     gpu_memory_utilization = 0
+    _default_gpu_memory_utilization = 0.9
+    _gpu_memory_free_safety_margin = 0.9
     _vram_cache: dict[tuple[str, str], float]
     _installing: set[tuple[str, str]]
 
@@ -249,9 +258,8 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     ModelField(
                         type="number",
                         name="gpu_memory_utilization",
-                        description="Gpu usage (in range 0.00 - 1.00)",
+                        description="Gpu usage (in range 0.00 - 1.00). Left blank, defaults to the fraction of VRAM currently free.",
                         required=False,
-                        default="0.9",
                     ),
                 )
         fields.extend(
@@ -264,7 +272,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     description="Additional vLLM arguments. Key: flag name (e.g. --dtype), value: flag value (empty for boolean flags).",
                     required=False,
                     placeholder="extra_args",
-                    default='{"--trust-remote-code":""}' if model_type == "reranker" else None,
+                    default='{"--trust-remote-code":""}' if model_type in ("reranker", "embedding") else None,
                 ),
                 ModelField(
                     type="map",
@@ -539,8 +547,22 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             raise HTTPException(500, f"Downloader doesn't return filepath in {model_dir} of {model_id} model")
         return local_model_path
 
+    async def _get_default_gpu_memory_utilization(self) -> float:
+        """Size the default utilization to the fraction of VRAM currently free instead of a flat value.
+
+        A flat default can request more memory than is actually free (e.g. when other processes already
+        hold some VRAM), which makes vLLM fail to start. Sizing the default off live free memory avoids that.
+        """
+        stats = await self.hardware.get_realtime_stats()
+        if not stats or stats.total_vram_gb <= 0:
+            return self._default_gpu_memory_utilization
+        free_fraction = max(0.0, stats.total_vram_gb - stats.used_vram_gb) / stats.total_vram_gb
+        return round(min(self._default_gpu_memory_utilization, free_fraction * self._gpu_memory_free_safety_margin), 2)
+
     async def _get_gpu_memory_utilization(self, parsed_model_options: VllmModelOptions, model: VllmModel) -> float:
-        gpu_memory_utilization = parsed_model_options.gpu_memory_utilization or model.gpu_memory_utilization or 0.95
+        gpu_memory_utilization = parsed_model_options.gpu_memory_utilization or model.gpu_memory_utilization
+        if gpu_memory_utilization is None:
+            gpu_memory_utilization = await self._get_default_gpu_memory_utilization()
         if self.gpu_memory_utilization + gpu_memory_utilization > 1:
             raise HTTPException(
                 422,
@@ -636,6 +658,13 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                 options=ProxyOptions(url=f"{model_info.base_url}/v1/rerank", rewrite_model_to=model_id),
                 registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
             )
+        if model.model_type == "embedding":
+            return self.endpoint_registry.register_embeddings_as_proxy(
+                model=registered_name,
+                props=ModelProps(private=True, type="embedding", endpoints=EMBEDDINGS_ENDPOINTS),
+                options=ProxyOptions(url=f"{model_info.base_url}/v1/embeddings", rewrite_model_to=model_id),
+                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+            )
         return self.endpoint_registry.register_chat_completion_as_proxy(
             model=registered_name,
             props=ModelProps(
@@ -682,8 +711,10 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             raise
 
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
+            nonlocal user_model_length
             model_info: ModelInstalledInfo | None = None
             docker_options: DockerOptions | None = None
+            docker_stopped = False
             try:
                 model_id_fixed = model_id.replace("/", "-")
                 models_dir = self._get_working_dir() / "models"
@@ -747,9 +778,39 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                         "start_period": "240s",
                     },
                 )
-
-                docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
-
+                try:
+                    docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
+                except Exception as exc:
+                    await self.docker_service.stop_docker(docker_options)
+                    docker_stopped = True
+                    suggested_max_length = (
+                        self._parse_kv_cache_max_len_suggestion(str(exc)) if use_gpu and user_model_length is None else None
+                    )
+                    if suggested_max_length is None:
+                        raise
+                    msg = (
+                        f"vLLM rejected the model's default context length for {model_id!r} "
+                        f"(insufficient KV cache memory); retrying with --max-model-len {suggested_max_length}."
+                    )
+                    logger.warning(msg)
+                    user_model_length = suggested_max_length
+                    vllm_command = self._build_vllm_command(
+                        docker_model_path=docker_model_path,
+                        model_id=model_id,
+                        opts=parsed_model_options,
+                        quantization=quantization,
+                        gpu_memory_utilization=gpu_memory_utilization,
+                        user_model_length=user_model_length,
+                        use_gpu=use_gpu,
+                    )
+                    docker_options.command = " ".join(vllm_command)
+                    docker_stopped = False
+                    try:
+                        docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
+                    except Exception:
+                        await self.docker_service.stop_docker(docker_options)
+                        docker_stopped = True
+                        raise
                 registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
                 container_host = self.docker_service.get_container_host(subnet, docker_options.name)
                 container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
@@ -788,7 +849,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                 self._release_gpu_utilization(gpu_memory_utilization)
                 if model_info is not None and info.models.get(model_id) is model_info:
                     info.models.pop(model_id, None)
-                if docker_options is not None:
+                if docker_options is not None and not docker_stopped:
                     with suppress(Exception):
                         await self.docker_service.stop_docker(docker_options)
                 raise
@@ -845,6 +906,8 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             del info.models[model_id]
             if model.model_type == "reranker":
                 self.endpoint_registry.unregister_rerank(model.registered_name, model.registration_id)
+            elif model.model_type == "embedding":
+                self.endpoint_registry.unregister_embeddings(model.registered_name, model.registration_id)
             else:
                 self.endpoint_registry.unregister_chat_completion(model.registered_name, model.registration_id)
             await self.docker_service.uninstall_docker(model.docker)
@@ -854,6 +917,18 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             if model_path := model.model_path:
                 shutil.rmtree(Path(model_path))
             del self.models_downloaded[model_id]
+
+    @staticmethod
+    def _parse_kv_cache_max_len_suggestion(raw: str) -> int | None:
+        """Parse vLLM's suggested max model length from a KV-cache-too-small startup failure.
+
+        When a model's default context length needs more KV cache than is actually free, vLLM aborts
+        startup but reports the largest length that would fit (e.g. "the estimated maximum model length
+        is 110256"). Reusing that value lets install retry once instead of failing outright.
+        """
+        if m := re.search(r"estimated maximum model length is (\d+)", raw):
+            return int(m.group(1))
+        return None
 
     @staticmethod
     def _parse_vllm_vram_gb(raw: str) -> float | None:

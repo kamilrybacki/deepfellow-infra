@@ -5,21 +5,28 @@
 
 import asyncio
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import aiohttp
 import pytest
 
 from scripts.get_huggingface_models import (
+    collect_embedding_models,
     collect_llm_models,
     collect_reranker_models,
-    fetch_model_size,
+    fetch_model_details,
+    fetch_popular_embedding_models,
     fetch_popular_models,
     fetch_popular_reranker_models,
     fmt_size,
     fmt_size_compact,
+    get_json_with_retry,
+    has_chat_template,
+    is_embedding,
     is_llm,
     is_reranker,
+    is_supported_cross_encoder,
     main,
 )
 
@@ -99,6 +106,99 @@ def test_is_reranker(input_dict: dict[str, str], expected: bool):
     assert is_reranker(input_dict) is expected
 
 
+@pytest.mark.parametrize(
+    ("architectures", "expected"),
+    [
+        (["XLMRobertaForSequenceClassification"], True),
+        (["ModernBertForSequenceClassification"], True),
+        (["Qwen3ForCausalLM"], False),
+        (["JinaForRanking"], False),
+        ([], False),
+    ],
+    ids=[
+        "sequence_classification_head",
+        "another_sequence_classification_head",
+        "causal_lm_excluded",
+        "custom_ranking_head_excluded",
+        "no_architecture_info",
+    ],
+)
+def test_is_supported_cross_encoder(architectures: list[str], expected: bool) -> None:
+    assert is_supported_cross_encoder(architectures) is expected
+
+
+@pytest.mark.asyncio
+async def test_has_chat_template_true_for_standalone_jinja_file() -> None:
+    session = MagicMock()
+    siblings = [{"rfilename": "chat_template.jinja"}, {"rfilename": "config.json"}]
+
+    result = await has_chat_template(session, "org/model", siblings)
+
+    assert result is True
+    session.get.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_has_chat_template_false_when_no_tokenizer_config() -> None:
+    session = MagicMock()
+    siblings = [{"rfilename": "config.json"}]
+
+    result = await has_chat_template(session, "org/model", siblings)
+
+    assert result is False
+    session.get.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_has_chat_template_true_when_embedded_in_tokenizer_config() -> None:
+    session = _make_mock_session({"chat_template": "{% for message in messages %}...{% endfor %}"})
+    siblings = [{"rfilename": "tokenizer_config.json"}]
+
+    result = await has_chat_template(session, "org/model", siblings)
+
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_has_chat_template_false_when_tokenizer_config_lacks_key() -> None:
+    session = _make_mock_session({"tokenizer_class": "GPT2Tokenizer"})
+    siblings = [{"rfilename": "tokenizer_config.json"}]
+
+    result = await has_chat_template(session, "org/model", siblings)
+
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_has_chat_template_false_on_fetch_error() -> None:
+    mock_resp = AsyncMock()
+    mock_resp.raise_for_status = MagicMock(side_effect=aiohttp.ClientResponseError(MagicMock(), (), status=404))
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+    session = MagicMock()
+    session.get = MagicMock(return_value=mock_resp)
+    siblings = [{"rfilename": "tokenizer_config.json"}]
+
+    result = await has_chat_template(session, "org/missing", siblings)
+
+    assert result is False
+
+
+@pytest.mark.parametrize(
+    ("input_dict", "expected"),
+    [
+        ({"id": "org/text-embedding-3-large"}, True),
+        ({"id": "bert-base-uncased"}, False),
+        ({"id": ""}, False),
+        ({}, False),
+        ({"id": "BAAI/bge-EMBED-v2"}, True),
+    ],
+    ids=["embed_in_name", "no_embed", "empty_id", "missing_id", "case_insensitive"],
+)
+def test_is_embedding(input_dict: dict[str, str], expected: bool):
+    assert is_embedding(input_dict) is expected
+
+
 def _make_mock_session(json_data: object) -> MagicMock:
     mock_resp = AsyncMock()
     mock_resp.raise_for_status = MagicMock()
@@ -137,13 +237,78 @@ async def test_fetch_popular_models_passes_correct_params() -> None:
 async def test_fetch_popular_models_raises_on_http_error() -> None:
     mock_resp = AsyncMock()
     mock_resp.raise_for_status = MagicMock(side_effect=aiohttp.ClientResponseError(MagicMock(), (), status=429))
+    mock_resp.headers = {}
     mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
     mock_resp.__aexit__ = AsyncMock(return_value=False)
     session = MagicMock()
     session.get = MagicMock(return_value=mock_resp)
 
-    with pytest.raises(aiohttp.ClientResponseError):
+    with patch("asyncio.sleep", AsyncMock()), pytest.raises(aiohttp.ClientResponseError):
         await fetch_popular_models(session, "text-generation", "downloads", 10)
+
+
+@pytest.mark.asyncio
+async def test_get_json_with_retry_retries_on_429_then_succeeds() -> None:
+    failing_resp = AsyncMock()
+    failing_resp.raise_for_status = MagicMock(side_effect=aiohttp.ClientResponseError(MagicMock(), (), status=429))
+    failing_resp.headers = {}
+    failing_resp.__aenter__ = AsyncMock(return_value=failing_resp)
+    failing_resp.__aexit__ = AsyncMock(return_value=False)
+
+    ok_resp = AsyncMock()
+    ok_resp.raise_for_status = MagicMock()
+    ok_resp.json = AsyncMock(return_value=[{"id": "org/model"}])
+    ok_resp.__aenter__ = AsyncMock(return_value=ok_resp)
+    ok_resp.__aexit__ = AsyncMock(return_value=False)
+
+    session = MagicMock()
+    session.get = MagicMock(side_effect=[failing_resp, failing_resp, ok_resp])
+
+    with patch("asyncio.sleep", AsyncMock()) as mock_sleep:
+        result = await get_json_with_retry(session, "https://huggingface.co/api/models", {})
+
+    assert result == [{"id": "org/model"}]
+    assert mock_sleep.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_get_json_with_retry_respects_retry_after_header() -> None:
+    failing_resp = AsyncMock()
+    failing_resp.raise_for_status = MagicMock(side_effect=aiohttp.ClientResponseError(MagicMock(), (), status=429))
+    failing_resp.headers = {"Retry-After": "7"}
+    failing_resp.__aenter__ = AsyncMock(return_value=failing_resp)
+    failing_resp.__aexit__ = AsyncMock(return_value=False)
+
+    ok_resp = AsyncMock()
+    ok_resp.raise_for_status = MagicMock()
+    ok_resp.json = AsyncMock(return_value=[])
+    ok_resp.__aenter__ = AsyncMock(return_value=ok_resp)
+    ok_resp.__aexit__ = AsyncMock(return_value=False)
+
+    session = MagicMock()
+    session.get = MagicMock(side_effect=[failing_resp, ok_resp])
+
+    with patch("asyncio.sleep", AsyncMock()) as mock_sleep:
+        await get_json_with_retry(session, "https://huggingface.co/api/models", {})
+
+    mock_sleep.assert_awaited_once_with(7.0)
+
+
+@pytest.mark.asyncio
+async def test_get_json_with_retry_does_not_retry_on_client_error() -> None:
+    mock_resp = AsyncMock()
+    mock_resp.raise_for_status = MagicMock(side_effect=aiohttp.ClientResponseError(MagicMock(), (), status=404))
+    mock_resp.headers = {}
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+    session = MagicMock()
+    session.get = MagicMock(return_value=mock_resp)
+
+    with patch("asyncio.sleep", AsyncMock()) as mock_sleep, pytest.raises(aiohttp.ClientResponseError):
+        await get_json_with_retry(session, "https://huggingface.co/api/models", {})
+
+    mock_sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -157,14 +322,37 @@ async def test_fetch_popular_reranker_models_returns_list() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_popular_reranker_models_passes_other_param() -> None:
+async def test_fetch_popular_reranker_models_passes_search_param() -> None:
     session = _make_mock_session([])
 
     await fetch_popular_reranker_models(session, "trending", 20)
 
     call_kwargs = session.get.call_args
     params = call_kwargs[1]["params"]
-    assert params["other"] == "reranker"
+    assert params["search"] == "rerank"
+    assert params["sort"] == "trending"
+    assert params["limit"] == "20"
+
+
+@pytest.mark.asyncio
+async def test_fetch_popular_embedding_models_returns_list() -> None:
+    data = [{"id": "org/embed-a"}]
+    session = _make_mock_session(data)
+
+    result = await fetch_popular_embedding_models(session, "downloads", 10)
+
+    assert result == data
+
+
+@pytest.mark.asyncio
+async def test_fetch_popular_embedding_models_passes_search_param() -> None:
+    session = _make_mock_session([])
+
+    await fetch_popular_embedding_models(session, "trending", 20)
+
+    call_kwargs = session.get.call_args
+    params = call_kwargs[1]["params"]
+    assert params["search"] == "embed"
     assert params["sort"] == "trending"
     assert params["limit"] == "20"
 
@@ -241,29 +429,61 @@ async def test_collect_reranker_models_filters_non_rerankers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_model_size_returns_size() -> None:
+async def test_collect_embedding_models_deduplicates() -> None:
+    embedding = {"id": "org/bge-embedding-v2"}
+
+    async def fake_fetch(session: Mock, sort: str, limit: int):
+        return [embedding]
+
+    with patch(
+        "scripts.get_huggingface_models.fetch_popular_embedding_models",
+        side_effect=fake_fetch,
+    ):
+        result = await collect_embedding_models(MagicMock(), {"downloads": 10, "trendingScore": 10})
+
+    assert len(result) == 1
+
+
+@pytest.mark.asyncio
+async def test_collect_embedding_models_filters_non_embeddings() -> None:
+    async def fake_fetch(session: Mock, sort: str, limit: int):
+        return [{"id": "org/bert-base"}]
+
+    with patch(
+        "scripts.get_huggingface_models.fetch_popular_embedding_models",
+        side_effect=fake_fetch,
+    ):
+        result = await collect_embedding_models(MagicMock(), {"downloads": 10})
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_model_details_returns_size() -> None:
     data = {"siblings": [{"size": 1024**3}, {"size": 1024**3}]}
     session = _make_mock_session(data)
     sem = asyncio.Semaphore(1)
 
-    model_id, size = await fetch_model_size(session, "org/model", sem)
+    model_id, size, architectures, chat_ok = await fetch_model_details(session, "org/model", sem)
 
     assert model_id == "org/model"
     assert size == "2.0 GB"
+    assert architectures == []
+    assert chat_ok is True
 
 
 @pytest.mark.asyncio
-async def test_fetch_model_size_returns_na_when_no_siblings() -> None:
+async def test_fetch_model_details_returns_na_when_no_siblings() -> None:
     session = _make_mock_session({"siblings": []})
     sem = asyncio.Semaphore(1)
 
-    _, size = await fetch_model_size(session, "org/model", sem)
+    _, size, _, _ = await fetch_model_details(session, "org/model", sem)
 
     assert size == "N/A"
 
 
 @pytest.mark.asyncio
-async def test_fetch_model_size_returns_na_on_exception() -> None:
+async def test_fetch_model_details_returns_na_on_exception() -> None:
     mock_resp = AsyncMock()
     mock_resp.raise_for_status = MagicMock(side_effect=aiohttp.ClientResponseError(MagicMock(), (), status=404))
     mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
@@ -272,21 +492,67 @@ async def test_fetch_model_size_returns_na_on_exception() -> None:
     session.get = MagicMock(return_value=mock_resp)
     sem = asyncio.Semaphore(1)
 
-    model_id, size = await fetch_model_size(session, "org/missing", sem)
+    model_id, size, architectures, chat_ok = await fetch_model_details(session, "org/missing", sem)
 
     assert model_id == "org/missing"
     assert size == "N/A"
+    assert architectures == []
+    assert chat_ok is False
 
 
 @pytest.mark.asyncio
-async def test_fetch_model_size_skips_siblings_without_size() -> None:
+async def test_fetch_model_details_skips_siblings_without_size() -> None:
     data = {"siblings": [{"name": "config.json"}, {"size": 1024}]}
     session = _make_mock_session(data)
     sem = asyncio.Semaphore(1)
 
-    _, size = await fetch_model_size(session, "org/model", sem)
+    _, size, _, _ = await fetch_model_details(session, "org/model", sem)
 
     assert size == "1.0 KB"
+
+
+@pytest.mark.asyncio
+async def test_fetch_model_details_returns_architectures() -> None:
+    data = {"siblings": [], "config": {"architectures": ["XLMRobertaForSequenceClassification"]}}
+    session = _make_mock_session(data)
+    sem = asyncio.Semaphore(1)
+
+    _, _, architectures, _ = await fetch_model_details(session, "org/model", sem)
+
+    assert architectures == ["XLMRobertaForSequenceClassification"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_model_details_skips_chat_template_check_by_default() -> None:
+    data = {"siblings": []}
+    session = _make_mock_session(data)
+    sem = asyncio.Semaphore(1)
+
+    _, _, _, chat_ok = await fetch_model_details(session, "org/model", sem)
+
+    assert chat_ok is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_model_details_checks_chat_template_when_requested() -> None:
+    data = {"siblings": [{"rfilename": "config.json"}]}
+    session = _make_mock_session(data)
+    sem = asyncio.Semaphore(1)
+
+    _, _, _, chat_ok = await fetch_model_details(session, "org/base-model", sem, check_chat_template=True)
+
+    assert chat_ok is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_model_details_chat_template_present_when_requested() -> None:
+    data = {"siblings": [{"rfilename": "chat_template.jinja"}]}
+    session = _make_mock_session(data)
+    sem = asyncio.Semaphore(1)
+
+    _, _, _, chat_ok = await fetch_model_details(session, "org/instruct-model", sem, check_chat_template=True)
+
+    assert chat_ok is True
 
 
 @pytest.mark.asyncio
@@ -305,12 +571,14 @@ async def test_main_llm_output_json(capsys: pytest.CaptureFixture[str]) -> None:
     async def fake_collect(session: Mock, _active: dict[str, int]) -> list[dict[str, str]]:
         return models
 
-    async def fake_size(session: Mock, model_id: str, _sem: asyncio.Semaphore) -> tuple[str, str]:
-        return model_id, sizes.get(model_id, "N/A")
+    async def fake_details(
+        session: Mock, model_id: str, _sem: asyncio.Semaphore, check_chat_template: bool = False
+    ) -> tuple[str, str, list[str], bool]:
+        return model_id, sizes.get(model_id, "N/A"), [], True
 
     with (
         patch("scripts.get_huggingface_models.collect_llm_models", side_effect=fake_collect),
-        patch("scripts.get_huggingface_models.fetch_model_size", side_effect=fake_size),
+        patch("scripts.get_huggingface_models.fetch_model_details", side_effect=fake_details),
         patch(
             "aiohttp.ClientSession",
             return_value=AsyncMock(__aenter__=AsyncMock(return_value=MagicMock()), __aexit__=AsyncMock(return_value=False)),
@@ -329,16 +597,19 @@ async def test_main_llm_output_json(capsys: pytest.CaptureFixture[str]) -> None:
 async def test_main_reranker_output_json(capsys: pytest.CaptureFixture[str]) -> None:
     models = [{"id": "org/bge-reranker"}]
     sizes = {"org/bge-reranker": "1.0 GB"}
+    architectures = {"org/bge-reranker": ["XLMRobertaForSequenceClassification"]}
 
     async def fake_collect(session: Mock, active: dict[str, str]):
         return models
 
-    async def fake_size(session: Mock, model_id: str, sem: asyncio.Semaphore):
-        return model_id, sizes.get(model_id, "N/A")
+    async def fake_details(
+        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
+    ) -> tuple[str, str, list[str], bool]:
+        return model_id, sizes.get(model_id, "N/A"), architectures.get(model_id, []), True
 
     with (
         patch("scripts.get_huggingface_models.collect_reranker_models", side_effect=fake_collect),
-        patch("scripts.get_huggingface_models.fetch_model_size", side_effect=fake_size),
+        patch("scripts.get_huggingface_models.fetch_model_details", side_effect=fake_details),
         patch(
             "aiohttp.ClientSession",
             return_value=AsyncMock(__aenter__=AsyncMock(return_value=MagicMock()), __aexit__=AsyncMock(return_value=False)),
@@ -349,6 +620,102 @@ async def test_main_reranker_output_json(capsys: pytest.CaptureFixture[str]) -> 
     out = capsys.readouterr().out
     data = json.loads(out)
     assert "rerankers" in data
+    assert data["rerankers"][0]["name"] == "org/bge-reranker"
+
+
+@pytest.mark.asyncio
+async def test_main_reranker_drops_unsupported_architecture(capsys: pytest.CaptureFixture[str]) -> None:
+    models = [{"id": "org/bge-reranker"}, {"id": "org/generative-reranker"}]
+    sizes = {"org/bge-reranker": "1.0 GB", "org/generative-reranker": "4.0 GB"}
+    architectures = {
+        "org/bge-reranker": ["XLMRobertaForSequenceClassification"],
+        "org/generative-reranker": ["Qwen3ForCausalLM"],
+    }
+
+    async def fake_collect(session: Mock, active: dict[str, str]):
+        return models
+
+    async def fake_details(
+        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
+    ) -> tuple[str, str, list[str], bool]:
+        return model_id, sizes.get(model_id, "N/A"), architectures.get(model_id, []), True
+
+    with (
+        patch("scripts.get_huggingface_models.collect_reranker_models", side_effect=fake_collect),
+        patch("scripts.get_huggingface_models.fetch_model_details", side_effect=fake_details),
+        patch(
+            "aiohttp.ClientSession",
+            return_value=AsyncMock(__aenter__=AsyncMock(return_value=MagicMock()), __aexit__=AsyncMock(return_value=False)),
+        ),
+    ):
+        await main(10, 0, 0, raw=False, model_type="reranker")
+
+    out = capsys.readouterr()
+    data = json.loads(out.out)
+    names = [e["name"] for e in data["rerankers"]]
+    assert names == ["org/bge-reranker"]
+    assert "Dropped 1 reranker candidate" in out.err
+
+
+@pytest.mark.asyncio
+async def test_main_llm_drops_models_without_chat_template(capsys: pytest.CaptureFixture[str]) -> None:
+    models = [{"id": "org/llama-instruct"}, {"id": "org/llama-base"}]
+    sizes = {"org/llama-instruct": "4.0 GB", "org/llama-base": "4.0 GB"}
+    chat_capable = {"org/llama-instruct": True, "org/llama-base": False}
+
+    async def fake_collect(session: Mock, active: dict[str, int]) -> list[dict[str, str]]:
+        return models
+
+    async def fake_details(
+        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
+    ) -> tuple[str, str, list[str], bool]:
+        assert check_chat_template is True
+        return model_id, sizes.get(model_id, "N/A"), [], chat_capable.get(model_id, False)
+
+    with (
+        patch("scripts.get_huggingface_models.collect_llm_models", side_effect=fake_collect),
+        patch("scripts.get_huggingface_models.fetch_model_details", side_effect=fake_details),
+        patch(
+            "aiohttp.ClientSession",
+            return_value=AsyncMock(__aenter__=AsyncMock(return_value=MagicMock()), __aexit__=AsyncMock(return_value=False)),
+        ),
+    ):
+        await main(10, 0, 0, raw=False, model_type="llm")
+
+    out = capsys.readouterr()
+    data = json.loads(out.out)
+    names = [e["name"] for e in data["llms"]]
+    assert names == ["org/llama-instruct"]
+    assert "Dropped 1 LLM candidate" in out.err
+
+
+@pytest.mark.asyncio
+async def test_main_embedding_output_json(capsys: pytest.CaptureFixture[str]) -> None:
+    models = [{"id": "org/bge-embedding"}]
+    sizes = {"org/bge-embedding": "1.0 GB"}
+
+    async def fake_collect(session: Mock, active: dict[str, str]):
+        return models
+
+    async def fake_details(
+        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
+    ) -> tuple[str, str, list[str], bool]:
+        return model_id, sizes.get(model_id, "N/A"), [], True
+
+    with (
+        patch("scripts.get_huggingface_models.collect_embedding_models", side_effect=fake_collect),
+        patch("scripts.get_huggingface_models.fetch_model_details", side_effect=fake_details),
+        patch(
+            "aiohttp.ClientSession",
+            return_value=AsyncMock(__aenter__=AsyncMock(return_value=MagicMock()), __aexit__=AsyncMock(return_value=False)),
+        ),
+    ):
+        await main(10, 0, 0, raw=True, model_type="embedding")
+
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    assert "embeddings" in data
+    assert data["embeddings"][0]["name"] == "org/bge-embedding"
 
 
 @pytest.mark.asyncio
@@ -356,12 +723,14 @@ async def test_main_raw_false_logs_to_stderr(capsys: pytest.CaptureFixture[str])
     async def fake_collect(session: Mock, active: dict[str, str]) -> list[dict[str, str]]:
         return []
 
-    async def fake_size(session: Mock, model_id: str, sem: asyncio.Semaphore):
-        return model_id, "N/A"
+    async def fake_details(
+        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
+    ) -> tuple[str, str, list[str], bool]:
+        return model_id, "N/A", [], True
 
     with (
         patch("scripts.get_huggingface_models.collect_llm_models", side_effect=fake_collect),
-        patch("scripts.get_huggingface_models.fetch_model_size", side_effect=fake_size),
+        patch("scripts.get_huggingface_models.fetch_model_details", side_effect=fake_details),
         patch(
             "aiohttp.ClientSession",
             return_value=AsyncMock(__aenter__=AsyncMock(return_value=MagicMock()), __aexit__=AsyncMock(return_value=False)),
@@ -374,6 +743,64 @@ async def test_main_raw_false_logs_to_stderr(capsys: pytest.CaptureFixture[str])
 
 
 @pytest.mark.asyncio
+async def test_main_output_writes_file_and_preserves_other_key(tmp_path: Path) -> None:
+    output_path = tmp_path / "vllm-min.json"
+    output_path.write_text(json.dumps({"rerankers": [{"name": "org/existing-reranker", "size": "1GB"}]}))
+
+    models = [{"id": "org/llama"}]
+    sizes = {"org/llama": "4.0 GB"}
+
+    async def fake_collect(session: Mock, _active: dict[str, int]) -> list[dict[str, str]]:
+        return models
+
+    async def fake_details(
+        session: Mock, model_id: str, _sem: asyncio.Semaphore, check_chat_template: bool = False
+    ) -> tuple[str, str, list[str], bool]:
+        return model_id, sizes.get(model_id, "N/A"), [], True
+
+    with (
+        patch("scripts.get_huggingface_models.collect_llm_models", side_effect=fake_collect),
+        patch("scripts.get_huggingface_models.fetch_model_details", side_effect=fake_details),
+        patch(
+            "aiohttp.ClientSession",
+            return_value=AsyncMock(__aenter__=AsyncMock(return_value=MagicMock()), __aexit__=AsyncMock(return_value=False)),
+        ),
+    ):
+        await main(10, 0, 0, raw=True, model_type="llm", output=str(output_path))
+
+    data = json.loads(output_path.read_text())
+    assert data["llms"] == [{"name": "org/llama", "size": "4GB"}]
+    assert data["rerankers"] == [{"name": "org/existing-reranker", "size": "1GB"}]
+
+
+@pytest.mark.asyncio
+async def test_main_output_overwrites_same_key(tmp_path: Path) -> None:
+    output_path = tmp_path / "vllm-min.json"
+    output_path.write_text(json.dumps({"llms": [{"name": "org/old-model", "size": "1GB"}]}))
+
+    async def fake_collect(session: Mock, _active: dict[str, int]) -> list[dict[str, str]]:
+        return [{"id": "org/new-model"}]
+
+    async def fake_details(
+        session: Mock, model_id: str, _sem: asyncio.Semaphore, check_chat_template: bool = False
+    ) -> tuple[str, str, list[str], bool]:
+        return model_id, "2.0 GB", [], True
+
+    with (
+        patch("scripts.get_huggingface_models.collect_llm_models", side_effect=fake_collect),
+        patch("scripts.get_huggingface_models.fetch_model_details", side_effect=fake_details),
+        patch(
+            "aiohttp.ClientSession",
+            return_value=AsyncMock(__aenter__=AsyncMock(return_value=MagicMock()), __aexit__=AsyncMock(return_value=False)),
+        ),
+    ):
+        await main(10, 0, 0, raw=True, model_type="llm", output=str(output_path))
+
+    data = json.loads(output_path.read_text())
+    assert data["llms"] == [{"name": "org/new-model", "size": "2GB"}]
+
+
+@pytest.mark.asyncio
 async def test_main_active_dict_built_correctly() -> None:
     captured_active: dict[str, str] = {}
 
@@ -381,12 +808,14 @@ async def test_main_active_dict_built_correctly() -> None:
         captured_active.update(active)
         return []
 
-    async def fake_size(session: Mock, model_id: str, sem: asyncio.Semaphore):
-        return model_id, "N/A"
+    async def fake_details(
+        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
+    ) -> tuple[str, str, list[str], bool]:
+        return model_id, "N/A", [], True
 
     with (
         patch("scripts.get_huggingface_models.collect_llm_models", side_effect=fake_collect),
-        patch("scripts.get_huggingface_models.fetch_model_size", side_effect=fake_size),
+        patch("scripts.get_huggingface_models.fetch_model_details", side_effect=fake_details),
         patch(
             "aiohttp.ClientSession",
             return_value=AsyncMock(__aenter__=AsyncMock(return_value=MagicMock()), __aexit__=AsyncMock(return_value=False)),

@@ -11,6 +11,8 @@ import argparse
 import asyncio
 import json
 import sys
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -50,10 +52,72 @@ def is_llm(model: dict[str, Any]) -> bool:
     return not any(kw in name for kw in exclude)
 
 
+def is_gguf(model: dict[str, Any]) -> bool:
+    """Filter out GGUF-quantized models, which vLLM doesn't support."""
+    name = model.get("id", "").lower()
+    tags = [t.lower() for t in model.get("tags", [])]
+    return "gguf" in name or "gguf" in tags
+
+
 def is_reranker(model: dict[str, Any]) -> bool:
     """Filter reranker models by name heuristic."""
     name = model.get("id", "").lower()
     return "rerank" in name
+
+
+def is_embedding(model: dict[str, Any]) -> bool:
+    """Filter embedding models by name heuristic."""
+    name = model.get("id", "").lower()
+    return "embed" in name
+
+
+def is_supported_cross_encoder(architectures: list[str]) -> bool:
+    """Return True if any architecture is a standard HF sequence-classification head.
+
+    vLLM's rerank/score task only serves this kind of cross-encoder. Models named "reranker"
+    that use a different architecture (e.g. a causal LM doing generative ranking, or a custom
+    multi-vector ranking head) fail to load in vLLM even though they match the name heuristic.
+    """
+    return any(a.endswith("ForSequenceClassification") for a in architectures)
+
+
+async def has_chat_template(session: aiohttp.ClientSession, model_id: str, siblings: list[dict[str, Any]]) -> bool:
+    """Return True if the model ships a chat template vLLM can use for chat completions.
+
+    As of transformers v4.44, vLLM no longer falls back to a generic template, so serving a
+    model whose tokenizer defines none raises a 400 on every chat request. Newer repos carry a
+    standalone `chat_template.jinja` file; older ones embed a `chat_template` key in
+    `tokenizer_config.json`. Base/pretrain models typically have neither.
+    """
+    filenames = {f.get("rfilename", "") for f in siblings}
+    if "chat_template.jinja" in filenames:
+        return True
+    if "tokenizer_config.json" not in filenames:
+        return False
+    try:
+        tokenizer_config = await get_json_with_retry(
+            session, f"https://huggingface.co/{model_id}/raw/main/tokenizer_config.json", {}, max_retries=3
+        )
+        return bool(tokenizer_config.get("chat_template"))
+    except Exception:
+        return False
+
+
+async def get_json_with_retry(session: aiohttp.ClientSession, url: str, params: dict[str, str], max_retries: int = 5) -> Any:  # noqa: ANN401
+    """GET url as JSON, retrying with backoff when HuggingFace rate-limits (429) or errors transiently (5xx)."""
+    for attempt in range(max_retries):
+        async with session.get(url, params=params) as resp:
+            try:
+                resp.raise_for_status()
+            except aiohttp.ClientResponseError as exc:
+                if (exc.status != 429 and exc.status < 500) or attempt == max_retries - 1:
+                    raise
+                retry_after = resp.headers.get("Retry-After")
+                delay = float(retry_after) if retry_after else min(2.0**attempt, 30.0)
+                await asyncio.sleep(delay)
+                continue
+            return await resp.json(content_type=None)
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 async def fetch_popular_models(session: aiohttp.ClientSession, tag: str, sort: str, limit: int) -> list[dict[str, Any]]:
@@ -65,23 +129,31 @@ async def fetch_popular_models(session: aiohttp.ClientSession, tag: str, sort: s
         "limit": str(limit),
         "cardData": "true",
     }
-    async with session.get(f"{HF_API}/models", params=params) as resp:
-        resp.raise_for_status()
-        return await resp.json()
+    return await get_json_with_retry(session, f"{HF_API}/models", params)
 
 
 async def fetch_popular_reranker_models(session: aiohttp.ClientSession, sort: str, limit: int) -> list[dict[str, Any]]:
     """Fetch popular reranker models from HuggingFace API sorted by the given criterion."""
     params = {
-        "other": "reranker",
+        "search": "rerank",
         "sort": sort,
         "direction": "-1",
         "limit": str(limit),
         "cardData": "true",
     }
-    async with session.get(f"{HF_API}/models", params=params) as resp:
-        resp.raise_for_status()
-        return await resp.json()
+    return await get_json_with_retry(session, f"{HF_API}/models", params)
+
+
+async def fetch_popular_embedding_models(session: aiohttp.ClientSession, sort: str, limit: int) -> list[dict[str, Any]]:
+    """Fetch popular embedding models from HuggingFace API sorted by the given criterion."""
+    params = {
+        "search": "embed",
+        "sort": sort,
+        "direction": "-1",
+        "limit": str(limit),
+        "cardData": "true",
+    }
+    return await get_json_with_retry(session, f"{HF_API}/models", params)
 
 
 async def collect_llm_models(session: aiohttp.ClientSession, active: dict[str, int]) -> list[dict[str, Any]]:
@@ -93,7 +165,7 @@ async def collect_llm_models(session: aiohttp.ClientSession, active: dict[str, i
     for batch in results:
         for m in batch:
             mid = m["id"]
-            if mid not in seen and is_llm(m):
+            if mid not in seen and is_llm(m) and not is_gguf(m):
                 seen.add(mid)
                 models.append(m)
     return models
@@ -108,27 +180,71 @@ async def collect_reranker_models(session: aiohttp.ClientSession, active: dict[s
     for batch in results:
         for m in batch:
             mid = m["id"]
-            if mid not in seen and is_reranker(m):
+            if mid not in seen and is_reranker(m) and not is_gguf(m):
                 seen.add(mid)
                 models.append(m)
     return models
 
 
-async def fetch_model_size(session: aiohttp.ClientSession, model_id: str, sem: asyncio.Semaphore) -> tuple[str, str]:
-    """Return (model_id, human_readable_size)."""
+async def collect_embedding_models(session: aiohttp.ClientSession, active: dict[str, int]) -> list[dict[str, Any]]:
+    """Fetch and deduplicate embedding models across all sort combinations."""
+    fetch_tasks = [fetch_popular_embedding_models(session, sort, limit) for sort, limit in active.items()]
+    results = await asyncio.gather(*fetch_tasks)
+    seen: set[str] = set()
+    models: list[dict[str, Any]] = []
+    for batch in results:
+        for m in batch:
+            mid = m["id"]
+            if mid not in seen and is_embedding(m) and not is_gguf(m):
+                seen.add(mid)
+                models.append(m)
+    return models
+
+
+async def fetch_model_details(
+    session: aiohttp.ClientSession, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
+) -> tuple[str, str, list[str], bool]:
+    """Return (model_id, human_readable_size, architectures, has_chat_template).
+
+    `has_chat_template` is only checked when `check_chat_template` is set (LLM candidates); it is
+    True by default for reranker/embedding candidates, for which the check is meaningless.
+    """
     async with sem:
         try:
-            async with session.get(f"{HF_API}/models/{model_id}", params={"blobs": "true"}) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-            total = sum(f.get("size", 0) for f in data.get("siblings", []) if f.get("size"))
-            return model_id, fmt_size(total) if total else "N/A"
+            data = await get_json_with_retry(session, f"{HF_API}/models/{model_id}", {"blobs": "true"}, max_retries=3)
+            siblings = data.get("siblings", [])
+            total = sum(f.get("size", 0) for f in siblings if f.get("size"))
+            architectures = data.get("config", {}).get("architectures") or []
+            chat_ok = await has_chat_template(session, model_id, siblings) if check_chat_template else True
+            return model_id, fmt_size(total) if total else "N/A", architectures, chat_ok
         except Exception:
-            return model_id, "N/A"
+            return model_id, "N/A", [], False
 
 
-async def main(top_by_downloads: int, top_by_likes: int, top_by_trending: int, raw: bool, model_type: str) -> None:
-    """Fetch models from HuggingFace and print a vllm-min.json compatible registry."""
+def _drop_unsupported_models(
+    registry_key: str,
+    models: list[dict[str, Any]],
+    architectures: dict[str, list[str]],
+    chat_capable: dict[str, bool],
+    log: Callable[[str], None],
+) -> list[dict[str, Any]]:
+    """Drop candidates vLLM can't actually serve for the given registry, logging what was dropped."""
+    before = len(models)
+    if registry_key == "rerankers":
+        models = [m for m in models if is_supported_cross_encoder(architectures.get(m["id"], []))]
+        if dropped := before - len(models):
+            log(f"Dropped {dropped} reranker candidate(s) whose architecture vLLM can't serve as a cross-encoder.")
+    elif registry_key == "llms":
+        models = [m for m in models if chat_capable.get(m["id"], False)]
+        if dropped := before - len(models):
+            log(f"Dropped {dropped} LLM candidate(s) without a usable chat template (base/pretrain models vLLM can't serve for chat).")
+    return models
+
+
+async def main(
+    top_by_downloads: int, top_by_likes: int, top_by_trending: int, raw: bool, model_type: str, output: str | None = None
+) -> None:
+    """Fetch models from HuggingFace and print (or write) a vllm-min.json compatible registry."""
 
     def log(msg: str) -> None:
         if not raw:
@@ -156,20 +272,40 @@ async def main(top_by_downloads: int, top_by_likes: int, top_by_trending: int, r
         if model_type == "reranker":
             models = await collect_reranker_models(session, active)
             registry_key = "rerankers"
+        elif model_type == "embedding":
+            models = await collect_embedding_models(session, active)
+            registry_key = "embeddings"
         else:
             models = await collect_llm_models(session, active)
             registry_key = "llms"
 
         log(f"Fetching disk sizes for {len(models)} unique models concurrently (max {CONCURRENCY} at a time)...")
         sem = asyncio.Semaphore(CONCURRENCY)
-        sizes = dict(await asyncio.gather(*[fetch_model_size(session, m["id"], sem) for m in models]))
+        check_chat_template = registry_key == "llms"
+        details = await asyncio.gather(*[fetch_model_details(session, m["id"], sem, check_chat_template) for m in models])
+        sizes = {mid: size for mid, size, _, _ in details}
+        architectures = {mid: arch for mid, _, arch, _ in details}
+        chat_capable = {mid: chat_ok for mid, _, _, chat_ok in details}
 
-    registry: dict[str, Any] = {registry_key: []}
+    models = _drop_unsupported_models(registry_key, models, architectures, chat_capable, log)
+
+    entries: list[dict[str, str]] = []
     for m in models:
         mid = m["id"]
         size = fmt_size_compact(sizes.get(mid, "N/A"))
-        registry[registry_key].append({"name": mid, "size": size})
-    print(json.dumps(registry, indent=4))
+        entries.append({"name": mid, "size": size})
+    entries.sort(key=lambda e: e["name"].casefold())
+
+    if output is None:
+        print(json.dumps({registry_key: entries}, indent=4))
+        return
+
+    output_path = Path(output)
+    registry: dict[str, Any] = json.loads(output_path.read_text(encoding="utf-8")) if output_path.exists() else {}
+    registry[registry_key] = entries
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(registry, indent=4), encoding="utf-8")
+    log(f"Written {len(entries)} {registry_key} to {output_path}")
 
 
 if __name__ == "__main__":
@@ -178,6 +314,9 @@ if __name__ == "__main__":
     p.add_argument("--top-by-likes", type=int, default=0, metavar="N", help="Fetch top N models sorted by likes")
     p.add_argument("--top-by-trending", type=int, default=0, metavar="N", help="Fetch top N models sorted by trending score")
     p.add_argument("--raw", action="store_true", help="Output JSON only, suppress progress messages")
-    p.add_argument("--type", choices=["llm", "reranker"], default="llm", dest="model_type", help="Model type to fetch (default: llm)")
+    p.add_argument(
+        "--type", choices=["llm", "reranker", "embedding"], default="llm", dest="model_type", help="Model type to fetch (default: llm)"
+    )
+    p.add_argument("--output", default=None, metavar="PATH", help="Write into PATH, merging into its existing keys, instead of stdout")
     args = p.parse_args()
-    asyncio.run(main(args.top_by_downloads, args.top_by_likes, args.top_by_trending, args.raw, args.model_type))
+    asyncio.run(main(args.top_by_downloads, args.top_by_likes, args.top_by_trending, args.raw, args.model_type, args.output))

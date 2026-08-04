@@ -694,3 +694,27 @@ async def test_download_with_ollama_raises_with_raw_error_for_unknown_errors() -
 
     assert exc_info.value.status_code == 400
     assert "some unexpected ollama error" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_download_with_ollama_logs_progress_percentage(caplog: pytest.LogCaptureFixture) -> None:
+    svc = _make_service()
+    stream = MagicMock()
+
+    async def mock_stream(*args: object, **kwargs: object):  # type: ignore[misc]
+        yield FetchResult(status_code=200, data=json.dumps({"digest": "sha256:abc", "completed": 2_000_000_000}))
+        yield FetchResult(status_code=200, data=json.dumps({"status": "success"}))
+        # Ollama keeps streaming "success" statuses after completion for small models — the
+        # 100% log line must not repeat for each of them.
+        yield FetchResult(status_code=200, data=json.dumps({"status": "success"}))
+        yield FetchResult(status_code=200, data=json.dumps({"status": "success"}))
+
+    with (
+        patch("server.services.ollama_service.stream_fetch_from", side_effect=mock_stream),
+        caplog.at_level("INFO", logger="uvicorn.error"),
+    ):
+        await svc._download_with_ollama(stream, "http://localhost:11434", "llama3", "4GB")  # pyright: ignore[reportPrivateUsage]
+
+    assert "llama3" in caplog.text
+    assert "50%" in caplog.text
+    assert caplog.text.count("100%") == 1

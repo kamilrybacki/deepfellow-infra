@@ -12,7 +12,7 @@ from fastapi import HTTPException
 
 from server.docker import ContainerStatus
 from server.models.models import InstallModelIn, ListModelsFilters, UninstallModelIn
-from server.models.services import InstallServiceIn, UninstallServiceIn
+from server.models.services import GpuStats, InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import CustomModel, Instance, InstanceConfig
 from server.services.vllm_service import (
     DownloadedInfo,
@@ -535,6 +535,46 @@ async def test_get_gpu_memory_utilization_raises_422_when_sum_exceeds_1(svc: Vll
 
 
 @pytest.mark.asyncio
+async def test_get_default_gpu_memory_utilization_uses_free_fraction_with_margin(svc: VllmService, deps: dict[str, Any]) -> None:
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=5.0, gpus=None))
+
+    result = await svc._get_default_gpu_memory_utilization()  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.45
+
+
+@pytest.mark.asyncio
+async def test_get_default_gpu_memory_utilization_caps_at_default_when_gpu_is_free(svc: VllmService, deps: dict[str, Any]) -> None:
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+
+    result = await svc._get_default_gpu_memory_utilization()  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.9
+
+
+@pytest.mark.asyncio
+async def test_get_default_gpu_memory_utilization_falls_back_when_stats_unavailable(svc: VllmService, deps: dict[str, Any]) -> None:
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=None)
+
+    result = await svc._get_default_gpu_memory_utilization()  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.9
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_uses_dynamic_default_when_unset(svc: VllmService, deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=5.0, gpus=None))
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions()
+
+    result = await svc._get_gpu_memory_utilization(opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.45
+    assert svc.gpu_memory_utilization == 0.45
+
+
+@pytest.mark.asyncio
 async def test_get_quantization_returns_valid_value(svc: VllmService) -> None:
     model = VllmModel(hf_id="google/test", size="1GB")
     opts = VllmModelOptions(quantization="fp8")
@@ -608,6 +648,24 @@ def test_register_model_endpoint_reranker_calls_rerank_proxy(svc: VllmService, d
 
     assert deps["endpoint_registry"].register_rerank_as_proxy.call_count == 1
     assert deps["endpoint_registry"].register_chat_completion_as_proxy.call_count == 0
+
+
+def test_register_model_endpoint_embedding_calls_embeddings_proxy(svc: VllmService, deps: dict[str, Any]) -> None:
+    model = VllmModel(hf_id="google/embedder", size="1GB", model_type="embedding")
+    model_info = _make_model_installed_info("google/embedder", model_type="embedding")
+
+    svc._register_model_endpoint(  # pyright: ignore[reportPrivateUsage]
+        model_info=model_info,
+        model=model,
+        registered_name="google/embedder",
+        model_id="google/embedder",
+        context_window=None,
+        max_context_window=None,
+    )
+
+    assert deps["endpoint_registry"].register_embeddings_as_proxy.call_count == 1
+    assert deps["endpoint_registry"].register_chat_completion_as_proxy.call_count == 0
+    assert deps["endpoint_registry"].register_rerank_as_proxy.call_count == 0
 
 
 def test_get_image_true_returns_gpu_image(svc: VllmService) -> None:
@@ -759,6 +817,116 @@ async def test_install_model_docker_failure_decrements_gpu_memory(svc: VllmServi
     assert svc2.gpu_memory_utilization == 0.0
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("the estimated maximum model length is 110256.", 110256),
+        ("estimated maximum model length is 4096", 4096),
+        ("docker failed for some other reason", None),
+    ],
+)
+def test_parse_kv_cache_max_len_suggestion(raw: str, expected: int | None) -> None:
+    assert VllmService._parse_kv_cache_max_len_suggestion(raw) == expected  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_install_model_retries_with_suggested_max_len_on_kv_cache_error(
+    svc: VllmService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    nvidia = MagicMock(spec=NvidiaGpuInfo)
+    deps["hardware"].gpus = [nvidia]
+    svc2 = VllmService(**deps)
+    installed = _make_installed_info(hardware=True)
+    svc2.instances_info["default"].installed = installed
+    kv_cache_error = RuntimeError(
+        "ValueError: To serve at least one request with the models's max seq len (131072), "
+        "(4.0 GiB KV cache is needed, which is larger than the available KV cache memory (3.37 GiB). "
+        "Based on the available memory, the estimated maximum model length is 110256."
+    )
+    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[kv_cache_error, 8000])
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "container"
+    deps["docker_service"].get_container_host.return_value = "localhost"
+    deps["docker_service"].get_container_port.return_value = 8000
+    deps["docker_service"].stop_docker = AsyncMock()
+    model_id = next(iter(svc2.models["default"]))
+
+    with (
+        patch.object(svc2, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=131072),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc2, "get_specified_hardware_parts", return_value=[nvidia]),
+        patch.object(svc2, "is_given_hardware_support_gpu", return_value=True),
+    ):
+        promise = await svc2._install_model("default", model_id, InstallModelIn(spec={"gpu_memory_utilization": 0.5}))  # pyright: ignore[reportPrivateUsage]
+        result = await promise.wait()
+
+    assert result.status == "OK"
+    assert deps["docker_service"].install_and_run_docker.call_count == 2
+    register_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
+    assert register_kwargs["props"].context_window == 110256
+
+
+@pytest.mark.asyncio
+async def test_install_model_does_not_retry_when_max_model_length_is_explicit(
+    svc: VllmService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    nvidia = MagicMock(spec=NvidiaGpuInfo)
+    deps["hardware"].gpus = [nvidia]
+    svc2 = VllmService(**deps)
+    installed = _make_installed_info(hardware=True)
+    svc2.instances_info["default"].installed = installed
+    kv_cache_error = RuntimeError("the estimated maximum model length is 110256.")
+    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=kv_cache_error)
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "container"
+    deps["docker_service"].stop_docker = AsyncMock()
+    model_id = next(iter(svc2.models["default"]))
+
+    with (
+        patch.object(svc2, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc2, "get_specified_hardware_parts", return_value=[nvidia]),
+        patch.object(svc2, "is_given_hardware_support_gpu", return_value=True),
+    ):
+        promise = await svc2._install_model(  # pyright: ignore[reportPrivateUsage]
+            "default", model_id, InstallModelIn(spec={"gpu_memory_utilization": 0.5, "max_model_length": 4096})
+        )
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert deps["docker_service"].install_and_run_docker.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_install_model_reraises_when_retry_also_fails(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    nvidia = MagicMock(spec=NvidiaGpuInfo)
+    deps["hardware"].gpus = [nvidia]
+    svc2 = VllmService(**deps)
+    installed = _make_installed_info(hardware=True)
+    svc2.instances_info["default"].installed = installed
+    kv_cache_error = RuntimeError("the estimated maximum model length is 110256.")
+    retry_error = RuntimeError("still failing")
+    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[kv_cache_error, retry_error])
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "container"
+    deps["docker_service"].stop_docker = AsyncMock()
+    model_id = next(iter(svc2.models["default"]))
+
+    with (
+        patch.object(svc2, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc2, "get_specified_hardware_parts", return_value=[nvidia]),
+        patch.object(svc2, "is_given_hardware_support_gpu", return_value=True),
+    ):
+        promise = await svc2._install_model("default", model_id, InstallModelIn(spec={"gpu_memory_utilization": 0.5}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError, match="still failing"):
+            await promise.wait()
+
+    assert deps["docker_service"].install_and_run_docker.call_count == 2
+    assert deps["docker_service"].stop_docker.call_count == 2
+
+
 @pytest.mark.asyncio
 async def test_uninstall_model_removes_from_installed_and_unregisters_endpoint(svc: VllmService, deps: dict[str, Any]) -> None:
     installed = _make_installed_info()
@@ -829,6 +997,21 @@ async def test_uninstall_model_reranker_calls_unregister_rerank(svc: VllmService
     assert deps["endpoint_registry"].unregister_rerank.call_count == 1
     assert deps["endpoint_registry"].unregister_rerank.call_args == call("reranker-model", "reg-rerank")
     assert deps["endpoint_registry"].unregister_chat_completion.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_uninstall_model_embedding_calls_unregister_embeddings(svc: VllmService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info()
+    installed.models["embedder-model"] = _make_model_installed_info("embedder-model", "reg-embed", model_type="embedding")
+    svc.instances_info["default"].installed = installed
+    deps["docker_service"].uninstall_docker = AsyncMock()
+
+    await svc._uninstall_model("default", "embedder-model", UninstallModelIn(purge=False))  # pyright: ignore[reportPrivateUsage]
+
+    assert deps["endpoint_registry"].unregister_embeddings.call_count == 1
+    assert deps["endpoint_registry"].unregister_embeddings.call_args == call("embedder-model", "reg-embed")
+    assert deps["endpoint_registry"].unregister_chat_completion.call_count == 0
+    assert deps["endpoint_registry"].unregister_rerank.call_count == 0
 
 
 @pytest.mark.asyncio

@@ -42,6 +42,22 @@ ARCH_ALIASES = {
 
 ARCHES_WITH_REQUIRED_VARIANT = ["arm", "arm64"]
 
+# Cap on how many trailing characters of docker compose logs are surfaced in the short
+# exception message shown in the WebUI when no line matches _ERROR_LINE_MARKERS.
+_SHORT_LOG_CHARS = 500
+
+# Cap on how many trailing characters of docker compose logs are written to logger.error.
+# Much larger than _SHORT_LOG_CHARS since this is for server-side debugging, not the WebUI,
+# but a failed model download can still emit megabytes of progress lines — stay bounded.
+_MAX_LOGGED_CHARS = 20_000
+
+# Substrings that mark a log line as actually describing the failure, as opposed to routine
+# startup chatter — used to pick a short, relevant excerpt instead of an arbitrary tail cut.
+_ERROR_LINE_MARKERS = ("error", "fatal", "exception", "traceback", "panic", "critical")
+
+# How many matched error lines to keep, most recent first.
+_MAX_ERROR_LINES = 5
+
 # Substrings that indicate the NVIDIA container toolkit is not installed.
 _GPU_TOOLKIT_PATTERNS = (
     "could not select device driver",
@@ -74,10 +90,34 @@ def _diagnose_gpu_error(text: str) -> str | None:
     return None
 
 
-_CONTAINER_NAME_CONFLICT_PATTERNS = (
-    "is already in use",
-    "name is already in use",
-)
+_CONTAINER_NAME_CONFLICT_PATTERNS = ("is already in use",)
+
+
+def _short_log_snippet(logs: str) -> str:
+    """Return the last _SHORT_LOG_CHARS characters of *logs*, for a bounded user-facing message."""
+    if len(logs) <= _SHORT_LOG_CHARS:
+        return logs
+    return f"...(see server logs for full output)...\n{logs[-_SHORT_LOG_CHARS:]}"
+
+
+def _bounded_for_logging(text: str) -> str:
+    """Return the last _MAX_LOGGED_CHARS characters of *text*, so a runaway container can't flood the server log."""
+    if len(text) <= _MAX_LOGGED_CHARS:
+        return text
+    return f"...(truncated, {len(text) - _MAX_LOGGED_CHARS} chars omitted)...\n{text[-_MAX_LOGGED_CHARS:]}"
+
+
+def _extract_error_excerpt(logs: str) -> str:
+    """Return the most relevant lines of *logs* for a short user-facing message.
+
+    Picks lines that look like they actually describe the failure (see _ERROR_LINE_MARKERS)
+    instead of an arbitrary tail cut, so unrelated startup chatter doesn't crowd out the cause.
+    Falls back to a plain tail snippet when nothing matches.
+    """
+    matches = [line for line in logs.splitlines() if any(marker in line.lower() for marker in _ERROR_LINE_MARKERS)]
+    if not matches:
+        return _short_log_snippet(logs)
+    return "\n".join(matches[-_MAX_ERROR_LINES:])
 
 
 def _is_container_name_conflict(text: str) -> bool:
@@ -870,15 +910,22 @@ class DockerService:
                 port = await self.create_compose_file(compose_path, options)
                 start_output = await self.start_docker_compose(compose_path)
         except DockerComposeStartError as exc:
-            combined = f"{exc.stdout}\n{exc.stderr}"
+            exc_output = "\n".join(filter(None, [exc.stdout, exc.stderr]))
+            if _is_container_name_conflict(exc_output):
+                name = options.container_name or options.name
+                raise HTTPException(409, f"A container named '{name}' already exists — remove it or choose a different name.") from None
+            logs = ""
+            with suppress(Exception):
+                logs = await self.get_docker_compose_logs(compose_path)
+            combined = "\n".join(filter(None, [exc_output, logs]))
             if uses_gpu:
                 gpu_msg = _diagnose_gpu_error(combined)
                 if gpu_msg:
                     raise AppError(gpu_msg) from None
-            if _is_container_name_conflict(combined):
-                name = options.container_name or options.name
-                raise HTTPException(409, f"A container named '{name}' already exists — remove it or choose a different name.") from None
-            msg = f"Failed to start {options.name}: {exc.stderr or exc.stdout}"
+            if logs:
+                logger.exception("Failed to start %s — full compose logs:\n%s", options.name, _bounded_for_logging(combined))
+            short = "\n".join(filter(None, [exc_output, _extract_error_excerpt(logs)]))
+            msg = f"Failed to start {options.name}: {short or 'unknown error, see server logs for details'}"
             raise AppError(msg) from None
         return start_output, port
 
@@ -904,9 +951,21 @@ class DockerService:
             gpu_msg = _diagnose_gpu_error(combined)
             if gpu_msg:
                 raise AppError(gpu_msg)
+        if logs:
+            logger.error("Container %s failed to become healthy — full compose logs:\n%s", options.name, _bounded_for_logging(combined))
+        short = "\n".join(
+            filter(
+                None,
+                [
+                    start_output.stdout if start_output else "",
+                    start_output.stderr if start_output else "",
+                    _extract_error_excerpt(logs),
+                ],
+            )
+        )
         msg = f"Container {options.name} failed to become healthy"
-        if combined:
-            msg = f"{msg}:\n{combined}"
+        if short:
+            msg = f"{msg}:\n{short}"
         raise AppError(msg)
 
     async def install_and_run_docker(self, options: DockerOptions) -> int:

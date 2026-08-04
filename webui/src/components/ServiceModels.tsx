@@ -64,6 +64,10 @@ import {
   useModelInstallProgress,
 } from "@/state/install-progress-store";
 import {
+  renderMarkdownLinks,
+  stripMarkdownLinks,
+} from "@/utils/markdown-links";
+import {
   COMPLETION_SMOOTH_MIN_MS,
   COMPLETION_SMOOTH_MS,
   getStepPerTick,
@@ -73,9 +77,9 @@ import type { SimulationHandle } from "@/utils/progress-simulation";
 import type { ProgressEvent } from "@/utils/sse-stream";
 import { getStageLabel } from "@/utils/sse-stream";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "@tanstack/react-router";
 import { AlertCircle, ExternalLink, Info, MoreVertical } from "lucide-react";
 import {
-  type ReactNode,
   type RefObject,
   memo,
   startTransition,
@@ -102,33 +106,19 @@ import { TestResultModal } from "./TestResultModal";
 import { UninstallWithPurgeModal } from "./UninstallWithPurgeModal";
 import { WarningsModal } from "./WarningsModal";
 
-const MARKDOWN_LINK_RE = /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g;
+// Backend surfaces these env var names in error messages when a model download needs
+// credentials — point the user at the config page instead of leaving them to guess.
+const CONFIG_ENV_VAR_MARKERS = ["DF_HUGGING_FACE_TOKEN", "DF_CIVITAI_TOKEN"];
 
-function renderMarkdownLinks(text: string): ReactNode {
-  const parts: ReactNode[] = [];
-  let last = 0;
-  for (const m of text.matchAll(MARKDOWN_LINK_RE)) {
-    if (m.index > last) parts.push(text.slice(last, m.index));
-    parts.push(
-      <a
-        key={m.index}
-        href={m[2]}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="underline hover:text-foreground"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {m[1]}
-      </a>,
-    );
-    last = m.index + m[0].length;
-  }
-  if (last < text.length) parts.push(text.slice(last));
-  return parts;
+function needsConfigPageLink(message: string): boolean {
+  return CONFIG_ENV_VAR_MARKERS.some((marker) => message.includes(marker));
 }
 
-function stripMarkdownLinks(text: string): string {
-  return text.replace(MARKDOWN_LINK_RE, "$1");
+function configPageToastAction(navigate: ReturnType<typeof useNavigate>) {
+  return {
+    label: "Open Configuration",
+    onClick: () => navigate({ to: "/dashboard/config" }),
+  };
 }
 
 interface ServiceModelsProps {
@@ -137,6 +127,7 @@ interface ServiceModelsProps {
 
 export function ServiceModels({ serviceId }: ServiceModelsProps) {
   const modal = useModal();
+  const navigate = useNavigate();
   const [filterText, setFilterText] = useState("");
   const deferredFilterText = useDeferredValue(filterText);
   const [filterType, setFilterType] = useState<string>("__all");
@@ -359,9 +350,12 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
                 sim.stop();
                 delete simulationStopFnsRef.current[simKey];
                 clearModelInstallProgress(serviceId, modelId);
-                toast.error(
-                  `Installation failed for ${modelId}: ${event.details || "Unknown error"}`,
-                );
+                const message = `Installation failed for ${modelId}: ${event.details || "Unknown error"}`;
+                toast.error(renderMarkdownLinks(message), {
+                  action: needsConfigPageLink(message)
+                    ? configPageToastAction(navigate)
+                    : undefined,
+                });
               }
             }
           },
@@ -388,7 +382,7 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
     return () => {
       for (const cleanup of cleanups) cleanup();
     };
-  }, [modelsData, serviceId, queryClient]);
+  }, [modelsData, serviceId, queryClient, navigate]);
 
   // Cancel an in-progress install: stop the backend Docker pull, abort the local SSE read, and reset the UI.
   const handleCancelInstall = useCallback(
@@ -588,11 +582,15 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
         clearModelInstallProgress(serviceId, modelId);
         const toastId = toastIdsRef.current[modelId];
         if (toastId) {
-          // action: undefined removes the Cancel button — there is nothing left to cancel.
-          toast.error(
-            `Failed to install model ${modelId}: ${(e instanceof Error ? e.message : "") || "Installation failed"}`,
-            { id: toastId, action: undefined },
-          );
+          const message = `Failed to install model ${modelId}: ${(e instanceof Error ? e.message : "") || "Installation failed"}`;
+          // action: undefined removes the Cancel button — there is nothing left to cancel,
+          // unless the error itself points at a config value the user should go fix.
+          toast.error(renderMarkdownLinks(message), {
+            id: toastId,
+            action: needsConfigPageLink(message)
+              ? configPageToastAction(navigate)
+              : undefined,
+          });
           delete toastIdsRef.current[modelId];
         }
       } finally {
@@ -645,7 +643,12 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
       // Finish toast is handled in the SSE callback. If we failed before streaming starts,
       // fall back to a plain error toast.
       if (!toastIdsRef.current[modelId]) {
-        toast.error(`Failed to install model: ${error.message}`);
+        const message = `Failed to install model: ${error.message}`;
+        toast.error(renderMarkdownLinks(message), {
+          action: needsConfigPageLink(message)
+            ? configPageToastAction(navigate)
+            : undefined,
+        });
       }
       clearModelInstallProgress(serviceId, modelId);
     },

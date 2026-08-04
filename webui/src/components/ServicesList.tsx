@@ -35,6 +35,7 @@ import {
   setServiceInstallProgress,
   useInstallProgressSnapshot,
 } from "@/state/install-progress-store";
+import { renderMarkdownLinks } from "@/utils/markdown-links";
 import {
   COMPLETION_SMOOTH_MIN_MS,
   COMPLETION_SMOOTH_MS,
@@ -246,7 +247,9 @@ export function ServicesList() {
                 delete simulationStopFnsRef.current[serviceId];
                 clearServiceInstallProgress(serviceId);
                 toast.error(
-                  `Installation failed for ${serviceId}: ${event.details || "Unknown error"}`,
+                  renderMarkdownLinks(
+                    `Installation failed for ${serviceId}: ${event.details || "Unknown error"}`,
+                  ),
                 );
               }
             }
@@ -398,7 +401,9 @@ export function ServicesList() {
       hasWarningsRef.current = false;
       clearServiceInstallProgress(variables.serviceId);
       toast.error(
-        `Failed to ${variables.update ? "update" : "install"} service: ${error.message}`,
+        renderMarkdownLinks(
+          `Failed to ${variables.update ? "update" : "install"} service: ${error.message}`,
+        ),
       );
     },
     onSettled: () => {
