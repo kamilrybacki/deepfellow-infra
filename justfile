@@ -74,3 +74,8 @@ get-ollama-models *FLAGS:
 clear-ollama-cache:
     uv run python ./scripts/get_ollama_models.py --clear-cache
 
+get-vllm-models *FLAGS:
+    uv run python ./scripts/get_huggingface_models.py --type llm --top-by-downloads 200 --top-by-likes 100 --top-by-trending 50 --output static/vllm-min.json {{FLAGS}}
+    uv run python ./scripts/get_huggingface_models.py --type reranker --top-by-downloads 10 --top-by-trending 10 --output static/vllm-min.json {{FLAGS}}
+    uv run python ./scripts/get_huggingface_models.py --type embedding --top-by-downloads 10 --top-by-trending 10 --output static/vllm-min.json {{FLAGS}}
+

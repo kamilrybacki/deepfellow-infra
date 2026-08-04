@@ -18,9 +18,20 @@ from aiohttp import ClientSession
 from fastapi import HTTPException
 
 from server.config import AppSettings
-from server.utils.core import DownloadPacket, HttpClientError, PreDownloadPacket, SuccessDownloadPacket, Utils, download_file
+from server.utils.core import (
+    DownloadedPacket,
+    DownloadPacket,
+    HttpClientError,
+    PreDownloadPacket,
+    SuccessDownloadPacket,
+    Utils,
+    download_file,
+)
+from server.utils.loading import Progress
 
 logger = logging.getLogger("uvicorn.error")
+
+_PROGRESS_LOG_STEP = 0.1  # log every ~10% of progress so the console isn't flooded with updates
 
 
 class BDownloader:
@@ -30,24 +41,28 @@ class BDownloader:
     def check_url(self, url: str) -> bool:
         """Check is url handled by this downloader."""
 
-    def create_error_msg(self, msg: str) -> str | dict[str, Any]:
+    def create_error_msg(self, msg: str, model_page_url: str | None = None) -> str | dict[str, Any]:
         """Create new string with error msg modifiers."""
         try:
             data = json.loads(msg)
             if isinstance(data, dict) and "message" in data and isinstance(data["message"], str):
-                data["message"] = self._replace_str(data["message"])
+                data["message"] = self._replace_str(data["message"], model_page_url)
                 return data  # pyright: ignore[reportUnknownVariableType]
         except Exception:
             pass
-        return self._replace_str(msg)
+        return self._replace_str(msg, model_page_url)
 
-    def _raise_http_error(self, e: HttpClientError) -> Never:
-        raise HTTPException(404 if e.status_code == 404 else 500, self.create_error_msg(e.body)) from e
+    def _raise_http_error(self, e: HttpClientError, model_page_url: str | None = None) -> Never:
+        raise HTTPException(404 if e.status_code == 404 else 500, self.create_error_msg(e.body, model_page_url)) from e
 
-    def _replace_str(self, msg: str) -> str:
+    def _replace_str(self, msg: str, model_page_url: str | None = None) -> str:
         new_msg = msg
         for msg_to_replace, replacement in self.error_msg_modifiers:
             new_msg = new_msg.replace(msg_to_replace, replacement)
+        if model_page_url:
+            new_msg = new_msg.replace("{MODEL_URL}", f" Visit [the model page]({model_page_url}) to review and accept the model license.")
+        else:
+            new_msg = new_msg.replace("{MODEL_URL}", "")
 
         return new_msg
 
@@ -115,14 +130,14 @@ class HuggingFaceRepoWithBlobsDownloader(BDownloader):
                 "is restricted. You must have access to it and be authenticated to access it. Please log in.",
                 "is restricted. "
                 "This model need HuggingFace Token to download. "
-                "Account also need access to this project. Check project site for rules approve. "
+                "Account also need access to this project. Check project site for rules approve.{MODEL_URL} "
                 "After that setup DF_HUGGING_FACE_TOKEN env in enviromental variables to download this model. "
                 "if token is set up probably is wrong or expired.",
             ),
             (
                 "is restricted and you are not in the authorized list.",
                 "is restricted and you are not in the authorized list. "
-                "Account with your DF_HUGGING_FACE_TOKEN env doesn't have access to this model.",
+                "Account with your DF_HUGGING_FACE_TOKEN env doesn't have access to this model.{MODEL_URL}",
             ),
         ]
 
@@ -187,7 +202,7 @@ class HuggingFaceRepoWithBlobsDownloader(BDownloader):
                     continue
                 symlink_path.symlink_to(f"../../blobs/{file['oid']}", target_is_directory=False)
             except HttpClientError as e:
-                self._raise_http_error(e)
+                self._raise_http_error(e, f"https://huggingface.co/{model_id}")
 
         yield SuccessDownloadPacket(model_dir)
 
@@ -209,14 +224,14 @@ class HuggingFaceRepoDownloader(BaseDownloader):
                 "is restricted. You must have access to it and be authenticated to access it. Please log in.",
                 "is restricted. "
                 "This model need HuggingFace Token to download. "
-                "Account also need access to this project. Check project site for rules approve. "
+                "Account also need access to this project. Check project site for rules approve.{MODEL_URL} "
                 "After that setup DF_HUGGING_FACE_TOKEN env in enviromental variables to download this model. "
                 "if token is set up probably is wrong or expired.",
             ),
             (
                 "is restricted and you are not in the authorized list.",
                 "is restricted and you are not in the authorized list. "
-                "Account with your DF_HUGGING_FACE_TOKEN env doesn't have access to this model.",
+                "Account with your DF_HUGGING_FACE_TOKEN env doesn't have access to this model.{MODEL_URL}",
             ),
         ]
 
@@ -275,7 +290,7 @@ class HuggingFaceRepoDownloader(BaseDownloader):
                     if not isinstance(packet, PreDownloadPacket):
                         yield packet
             except HttpClientError as e:
-                self._raise_http_error(e)
+                self._raise_http_error(e, f"https://huggingface.co/{model_id}")
 
         yield SuccessDownloadPacket(model_dir)
 
@@ -296,14 +311,14 @@ class HuggingFaceModelDownloader(BaseDownloader):
                 "is restricted. You must have access to it and be authenticated to access it. Please log in.",
                 "is restricted. "
                 "This model need HuggingFace Token to download. "
-                "Account also need access to this project. Check project site for rules approve. "
+                "Account also need access to this project. Check project site for rules approve.{MODEL_URL} "
                 "After that setup DF_HUGGING_FACE_TOKEN env in enviromental variables to download this model. "
                 "if token is set up probably is wrong or expired.",
             ),
             (
                 "is restricted and you are not in the authorized list.",
                 "is restricted and you are not in the authorized list. "
-                "Account with your DF_HUGGING_FACE_TOKEN env doesn't have access to this model.",
+                "Account with your DF_HUGGING_FACE_TOKEN env doesn't have access to this model.{MODEL_URL}",
             ),
         ]
 
@@ -319,7 +334,8 @@ class HuggingFaceModelDownloader(BaseDownloader):
             async for packet in Utils.ensure_model_downloaded(url_without_query, model_dir, temp_dir, filename, self.headers):
                 yield packet
         except HttpClientError as e:
-            self._raise_http_error(e)
+            match = re.match(r"(https://huggingface\.co/[^/]+/[^/]+)", url_without_query)
+            self._raise_http_error(e, match.group(1) if match else None)
 
 
 class CivitaiModelDownloader(BaseDownloader):
@@ -443,7 +459,19 @@ class ModelDownloader:
                 specified_downloader = downloader
 
         logger.debug("ModelDownloader.download: url=%s, selected=%s", url, type(specified_downloader).__name__)
+        progress = Progress(0)
+        last_logged_percentage = 0.0
         async for packet in specified_downloader.download(url, model_dir, self.temp_dir, filename):
+            if isinstance(packet, PreDownloadPacket) and packet.file_bytes_size:
+                progress.set_max_value(packet.file_bytes_size)
+            elif isinstance(packet, DownloadedPacket) and progress.max:
+                progress.add_to_actual_value(packet.downloaded_bytes_size)
+                percentage = progress.get_percentage()
+                if percentage - last_logged_percentage >= _PROGRESS_LOG_STEP:
+                    logger.info("Downloading %s: %.0f%%", url, percentage * 100)
+                    last_logged_percentage = percentage
+            elif isinstance(packet, SuccessDownloadPacket):
+                logger.info("Downloaded %s", url)
             yield packet
 
     def get_hugging_face_token(self, config: AppSettings) -> str:

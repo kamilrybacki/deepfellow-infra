@@ -334,7 +334,8 @@ def test_reasoning_config_summary_and_generate_summary_valid(value: str) -> None
     config = ReasoningConfig(summary=value, generate_summary=value)  # pyright: ignore[reportArgumentType]
 
     assert config.summary == value
-    assert config.generate_summary == value
+    with pytest.deprecated_call():
+        assert config.generate_summary == value
 
 
 def test_reasoning_config_summary_invalid() -> None:
