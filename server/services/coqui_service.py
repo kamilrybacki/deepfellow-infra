@@ -72,6 +72,9 @@ class CoquiConst(BaseModel):
 
 
 _const = CoquiConst(
+    # Images are pinned to a commit SHA (no semver releases upstream) — check for newer builds at:
+    # https://github.com/idiap/coqui-ai-TTS/pkgs/container/coqui-tts
+    # https://github.com/idiap/coqui-ai-TTS/pkgs/container/coqui-tts-cpu
     images={
         "cpu": DockerImage(name="ghcr.io/idiap/coqui-tts-cpu:ca2cf5155bca892ea820ad384400efbfac41b178", size="3.9 GB"),
         "gpu": DockerImage(name="ghcr.io/idiap/coqui-tts:ca2cf5155bca892ea820ad384400efbfac41b178", size="14.5 GB"),

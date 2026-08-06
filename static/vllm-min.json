@@ -1,12 +1,24 @@
 {
     "llms": [
         {
+            "name": "ai9stars/G9v3-39A5B",
+            "size": "72GB"
+        },
+        {
+            "name": "Akahsizrr/fuse-1-Lite",
+            "size": "10GB"
+        },
+        {
             "name": "amd/Instella-MoE-16B-A3B-Think",
             "size": "29GB"
         },
         {
             "name": "Bahushruth/Qwen3.6-35B-A3B-abliterated-v4",
             "size": "64GB"
+        },
+        {
+            "name": "casperhansen/llama-3.3-70b-instruct-awq",
+            "size": "37GB"
         },
         {
             "name": "cyankiwi/GLM-4.7-Flash-AWQ-4bit",
@@ -21,20 +33,8 @@
             "size": "16GB"
         },
         {
-            "name": "deepreinforce-ai/Ornith-1.0-35B",
-            "size": "65GB"
-        },
-        {
-            "name": "deepreinforce-ai/Ornith-1.0-35B-FP8",
-            "size": "35GB"
-        },
-        {
-            "name": "deepreinforce-ai/Ornith-1.0-397B-FP8",
-            "size": "377GB"
-        },
-        {
-            "name": "deepreinforce-ai/Ornith-1.0-9B",
-            "size": "17GB"
+            "name": "deepgrove/maple-preview",
+            "size": "37GB"
         },
         {
             "name": "deepseek-ai/deepseek-coder-6.7b-instruct",
@@ -173,6 +173,10 @@
             "size": "16GB"
         },
         {
+            "name": "inclusionAI/Ling-3.0-flash",
+            "size": "237GB"
+        },
+        {
             "name": "Kwaipilot/KAT-Coder-V2.5-Dev",
             "size": "64GB"
         },
@@ -203,6 +207,14 @@
         {
             "name": "LiquidAI/LFM2.5-1.2B-Instruct",
             "size": "2GB"
+        },
+        {
+            "name": "LiquidAI/LFM2.5-2.6B",
+            "size": "5GB"
+        },
+        {
+            "name": "LiquidAI/LFM2.5-2.6B-Base",
+            "size": "5GB"
         },
         {
             "name": "manycore-research/SpatialLM-Llama-1B",
@@ -237,16 +249,8 @@
             "size": "27GB"
         },
         {
-            "name": "microsoft/Phi-4-mini-instruct",
-            "size": "7GB"
-        },
-        {
             "name": "microsoft/Phi-tiny-MoE-instruct",
             "size": "7GB"
-        },
-        {
-            "name": "mindlab-research/Macaron-V1-Tall",
-            "size": "102GB"
         },
         {
             "name": "MiniMaxAI/MiniMax-M2",
@@ -295,18 +299,6 @@
         {
             "name": "nm-testing/SmolLM-1.7B-Instruct-quantized.w4a16",
             "size": "1GB"
-        },
-        {
-            "name": "nota-ai/Solar-Open2-250B-Nota-INT4",
-            "size": "133GB"
-        },
-        {
-            "name": "nota-ai/Solar-Open2-250B-Nota-INT4-GlobalPruned",
-            "size": "109GB"
-        },
-        {
-            "name": "nota-ai/Solar-Open2-250B-Nota-NVFP4",
-            "size": "142GB"
         },
         {
             "name": "NousResearch/Hermes-3-Llama-3.1-8B",
@@ -397,16 +389,40 @@
             "size": "5GB"
         },
         {
+            "name": "ornith-ai/Ornith-1.0-35B",
+            "size": "65GB"
+        },
+        {
+            "name": "ornith-ai/Ornith-1.0-35B-FP8",
+            "size": "35GB"
+        },
+        {
+            "name": "ornith-ai/Ornith-1.0-397B-FP8",
+            "size": "377GB"
+        },
+        {
+            "name": "ornith-ai/Ornith-1.0-9B",
+            "size": "17GB"
+        },
+        {
             "name": "poolside/Laguna-S-2.1",
             "size": "219GB"
         },
         {
-            "name": "poolside/Laguna-S-2.1-NVFP4",
-            "size": "92GB"
+            "name": "prism-ml/Bonsai-27B-mlx-1bit",
+            "size": "4GB"
+        },
+        {
+            "name": "prism-ml/Ternary-Bonsai-27B-mlx-2bit",
+            "size": "7GB"
         },
         {
             "name": "QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ",
             "size": "16GB"
+        },
+        {
+            "name": "Qwen/Qwen-AgentWorld-35B-A3B",
+            "size": "64GB"
         },
         {
             "name": "Qwen/Qwen2-0.5B",
@@ -463,10 +479,6 @@
         {
             "name": "Qwen/Qwen2.5-3B-Instruct",
             "size": "5GB"
-        },
-        {
-            "name": "Qwen/Qwen2.5-72B-Instruct",
-            "size": "135GB"
         },
         {
             "name": "Qwen/Qwen2.5-72B-Instruct-AWQ",
@@ -625,6 +637,10 @@
             "size": "151GB"
         },
         {
+            "name": "Qwen/Qwen3Guard-Gen-4B",
+            "size": "8GB"
+        },
+        {
             "name": "Qwen/QwQ-32B",
             "size": "61GB"
         },
@@ -695,14 +711,6 @@
         {
             "name": "unsloth/DeepSeek-V4-Flash-0731",
             "size": "155GB"
-        },
-        {
-            "name": "unsloth/Qwen2.5-3B-Instruct-unsloth-bnb-4bit",
-            "size": "2GB"
-        },
-        {
-            "name": "upstage/Solar-Open2-250B",
-            "size": "466GB"
         },
         {
             "name": "XiaomiMiMo/MiMo-7B-RL",
@@ -785,20 +793,20 @@
         {
             "name": "nvidia/llama-nemotron-rerank-1b-v2",
             "size": "4GB"
-        },
-        {
-            "name": "nvidia/llama-nemotron-rerank-vl-1b-v2-fp8",
-            "size": "2GB"
         }
     ],
     "embeddings": [
         {
-            "name": "EximiusLabs/fusion-embedding-2-k3-vision",
-            "size": "14MB"
-        },
-        {
             "name": "google/embeddinggemma-300m",
             "size": "1GB"
+        },
+        {
+            "name": "hotchpotch/bekko-embedding-v1-a25m",
+            "size": "4GB"
+        },
+        {
+            "name": "hotchpotch/bekko-embedding-v1-a8m",
+            "size": "3GB"
         },
         {
             "name": "ibm-granite/granite-embedding-small-english-r2",
@@ -825,10 +833,6 @@
             "size": "2GB"
         },
         {
-            "name": "nvidia/Nemotron-3-Embed-8B-BF16",
-            "size": "14GB"
-        },
-        {
             "name": "Qwen/Qwen3-Embedding-0.6B",
             "size": "1GB"
         },
@@ -841,8 +845,8 @@
             "size": "14GB"
         },
         {
-            "name": "Snowflake/snowflake-arctic-embed-xs",
-            "size": "385MB"
+            "name": "Qwen/Qwen3-VL-Embedding-8B",
+            "size": "15GB"
         }
     ]
 }
