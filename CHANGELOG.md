@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [0.31.0] - 2026-08-06
 
 ### Added
 - New `POST /admin/mcp/convert-config` endpoint converts a standard MCP client JSON config (`{"mcpServers": {...}}`) into DeepFellow's custom-model parameters, so the CLI and other clients can reuse the same conversion the WebUI's "Auto-Import" tab already performed client-side.
