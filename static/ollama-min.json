@@ -1077,12 +1077,6 @@
             "context": 32768
         },
         {
-            "name": "gemini-3-flash-preview",
-            "size": "",
-            "hash": "ebade0d31690",
-            "context": 1048576
-        },
-        {
             "name": "gemma",
             "size": "5.0GB",
             "hash": "a72c7f4d0a15",
@@ -1617,27 +1611,87 @@
             "context": 32768
         },
         {
+            "name": "laguna-s-2.1",
+            "size": "96GB",
+            "hash": "1adabf138c90",
+            "context": 262144
+        },
+        {
+            "name": "laguna-s-2.1:f16",
+            "size": "235GB",
+            "hash": "8bad4c600f65",
+            "context": 262144
+        },
+        {
+            "name": "laguna-s-2.1:mlx-bf16",
+            "size": "235GB",
+            "hash": "f9fa40073739",
+            "context": 1048576
+        },
+        {
+            "name": "laguna-s-2.1:mxfp8",
+            "size": "136GB",
+            "hash": "85623901a2bb",
+            "context": 1048576
+        },
+        {
+            "name": "laguna-s-2.1:nvfp4",
+            "size": "67GB",
+            "hash": "6a25a6e6e44c",
+            "context": 1048576
+        },
+        {
+            "name": "laguna-s-2.1:q4_K_M",
+            "size": "96GB",
+            "hash": "1adabf138c90",
+            "context": 262144
+        },
+        {
+            "name": "laguna-s-2.1:q8_0",
+            "size": "128GB",
+            "hash": "fcc6705b7cd8",
+            "context": 262144
+        },
+        {
             "name": "laguna-xs-2.1",
             "size": "20GB",
-            "hash": "a8562dfd0cad",
+            "hash": "0175be1e57f4",
             "context": 262144
         },
         {
             "name": "laguna-xs-2.1:bf16",
             "size": "67GB",
-            "hash": "5bda9bef69e1",
+            "hash": "79a64d06873a",
+            "context": 262144
+        },
+        {
+            "name": "laguna-xs-2.1:mlx-bf16",
+            "size": "67GB",
+            "hash": "0f9a63efe3ac",
+            "context": 262144
+        },
+        {
+            "name": "laguna-xs-2.1:mxfp8",
+            "size": "39GB",
+            "hash": "3bda218ff75c",
+            "context": 262144
+        },
+        {
+            "name": "laguna-xs-2.1:nvfp4",
+            "size": "19GB",
+            "hash": "6b0fae515b6d",
             "context": 262144
         },
         {
             "name": "laguna-xs-2.1:q4_K_M",
             "size": "20GB",
-            "hash": "a8562dfd0cad",
+            "hash": "0175be1e57f4",
             "context": 262144
         },
         {
             "name": "laguna-xs-2.1:q8_0",
             "size": "36GB",
-            "hash": "7073183a9e7c",
+            "hash": "a249c0765c04",
             "context": 262144
         },
         {
@@ -1655,20 +1709,20 @@
         {
             "name": "laguna-xs.2:mlx-bf16",
             "size": "67GB",
-            "hash": "10011d1c9084",
-            "context": 131072
+            "hash": "77c0711e5d46",
+            "context": 262144
         },
         {
             "name": "laguna-xs.2:mxfp8",
-            "size": "36GB",
-            "hash": "d978dfa2896b",
-            "context": 131072
+            "size": "39GB",
+            "hash": "573baf5fcf0c",
+            "context": 262144
         },
         {
             "name": "laguna-xs.2:nvfp4",
-            "size": "22GB",
-            "hash": "f6daa0fecaaa",
-            "context": 131072
+            "size": "19GB",
+            "hash": "5bc4c3edeb0c",
+            "context": 262144
         },
         {
             "name": "laguna-xs.2:q4_K_M",
