@@ -1,11 +1,5 @@
-# DeepFellow Software Framework.
-# Copyright © 2026 Simplito sp. z o.o.
-#
-# This file is part of the DeepFellow Software Framework (https://deepfellow.ai).
-# This software is Licensed under the DeepFellow Free License.
-#
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
 
 import base64
 import hashlib
@@ -17,7 +11,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from pydantic import ValidationError
 
-from server.services.mcp_oauth import (
+from server.utils.mcp_oauth import (
     AuthorizationServerMetadata,
     DcrResponse,
     McpOAuthConfig,
@@ -186,7 +180,7 @@ def test_mcp_oauth_state_store_find_for_model_false_for_other_model() -> None:
     assert result is False
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_discover_protected_resource_metadata_parses_response(mock_client_session: MagicMock) -> None:
     resp = _make_mock_resp(status=200, json_data={"resource": "http://mcp.example/mcp", "authorization_servers": ["http://as.example"]})
@@ -204,7 +198,7 @@ async def test_discover_protected_resource_metadata_parses_response(mock_client_
     assert called_url == "http://mcp.example/.well-known/oauth-protected-resource"
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_discover_protected_resource_metadata_non_200_returns_none(mock_client_session: MagicMock) -> None:
     resp = _make_mock_resp(status=404, json_data=None)
@@ -217,7 +211,7 @@ async def test_discover_protected_resource_metadata_non_200_returns_none(mock_cl
     assert result is None
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_discover_protected_resource_metadata_invalid_shape_returns_none(mock_client_session: MagicMock) -> None:
     resp = _make_mock_resp(status=200, json_data={"authorization_servers": ["http://as.example"]})
@@ -230,7 +224,7 @@ async def test_discover_protected_resource_metadata_invalid_shape_returns_none(m
     assert result is None
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_discover_authorization_server_metadata_parses_response(mock_client_session: MagicMock) -> None:
     resp = _make_mock_resp(
@@ -254,7 +248,7 @@ async def test_discover_authorization_server_metadata_parses_response(mock_clien
     assert called_url == "http://as.example/.well-known/oauth-authorization-server"
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_discover_authorization_server_metadata_falls_back_to_openid_configuration(mock_client_session: MagicMock) -> None:
     not_found = _make_mock_resp(status=404, json_data=None)
@@ -289,7 +283,7 @@ def test_authorization_server_metadata_rejects_non_http_scheme(bad_url: str) -> 
         )
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_discover_authorization_server_metadata_rejects_malicious_scheme(mock_client_session: MagicMock) -> None:
     resp = _make_mock_resp(
@@ -309,7 +303,7 @@ async def test_discover_authorization_server_metadata_rejects_malicious_scheme(m
     assert result is None
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_discover_authorization_server_metadata_both_missing_returns_none(mock_client_session: MagicMock) -> None:
     not_found = _make_mock_resp(status=404, json_data=None)
@@ -322,7 +316,7 @@ async def test_discover_authorization_server_metadata_both_missing_returns_none(
     assert result is None
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_discover_protected_resource_metadata_network_exception_returns_none(mock_client_session: MagicMock) -> None:
     mock_client_session.side_effect = ConnectionError("boom")
@@ -332,7 +326,7 @@ async def test_discover_protected_resource_metadata_network_exception_returns_no
     assert result is None
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_discover_authorization_server_metadata_invalid_first_response_falls_back(mock_client_session: MagicMock) -> None:
     invalid = _make_mock_resp(status=200, json_data={"issuer": "http://as.example"})
@@ -355,8 +349,8 @@ async def test_discover_authorization_server_metadata_invalid_first_response_fal
     assert session.get.call_count == 2
 
 
-@mock.patch("server.services.mcp_oauth.discover_authorization_server_metadata")
-@mock.patch("server.services.mcp_oauth.discover_protected_resource_metadata")
+@mock.patch("server.utils.mcp_oauth.discover_authorization_server_metadata")
+@mock.patch("server.utils.mcp_oauth.discover_protected_resource_metadata")
 @pytest.mark.asyncio
 async def test_discover_authorization_server_for_resource_two_hop(
     mock_discover_prm: AsyncMock,
@@ -377,8 +371,8 @@ async def test_discover_authorization_server_for_resource_two_hop(
     assert mock_discover_as.call_args == mock.call("http://as.example")
 
 
-@mock.patch("server.services.mcp_oauth.discover_authorization_server_metadata")
-@mock.patch("server.services.mcp_oauth.discover_protected_resource_metadata")
+@mock.patch("server.utils.mcp_oauth.discover_authorization_server_metadata")
+@mock.patch("server.utils.mcp_oauth.discover_protected_resource_metadata")
 @pytest.mark.asyncio
 async def test_discover_authorization_server_for_resource_falls_back_to_direct_issuer(
     mock_discover_prm: AsyncMock,
@@ -398,8 +392,8 @@ async def test_discover_authorization_server_for_resource_falls_back_to_direct_i
     assert mock_discover_as.call_args == mock.call("http://mcp.example/mcp")
 
 
-@mock.patch("server.services.mcp_oauth.discover_authorization_server_metadata")
-@mock.patch("server.services.mcp_oauth.discover_protected_resource_metadata")
+@mock.patch("server.utils.mcp_oauth.discover_authorization_server_metadata")
+@mock.patch("server.utils.mcp_oauth.discover_protected_resource_metadata")
 @pytest.mark.asyncio
 async def test_discover_authorization_server_for_resource_all_issuers_fail_returns_none(
     mock_discover_prm: AsyncMock,
@@ -414,7 +408,7 @@ async def test_discover_authorization_server_for_resource_all_issuers_fail_retur
     assert mock_discover_as.await_count == 2
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_register_dynamic_client_success_returns_response(mock_client_session: MagicMock) -> None:
     resp = _make_mock_resp(status=201, json_data={"client_id": "abc123", "client_secret": "shh"})
@@ -427,7 +421,7 @@ async def test_register_dynamic_client_success_returns_response(mock_client_sess
     assert result == DcrResponse(client_id="abc123", client_secret="shh")
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_register_dynamic_client_non_2xx_returns_none(mock_client_session: MagicMock) -> None:
     resp = _make_mock_resp(status=400, json_data={"error": "invalid_request"})
@@ -440,7 +434,7 @@ async def test_register_dynamic_client_non_2xx_returns_none(mock_client_session:
     assert result is None
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_register_dynamic_client_network_exception_returns_none(mock_client_session: MagicMock) -> None:
     mock_client_session.side_effect = ConnectionError("boom")
@@ -505,7 +499,7 @@ def test_build_authorize_url_includes_scope_when_given() -> None:
     assert query["scope"] == ["tools:read"]
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_exchange_code_for_token_success_returns_token_response(mock_client_session: MagicMock) -> None:
     resp = _make_mock_resp(status=200, json_data={"access_token": "tok", "refresh_token": "rtok", "expires_in": 3600})
@@ -522,7 +516,7 @@ async def test_exchange_code_for_token_success_returns_token_response(mock_clien
     assert result.expires_in == 3600
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_exchange_code_for_token_non_200_raises(mock_client_session: MagicMock) -> None:
     resp = _make_mock_resp(status=400, json_data={"error": "invalid_grant"})
@@ -542,7 +536,7 @@ async def test_exchange_code_for_token_non_200_raises(mock_client_session: Magic
         )
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_exchange_code_for_token_omits_client_secret_when_not_provided(mock_client_session: MagicMock) -> None:
     resp = _make_mock_resp(status=200, json_data={"access_token": "tok"})
@@ -558,7 +552,7 @@ async def test_exchange_code_for_token_omits_client_secret_when_not_provided(moc
     assert "client_secret" not in sent_form
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_exchange_code_for_token_includes_client_secret_when_provided(mock_client_session: MagicMock) -> None:
     resp = _make_mock_resp(status=200, json_data={"access_token": "tok"})
@@ -580,7 +574,7 @@ async def test_exchange_code_for_token_includes_client_secret_when_provided(mock
     assert sent_form["client_secret"] == "secret-1"
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_exchange_code_for_token_network_exception_raises_mcpoautherror(mock_client_session: MagicMock) -> None:
     mock_client_session.side_effect = ConnectionError("boom")
@@ -597,7 +591,7 @@ async def test_exchange_code_for_token_network_exception_raises_mcpoautherror(mo
         )
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_refresh_access_token_success_returns_token_response(mock_client_session: MagicMock) -> None:
     resp = _make_mock_resp(status=200, json_data={"access_token": "new-tok", "expires_in": 60})
@@ -611,7 +605,7 @@ async def test_refresh_access_token_success_returns_token_response(mock_client_s
     assert result.expires_in == 60
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_refresh_access_token_error_field_raises(mock_client_session: MagicMock) -> None:
     resp = _make_mock_resp(status=200, json_data={"error": "invalid_grant"})
@@ -624,7 +618,7 @@ async def test_refresh_access_token_error_field_raises(mock_client_session: Magi
         await refresh_access_token("http://as.example/token", "rtok", "client-1", None, "http://mcp.example")
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_refresh_access_token_omits_client_secret_when_not_provided(mock_client_session: MagicMock) -> None:
     resp = _make_mock_resp(status=200, json_data={"access_token": "new-tok"})
@@ -638,7 +632,7 @@ async def test_refresh_access_token_omits_client_secret_when_not_provided(mock_c
     assert "client_secret" not in sent_form
 
 
-@mock.patch("server.services.mcp_oauth.aiohttp.ClientSession")
+@mock.patch("server.utils.mcp_oauth.aiohttp.ClientSession")
 @pytest.mark.asyncio
 async def test_refresh_access_token_includes_client_secret_when_provided(mock_client_session: MagicMock) -> None:
     resp = _make_mock_resp(status=200, json_data={"access_token": "new-tok"})

@@ -18,14 +18,6 @@ from server.models.api import McpToolInfo
 from server.models.models import InstallModelIn, ListModelsFilters, McpHealthCheckResult, UninstallModelIn
 from server.models.services import InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import CustomModel, Instance, InstanceConfig
-from server.services.mcp_oauth import (
-    AuthorizationServerMetadata,
-    DcrResponse,
-    McpOAuthConfig,
-    McpOAuthError,
-    PendingOAuthFlow,
-    TokenResponse,
-)
 from server.services.mcp_service import (
     DownloadedInfo,
     InstalledInfo,
@@ -44,6 +36,14 @@ from server.services.mcp_service import (
     _run_sse_reader,  # pyright: ignore[reportPrivateUsage]
     _sse_rpc,  # pyright: ignore[reportPrivateUsage]
     _SseState,  # pyright: ignore[reportPrivateUsage]
+)
+from server.utils.mcp_oauth import (
+    AuthorizationServerMetadata,
+    DcrResponse,
+    McpOAuthConfig,
+    McpOAuthError,
+    PendingOAuthFlow,
+    TokenResponse,
 )
 
 

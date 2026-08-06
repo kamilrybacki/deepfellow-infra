@@ -12,6 +12,7 @@ limitations under the License.
 import type {
   ConfigOut,
   ConfigRevealOut,
+  ConvertedMcpConfig,
   GpuStats,
   InfraSettings,
   McpOAuthStartOut,
@@ -477,6 +478,15 @@ export class DeepFellowClient {
     return this.makeRequest<McpOAuthStatus>(
       `/admin/services/${serviceId}/models/${encodeURIComponent(modelId)}/oauth/status`,
     );
+  }
+
+  async convertMcpConfig(
+    config: Record<string, unknown>,
+  ): Promise<ConvertedMcpConfig> {
+    return this.makeRequest<ConvertedMcpConfig>("/admin/mcp/convert-config", {
+      method: "POST",
+      body: JSON.stringify({ config }),
+    });
   }
 
   async syncModels(serviceId: string): Promise<{ status: string }> {

@@ -50,7 +50,6 @@ import type { SpecField } from "@/deepfellow/types";
 import {
   type McpVariant,
   type NodeVersion,
-  type ParsedMcpOAuth,
   type ProxyMcpServerOAuthSpec,
   type ProxyMcpServerSpec,
   type PythonVersion,
@@ -146,267 +145,6 @@ interface AddMcpServerModalProps {
   apiError?: string | null;
 }
 
-function shquote(arg: string): string {
-  if (/^[a-zA-Z0-9_./:@,=+\-]+$/.test(arg)) return arg;
-  return `'${arg.replace(/'/g, "'\\''")}'`;
-}
-
-// docker run flags that consume a following value argument
-const DOCKER_VALUE_FLAGS = new Set([
-  "-v",
-  "--volume",
-  "-e",
-  "--env",
-  "--env-file",
-  "--name",
-  "-p",
-  "--publish",
-  "--expose",
-  "--network",
-  "--hostname",
-  "-h",
-  "-u",
-  "--user",
-  "-w",
-  "--workdir",
-  "--entrypoint",
-  "-l",
-  "--label",
-  "--add-host",
-  "--dns",
-  "--link",
-  "-m",
-  "--memory",
-  "--memory-swap",
-  "--cpus",
-  "--runtime",
-  "--platform",
-  "--ulimit",
-  "--security-opt",
-  "--cap-add",
-  "--cap-drop",
-  "--device",
-  "--cidfile",
-  "--volumes-from",
-  "--log-driver",
-  "--log-opt",
-  "--health-cmd",
-  "--health-interval",
-  "--health-retries",
-  "--health-timeout",
-  "--mount",
-  "--tmpfs",
-  "--shm-size",
-  "--ipc",
-]);
-
-function parseMountFlag(val: string): string | null {
-  const parts: Record<string, string> = {};
-  for (const segment of val.split(",")) {
-    const eq = segment.indexOf("=");
-    if (eq === -1) continue;
-    parts[segment.slice(0, eq)] = segment.slice(eq + 1);
-  }
-  if (parts.type && parts.type !== "bind") return null;
-  const src = parts.src ?? parts.source ?? "";
-  const dst = parts.dst ?? parts.destination ?? parts.target ?? "";
-  if (!src || !dst) return null;
-  return parts.ro === "true" || parts.readonly === "true"
-    ? `${src}:${dst}:ro`
-    : `${src}:${dst}`;
-}
-
-function parseDockerRunArgs(args: string[]): {
-  image: string;
-  cmd: string[];
-  volumes: string[];
-} {
-  const volumes: string[] = [];
-  let i = 0;
-  while (i < args.length) {
-    const arg = args[i];
-    if (arg === "run") {
-      i++;
-      continue;
-    }
-    if (arg.startsWith("-")) {
-      const eqIdx = arg.indexOf("=");
-      const flag = eqIdx === -1 ? arg : arg.slice(0, eqIdx);
-      const inlineVal = eqIdx === -1 ? null : arg.slice(eqIdx + 1);
-      if (flag === "-v" || flag === "--volume") {
-        const val = inlineVal ?? args[i + 1];
-        if (val) volumes.push(val);
-        i += inlineVal !== null ? 1 : 2;
-      } else if (flag === "--mount") {
-        const val = inlineVal ?? args[i + 1];
-        if (val) {
-          const mount = parseMountFlag(val);
-          if (mount) volumes.push(mount);
-        }
-        i += inlineVal !== null ? 1 : 2;
-      } else {
-        i += DOCKER_VALUE_FLAGS.has(flag) && inlineVal === null ? 2 : 1;
-      }
-      continue;
-    }
-    return { image: arg, cmd: args.slice(i + 1), volumes };
-  }
-  throw new Error("Could not find image name in docker run arguments.");
-}
-
-type ParsedMcpConfig =
-  | {
-      kind: "stdio";
-      name: string;
-      command: string;
-      base_image?: string;
-      envs: Record<string, string>;
-      variant: McpVariant | null;
-    }
-  | {
-      kind: "proxy";
-      name: string;
-      server_url: string;
-      transport: "streamable_http" | "sse";
-      headers: Record<string, string>;
-      oauth?: ParsedMcpOAuth;
-    }
-  | {
-      kind: "docker";
-      name: string;
-      image: string;
-      command: string;
-      volumes: string[];
-      envs: Record<string, string>;
-    };
-
-function parseOauthField(raw: unknown): ParsedMcpOAuth | undefined {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
-  const o = raw as Record<string, unknown>;
-  const clientId = o.client_id ?? o.clientId;
-  const clientSecret = o.client_secret ?? o.clientSecret;
-  const scope = o.scope;
-  const oauth: ParsedMcpOAuth = {
-    client_id: typeof clientId === "string" ? clientId : undefined,
-    client_secret: typeof clientSecret === "string" ? clientSecret : undefined,
-    scope: typeof scope === "string" ? scope : undefined,
-  };
-  return oauth.client_id || oauth.client_secret || oauth.scope
-    ? oauth
-    : undefined;
-}
-
-export function parseMcpJsonConfig(text: string): ParsedMcpConfig {
-  const json = JSON.parse(text) as unknown;
-  if (!json || typeof json !== "object" || Array.isArray(json))
-    throw new Error("Expected a JSON object.");
-
-  const root = json as Record<string, unknown>;
-  let entries: [string, unknown][];
-  if (root.mcpServers && typeof root.mcpServers === "object") {
-    entries = Object.entries(root.mcpServers as Record<string, unknown>);
-  } else {
-    entries = Object.entries(root);
-  }
-  if (entries.length === 0) throw new Error("No servers found in config.");
-
-  const [name, config] = entries[0];
-  if (!config || typeof config !== "object" || Array.isArray(config))
-    throw new Error("Invalid server config.");
-
-  const {
-    command: rawCommand,
-    args,
-    env,
-    serverUrl,
-    url,
-    transport: rawTransport,
-    headers: rawHeaders,
-    oauth: rawOauth,
-  } = config as Record<string, unknown>;
-
-  if (serverUrl || url) {
-    const resolvedUrl =
-      typeof serverUrl === "string"
-        ? serverUrl
-        : typeof url === "string"
-          ? url
-          : "";
-    if (!resolvedUrl)
-      throw new Error('"serverUrl" must be a non-empty string.');
-    const headers: Record<string, string> = {};
-    if (
-      rawHeaders &&
-      typeof rawHeaders === "object" &&
-      !Array.isArray(rawHeaders)
-    ) {
-      for (const [k, v] of Object.entries(
-        rawHeaders as Record<string, unknown>,
-      )) {
-        if (typeof v === "string") headers[k] = v;
-      }
-    }
-    const transport: "streamable_http" | "sse" =
-      rawTransport === "sse" || resolvedUrl.endsWith("/sse")
-        ? "sse"
-        : "streamable_http";
-    const oauth = parseOauthField(rawOauth);
-    return {
-      kind: "proxy",
-      name,
-      server_url: resolvedUrl,
-      transport,
-      headers,
-      ...(oauth ? { oauth } : {}),
-    };
-  }
-
-  if (typeof rawCommand !== "string" || !rawCommand)
-    throw new Error('Missing "command" field.');
-
-  let cmd = rawCommand;
-  let argList: string[] = Array.isArray(args) ? args.map(String) : [];
-
-  if (cmd.toLowerCase() === "cmd" && argList[0] === "/c") {
-    argList = argList.slice(1);
-    cmd = argList.shift() ?? "";
-    if (!cmd) throw new Error('Empty command after stripping "cmd /c".');
-  }
-
-  const envs: Record<string, string> = {};
-  if (env && typeof env === "object" && !Array.isArray(env)) {
-    for (const [k, v] of Object.entries(env as Record<string, unknown>)) {
-      if (typeof v === "string") envs[k] = v;
-    }
-  }
-
-  if (cmd === "docker" && argList[0] === "run") {
-    const dockerParsed = parseDockerRunArgs(argList);
-    return {
-      kind: "docker",
-      name,
-      image: dockerParsed.image,
-      command: dockerParsed.cmd.map(shquote).join(" "),
-      volumes: dockerParsed.volumes,
-      envs,
-    };
-  }
-
-  const runtime = detectRuntime(cmd);
-  return {
-    kind: "stdio",
-    name,
-    command: [cmd, ...argList].map(shquote).join(" "),
-    envs,
-    variant:
-      runtime === "python"
-        ? "python-headless"
-        : runtime === "node"
-          ? "node-headless"
-          : null,
-  };
-}
-
 const JSON_CONFIG_PLACEHOLDER = `{
   "mcpServers": {
     "filesystem": {
@@ -464,7 +202,6 @@ export function AddMcpServerModal({
       setServerMode("docker");
       docker.populate(parsed);
     },
-    parseMcpJsonConfig,
     () => setServerMode("command"),
   );
 
@@ -496,7 +233,7 @@ export function AddMcpServerModal({
     e.preventDefault();
 
     if (isAutoImportMode) {
-      stdio.convertJson();
+      void stdio.convertJson();
       return;
     }
 
@@ -1166,14 +903,18 @@ export function AddMcpServerModal({
             <Button
               type="submit"
               form="add-mcp-server-form"
-              disabled={isSubmitting}
+              disabled={
+                isSubmitting || (isAutoImportMode && stdio.isConverting)
+              }
             >
               {isSubmitting
                 ? "Saving…"
                 : isEditMode
                   ? "Save"
                   : isAutoImportMode
-                    ? "Convert"
+                    ? stdio.isConverting
+                      ? "Converting…"
+                      : "Convert"
                     : "Add"}
             </Button>
           </DialogFooter>

@@ -10,7 +10,8 @@ limitations under the License.
 */
 
 import { initFormData, validateFields } from "@/components/DynamicFormFields";
-import type { SpecField } from "@/deepfellow/types";
+import { apiClient } from "@/deepfellow/client";
+import type { ConvertedMcpConfig, SpecField } from "@/deepfellow/types";
 import { proposePrefix } from "@/utils/prefix";
 import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -35,6 +36,9 @@ export const DEFAULT_NODE_VERSION: NodeVersion = "22";
 
 const PREFIX_PATTERN = /^[a-zA-Z0-9_-]+$/;
 
+// Keep in sync with _PYTHON_BINS/_NODE_BINS in server/services/mcp_json_converter.py — duplicated
+// here so we can auto-detect the variant locally while the user is still typing a manual command,
+// without a round-trip to the backend on every keystroke.
 const PYTHON_BINS = new Set(["uvx", "python", "python3", "uv", "pipx"]);
 const NODE_BINS = new Set([
   "node",
@@ -112,6 +116,55 @@ export interface ParsedMcpOAuth {
   client_id?: string;
   client_secret?: string;
   scope?: string;
+}
+
+function toParsedMcpConfig(dto: ConvertedMcpConfig): ParsedMcpConfig {
+  if (dto.kind === "proxy") {
+    const oauth: ParsedMcpOAuth | undefined = dto.oauth
+      ? {
+          client_id: dto.oauth.client_id ?? undefined,
+          client_secret: dto.oauth.client_secret ?? undefined,
+          scope: dto.oauth.scope ?? undefined,
+        }
+      : undefined;
+    return {
+      kind: "proxy",
+      name: dto.name,
+      server_url: dto.server_url,
+      transport: dto.transport,
+      headers: dto.headers,
+      ...(oauth ? { oauth } : {}),
+    };
+  }
+  if (dto.kind === "custom") {
+    return {
+      kind: "docker",
+      name: dto.name,
+      image: dto.image,
+      command: dto.command,
+      volumes: dto.volumes,
+      envs: dto.envs,
+    };
+  }
+  return {
+    kind: "stdio",
+    name: dto.name,
+    command: dto.command,
+    envs: dto.envs,
+    variant: dto.variant ?? null,
+  };
+}
+
+/** Parse a standard `mcpServers` JSON config via the backend MCP JSON converter. */
+export async function convertMcpJsonConfig(
+  text: string,
+): Promise<ParsedMcpConfig> {
+  const json = JSON.parse(text) as unknown;
+  if (!json || typeof json !== "object" || Array.isArray(json)) {
+    throw new Error("Expected a JSON object.");
+  }
+  const dto = await apiClient.convertMcpConfig(json as Record<string, unknown>);
+  return toParsedMcpConfig(dto);
 }
 
 export interface DockerFormState {
@@ -441,9 +494,10 @@ export interface StdioFormState {
   description: string;
   setDescription: (v: string) => void;
   errors: Record<string, string | undefined>;
+  isConverting: boolean;
   commandRef: React.RefObject<HTMLTextAreaElement | null>;
   handleJsonChange: (text: string) => void;
-  convertJson: () => boolean;
+  convertJson: () => Promise<boolean>;
   handleCommandChange: (text: string) => void;
   handleVariantChange: (v: string) => void;
   clearErrors: () => void;
@@ -481,7 +535,6 @@ export function useStdioForm(
     command: string;
     volumes: string[];
   }) => void,
-  parseMcpJson: (text: string) => ParsedMcpConfig,
   /** Called when JSON paste is detected as a stdio config. Component switches to Command mode. */
   onStdioParsed?: () => void,
 ): StdioFormState {
@@ -521,11 +574,35 @@ export function useStdioForm(
     initialValues?.description ?? "",
   );
   const [errors, setErrors] = useState<Record<string, string | undefined>>({});
+  const [isConverting, setIsConverting] = useState(false);
   const commandRef = useRef<HTMLTextAreaElement>(null);
+  const jsonStatusSeqRef = useRef(0);
+  const jsonStatusDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const convertSeqRef = useRef(0);
+  // Caches the result of the debounced status-check conversion (keyed by its exact input text) so
+  // convertJson/handleCommandChange can reuse it instead of firing a second identical request.
+  const lastConvertedRef = useRef<{
+    text: string;
+    parsed: ParsedMcpConfig;
+  } | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (jsonStatusDebounceRef.current)
+        clearTimeout(jsonStatusDebounceRef.current);
+    };
+  }, []);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: open is the reset trigger; initialValues is read at reset time via closure
   useEffect(() => {
     if (!open) return;
+    if (jsonStatusDebounceRef.current)
+      clearTimeout(jsonStatusDebounceRef.current);
+    jsonStatusSeqRef.current++;
+    lastConvertedRef.current = null;
+    setIsConverting(false);
     setSubMode(initialValues ? "manual" : "import");
     setJsonText("");
     setJsonStatus(null);
@@ -557,10 +634,16 @@ export function useStdioForm(
     else setVariant("");
   };
 
-  const tryApplyJson = (text: string): boolean => {
+  const tryApplyJson = async (text: string): Promise<boolean> => {
     if (!text.trimStart().startsWith("{")) return false;
+    const seq = ++convertSeqRef.current;
+    setIsConverting(true);
     try {
-      const parsed = parseMcpJson(text);
+      const parsed =
+        lastConvertedRef.current?.text === text
+          ? lastConvertedRef.current.parsed
+          : await convertMcpJsonConfig(text);
+      if (convertSeqRef.current !== seq) return false;
       if (parsed.kind === "proxy") {
         onProxyParsed(parsed);
       } else if (parsed.kind === "docker") {
@@ -579,11 +662,15 @@ export function useStdioForm(
       return true;
     } catch {
       return false;
+    } finally {
+      if (convertSeqRef.current === seq) setIsConverting(false);
     }
   };
 
   const handleJsonChange = (text: string) => {
     setJsonText(text);
+    if (jsonStatusDebounceRef.current)
+      clearTimeout(jsonStatusDebounceRef.current);
     if (!text.trim()) {
       setJsonStatus(null);
       return;
@@ -595,25 +682,34 @@ export function useStdioForm(
       });
       return;
     }
-    try {
-      const parsed = parseMcpJson(text);
-      setJsonStatus({ ok: true, parsedName: parsed.name });
-    } catch {
-      setJsonStatus({
-        ok: false,
-        error: "Invalid JSON — expected mcpServers config.",
-      });
-    }
+    const seq = ++jsonStatusSeqRef.current;
+    jsonStatusDebounceRef.current = setTimeout(() => {
+      convertMcpJsonConfig(text)
+        .then((parsed) => {
+          if (jsonStatusSeqRef.current !== seq) return;
+          lastConvertedRef.current = { text, parsed };
+          setJsonStatus({ ok: true, parsedName: parsed.name });
+        })
+        .catch((err: unknown) => {
+          if (jsonStatusSeqRef.current !== seq) return;
+          setJsonStatus({
+            ok: false,
+            error:
+              err instanceof Error
+                ? err.message
+                : "Invalid JSON — expected mcpServers config.",
+          });
+        });
+    }, 350);
   };
 
-  const convertJson = (): boolean => {
-    if (!tryApplyJson(jsonText)) return false;
+  const convertJson = async (): Promise<boolean> => {
+    if (!(await tryApplyJson(jsonText))) return false;
     setSubMode("manual");
     return true;
   };
 
   const handleCommandChange = (text: string) => {
-    if (tryApplyJson(text)) return;
     setCommand(text);
     applyAutoVariant(text);
     setErrors((prev) => {
@@ -622,6 +718,9 @@ export function useStdioForm(
       next.command = undefined;
       return next;
     });
+    if (text.trimStart().startsWith("{")) {
+      void tryApplyJson(text);
+    }
   };
 
   const handleVariantChange = (v: string) => {
@@ -704,6 +803,7 @@ export function useStdioForm(
     description,
     setDescription,
     errors,
+    isConverting,
     commandRef,
     handleJsonChange,
     convertJson,
