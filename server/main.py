@@ -5,7 +5,7 @@
 
 from fastapi import FastAPI
 
-from server.api import config, mcp_oauth, mesh, metrics, models, openai, services, settings, utils
+from server.api import config, mcp, mcp_oauth, mesh, metrics, models, openai, services, settings, utils
 from server.api.fallback import StaticFilesHandler
 from server.error_handlers import register_exception_handlers
 from server.lifecycle import lifespan
@@ -22,6 +22,7 @@ app.include_router(openai.router)
 app.include_router(mesh.router)
 app.include_router(metrics.router)
 app.include_router(utils.router)
+app.include_router(mcp.router)
 app.include_router(mcp_oauth.router)
 # Deliberately kept as a separate router object (no auth dependency) — see module docstring.
 app.include_router(mcp_oauth.callback_router)

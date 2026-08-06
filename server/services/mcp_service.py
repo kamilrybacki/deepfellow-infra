@@ -54,7 +54,17 @@ from server.models.services import (
     UninstallServiceIn,
 )
 from server.services.base2_service import Base2Service, CustomModel, Instance, InstanceConfig, ModelConfig
-from server.services.mcp_oauth import (
+from server.services_manager import ServicesManager
+from server.utils.core import (
+    PromiseWithProgress,
+    Stream,
+    StreamChunk,
+    StreamChunkProgress,
+    Utils,
+    normalize_name,
+    try_parse_pydantic,
+)
+from server.utils.mcp_oauth import (
     McpOAuthConfig,
     McpOAuthError,
     McpOAuthStateStore,
@@ -66,16 +76,6 @@ from server.services.mcp_oauth import (
     has_valid_access_token,
     refresh_access_token,
     register_dynamic_client,
-)
-from server.services_manager import ServicesManager
-from server.utils.core import (
-    PromiseWithProgress,
-    Stream,
-    StreamChunk,
-    StreamChunkProgress,
-    Utils,
-    normalize_name,
-    try_parse_pydantic,
 )
 from server.utils.size_fetcher import fmt_size
 

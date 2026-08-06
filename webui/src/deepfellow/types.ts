@@ -231,3 +231,48 @@ export interface McpOAuthStatus {
 export interface McpOAuthStartOut {
   authorize_url: string;
 }
+
+// MCP JSON config conversion types (backend-owned; see `/admin/mcp/convert-config`)
+export type ConvertedMcpKind = "user" | "proxy" | "custom";
+
+export interface ConvertedMcpOAuth {
+  client_id?: string | null;
+  client_secret?: string | null;
+  scope?: string | null;
+}
+
+export interface ConvertedUserMcpConfig {
+  kind: "user";
+  name: string;
+  command: string;
+  envs: Record<string, string>;
+  variant?:
+    | "node-headless"
+    | "node-headed"
+    | "python-headless"
+    | "python-headed"
+    | null;
+}
+
+export interface ConvertedProxyMcpConfig {
+  kind: "proxy";
+  name: string;
+  server_url: string;
+  transport: "streamable_http" | "sse";
+  headers: Record<string, string>;
+  oauth?: ConvertedMcpOAuth | null;
+}
+
+export interface ConvertedCustomMcpConfig {
+  kind: "custom";
+  name: string;
+  image: string;
+  command: string;
+  volumes: string[];
+  envs: Record<string, string>;
+}
+
+export type ConvertedMcpConfig =
+  | ConvertedUserMcpConfig
+  | ConvertedProxyMcpConfig
+  | ConvertedCustomMcpConfig;
