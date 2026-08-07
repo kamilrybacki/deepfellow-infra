@@ -582,6 +582,11 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
     def _load_download_info(self, data: dict[str, Any]) -> DownloadedInfo:
         return DownloadedInfo(**data)
 
+    def _get_hub_dir(self) -> Path:
+        path = self._get_working_dir() / "cache"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
     async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self.load_default_models(instance)
@@ -590,7 +595,7 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
             options.spec["hardware"] = options.spec.get("gpu", self.docker_service.has_gpu_support)
         options.spec["hardware"] = self.canonicalize_hardware_spec(options.spec["hardware"])
         parsed_options = try_parse_pydantic(SpeachesAIOptions, options.spec)
-        volumes = [f"{self._get_working_dir()}/cache:/home/ubuntu/.cache/huggingface/hub"]
+        volumes = [f"{self._get_hub_dir()}:/home/ubuntu/.cache/huggingface/hub"]
 
         image = self._get_image(self.is_given_hardware_support_gpu(parsed_options.hardware))
 
@@ -613,7 +618,7 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
                     "ENABLE_UI": "False",
                 },
                 restart="unless-stopped",
-                user="0:0",
+                user=await self.docker_service.get_user_for_docker(),
                 subnet=subnet,
                 healthcheck={
                     "test": "curl --fail http://localhost:8000/health || exit 1",
@@ -861,7 +866,7 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
             try:
                 model_dir = Path()
                 model_id_fixed = f"models--{model_id.replace('/', '--')}"
-                models_dir = self._get_working_dir() / "cache"
+                models_dir = self._get_hub_dir()
                 model_dir = models_dir / model_id_fixed
                 model_dir.mkdir(parents=True, exist_ok=True)
 

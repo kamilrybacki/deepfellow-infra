@@ -335,6 +335,14 @@ def test_load_download_info_returns_downloaded_info(svc: SpeachesAIService) -> N
     assert result.model_path == "/x"
 
 
+def test_get_hub_dir_creates_directory(svc: SpeachesAIService, tmp_path: Path) -> None:
+    with patch.object(svc, "_get_working_dir", return_value=tmp_path):  # pyright: ignore[reportPrivateUsage]
+        result = svc._get_hub_dir()  # pyright: ignore[reportPrivateUsage]
+
+    assert result == tmp_path / "cache"
+    assert result.is_dir()
+
+
 def test_get_docker_compose_file_path_raises_400_with_model_id(svc: SpeachesAIService) -> None:
     installed = _make_installed_info()
     svc.instances_info["default"].installed = installed
@@ -908,6 +916,7 @@ async def test_uninstall_model_does_nothing_for_unknown_model(svc: SpeachesAISer
 async def test_install_instance_raises_503_on_cuda_version_error(svc: SpeachesAIService, deps: dict[str, Any], tmp_path: Path) -> None:
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-speaches"
+    deps["docker_service"].get_user_for_docker = AsyncMock(return_value="0:0")
     deps["docker_service"].install_and_run_docker = AsyncMock(
         side_effect=RuntimeError("docker failed", ["", "", "", "cuda>=12.9 required, please update your driver"])
     )
@@ -930,6 +939,7 @@ async def test_install_instance_raises_503_on_cuda_version_error(svc: SpeachesAI
 async def test_install_instance_reraises_non_cuda_runtime_error(svc: SpeachesAIService, deps: dict[str, Any], tmp_path: Path) -> None:
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-speaches"
+    deps["docker_service"].get_user_for_docker = AsyncMock(return_value="0:0")
     deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=RuntimeError("generic docker error"))
     options = InstallServiceIn(spec={"hardware": False})
 
@@ -948,6 +958,7 @@ async def test_install_instance_reraises_non_cuda_runtime_error(svc: SpeachesAIS
 async def test_install_instance_returns_installed_info(svc: SpeachesAIService, deps: dict[str, Any], tmp_path: Path) -> None:
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-speaches"
+    deps["docker_service"].get_user_for_docker = AsyncMock(return_value="0:0")
     deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8000)
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 8000
@@ -969,6 +980,7 @@ async def test_install_instance_returns_installed_info(svc: SpeachesAIService, d
 async def test_install_instance_calls_docker_install(svc: SpeachesAIService, deps: dict[str, Any], tmp_path: Path) -> None:
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-speaches"
+    deps["docker_service"].get_user_for_docker = AsyncMock(return_value="0:0")
     deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8000)
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 8000
@@ -991,6 +1003,7 @@ async def test_install_instance_loads_default_models_for_new_instance(svc: Speac
     svc.instances_info["extra"] = Instance(None, None, {}, InstanceConfig())
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-speaches-extra"
+    deps["docker_service"].get_user_for_docker = AsyncMock(return_value="0:0")
     deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8000)
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 8000
