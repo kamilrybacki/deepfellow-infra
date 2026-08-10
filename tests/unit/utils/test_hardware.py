@@ -252,6 +252,17 @@ async def test_get_cpu_info_avx512(avx512: bool):
     assert result == CpuInfo(model="Test CPU", avx512=avx512)
 
 
+@pytest.mark.asyncio
+async def test_get_cpu_info_debug_force_no_avx512():
+    with (
+        patch("server.utils.hardware.cpuinfo.get_cpu_info", return_value={"brand_raw": "Test CPU", "flags": ["avx512f"]}),
+        patch.dict("os.environ", {"DF_DEBUG_FORCE_NO_AVX512": "true"}),
+    ):
+        result = await get_cpu_info()
+
+    assert result == CpuInfo(model="Test CPU", avx512=False)
+
+
 @pytest.mark.parametrize(
     ("mib_str", "expected"),
     [
@@ -447,6 +458,28 @@ async def test_hardware_init_async_with_intel_gpu():
 
     assert hw.intel_gpus == [gpu]
     assert hw.has_gpu_support is True
+
+
+@pytest.mark.asyncio
+async def test_hardware_init_async_debug_force_no_gpu():
+    cpu = CpuInfo(model="Test CPU", avx512=False)
+    nvidia_gpu = NvidiaGpuInfo(name="RTX 4090", vram="24 GB", id=0)
+    intel_gpu = IntelGpuInfo(name="Intel GPU (0xe20b)", vram=None, id=0)
+    with (
+        patch("server.utils.hardware.get_cpu_info", new_callable=AsyncMock, return_value=cpu),
+        patch("server.utils.hardware.get_nvidia_gpus_info", new_callable=AsyncMock, return_value=[nvidia_gpu]) as mock_nvidia,
+        patch("server.utils.hardware.get_intel_gpus_info", new_callable=AsyncMock, return_value=[intel_gpu]) as mock_intel,
+        patch.dict("os.environ", {"DF_DEBUG_FORCE_NO_GPU": "true"}),
+    ):
+        hw = Hardware()
+
+        await hw.init_async()
+
+    assert hw.nvidia_gpus == []
+    assert hw.intel_gpus == []
+    assert hw.has_gpu_support is False
+    mock_nvidia.assert_not_called()
+    mock_intel.assert_not_called()
 
 
 @pytest.mark.asyncio

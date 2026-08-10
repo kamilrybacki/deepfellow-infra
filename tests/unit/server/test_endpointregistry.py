@@ -32,6 +32,7 @@ from server.endpointregistry import (
     _rewrite_sse_endpoint_events,  # pyright: ignore[reportPrivateUsage]
     post_form,
     post_json,
+    post_json_rerank_sglang,
     post_json_responses,
 )
 from server.models.api import (
@@ -2067,6 +2068,22 @@ async def test_register_rerank_as_proxy_callback_invokes_post_json():
 
 
 @pytest.mark.asyncio
+async def test_register_rerank_as_proxy_normalize_sglang_invokes_post_json_rerank_sglang():
+    reg = make_registry()
+    opts = ProxyOptions(url="http://example.com/v1/rerank")
+    reg.register_rerank_as_proxy("rnk-sglang", make_props(), opts, None, normalize_sglang_response=True)
+    ep = reg.rerank_endpoints.get_model("rnk-sglang")
+    mock_resp = MagicMock(spec=StreamingResponse)
+
+    with patch("server.endpointregistry.post_json_rerank_sglang", new_callable=AsyncMock, return_value=mock_resp) as mock_call:
+        body = MagicMock(spec=RerankRequest)
+        result = await ep.endpoint.on_request(body, None)  # pyright: ignore[reportOptionalMemberAccess]
+
+    assert result is mock_resp
+    mock_call.assert_awaited_once_with(body, opts, None)
+
+
+@pytest.mark.asyncio
 async def test_register_custom_endpoint_as_proxy_callback_invokes_make_http_request():
     reg = make_registry()
     opts = ProxyOptions(url="http://example.com/custom/")
@@ -3486,6 +3503,104 @@ async def test_post_json_responses_logs_and_passes_through_on_invalid_json(caplo
 
     assert await _collect(result.body_iterator) == b"not json"
     assert "Failed to parse" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_post_json_rerank_sglang_rewrites_array_response_to_cohere_shape() -> None:
+    sglang_body = json.dumps(
+        [
+            {"score": 2.484375, "document": "A cat is an animal.", "index": 2, "meta_info": {}},
+            {"score": 0.91796875, "document": "The Yeti is a legendary creature.", "index": 1, "meta_info": {}},
+        ]
+    ).encode()
+
+    async def content_gen():  # type: ignore[return]
+        yield sglang_body
+
+    mock_http_response = MagicMock()
+    mock_http_response.response.content_type = "application/json"
+    mock_http_response.response.status = 200
+    mock_http_response.response.headers = {}
+    mock_http_response.content = content_gen()
+
+    opts = ProxyOptions(url="http://example.com/v1/rerank")
+
+    with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response):
+        result = await post_json_rerank_sglang(RerankRequest(model="m", query="q", documents=[]), opts)
+
+    body = await _collect(result.body_iterator)
+    assert json.loads(body) == {
+        "results": [
+            {"index": 2, "relevance_score": 2.484375, "document": {"text": "A cat is an animal."}},
+            {"index": 1, "relevance_score": 0.91796875, "document": {"text": "The Yeti is a legendary creature."}},
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_post_json_rerank_sglang_passes_through_non_json_response() -> None:
+    mock_http_response = MagicMock()
+    mock_streaming = MagicMock(spec=StreamingResponse)
+    mock_http_response.response.content_type = "text/plain"
+    mock_http_response.as_streaming_response.return_value = mock_streaming
+
+    opts = ProxyOptions(url="http://example.com/v1/rerank")
+
+    with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response):
+        result = await post_json_rerank_sglang(RerankRequest(model="m", query="q", documents=[]), opts)
+
+    assert result is mock_streaming
+
+
+@pytest.mark.asyncio
+async def test_post_json_rerank_sglang_removes_model_when_requested() -> None:
+    mock_http_response = MagicMock()
+    mock_http_response.response.content_type = "text/plain"
+    mock_http_response.as_streaming_response.return_value = MagicMock()
+    opts = ProxyOptions(url="http://example.com/v1/rerank", remove_model=True)
+
+    with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response) as mock_req:
+        await post_json_rerank_sglang(RerankRequest(model="m", query="q", documents=[]), opts)
+
+    called_data = mock_req.call_args.kwargs["data"]
+    assert "model" not in json.loads(called_data._value)
+
+
+@pytest.mark.asyncio
+async def test_post_json_rerank_sglang_rewrites_model_when_requested() -> None:
+    mock_http_response = MagicMock()
+    mock_http_response.response.content_type = "text/plain"
+    mock_http_response.as_streaming_response.return_value = MagicMock()
+    opts = ProxyOptions(url="http://example.com/v1/rerank", rewrite_model_to="served-name")
+
+    with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response) as mock_req:
+        await post_json_rerank_sglang(RerankRequest(model="m", query="q", documents=[]), opts)
+
+    called_data = mock_req.call_args.kwargs["data"]
+    assert json.loads(called_data._value)["model"] == "served-name"
+
+
+@pytest.mark.asyncio
+async def test_post_json_rerank_sglang_logs_and_passes_through_on_malformed_body(caplog: pytest.LogCaptureFixture) -> None:
+    async def content_gen():  # type: ignore[return]
+        yield b"not json"
+
+    mock_http_response = MagicMock()
+    mock_http_response.response.content_type = "application/json"
+    mock_http_response.response.status = 200
+    mock_http_response.response.headers = {}
+    mock_http_response.content = content_gen()
+
+    opts = ProxyOptions(url="http://example.com/v1/rerank")
+
+    with (
+        caplog.at_level(logging.WARNING, logger="uvicorn.error"),
+        patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response),
+    ):
+        result = await post_json_rerank_sglang(RerankRequest(model="m", query="q", documents=[]), opts)
+
+    assert await _collect(result.body_iterator) == b"not json"
+    assert "Failed to normalize SGLang rerank response" in caplog.text
 
 
 @pytest.mark.asyncio

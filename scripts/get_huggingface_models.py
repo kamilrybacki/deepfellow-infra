@@ -227,13 +227,20 @@ def _drop_unsupported_models(
     architectures: dict[str, list[str]],
     chat_capable: dict[str, bool],
     log: Callable[[str], None],
+    keep_generative_rerankers: bool = False,
 ) -> list[dict[str, Any]]:
-    """Drop candidates vLLM can't actually serve for the given registry, logging what was dropped."""
+    """Drop candidates the target engine can't actually serve, logging what was dropped.
+
+    `keep_generative_rerankers` opts a registry out of the cross-encoder-only filter: engines
+    that can serve generative rerankers (e.g. SGLang, given the right startup flags) pass this so
+    those candidates stay in and get tagged via `is_generative` instead of being dropped outright.
+    """
     before = len(models)
     if registry_key == "rerankers":
-        models = [m for m in models if is_supported_cross_encoder(architectures.get(m["id"], []))]
-        if dropped := before - len(models):
-            log(f"Dropped {dropped} reranker candidate(s) whose architecture vLLM can't serve as a cross-encoder.")
+        if not keep_generative_rerankers:
+            models = [m for m in models if is_supported_cross_encoder(architectures.get(m["id"], []))]
+            if dropped := before - len(models):
+                log(f"Dropped {dropped} reranker candidate(s) whose architecture vLLM can't serve as a cross-encoder.")
     elif registry_key == "llms":
         models = [m for m in models if chat_capable.get(m["id"], False)]
         if dropped := before - len(models):
@@ -242,7 +249,13 @@ def _drop_unsupported_models(
 
 
 async def main(
-    top_by_downloads: int, top_by_likes: int, top_by_trending: int, raw: bool, model_type: str, output: str | None = None
+    top_by_downloads: int,
+    top_by_likes: int,
+    top_by_trending: int,
+    raw: bool,
+    model_type: str,
+    output: str | None = None,
+    allow_generative_rerankers: bool = False,
 ) -> None:
     """Fetch models from HuggingFace and print (or write) a vllm-min.json compatible registry."""
 
@@ -287,13 +300,16 @@ async def main(
         architectures = {mid: arch for mid, _, arch, _ in details}
         chat_capable = {mid: chat_ok for mid, _, _, chat_ok in details}
 
-    models = _drop_unsupported_models(registry_key, models, architectures, chat_capable, log)
+    models = _drop_unsupported_models(registry_key, models, architectures, chat_capable, log, allow_generative_rerankers)
 
-    entries: list[dict[str, str]] = []
+    entries: list[dict[str, Any]] = []
     for m in models:
         mid = m["id"]
         size = fmt_size_compact(sizes.get(mid, "N/A"))
-        entries.append({"name": mid, "size": size})
+        entry: dict[str, Any] = {"name": mid, "size": size}
+        if registry_key == "rerankers":
+            entry["is_generative"] = not is_supported_cross_encoder(architectures.get(mid, []))
+        entries.append(entry)
     entries.sort(key=lambda e: e["name"].casefold())
 
     if output is None:
@@ -318,5 +334,20 @@ if __name__ == "__main__":
         "--type", choices=["llm", "reranker", "embedding"], default="llm", dest="model_type", help="Model type to fetch (default: llm)"
     )
     p.add_argument("--output", default=None, metavar="PATH", help="Write into PATH, merging into its existing keys, instead of stdout")
+    p.add_argument(
+        "--allow-generative-rerankers",
+        action="store_true",
+        help="Keep generative (non-cross-encoder) reranker candidates instead of dropping them; tags each entry with 'is_generative'",
+    )
     args = p.parse_args()
-    asyncio.run(main(args.top_by_downloads, args.top_by_likes, args.top_by_trending, args.raw, args.model_type, args.output))
+    asyncio.run(
+        main(
+            args.top_by_downloads,
+            args.top_by_likes,
+            args.top_by_trending,
+            args.raw,
+            args.model_type,
+            args.output,
+            args.allow_generative_rerankers,
+        )
+    )

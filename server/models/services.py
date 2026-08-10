@@ -64,6 +64,7 @@ class RetrieveServiceOut(BaseModel):
     custom_model_spec: CustomModelSpecification | None
     has_docker: bool
     is_cloud: bool = False
+    disabled_reason: str | None = None
 
 
 class ListServicesFilters(BaseModel):

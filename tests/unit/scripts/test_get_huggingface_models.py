@@ -658,6 +658,40 @@ async def test_main_reranker_drops_unsupported_architecture(capsys: pytest.Captu
 
 
 @pytest.mark.asyncio
+async def test_main_reranker_keeps_generative_when_allowed(capsys: pytest.CaptureFixture[str]) -> None:
+    models = [{"id": "org/bge-reranker"}, {"id": "org/generative-reranker"}]
+    sizes = {"org/bge-reranker": "1.0 GB", "org/generative-reranker": "4.0 GB"}
+    architectures = {
+        "org/bge-reranker": ["XLMRobertaForSequenceClassification"],
+        "org/generative-reranker": ["Qwen3ForCausalLM"],
+    }
+
+    async def fake_collect(session: Mock, active: dict[str, str]):
+        return models
+
+    async def fake_details(
+        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
+    ) -> tuple[str, str, list[str], bool]:
+        return model_id, sizes.get(model_id, "N/A"), architectures.get(model_id, []), True
+
+    with (
+        patch("scripts.get_huggingface_models.collect_reranker_models", side_effect=fake_collect),
+        patch("scripts.get_huggingface_models.fetch_model_details", side_effect=fake_details),
+        patch(
+            "aiohttp.ClientSession",
+            return_value=AsyncMock(__aenter__=AsyncMock(return_value=MagicMock()), __aexit__=AsyncMock(return_value=False)),
+        ),
+    ):
+        await main(10, 0, 0, raw=False, model_type="reranker", allow_generative_rerankers=True)
+
+    out = capsys.readouterr()
+    data = json.loads(out.out)
+    entries = {e["name"]: e["is_generative"] for e in data["rerankers"]}
+    assert entries == {"org/bge-reranker": False, "org/generative-reranker": True}
+    assert "Dropped" not in out.err
+
+
+@pytest.mark.asyncio
 async def test_main_llm_drops_models_without_chat_template(capsys: pytest.CaptureFixture[str]) -> None:
     models = [{"id": "org/llama-instruct"}, {"id": "org/llama-base"}]
     sizes = {"org/llama-instruct": "4.0 GB", "org/llama-base": "4.0 GB"}

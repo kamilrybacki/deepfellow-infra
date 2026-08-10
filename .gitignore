@@ -53,3 +53,4 @@ memory
 
 # Bruno smoke tests — local auth tokens
 /tests/bruno/.env
+.claude/skills/sync-release

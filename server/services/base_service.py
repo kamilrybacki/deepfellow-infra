@@ -91,6 +91,7 @@ class BaseService(ABC):
             custom_model_spec=self.get_custom_model_spec(),
             has_docker=self.service_has_docker(),
             is_cloud=self.is_cloud_service(),
+            disabled_reason=self.get_hardware_unsupported_reason(),
         )
 
     @abstractmethod
@@ -128,6 +129,10 @@ class BaseService(ABC):
     def is_cloud_service(self) -> bool:
         """Return true when this service uses external cloud APIs."""
         return self.is_cloud
+
+    def get_hardware_unsupported_reason(self) -> str | None:
+        """Return why this service can't run on the current hardware, or None if it can. None by default."""
+        return None
 
     @abstractmethod
     async def load_service(self, config: ServiceRawConfig) -> None:

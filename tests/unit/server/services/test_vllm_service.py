@@ -606,16 +606,6 @@ async def test_get_quantization_returns_none_when_not_set(svc: VllmService) -> N
     assert result is None
 
 
-@pytest.mark.asyncio
-async def test_get_max_model_length_returns_value_for_integer_float(svc: VllmService) -> None:
-    model = VllmModel(hf_id="google/test", size="1GB")
-    opts = VllmModelOptions.model_construct(max_model_length=4096.0)
-
-    result = await svc._get_max_model_length(opts, model)  # pyright: ignore[reportPrivateUsage]
-
-    assert result == 4096.0
-
-
 def test_register_model_endpoint_llm_calls_chat_completion_proxy(svc: VllmService, deps: dict[str, Any]) -> None:
     model = VllmModel(hf_id="google/test", size="1GB", model_type="llm")
     model_info = _make_model_installed_info("google/test", model_type="llm")
@@ -1264,17 +1254,6 @@ async def test_download_model_or_set_progress_breaks_on_non_download_chunk(svc: 
     assert result_path is not None
 
 
-@pytest.mark.asyncio
-async def test_get_max_model_length_raises_422_for_non_integer_float(svc: VllmService) -> None:
-    model = VllmModel(hf_id="google/test", size="1GB")
-    opts = VllmModelOptions.model_construct(max_model_length=4096.5)
-
-    with pytest.raises(HTTPException) as exc_info:
-        await svc._get_max_model_length(opts, model)  # pyright: ignore[reportPrivateUsage]
-
-    assert exc_info.value.status_code == 422
-
-
 def test_build_vllm_command_use_gpu_with_model_length(svc: VllmService, tmp_path: Path) -> None:
     opts = VllmModelOptions.model_construct(extra_args={})
 
@@ -1784,7 +1763,7 @@ async def test_install_model_releases_gpu_when_option_parsing_fails(svc: VllmSer
 
     with (
         patch.object(svc2, "is_given_hardware_support_gpu", return_value=True),
-        patch.object(svc2, "_get_max_model_length", new_callable=AsyncMock, side_effect=RuntimeError("bad length")),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc2, "_get_quantization", new_callable=AsyncMock, side_effect=RuntimeError("bad quantization")),  # pyright: ignore[reportPrivateUsage]
         pytest.raises(RuntimeError),
     ):
         await svc2._install_model("default", model_id, InstallModelIn(spec={"gpu_memory_utilization": 0.5}))  # pyright: ignore[reportPrivateUsage]
