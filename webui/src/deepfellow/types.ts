@@ -67,6 +67,7 @@ export interface Service {
   custom_model_spec?: ServiceSpec;
   has_docker?: boolean;
   is_cloud?: boolean;
+  disabled_reason?: string | null;
 }
 
 export interface InfraSettings {

@@ -79,3 +79,8 @@ get-vllm-models *FLAGS:
     uv run python ./scripts/get_huggingface_models.py --type reranker --top-by-downloads 10 --top-by-trending 10 --output static/vllm-min.json {{FLAGS}}
     uv run python ./scripts/get_huggingface_models.py --type embedding --top-by-downloads 10 --top-by-trending 10 --output static/vllm-min.json {{FLAGS}}
 
+get-sglang-models *FLAGS:
+    uv run python ./scripts/get_huggingface_models.py --type llm --top-by-downloads 200 --top-by-likes 100 --top-by-trending 50 --output static/sglang-min.json {{FLAGS}}
+    uv run python ./scripts/get_huggingface_models.py --type reranker --top-by-downloads 50 --top-by-likes 30 --top-by-trending 30 --allow-generative-rerankers --output static/sglang-min.json {{FLAGS}}
+    uv run python ./scripts/get_huggingface_models.py --type embedding --top-by-downloads 10 --top-by-trending 10 --output static/sglang-min.json {{FLAGS}}
+

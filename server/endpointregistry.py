@@ -755,10 +755,19 @@ class EndpointRegistry:
         props: ModelProps,
         options: ProxyOptions,
         registration_options: RegistrationOptions | None,
+        normalize_sglang_response: bool = False,
     ) -> RegistrationId:
-        """Register rerank for given model as a proxy."""
+        """Register rerank for given model as a proxy.
+
+        `normalize_sglang_response` rewrites SGLang's native rerank response (a plain
+        `[{"score", "document", "index", ...}]` array) into the Cohere-style `{"results": [...]}`
+        shape the rest of this API expects; other backends (vLLM, the dedicated rerank service)
+        already return that shape natively and don't need it.
+        """
 
         async def on_request(body: RerankRequest, request: Request | None) -> StreamingResponse:
+            if normalize_sglang_response:
+                return await post_json_rerank_sglang(body, options, request)
             return await post_json(body, options, request)
 
         return self.register_rerank(model, props, SimpleEndpoint(on_request=on_request), registration_options)
@@ -1498,6 +1507,56 @@ async def post_json_responses(
                 store.put(item)
     except json.JSONDecodeError:
         logger.warning("Failed to parse /v1/responses body for item_reference caching", exc_info=True)
+
+    allowed_response_headers = options.allowed_response_headers or []
+    response_headers = {k: v for k, v in dict(http_response.response.headers).items() if k in allowed_response_headers}
+
+    async def replay() -> AsyncGenerator[bytes]:
+        yield body
+
+    return StreamingResponse(
+        replay(),
+        media_type=http_response.response.content_type,
+        status_code=http_response.response.status,
+        headers=response_headers,
+    )
+
+
+def _sglang_rerank_response_to_cohere(raw_body: bytes) -> bytes:
+    """Rewrite SGLang's native `/v1/rerank` array response into the Cohere-style `{"results": [...]}` shape."""
+    parsed = json.loads(raw_body)
+    results = [
+        {
+            "index": item["index"],
+            "relevance_score": item["score"],
+            "document": {"text": item["document"]} if item.get("document") is not None else None,
+        }
+        for item in parsed
+    ]
+    return json.dumps({"results": results}).encode()
+
+
+async def post_json_rerank_sglang(data: RerankRequest, options: ProxyOptions, request: Request | None = None) -> StreamingResponse:
+    """Make HTTP POST request to SGLang's `/v1/rerank`, rewriting its native array response into Cohere-style shape."""
+    raw = data.model_dump(exclude_none=True)
+    if options.remove_model:
+        del raw["model"]
+    if options.rewrite_model_to:
+        raw["model"] = options.rewrite_model_to
+    http_response = await make_http_request(
+        url=options.url,
+        method="POST",
+        data=JsonPayload(raw),
+        headers=await options.get_request_headers(request),
+    )
+    if not (http_response.response.content_type or "").startswith("application/json"):
+        return http_response.as_streaming_response(options.allowed_response_headers)
+
+    body = b"".join([chunk async for chunk in http_response.content])
+    try:
+        body = _sglang_rerank_response_to_cohere(body)
+    except (json.JSONDecodeError, KeyError, TypeError):
+        logger.warning("Failed to normalize SGLang rerank response into Cohere shape", exc_info=True)
 
     allowed_response_headers = options.allowed_response_headers or []
     response_headers = {k: v for k, v in dict(http_response.response.headers).items() if k in allowed_response_headers}

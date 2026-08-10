@@ -118,12 +118,12 @@ export function ServicesList() {
       ...(servicesData ? servicesData.list : []),
       ...anotherInstances,
     ];
+    const isDisabled = (service: Service) =>
+      !!service.disabled_reason || (!!service.is_cloud && !cloudEnabled);
     newList.sort((a, b) => {
-      if (!cloudEnabled) {
-        const aCloud = a.is_cloud ? 1 : 0;
-        const bCloud = b.is_cloud ? 1 : 0;
-        if (aCloud !== bCloud) return aCloud - bCloud;
-      }
+      const aDisabled = isDisabled(a) ? 1 : 0;
+      const bDisabled = isDisabled(b) ? 1 : 0;
+      if (aDisabled !== bDisabled) return aDisabled - bDisabled;
       return a.type.localeCompare(b.type) || a.id.localeCompare(b.id);
     });
     return newList;
@@ -902,6 +902,8 @@ export function ServicesList() {
                   "stage" in service.installed &&
                   "value" in service.installed;
                 const isCloudDisabled = service.is_cloud && !cloudEnabled;
+                const isHardwareDisabled = !!service.disabled_reason;
+                const isDisabled = isCloudDisabled || isHardwareDisabled;
 
                 return (
                   <TableRow
@@ -911,7 +913,7 @@ export function ServicesList() {
                         !isInstalled ||
                         installedIsProgress ||
                         isInProgress ||
-                        isCloudDisabled
+                        isDisabled
                       )
                         return;
                       handleRowNavigate(e, service.id);
@@ -921,10 +923,10 @@ export function ServicesList() {
                         isInstalled &&
                         !installedIsProgress &&
                         !isInProgress &&
-                        !isCloudDisabled
+                        !isDisabled
                           ? "cursor-pointer hover:bg-muted/50"
                           : undefined,
-                        isCloudDisabled ? "opacity-50" : undefined,
+                        isDisabled ? "opacity-50" : undefined,
                       ]
                         .filter(Boolean)
                         .join(" ") || undefined
@@ -999,7 +1001,7 @@ export function ServicesList() {
                                       }
                                       size="sm"
                                       disabled={
-                                        isInstallingCurrent || isCloudDisabled
+                                        isInstallingCurrent || isDisabled
                                       }
                                     >
                                       {isInstallingCurrent
@@ -1008,11 +1010,17 @@ export function ServicesList() {
                                     </Button>
                                   </span>
                                 </TooltipTrigger>
-                                {isCloudDisabled && (
+                                {isCloudDisabled ? (
                                   <TooltipContent>
                                     Cloud services are disabled. Enable cloud to
                                     install this service.
                                   </TooltipContent>
+                                ) : (
+                                  isHardwareDisabled && (
+                                    <TooltipContent className="whitespace-pre-line">
+                                      {service.disabled_reason}
+                                    </TooltipContent>
+                                  )
                                 )}
                               </Tooltip>
                             </TooltipProvider>

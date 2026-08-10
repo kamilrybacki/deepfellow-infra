@@ -4,6 +4,7 @@
 """Hardware module."""
 
 import asyncio
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -17,6 +18,16 @@ from server.utils.core import Utils
 
 INTEL_VENDOR_ID = "0x8086"
 DRM_PATH = Path("/sys/class/drm")
+
+# Debug-only overrides to simulate hardware without a supported GPU or AVX-512, e.g. to exercise
+# the "hardware doesn't support this service" gating for sglang/vllm without matching real hardware.
+# Not part of AppSettings/config.json: read once at process start, not meant to be toggled at runtime.
+DEBUG_FORCE_NO_GPU_ENV = "DF_DEBUG_FORCE_NO_GPU"
+DEBUG_FORCE_NO_AVX512_ENV = "DF_DEBUG_FORCE_NO_AVX512"
+
+
+def _debug_flag_enabled(env_var: str) -> bool:
+    return os.environ.get(env_var, "").strip().lower() in ("1", "true", "yes")
 
 
 @dataclass
@@ -79,6 +90,8 @@ async def get_cpu_info() -> CpuInfo:
     info = cpuinfo.get_cpu_info()
     model: str = info.get("brand_raw", "Unknown CPU")
     avx512: bool = any(flag.startswith("avx512") for flag in info.get("flags", []))
+    if _debug_flag_enabled(DEBUG_FORCE_NO_AVX512_ENV):
+        avx512 = False
     return CpuInfo(model=model, avx512=avx512)
 
 
@@ -244,8 +257,12 @@ class Hardware:
     async def init_async(self) -> None:
         """Init async."""
         self._cpu = await get_cpu_info()
-        self._nvidia_gpus = await get_nvidia_gpus_info()
-        self._intel_gpus = await get_intel_gpus_info()
+        if _debug_flag_enabled(DEBUG_FORCE_NO_GPU_ENV):
+            self._nvidia_gpus = []
+            self._intel_gpus = []
+        else:
+            self._nvidia_gpus = await get_nvidia_gpus_info()
+            self._intel_gpus = await get_intel_gpus_info()
         # Ensure these are assigned (even if empty) before calling set_gpus
         self._amd_gpus = []
 
@@ -379,9 +396,9 @@ class Hardware:
             ram_used_gb=round(mem.used / 1024**3, 2),
         )
 
-    async def get_realtime_stats(self) -> GpuStats | None:
+    async def get_realtime_stats(self, force_refresh: bool = False) -> GpuStats | None:
         """Return live GPU stats (NVIDIA or AMD), cached for up to _REALTIME_STATS_TTL seconds."""
-        if time.monotonic() - self._realtime_stats_cache_ts < _REALTIME_STATS_TTL:
+        if not force_refresh and time.monotonic() - self._realtime_stats_cache_ts < _REALTIME_STATS_TTL:
             return self._realtime_stats_cache
 
         cards = await self._get_nvidia_stats() or await self._get_amd_stats()
