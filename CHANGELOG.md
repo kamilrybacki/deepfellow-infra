@@ -65,6 +65,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `/v1/responses` no longer rejects function tools whose parameter schema has an optional (not-`required`) property — `strict` now defaults to `false` instead of `true`.
 - `/v1/responses` no longer rejects `function_call`/`function_call_output` history items on the OpenAI-backed path: a duplicated `type` discriminator on `CustomToolCall` was colliding with `FunctionToolCall`'s, making the union ambiguous for every `function_call` item. `id`/`call_id` also no longer share one value generated once per process, so tool-call history replays byte-for-byte.
 - `/v1/models?additional_data=true` now reports the correct endpoint list for Ollama, llama.cpp, and vLLM models; a malformed `LLM_ENDPOINTS` entry had merged two endpoint paths into one string and dropped the leading `/` used by every other endpoint.
+- The vLLM and SGLang model registries (`just get-vllm-models` / `just get-sglang-models`) no longer omit every multimodal model. HuggingFace tags vision-language chat models as `image-text-to-text` rather than `text-generation`, so the scraper never even requested them, while community re-uploads of the same weights that happened to be tagged `text-generation` were present. Single-purpose OCR models pulled in by the new tag are excluded, since they are text extractors rather than chat models.
+- The scraper's non-LLM name filter no longer discards valid models over a substring match: `ner` matched inside `ForConditionalGeneration` (every multimodal repo) and inside author names, so those models were dropped before any other check ran. Task words are now matched on word boundaries.
 
 ### Changed
 - Stable Diffusion service to Stable Diffusion Next

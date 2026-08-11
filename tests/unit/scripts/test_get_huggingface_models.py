@@ -74,6 +74,11 @@ def test_fmt_size_compact(input_val: str, expected: str):
         ({"id": ""}, True),
         ({}, True),
         ({"id": "Model-TRANSLATION-v2"}, False),
+        ({"id": "deepseek-ai/DeepSeek-OCR"}, False),
+        ({"id": "PaddlePaddle/PaddleOCR-VL"}, False),
+        ({"id": "stepfun-ai/GOT-OCR2_0"}, False),
+        ({"id": "trl-internal-testing/tiny-Gemma3ForConditionalGeneration"}, True),
+        ({"id": "gaunernst/gemma-3-27b-it-int4-awq"}, True),
     ],
     ids=[
         "plain_llm",
@@ -85,6 +90,11 @@ def test_fmt_size_compact(input_val: str, expected: str):
         "empty_id",
         "missing_id",
         "case_insensitive",
+        "ocr_excluded",
+        "ocr_glued_to_name_excluded",
+        "ocr_followed_by_digit_excluded",
+        "ner_inside_generation_kept",
+        "ner_inside_author_name_kept",
     ],
 )
 def test_is_llm(model_data: dict[str, str], expected: bool) -> None:
@@ -395,7 +405,33 @@ async def test_collect_llm_models_merges_multiple_sorts() -> None:
         result = await collect_llm_models(MagicMock(), {"downloads": 5, "likes": 5})
 
     assert len(result) == 2
-    assert len(calls) == 4  # 2 sorts x 2 LLM_TAGS
+    assert len(calls) == 6  # 2 sorts x 3 LLM_TAGS
+
+
+@pytest.mark.asyncio
+async def test_collect_llm_models_queries_multimodal_tag() -> None:
+    tags: list[str] = []
+
+    async def fake_fetch(session: Mock, tag: str, sort: str, limit: int):
+        tags.append(tag)
+        return [{"id": "google/gemma-4-31B-it-qat-w4a16-ct"}] if tag == "image-text-to-text" else []
+
+    with patch("scripts.get_huggingface_models.fetch_popular_models", side_effect=fake_fetch):
+        result = await collect_llm_models(MagicMock(), {"downloads": 10})
+
+    assert "image-text-to-text" in tags
+    assert [m["id"] for m in result] == ["google/gemma-4-31B-it-qat-w4a16-ct"]
+
+
+@pytest.mark.asyncio
+async def test_collect_llm_models_filters_ocr_models() -> None:
+    async def fake_fetch(session: Mock, tag: str, sort: str, limit: int):
+        return [{"id": "deepseek-ai/DeepSeek-OCR"}, {"id": "google/gemma-4-31B-it"}]
+
+    with patch("scripts.get_huggingface_models.fetch_popular_models", side_effect=fake_fetch):
+        result = await collect_llm_models(MagicMock(), {"downloads": 10})
+
+    assert [m["id"] for m in result] == ["google/gemma-4-31B-it"]
 
 
 @pytest.mark.asyncio
