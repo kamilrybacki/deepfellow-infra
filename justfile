@@ -11,16 +11,16 @@ ntest *FLAGS:
     uv run pytest --showlocals --tb=auto -ra --cov server --cov-branch --cov-report=term-missing --no-cov-on-fail -n auto {{FLAGS}}
 
 ruff *FLAGS:
-    uv run ruff check server/ tests/ {{FLAGS}}
+    uv run ruff check server/ scripts/ tests/ {{FLAGS}}
 
 ruff-format *FLAGS:
-    uv run ruff format server/ tests/ {{FLAGS}}
+    uv run ruff format server/ scripts/ tests/ {{FLAGS}}
 
 auth-static:
-    uv run python ./server/scripts/check_auth.py static ./server/ -v
+    uv run python -m server.scripts.check_auth static ./server/ -v
 
 auth-runtime:
-    uv run python ./server/scripts/check_auth.py runtime ./server/main.py -v
+    uv run python -m server.scripts.check_auth runtime ./server/main.py -v
 
 pyright:
     uv run pyright
@@ -60,7 +60,7 @@ ts-fix *FLAGS:
    (cd $(git rev-parse --show-toplevel)/webui && npx biome check --write src {{FLAGS}})
 
 env-copy:
-    uv run python ./scripts/copy_envs.py
+    uv run python -m scripts.copy_envs
 
 replace-docker *FLAGS:
     docker stop infra-infra-1; just dev {{FLAGS}}
@@ -69,15 +69,18 @@ inspector:
     npx @modelcontextprotocol/inspector node build/index.js
 
 get-ollama-models *FLAGS:
-    uv run python ./scripts/get_ollama_models.py {{FLAGS}}
+    uv run python -m scripts.get_ollama_models {{FLAGS}}
 
 clear-ollama-cache:
-    uv run python ./scripts/get_ollama_models.py --clear-cache
+    uv run python -m scripts.get_ollama_models --clear-cache
 
 get-vllm-models *FLAGS:
-    uv run python ./scripts/get_huggingface_models.py --type llm --top-by-downloads 200 --top-by-likes 100 --top-by-trending 50 --output static/vllm-min.json {{FLAGS}}
-    uv run python ./scripts/get_huggingface_models.py --type reranker --top-by-downloads 10 --top-by-trending 10 --output static/vllm-min.json {{FLAGS}}
-    uv run python ./scripts/get_huggingface_models.py --type embedding --top-by-downloads 10 --top-by-trending 10 --output static/vllm-min.json {{FLAGS}}
+    uv run python -m scripts.get_huggingface_models --type llm --top-by-downloads 200 --top-by-likes 100 --top-by-trending 50 --output static/vllm-min.json {{FLAGS}}
+    uv run python -m scripts.get_huggingface_models --type reranker --top-by-downloads 10 --top-by-trending 10 --output static/vllm-min.json {{FLAGS}}
+    uv run python -m scripts.get_huggingface_models --type embedding --top-by-downloads 10 --top-by-trending 10 --output static/vllm-min.json {{FLAGS}}
+
+get-llamacpp-models *FLAGS:
+    uv run python -m scripts.get_llamacpp_models --top-by-downloads 200 --top-by-likes 100 --top-by-trending 50 --output static/llamacpp-min.json {{FLAGS}}
 
 get-sglang-models *FLAGS:
     uv run python ./scripts/get_huggingface_models.py --type llm --top-by-downloads 200 --top-by-likes 100 --top-by-trending 50 --output static/sglang-min.json {{FLAGS}}
