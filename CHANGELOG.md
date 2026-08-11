@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Changed
+- vLLM service's hardware-support guard and GPU-utilization release logic are each backed by a single shared implementation instead of duplicated copies, removing the risk of the copies drifting apart on future changes.
+
 ## [0.31.0] - 2026-08-06
 
 ### Added

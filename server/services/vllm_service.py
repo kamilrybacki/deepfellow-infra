@@ -330,16 +330,18 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             )
         return None
 
-    def is_given_hardware_support_gpu(self, hardware_specification: str | bool | None) -> bool:
-        """Return is gpu will be used."""
+    def _ensure_hardware_supported(self) -> None:
         if reason := self.get_hardware_unsupported_reason():
             raise HTTPException(400, reason)
+
+    def is_given_hardware_support_gpu(self, hardware_specification: str | bool | None) -> bool:
+        """Return is gpu will be used."""
+        self._ensure_hardware_supported()
         return super().is_given_hardware_support_gpu(hardware_specification)
 
     def get_specified_hardware_parts(self, hardware_specification: str | bool | None) -> Sequence[HardwarePartInfo]:
         """Get hardware based on user input."""
-        if reason := self.get_hardware_unsupported_reason():
-            raise HTTPException(400, reason)
+        self._ensure_hardware_supported()
         return super().get_specified_hardware_parts(hardware_specification)
 
     def _load_download_info(self, data: dict[str, Any]) -> DownloadedInfo:
@@ -891,12 +893,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         if model_id in info.models:
             model = info.models[model_id]
-            if model.gpu_memory_utilization:
-                self.gpu_memory_utilization -= model.gpu_memory_utilization
-                if self.gpu_memory_utilization < 0:
-                    self.gpu_memory_utilization = 0
-                msg = f"VLLM gpu utilization = {self.gpu_memory_utilization}"
-                logger.debug(msg)
+            self._release_gpu_utilization(model.gpu_memory_utilization)
             del info.models[model_id]
             if model.model_type == "reranker":
                 self.endpoint_registry.unregister_rerank(model.registered_name, model.registration_id)
