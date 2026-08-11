@@ -10,6 +10,7 @@ Outputs a vllm-min.json compatible JSON to stdout.
 import argparse
 import asyncio
 import json
+import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -20,9 +21,10 @@ import aiohttp
 # ruff: noqa: T201
 
 HF_API = "https://huggingface.co/api"
-LLM_TAGS = ["text-generation", "text2text-generation"]
+LLM_TAGS = ["text-generation", "text2text-generation", "image-text-to-text"]
 CONCURRENCY = 10  # parallel size-fetch requests
 PAGE_SIZE = 100  # max models per API page (HF limit)
+NON_LLM_TASK_WORDS = re.compile(r"\b(?:translation|summarization|classification|ner|qa)\b")
 
 
 def fmt_size(n: int) -> str:
@@ -46,10 +48,16 @@ def fmt_size_compact(size_str: str) -> str:
 
 
 def is_llm(model: dict[str, Any]) -> bool:
-    """Filter out non-LLM models using a basic heuristic."""
+    """Filter out non-LLM models using a basic heuristic.
+
+    Task words are matched on word boundaries so that a substring buried in an unrelated name does
+    not disqualify a real LLM — "ner" occurs inside "ForConditionalGeneration", which every
+    multimodal repo carries. "ocr" is matched as a plain substring instead, because OCR models spell
+    it glued to the rest of the name ("PaddleOCR-VL", "olmOCR", "GOT-OCR2_0"); those are
+    single-purpose text extractors rather than chat models, so they don't belong in an LLM registry.
+    """
     name = model.get("id", "").lower()
-    exclude = ["translation", "summarization", "classification", "ner", "qa-"]
-    return not any(kw in name for kw in exclude)
+    return not NON_LLM_TASK_WORDS.search(name) and "ocr" not in name
 
 
 def is_gguf(model: dict[str, Any]) -> bool:
