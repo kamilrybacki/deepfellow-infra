@@ -851,11 +851,11 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
             model_info: ModelInstalledInfo | None = None
             docker_options: DockerOptions | None = None
             try:
-                model_id_fixed = model_id.replace("/", "-")
+                model_id_fixed = model.hf_id.replace("/", "-")
                 models_dir = self._get_working_dir() / "models"
                 model_dir = models_dir / model_id_fixed
                 model_dir.mkdir(parents=True, exist_ok=True)
-                local_model_path: Path | None = await self._download_model_or_set_progress(stream, model_id, model, model_dir)
+                local_model_path: Path | None = await self._download_model_or_set_progress(stream, model.hf_id, model, model_dir)
 
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
                 docker_model_path = Path(self.hugging_face_cache_path) / "hub" / model_id_fixed

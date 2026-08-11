@@ -41,6 +41,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Coqui TTS now runs from `idiap/coqui-ai-TTS`, an actively maintained community fork, instead of the original `coqui-ai/TTS` repo, which has had no upstream activity since August 2024. Also fixes the bundled CPU/GPU Docker images being swapped (the "CPU" option was pulling the GPU-capable image and vice versa).
 
 ### Fixed
+- Custom model installation for SGLang and VLLM now correctly uses model's hf_id instead of model_id.
 - speaches-ai model installs no longer fail with a `PermissionError` on a fresh install when running the backend as a non-root user (e.g. via `just dev`). The container now runs as the current host user instead of always as root, so the cache directory Docker creates on first start is writable by the backend.
 - `POST /v1/embeddings` Request schema now also accepts token-array `input` and restricts `encoding_format` to `base64`/`float`.
 - `/v1/responses` no longer fails a pyright type check by passing an unawaited coroutine as request headers.
