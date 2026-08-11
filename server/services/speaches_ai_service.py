@@ -618,7 +618,10 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
                     "ENABLE_UI": "False",
                 },
                 restart="unless-stopped",
-                user=await self.docker_service.get_user_for_docker(),
+                # user pinned to 0:0 - get_user_for_docker() returns the host uid:gid on rootful Docker, but the image's /home/ubuntu
+                # is 0750 ubuntu:ubuntu, so any uid other than 1000 cannot reach the venv on PATH - the container then dies with
+                # "exec: uvicorn: not found" (exit 127) and restart-loops, never going healthy.
+                user="0:0",
                 subnet=subnet,
                 healthcheck={
                     "test": "curl --fail http://localhost:8000/health || exit 1",
