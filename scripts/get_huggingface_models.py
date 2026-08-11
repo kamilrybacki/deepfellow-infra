@@ -18,6 +18,8 @@ from typing import Any
 
 import aiohttp
 
+from scripts.utils.hf_common import get_json_with_retry, is_embedding, is_gguf
+
 # ruff: noqa: T201
 
 HF_API = "https://huggingface.co/api"
@@ -60,23 +62,10 @@ def is_llm(model: dict[str, Any]) -> bool:
     return not NON_LLM_TASK_WORDS.search(name) and "ocr" not in name
 
 
-def is_gguf(model: dict[str, Any]) -> bool:
-    """Filter out GGUF-quantized models, which vLLM doesn't support."""
-    name = model.get("id", "").lower()
-    tags = [t.lower() for t in model.get("tags", [])]
-    return "gguf" in name or "gguf" in tags
-
-
 def is_reranker(model: dict[str, Any]) -> bool:
     """Filter reranker models by name heuristic."""
     name = model.get("id", "").lower()
     return "rerank" in name
-
-
-def is_embedding(model: dict[str, Any]) -> bool:
-    """Filter embedding models by name heuristic."""
-    name = model.get("id", "").lower()
-    return "embed" in name
 
 
 def is_supported_cross_encoder(architectures: list[str]) -> bool:
@@ -109,23 +98,6 @@ async def has_chat_template(session: aiohttp.ClientSession, model_id: str, sibli
         return bool(tokenizer_config.get("chat_template"))
     except Exception:
         return False
-
-
-async def get_json_with_retry(session: aiohttp.ClientSession, url: str, params: dict[str, str], max_retries: int = 5) -> Any:  # noqa: ANN401
-    """GET url as JSON, retrying with backoff when HuggingFace rate-limits (429) or errors transiently (5xx)."""
-    for attempt in range(max_retries):
-        async with session.get(url, params=params) as resp:
-            try:
-                resp.raise_for_status()
-            except aiohttp.ClientResponseError as exc:
-                if (exc.status != 429 and exc.status < 500) or attempt == max_retries - 1:
-                    raise
-                retry_after = resp.headers.get("Retry-After")
-                delay = float(retry_after) if retry_after else min(2.0**attempt, 30.0)
-                await asyncio.sleep(delay)
-                continue
-            return await resp.json(content_type=None)
-    raise AssertionError("unreachable")  # pragma: no cover
 
 
 async def fetch_popular_models(session: aiohttp.ClientSession, tag: str, sort: str, limit: int) -> list[dict[str, Any]]:

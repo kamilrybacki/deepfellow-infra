@@ -28,6 +28,7 @@ def is_ee_path(filepath: Path, root: Path | None = None) -> bool:
     base = (root or Path.cwd()).resolve() / "ee"
     return filepath.resolve().is_relative_to(base)
 
+
 def license_line_for(filepath: Path, root: Path | None = None) -> str:
     """Return the SPDX license line required for the given file's location."""
     return LICENSE_LINE_EE if is_ee_path(filepath, root) else LICENSE_LINE_MIT

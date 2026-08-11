@@ -6,7 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- New `just get-llamacpp-models` recipe generates `static/llamacpp-min.json`, a registry of GGUF models discovered on HuggingFace for the llama.cpp backend, mirroring the existing `get-vllm-models`/`get-ollama-models` tooling. Every quant a repo ships is listed as a separate entry (not just one picked tier); multimodal projector files, split (multi-part) GGUF shards, multi-component pipeline files, non-chat repos (image/video diffusion, TTS, ASR, OCR), and embedding-only repos (including the `bge-`/`gte-`/`e5-` family prefixes, not just repos with "embed" in the name) are excluded since llama.cpp can't serve them as standalone chat models.
+
 ### Changed
+- llama.cpp's default model list now loads from `static/llamacpp-min.json` at startup instead of being hardcoded in source, matching how vLLM and Ollama already manage their default model lists.
 - vLLM service's hardware-support guard and GPU-utilization release logic are each backed by a single shared implementation instead of duplicated copies, removing the risk of the copies drifting apart on future changes.
 
 ## [0.31.0] - 2026-08-06

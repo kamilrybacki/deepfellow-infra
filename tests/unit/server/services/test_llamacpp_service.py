@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
 
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from server.docker import ContainerStatus
 from server.models.models import InstallModelIn, ListModelsFilters, UninstallModelIn
@@ -20,6 +22,7 @@ from server.services.llamacpp_service import (
     LLamacppService,
     ModelInstalledInfo,
     _const,  # pyright: ignore[reportPrivateUsage]
+    _read_models,  # pyright: ignore[reportPrivateUsage]
 )
 from server.utils.core import DownloadedPacket, PreDownloadPacket, Stream, StreamChunk, StreamChunkProgress, SuccessDownloadPacket
 from server.utils.hardware import CpuInfo, GpuInfo, IntelGpuInfo, NvidiaGpuInfo
@@ -100,6 +103,48 @@ def test_service_has_docker(svc: LLamacppService) -> None:
 def test_default_models_loaded(svc: LLamacppService) -> None:
     assert "default" in svc.models
     assert len(svc.models["default"]) > 0
+
+
+def test_read_models_loads_registry_file(tmp_path: Path) -> None:
+    static_dir = tmp_path / "static"
+    static_dir.mkdir()
+    (static_dir / "llamacpp-min.json").write_text(
+        json.dumps(
+            {
+                "llms": [
+                    {"name": "org/model-q4-k-m", "url": "https://huggingface.co/org/model/resolve/main/model-Q4_K_M.gguf", "size": "4GB"},
+                    {
+                        "name": "org/other-model",
+                        "url": "https://huggingface.co/org/other/resolve/main/other.gguf",
+                        "size": "1GB",
+                        "jinja": True,
+                    },
+                ]
+            }
+        )
+    )
+
+    with patch("server.services.llamacpp_service.get_main_dir", return_value=tmp_path):
+        models = _read_models()
+
+    assert models["org/model-q4-k-m"] == LlamacppModel(
+        url="https://huggingface.co/org/model/resolve/main/model-Q4_K_M.gguf", size="4GB", jinja=False
+    )
+    assert models["org/other-model"] == LlamacppModel(
+        url="https://huggingface.co/org/other/resolve/main/other.gguf", size="1GB", jinja=True
+    )
+
+
+def test_read_models_raises_validationerror_naming_malformed_entry(tmp_path: Path) -> None:
+    static_dir = tmp_path / "static"
+    static_dir.mkdir()
+    (static_dir / "llamacpp-min.json").write_text(json.dumps({"llms": [{"name": "org/broken-model", "size": "1GB"}]}))
+
+    with (
+        patch("server.services.llamacpp_service.get_main_dir", return_value=tmp_path),
+        pytest.raises(ValidationError, match="url"),
+    ):
+        _read_models()
 
 
 def test_const_has_cpu_image() -> None:
@@ -591,8 +636,8 @@ async def test_install_model_appends_ctx_size_when_max_model_length_set(svc: LLa
 @pytest.mark.asyncio
 async def test_install_model_appends_jinja_flag_for_jinja_model(svc: LLamacppService, deps: dict[str, Any], tmp_path: Path) -> None:
     _setup_install_mocks(svc, deps)
-    jinja_model_id = "speakleash/Bielik-11B-v2.5-Instruct"
-    assert svc.models["default"][jinja_model_id].jinja is True
+    jinja_model_id = "org/jinja-model"
+    svc.models["default"][jinja_model_id] = LlamacppModel(url="https://example.com/model.gguf", size="1GB", jinja=True)
     captured: list[object] = []
 
     async def capture_docker(opts: object) -> int:

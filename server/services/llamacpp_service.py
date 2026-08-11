@@ -15,6 +15,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel
 
 from server.applicationcontext import get_base_url
+from server.config import get_main_dir
 from server.docker import DockerImage, DockerOptions
 from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
 from server.models.api import LLM_ENDPOINTS, ModelProps
@@ -32,6 +33,7 @@ from server.models.models import (
     RetrieveModelOut,
     UninstallModelIn,
 )
+from server.models.registries import LlamacppRegistry
 from server.models.services import (
     InstallServiceIn,
     InstallServiceProgress,
@@ -86,6 +88,13 @@ class LlamacppConst(BaseModel):
     models: dict[str, LlamacppModel]
 
 
+def _read_models() -> dict[str, LlamacppModel]:
+    llamacpp_path = get_main_dir() / "./static/llamacpp-min.json"
+    with llamacpp_path.open(encoding="utf-8") as f:
+        registry = LlamacppRegistry.model_validate_json(f.read())
+        return {entry.name: LlamacppModel(url=entry.url, size=entry.size, jinja=entry.jinja) for entry in registry.llms}
+
+
 _const = LlamacppConst(
     # b10290: latest published image build as of 2026-08-06. Known-risk: CVE-2026-2069 (GBNF
     # grammar stack overflow, fix PR ggml-org/llama.cpp#18993 unmerged) and an unpatched GGUF
@@ -98,59 +107,7 @@ _const = LlamacppConst(
         "cpu": DockerImage(name="ghcr.io/ggml-org/llama.cpp:server-b10290", size="0.3 GB"),
     },
     model_type="llm",
-    models={
-        "bartowski/mistral-community_pixtral-12b": LlamacppModel(
-            url="https://huggingface.co/bartowski/mistral-community_pixtral-12b-GGUF/resolve/main/mistral-community_pixtral-12b-Q5_K_M.gguf",
-            size="8.2GB",
-        ),
-        "bartowski/deepseek-ai_DeepSeek-R1-0528-Qwen3-8B": LlamacppModel(
-            url="https://huggingface.co/bartowski/deepseek-ai_DeepSeek-R1-0528-Qwen3-8B-GGUF/resolve/main/deepseek-ai_DeepSeek-R1-0528-Qwen3-8B-Q5_K_M.gguf",
-            size="5.5GB",
-        ),
-        "bartowski/Hermes-3-Llama-3.2-3B": LlamacppModel(
-            url="https://huggingface.co/bartowski/Hermes-3-Llama-3.2-3B-GGUF/resolve/main/Hermes-3-Llama-3.2-3B-Q5_K_M.gguf",
-            size="2.2GB",
-        ),
-        "bartowski/Meta-Llama-3.1-8B-Instruct": LlamacppModel(
-            url="https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
-            size="4.6GB",
-        ),
-        "mradermacher/PLLuM-12B-instruct": LlamacppModel(
-            url="https://huggingface.co/mradermacher/PLLuM-12B-instruct-GGUF/resolve/main/PLLuM-12B-instruct.Q4_K_M.gguf",
-            size="7.0GB",
-        ),
-        "google/gemma-3-1b-it-q8": LlamacppModel(
-            url="https://huggingface.co/brittlewis12/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it.Q8_0.gguf",
-            size="2.0GB",
-        ),
-        "google/gemma-3-1b-it-q4-k-m": LlamacppModel(
-            url="https://huggingface.co/bartowski/google_gemma-3-1b-it-GGUF/resolve/main/google_gemma-3-1b-it-Q4_K_M.gguf",
-            size="0.9GB",
-        ),
-        "lmstudio-community/gemma-3-270m-it-16f": LlamacppModel(
-            url="https://huggingface.co/lmstudio-community/gemma-3-270m-it-GGUF/resolve/main/gemma-3-270m-it-F16.gguf",
-            size="0.6GB",
-        ),
-        "google/gemma-2b": LlamacppModel(
-            url="https://huggingface.co/google/gemma-2b/resolve/main/gemma-2b.gguf",
-            size="10.0GB",
-        ),
-        "speakleash/Bielik-11B-v2.5-Instruct": LlamacppModel(
-            url="https://huggingface.co/speakleash/Bielik-11B-v2.5-Instruct-GGUF/resolve/main/Bielik-11B-v2.5-Instruct.Q4_K_M.gguf",
-            size="6.7GB",
-            jinja=True,
-        ),
-        "speakleash/Bielik-11B-v2.6-Instruct": LlamacppModel(
-            url="https://huggingface.co/speakleash/Bielik-11B-v2.6-Instruct-GGUF/resolve/main/Bielik-11B-v2.6-Instruct.Q4_K_M.gguf",
-            size="6.7GB",
-            jinja=True,
-        ),
-        "speakleash/Bielik-11B-v3.0-Instruct": LlamacppModel(
-            url="https://huggingface.co/speakleash/Bielik-11B-v3.0-Instruct-GGUF/resolve/main/Bielik-11B-v3.0-Instruct.Q4_K_M.gguf",
-            size="6.7GB",
-            jinja=True,
-        ),
-    },
+    models=_read_models(),
 )
 
 
