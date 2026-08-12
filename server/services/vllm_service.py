@@ -9,7 +9,6 @@ import logging
 import re
 import shutil
 from collections.abc import Sequence
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypedDict
@@ -778,7 +777,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                 try:
                     docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
                 except AppError as exc:
-                    await self.docker_service.stop_docker(docker_options)
+                    await self._stop_docker(docker_options)
                     docker_stopped = True
                     suggested_max_length = (
                         self._parse_kv_cache_max_len_suggestion(str(exc)) if use_gpu and user_model_length is None else None
@@ -805,7 +804,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     try:
                         docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
                     except AppError:
-                        await self.docker_service.stop_docker(docker_options)
+                        await self._stop_docker(docker_options)
                         docker_stopped = True
                         raise
                 registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
@@ -847,8 +846,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                 if model_info is not None and info.models.get(model_id) is model_info:
                     info.models.pop(model_id, None)
                 if docker_options is not None and not docker_stopped:
-                    with suppress(Exception):
-                        await self.docker_service.stop_docker(docker_options)
+                    await self._stop_docker(docker_options)
                 raise
             finally:
                 self._installing.discard(key)
@@ -948,9 +946,11 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         """Return actual GPU VRAM usage in GiB for an installed vLLM model by parsing its container logs."""
         info = self.get_instance_installed_info(instance)
         if (model_info := info.models.get(model_id)) and (container_name := model_info.docker.container_name or ""):
-            with suppress(Exception):
+            try:
                 raw = await self._get_docker_logs(container_name)
                 return self._parse_vllm_vram_gb(raw)
+            except Exception:
+                logger.debug("Could not determine VRAM usage from logs for %s", container_name)
         return None
 
     def _get_vram_estimate(self, model_info: ModelInstalledInfo) -> float | None:
