@@ -25,6 +25,7 @@ from server.services.vllm_service import (
     _const,  # pyright: ignore[reportPrivateUsage]
 )
 from server.utils.core import DownloadedPacket, PreDownloadPacket, Stream, StreamChunk, StreamChunkProgress, SuccessDownloadPacket
+from server.utils.exceptions import AppError
 from server.utils.hardware import NvidiaGpuInfo
 
 
@@ -828,7 +829,7 @@ async def test_install_model_retries_with_suggested_max_len_on_kv_cache_error(
     svc2 = VllmService(**deps)
     installed = _make_installed_info(hardware=True)
     svc2.instances_info["default"].installed = installed
-    kv_cache_error = RuntimeError(
+    kv_cache_error = AppError(
         "ValueError: To serve at least one request with the models's max seq len (131072), "
         "(4.0 GiB KV cache is needed, which is larger than the available KV cache memory (3.37 GiB). "
         "Based on the available memory, the estimated maximum model length is 110256."
@@ -866,7 +867,7 @@ async def test_install_model_does_not_retry_when_max_model_length_is_explicit(
     svc2 = VllmService(**deps)
     installed = _make_installed_info(hardware=True)
     svc2.instances_info["default"].installed = installed
-    kv_cache_error = RuntimeError("the estimated maximum model length is 110256.")
+    kv_cache_error = AppError("the estimated maximum model length is 110256.")
     deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=kv_cache_error)
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
@@ -882,7 +883,7 @@ async def test_install_model_does_not_retry_when_max_model_length_is_explicit(
         promise = await svc2._install_model(  # pyright: ignore[reportPrivateUsage]
             "default", model_id, InstallModelIn(spec={"gpu_memory_utilization": 0.5, "max_model_length": 4096})
         )
-        with pytest.raises(RuntimeError):
+        with pytest.raises(AppError):
             await promise.wait()
 
     assert deps["docker_service"].install_and_run_docker.call_count == 1
@@ -895,8 +896,8 @@ async def test_install_model_reraises_when_retry_also_fails(svc: VllmService, de
     svc2 = VllmService(**deps)
     installed = _make_installed_info(hardware=True)
     svc2.instances_info["default"].installed = installed
-    kv_cache_error = RuntimeError("the estimated maximum model length is 110256.")
-    retry_error = RuntimeError("still failing")
+    kv_cache_error = AppError("the estimated maximum model length is 110256.")
+    retry_error = AppError("still failing")
     deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[kv_cache_error, retry_error])
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
@@ -910,11 +911,39 @@ async def test_install_model_reraises_when_retry_also_fails(svc: VllmService, de
         patch.object(svc2, "is_given_hardware_support_gpu", return_value=True),
     ):
         promise = await svc2._install_model("default", model_id, InstallModelIn(spec={"gpu_memory_utilization": 0.5}))  # pyright: ignore[reportPrivateUsage]
-        with pytest.raises(RuntimeError, match="still failing"):
+        with pytest.raises(AppError, match="still failing"):
             await promise.wait()
 
     assert deps["docker_service"].install_and_run_docker.call_count == 2
     assert deps["docker_service"].stop_docker.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_install_model_kv_cache_handler_does_not_catch_runtime_error(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    nvidia = MagicMock(spec=NvidiaGpuInfo)
+    deps["hardware"].gpus = [nvidia]
+    svc2 = VllmService(**deps)
+    installed = _make_installed_info(hardware=True)
+    svc2.instances_info["default"].installed = installed
+    not_app_error = RuntimeError("the estimated maximum model length is 110256.")
+    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=not_app_error)
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "container"
+    deps["docker_service"].stop_docker = AsyncMock()
+    model_id = next(iter(svc2.models["default"]))
+
+    with (
+        patch.object(svc2, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc2, "get_specified_hardware_parts", return_value=[nvidia]),
+        patch.object(svc2, "is_given_hardware_support_gpu", return_value=True),
+    ):
+        promise = await svc2._install_model("default", model_id, InstallModelIn(spec={"gpu_memory_utilization": 0.5}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert not isinstance(deps["docker_service"].install_and_run_docker.side_effect, AppError)
+    assert deps["docker_service"].install_and_run_docker.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -1765,6 +1794,26 @@ async def test_install_model_releases_gpu_when_option_parsing_fails(svc: VllmSer
         patch.object(svc2, "is_given_hardware_support_gpu", return_value=True),
         patch.object(svc2, "_get_quantization", new_callable=AsyncMock, side_effect=RuntimeError("bad quantization")),  # pyright: ignore[reportPrivateUsage]
         pytest.raises(RuntimeError),
+    ):
+        await svc2._install_model("default", model_id, InstallModelIn(spec={"gpu_memory_utilization": 0.5}))  # pyright: ignore[reportPrivateUsage]
+
+    assert svc2.gpu_memory_utilization == 0.0
+    assert ("default", model_id) not in svc2._installing  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_install_model_releases_gpu_on_cancelled_error_before_docker_start(svc: VllmService, deps: dict[str, Any]) -> None:
+    nvidia = MagicMock(spec=NvidiaGpuInfo)
+    deps["hardware"].gpus = [nvidia]
+    svc2 = VllmService(**deps)
+    svc2.instances_info["default"].installed = _make_installed_info(hardware=True)
+    model_id = "cancel-before-docker-model"
+    svc2.models["default"][model_id] = VllmModel(hf_id=model_id, size="1GB", gpu_memory_utilization=0.5)
+
+    with (
+        patch.object(svc2, "is_given_hardware_support_gpu", return_value=True),
+        patch.object(svc2, "_get_quantization", new_callable=AsyncMock, side_effect=asyncio.CancelledError()),  # pyright: ignore[reportPrivateUsage]
+        pytest.raises(asyncio.CancelledError),
     ):
         await svc2._install_model("default", model_id, InstallModelIn(spec={"gpu_memory_utilization": 0.5}))  # pyright: ignore[reportPrivateUsage]
 

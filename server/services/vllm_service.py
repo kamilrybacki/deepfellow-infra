@@ -61,6 +61,7 @@ from server.utils.core import (
     normalize_name,
     try_parse_pydantic,
 )
+from server.utils.exceptions import AppError
 from server.utils.files import get_model_dir_context_window
 from server.utils.hardware import HardwarePartInfo
 from server.utils.loading import Progress
@@ -703,7 +704,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             gpu_memory_utilization = await self._get_gpu_memory_utilization(parsed_model_options, model) if use_gpu else None
             user_model_length = parsed_model_options.max_model_length or model.max_model_len or None
             quantization = await self._get_quantization(parsed_model_options, model)
-        except Exception:
+        except BaseException:
             self._release_gpu_utilization(gpu_memory_utilization)
             self._installing.discard(key)
             raise
@@ -776,7 +777,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                 )
                 try:
                     docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
-                except Exception as exc:
+                except AppError as exc:
                     await self.docker_service.stop_docker(docker_options)
                     docker_stopped = True
                     suggested_max_length = (
@@ -803,7 +804,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     docker_stopped = False
                     try:
                         docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
-                    except Exception:
+                    except AppError:
                         await self.docker_service.stop_docker(docker_options)
                         docker_stopped = True
                         raise

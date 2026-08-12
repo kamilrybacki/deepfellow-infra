@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+- vLLM model installation no longer gets stuck permanently in "installing" state if the request is cancelled during a graceful shutdown while GPU/quantization checks are still running.
+- vLLM's KV-cache-overflow retry logic no longer intercepts unrelated Docker startup failures; only the specific "estimated maximum model length" error now triggers a retry with an adjusted `--max-model-len`.
+
 ### Added
 - New `just get-llamacpp-models` recipe generates `static/llamacpp-min.json`, a registry of GGUF models discovered on HuggingFace for the llama.cpp backend, mirroring the existing `get-vllm-models`/`get-ollama-models` tooling. Every quant a repo ships is listed as a separate entry (not just one picked tier); multimodal projector files, split (multi-part) GGUF shards, multi-component pipeline files, non-chat repos (image/video diffusion, TTS, ASR, OCR), and embedding-only repos (including the `bge-`/`gte-`/`e5-` family prefixes, not just repos with "embed" in the name) are excluded since llama.cpp can't serve them as standalone chat models.
 
