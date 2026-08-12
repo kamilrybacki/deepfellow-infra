@@ -1662,6 +1662,20 @@ async def test_get_vram_from_logs_returns_none_when_no_container(svc: VllmServic
     assert result is None
 
 
+@pytest.mark.asyncio
+async def test_get_vram_from_logs_returns_none_on_docker_logs_error(svc: VllmService) -> None:
+    installed = _make_installed_info()
+    model_info = _make_model_installed_info("test-model")
+    model_info.docker.container_name = "vllm-container"
+    installed.models["test-model"] = model_info
+    svc.instances_info["default"].installed = installed
+
+    with patch.object(svc, "_get_docker_logs", new_callable=AsyncMock, side_effect=Exception("boom")):  # pyright: ignore[reportPrivateUsage]
+        result = await svc._get_vram_from_logs("default", "test-model")  # pyright: ignore[reportPrivateUsage]
+
+    assert result is None
+
+
 def test_get_vram_estimate_returns_value(svc: VllmService) -> None:
     svc.hardware.total_vram_gb = 24.0  # pyright: ignore[reportAttributeAccessIssue]
     model_info = _make_model_installed_info("test-model", gpu_memory_utilization=0.5)
