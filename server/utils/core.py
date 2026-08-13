@@ -453,11 +453,11 @@ class PromiseWithProgress[T, U]:
         async def the_func(_stream: Stream[U]) -> Z:
             try:
                 res = await self.wait()
+                return await func(res)
             except Exception as e:
                 with contextlib.suppress(Exception):
                     on_error(e)
                 raise
-            return await func(res)
 
         promise = PromiseWithProgress[Z, U](func=the_func)
         promise.progress = self.progress
