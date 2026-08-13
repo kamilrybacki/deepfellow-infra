@@ -15,7 +15,7 @@ from pydantic import ValidationError
 
 from server.models.models import InstallModelIn, ListModelsFilters, UninstallModelIn
 from server.models.services import InstallServiceIn, UninstallServiceIn
-from server.services.base2_service import CustomModel, Instance, InstanceConfig
+from server.services.base2_service import CustomModel, Instance, InstanceConfig, ModelConfig
 from server.services.ollama_service import (
     DownloadedInfo,
     InstalledInfo,
@@ -448,7 +448,7 @@ def test_load_download_info_returns_dataclass(svc: OllamaService) -> None:
 
 
 def test_generate_instance_config_no_info(svc: OllamaService) -> None:
-    config = svc._generate_instance_config(None, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", None, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options is None
     assert config.models == []
@@ -465,10 +465,60 @@ def test_generate_instance_config_with_info(svc: OllamaService) -> None:
         internal_name=None,
     )
 
-    config = svc._generate_instance_config(info, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options == info.options
     assert len(config.models or []) == 1
+
+
+def test_generate_instance_config_embeds_definition_when_in_registry(svc: OllamaService) -> None:
+    info = _make_installed_info(svc)
+    info.models["my-llm"] = ModelInstalledInfo(
+        id="my-llm",
+        registered_name="my-llm",
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+        internal_name=None,
+    )
+    svc.models["default"]["my-llm"] = OllamaModel(id="my-llm", size="1 GB", type="llm", hash="abc", context=None)
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert (config.models or [])[0].definition == {
+        "id": "my-llm",
+        "size": "1 GB",
+        "type": "llm",
+        "hash": "abc",
+        "context": None,
+        "custom": None,
+        "modelfile": None,
+        "quantization": None,
+    }
+
+
+def test_generate_instance_config_omits_definition_when_missing_from_registry(svc: OllamaService) -> None:
+    info = _make_installed_info(svc)
+    info.models["ghost-model"] = ModelInstalledInfo(
+        id="ghost-model",
+        registered_name="ghost-model",
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+        internal_name=None,
+    )
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert (config.models or [])[0].definition is None
+
+
+def test_restore_model_definition_reinstates_model(svc: OllamaService) -> None:
+    definition = {"id": "ghost-model", "size": "2 GB", "type": "llm", "hash": "xyz", "context": None}
+
+    svc._restore_model_definition("default", "ghost-model", definition)  # pyright: ignore[reportPrivateUsage]
+
+    assert svc.models["default"]["ghost-model"] == OllamaModel(id="ghost-model", size="2 GB", type="llm", hash="xyz", context=None)
 
 
 def test_model_installed_info_get_info() -> None:
@@ -2479,6 +2529,28 @@ async def test_refresh_catalog_updates_instance_models(svc: OllamaService) -> No
 
     assert "brand-new:3b" in svc.models["default"]
     assert "brand-new:3b" in svc.models["second"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalog_restores_installed_model_dropped_from_catalog(svc: OllamaService) -> None:
+    still_in_catalog_id = next(iter(svc.models["default"]))
+    svc.instances_info["default"].config.models = [
+        ModelConfig(
+            model_id="installed-but-gone:7b",
+            options=InstallModelIn(spec={}),
+            definition={"id": "installed-but-gone:7b", "size": "4.1 GB", "type": "llm", "hash": "sha256:installed", "context": 4096},
+        ),
+        ModelConfig(model_id=still_in_catalog_id, options=InstallModelIn(spec={}), definition=None),
+    ]
+
+    with patch("server.services.ollama_service.OllamaCatalogClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.fetch_trending.return_value = []
+        mock_cls.return_value = mock_client
+
+        await svc.refresh_catalog()
+
+    assert svc.models["default"]["installed-but-gone:7b"].hash == "sha256:installed"
 
 
 def test_get_image_with_version_overrides_tag(svc: OllamaService) -> None:

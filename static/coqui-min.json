@@ -1,0 +1,11 @@
+{
+    "models": [
+        {
+            "name": "tts_models/en/vctk/vits",
+            "docker_name": "en-vctk-vits",
+            "default_speaker": "p225",
+            "model_type": "tts",
+            "size": "152MB"
+        }
+    ]
+}

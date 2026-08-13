@@ -229,7 +229,7 @@ def test_supported_gpus_only_nvidia(deps: dict[str, Any]) -> None:
 
 
 def test_generate_instance_config_no_info(svc: RerankService) -> None:
-    config = svc._generate_instance_config(None, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", None, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options is None
     assert config.models == []
@@ -246,7 +246,7 @@ def test_generate_instance_config_with_info(svc: RerankService) -> None:
         registration_id="reg-1",
     )
 
-    config = svc._generate_instance_config(info, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options == info.options
     assert len(config.models or []) == 1
@@ -256,9 +256,50 @@ def test_generate_instance_config_with_custom(svc: RerankService) -> None:
     info = _make_installed_info()
     custom = [CustomModel(id="c-1", data={})]
 
-    config = svc._generate_instance_config(info, custom)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", info, custom)  # pyright: ignore[reportPrivateUsage]
 
     assert config.custom is not None
+
+
+def test_generate_instance_config_embeds_definition_when_in_registry(svc: RerankService) -> None:
+    info = _make_installed_info()
+    model_id = "my-reranker"
+    info.models[model_id] = ModelInstalledInfo(
+        id=model_id,
+        registered_name=model_id,
+        type="rerank",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+    )
+    svc.models["default"][model_id] = RerankModel(type="rerank", size="1 GB")
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert (config.models or [])[0].definition == {"type": "rerank", "size": "1 GB", "custom": None}
+
+
+def test_generate_instance_config_omits_definition_when_missing_from_registry(svc: RerankService) -> None:
+    info = _make_installed_info()
+    model_id = "ghost-model"
+    info.models[model_id] = ModelInstalledInfo(
+        id=model_id,
+        registered_name=model_id,
+        type="rerank",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+    )
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert (config.models or [])[0].definition is None
+
+
+def test_restore_model_definition_reinstates_model(svc: RerankService) -> None:
+    definition = {"type": "rerank", "size": "2 GB"}
+
+    svc._restore_model_definition("default", "ghost-model", definition)  # pyright: ignore[reportPrivateUsage]
+
+    assert svc.models["default"]["ghost-model"] == RerankModel(type="rerank", size="2 GB")
 
 
 def test_load_download_info_returns_downloaded_info(svc: RerankService) -> None:

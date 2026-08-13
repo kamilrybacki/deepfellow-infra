@@ -53,6 +53,7 @@ from server.utils.model_downloader import ModelDownloader
 class ModelConfig(BaseModel):
     model_id: str
     options: InstallModelIn
+    definition: dict[str, Any] | None = None
 
 
 class CustomModel(BaseModel):
@@ -130,6 +131,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
     service_provider: ServiceProvider
     model_downloader: ModelDownloader
     docker_service: DockerService
+    models: dict[str, dict[str, Any]]
     models_downloaded: dict[str, DownloadInfoType]
     service_downloaded: bool
     hardware: Hardware
@@ -140,6 +142,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
     _installing: set[tuple[str, str]]
     _reconciliation_tasks: dict[str, "asyncio.Task[None]"]
     _crash_poll_state: dict[tuple[str, str], int]
+    _failed_models: dict[str, set[str]]
 
     def __init__(
         self,
@@ -157,12 +160,14 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         self.model_downloader = model_downloader
         self.docker_service = docker_service
         self.hardware = hardware
+        self.models = {}
         self.models_downloaded = {}
         self.service_downloaded = False
         self.instances_info = {"default": Instance(None, None, {}, InstanceConfig())}
         self.models_download_progress = {}
         self.images_download_progress = {}
         self._log_cache = {}
+        self._failed_models = {}
         self._after_init()
 
     def _after_init(self) -> None:
@@ -335,13 +340,30 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         """Get service downloaded info."""
         return self.service_downloaded
 
+    def _restore_model_definition(self, instance: str, model_id: str, definition: dict[str, Any]) -> None:
+        """Re-register a model definition missing from the live registry, from a persisted snapshot. No-op by default."""
+
+    def _get_persisted_model_definition(self, instance: str, model_id: str) -> dict[str, Any] | None:
+        """Look up the last-persisted definition snapshot for a model no longer in the live catalog."""
+        persisted = self.instances_info.get(instance)
+        if not persisted:
+            return None
+        return next((m.definition for m in persisted.config.models or [] if m.model_id == model_id), None)
+
     async def load_model(self, instance: str, model: ModelConfig) -> None:
         """Load single model."""
         logger.info(f"{self.get_id(instance)} loading model {model.model_id}")  # noqa: G004
         try:
+            if model.model_id not in self.models.get(instance, {}) and model.definition:
+                logger.warning(
+                    f"{self.get_id(instance)} model {model.model_id} missing from current registry, restoring from persisted definition"  # noqa: G004
+                )
+                self._restore_model_definition(instance, model.model_id, model.definition)
             await (await self._install_model(instance, model.model_id, model.options)).wait()
+            self._failed_models.get(instance, set()).discard(model.model_id)
         except Exception:
             logger.exception(f"{self.get_id(instance)} get error while loading model {model.model_id}")  # noqa: G004
+            self._failed_models.setdefault(instance, set()).add(model.model_id)
 
     async def load_instance(self, instance: str, instance_data: InstanceConfig) -> None:
         """Load instance of service."""
@@ -369,8 +391,15 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         msg = f"{self.get_type()} service installed."
         logger.info(msg)
         if cfg.instances:
+            persists_definitions = type(self)._restore_model_definition is not Base2Service._restore_model_definition
+            needs_backfill = persists_definitions and any(
+                m.definition is None for instance in cfg.instances.values() for m in instance.models or []
+            )
             tasks = [asyncio.create_task(self.load_instance(name, instance)) for name, instance in cfg.instances.items()]
             await asyncio.gather(*tasks)
+            if needs_backfill:
+                logger.info(f"{self.get_type()} backfilling model definitions into persisted config")  # noqa: G004
+                await self._save()
 
     @abstractmethod
     def _load_download_info(self, data: dict[str, Any]) -> DownloadInfoType:
@@ -379,12 +408,29 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
     async def _save(self) -> None:
         instances_config = {}
         for instance_name, instance in self.instances_info.items():
-            instances_config[instance_name] = self._generate_instance_config(instance.installed, instance.config.custom)
+            generated = self._generate_instance_config(instance_name, instance.installed, instance.config.custom)
+            generated.models = self._preserve_failed_models(instance_name, generated.models or [])
+            instance.config.models = generated.models
+            instances_config[instance_name] = generated
         cfg = self.service_config(instances_config)
         await self.service_provider.save_service_config(self.get_type(), cfg.model_dump())
 
+    def _preserve_failed_models(self, instance: str, live_models: list[ModelConfig]) -> list[ModelConfig]:
+        """Keep the persisted entry for a model that failed to (re)load.
+
+        Otherwise it would get dropped the moment anything else triggers a save. Explicit uninstalls
+        clear the failure marker, so they are never resurrected here.
+        """
+        failed_ids = self._failed_models.get(instance)
+        if not failed_ids:
+            return live_models
+        live_ids = {m.model_id for m in live_models}
+        persisted_by_id = {m.model_id: m for m in self.instances_info[instance].config.models or []}
+        preserved = [persisted_by_id[model_id] for model_id in failed_ids if model_id not in live_ids and model_id in persisted_by_id]
+        return [*live_models, *preserved]
+
     @abstractmethod
-    def _generate_instance_config(self, info: InstalledInfoType | None, custom: list[CustomModel] | None) -> InstanceConfig:
+    def _generate_instance_config(self, instance: str, info: InstalledInfoType | None, custom: list[CustomModel] | None) -> InstanceConfig:
         """Generate instance config."""
 
     def service_config(self, instances_config: dict[str, InstanceConfig]) -> ServiceConfig:
@@ -430,10 +476,12 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         if not info.installed:
             raise HTTPException(status_code=400, detail=f"Service {self.get_id(instance)} on {instance} instance is not installed")
 
-        preserved_models = (self._generate_instance_config(info.installed, info.config.custom).models) or []
+        preserved_models = (self._generate_instance_config(instance, info.installed, info.config.custom).models) or []
+        preserved_models = self._preserve_failed_models(instance, preserved_models)
 
         await self._validate_update_options(options)
         await self._uninstall_instance(instance, UninstallServiceIn(purge=False))
+        self._failed_models.pop(instance, None)
 
         async def func(data: InstalledInfoType) -> InstallServiceOut:
             self.instances_info[instance].installed = data
@@ -467,6 +515,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
     async def uninstall_instance(self, instance: str, options: UninstallServiceIn) -> None:
         """Uninstall the service."""
         await self._uninstall_instance(instance, options)
+        self._failed_models.pop(instance, None)
         await self._save()
 
     @abstractmethod
@@ -547,6 +596,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         installing_model_progress = self.get_instance_info(instance).installing_model_progress
 
         async def func(data: InstallModelOut) -> InstallModelOut:
+            self._failed_models.get(instance, set()).discard(model_id)
             await self._save()
             msg = f"{model_id} model installed."
             logger.debug(msg)
@@ -573,6 +623,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
     async def uninstall_model(self, instance: str, model_id: str, options: UninstallModelIn) -> None:
         """Uninstall the model."""
         await self._uninstall_model(instance, model_id, options)
+        self._failed_models.get(instance, set()).discard(model_id)
         await self._save()
 
     @abstractmethod

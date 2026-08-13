@@ -165,7 +165,6 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
     _installing: set[tuple[str, str]]
 
     def _after_init(self) -> None:
-        self.models = {}
         self._installing = set()
         self.load_default_models("default")
 
@@ -256,7 +255,12 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
         installed = self.get_instance_info(instance).installed
         return self._get_service_installed_info(instance) if installed is None else installed.options.spec
 
-    def _generate_instance_config(self, info: InstalledInfo[T_Options] | None, custom: list[CustomModel] | None) -> InstanceConfig:
+    def _generate_instance_config(
+        self,
+        instance: str,  # noqa: ARG002
+        info: InstalledInfo[T_Options] | None,
+        custom: list[CustomModel] | None,
+    ) -> InstanceConfig:
         return InstanceConfig(
             options=info.options if info else None,
             models=[ModelConfig(model_id=x.id, options=x.options) for x in info.models.values()] if info else [],

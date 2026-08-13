@@ -277,7 +277,6 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         return self.hardware.gpus
 
     def _after_init(self) -> None:
-        self.models = {}
         self._dynamic_models = {}
         self.load_default_models("default")
         self.default_context_length = self.get_default_context_value()
@@ -286,8 +285,12 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         self._installing = set()
 
     def load_default_models(self, instance: str) -> None:
-        """Load default models to instance (merges static catalog with dynamic overlay)."""
+        """Load default models to instance (merges static catalog with dynamic overlay, restoring any installed model dropped from both)."""
         self.models[instance] = {**_const.models, **{k: v for k, v in self._dynamic_models.items() if k not in _const.models}}
+        persisted = self.instances_info.get(instance)
+        for model_config in (persisted.config.models if persisted else None) or []:
+            if model_config.model_id not in self.models[instance] and model_config.definition:
+                self._restore_model_definition(instance, model_config.model_id, model_config.definition)
 
     async def refresh_catalog(self) -> tuple[int, int]:
         """Fetch trending models from the Ollama library and merge them into the dynamic catalog.
@@ -496,12 +499,26 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         installed = self.get_instance_info(instance).installed
         return self._get_service_installed_info(instance) if installed is None else installed.options.spec
 
-    def _generate_instance_config(self, info: InstalledInfo | None, custom: list[CustomModel] | None) -> InstanceConfig:
+    def _generate_instance_config(self, instance: str, info: InstalledInfo | None, custom: list[CustomModel] | None) -> InstanceConfig:
         return InstanceConfig(
             options=info.options if info else None,
-            models=[ModelConfig(model_id=x.id, options=x.options) for x in info.models.values()] if info else [],
+            models=[
+                ModelConfig(
+                    model_id=x.id,
+                    options=x.options,
+                    definition=self.models[instance][x.id].model_dump(mode="json")
+                    if x.id in self.models[instance]
+                    else self._get_persisted_model_definition(instance, x.id),
+                )
+                for x in info.models.values()
+            ]
+            if info
+            else [],
             custom=custom,
         )
+
+    def _restore_model_definition(self, instance: str, model_id: str, definition: dict[str, Any]) -> None:
+        self.models[instance][model_id] = OllamaModel.model_validate(definition)
 
     def _get_image(self, image_version: str | None = None) -> DockerImage:
         if image_version:

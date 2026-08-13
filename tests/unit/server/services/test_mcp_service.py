@@ -347,7 +347,7 @@ def test_get_installed_info_when_installed_returns_spec(svc: McpService) -> None
 
 
 def test_generate_instance_config_with_none_info(svc: McpService) -> None:
-    result = svc._generate_instance_config(None, None)  # pyright: ignore[reportPrivateUsage]
+    result = svc._generate_instance_config("default", None, None)  # pyright: ignore[reportPrivateUsage]
 
     assert result.options is None
     assert result.models == []
@@ -358,7 +358,7 @@ def test_generate_instance_config_with_info(svc: McpService) -> None:
     options = InstallServiceIn(spec={})
     installed = InstalledInfo(models={}, options=options)
 
-    result = svc._generate_instance_config(installed, None)  # pyright: ignore[reportPrivateUsage]
+    result = svc._generate_instance_config("default", installed, None)  # pyright: ignore[reportPrivateUsage]
 
     assert result.options is options
 

@@ -4,16 +4,18 @@
 """Rerank service."""
 
 import asyncio
+import json
 import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 from fastapi import HTTPException
 from pydantic import BaseModel
 
 from server.applicationcontext import get_base_url
+from server.config import get_main_dir
 from server.docker import DockerImage, DockerOptions
 from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
 from server.models.api import ModelProps
@@ -71,19 +73,28 @@ class RerankConst(BaseModel):
     models: dict[str, RerankModel]
 
 
+class RerankRegistryEntry(TypedDict):
+    name: str
+    size: str
+
+
+class RerankRegistry(TypedDict):
+    models: list[RerankRegistryEntry]
+
+
+def _read_models() -> dict[str, RerankModel]:
+    rerank_path = get_main_dir() / "./static/rerank-min.json"
+    with rerank_path.open(encoding="utf-8") as f:
+        registry: RerankRegistry = json.loads(f.read())
+        return {entry["name"]: RerankModel(type="rerank", size=entry["size"]) for entry in registry["models"]}
+
+
 _const = RerankConst(
     images={
         "gpu": DockerImage(name="hub.simplito.com/deepfellow/deepfellow-rerank:1.1.0-cuda12.8", size="8.29 GB"),
         "cpu": DockerImage(name="hub.simplito.com/deepfellow/deepfellow-rerank:1.1.0-cpu", size="1.14 GB"),
     },
-    models={
-        "cross-encoder/ms-marco-MiniLM-L6-v2": RerankModel(type="rerank", size="88MB"),
-        "cross-encoder/ms-marco-MiniLM-L12-v2": RerankModel(type="rerank", size="129MB"),
-        "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1": RerankModel(type="rerank", size="470MB"),
-        "BAAI/bge-reranker-base": RerankModel(type="rerank", size="1.1GB"),
-        "BAAI/bge-reranker-v2-m3": RerankModel(type="rerank", size="2.2GB"),
-        "jinaai/jina-reranker-v2-base-multilingual": RerankModel(type="rerank", size="548MB"),
-    },
+    models=_read_models(),
 )
 
 
@@ -133,7 +144,6 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
     _installing: set[tuple[str, str]]
 
     def _after_init(self) -> None:
-        self.models = {}
         self._installing = set()
         self.load_default_models("default")
 
@@ -214,12 +224,26 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
         installed = self.get_instance_info(instance).installed
         return self._get_service_installed_info(instance) if installed is None else installed.options.spec
 
-    def _generate_instance_config(self, info: InstalledInfo | None, custom: list[CustomModel] | None) -> InstanceConfig:
+    def _generate_instance_config(self, instance: str, info: InstalledInfo | None, custom: list[CustomModel] | None) -> InstanceConfig:
         return InstanceConfig(
             options=info.options if info else None,
-            models=[ModelConfig(model_id=x.id, options=x.options) for x in info.models.values()] if info else [],
+            models=[
+                ModelConfig(
+                    model_id=x.id,
+                    options=x.options,
+                    definition=self.models[instance][x.id].model_dump(mode="json")
+                    if x.id in self.models[instance]
+                    else self._get_persisted_model_definition(instance, x.id),
+                )
+                for x in info.models.values()
+            ]
+            if info
+            else [],
             custom=custom,
         )
+
+    def _restore_model_definition(self, instance: str, model_id: str, definition: dict[str, Any]) -> None:
+        self.models[instance][model_id] = RerankModel.model_validate(definition)
 
     def _get_image(self, hardware: Sequence[HardwarePartInfo]) -> DockerImage:
         if any(isinstance(h, NvidiaGpuInfo) for h in hardware):
@@ -379,7 +403,7 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
         if not self.models.get(instance):
             self.models[instance] = {}
 
-        if model_id not in _const.models:
+        if model_id not in self.models[instance]:
             raise HTTPException(status_code=400, detail="Model not found")
 
         model = self.models[instance][model_id]
@@ -438,7 +462,7 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
         if model_id in info.models or key in self._installing:
             return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed"))
 
-        if model_id not in _const.models:
+        if model_id not in self.models[instance]:
             raise HTTPException(400, "Model not found")
 
         model = self.models[instance][model_id]

@@ -127,7 +127,6 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
     _installing: set[tuple[str, str]]
 
     def _after_init(self) -> None:
-        self.models = {}
         self.load_default_models("default")
         self._installing = set()
 
@@ -224,7 +223,7 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
         installed = self.get_instance_info(instance).installed
         return self._get_service_installed_info(instance) if installed is None else installed.options.spec
 
-    def _generate_instance_config(self, info: InstalledInfo | None, custom: list[CustomModel] | None) -> InstanceConfig:
+    def _generate_instance_config(self, instance: str, info: InstalledInfo | None, custom: list[CustomModel] | None) -> InstanceConfig:  # noqa: ARG002
         return InstanceConfig(
             options=info.options if info else None,
             models=[ModelConfig(model_id=x.id, options=x.options) for x in info.models.values()] if info else [],

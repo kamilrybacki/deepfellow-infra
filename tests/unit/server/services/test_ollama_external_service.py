@@ -158,7 +158,7 @@ def test_load_download_info_returns_downloaded_info(svc: OllamaExternalService) 
 
 
 def test_generate_instance_config_with_no_info(svc: OllamaExternalService) -> None:
-    config = svc._generate_instance_config(None, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", None, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options is None
     assert config.models == []
@@ -174,7 +174,7 @@ def test_generate_instance_config_with_info(svc: OllamaExternalService) -> None:
         registration_id="reg-1",
     )
 
-    config = svc._generate_instance_config(info, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options == info.options
     assert len(config.models or []) == 1
