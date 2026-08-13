@@ -307,6 +307,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         try:
             return await fetch_huggingface_model_size(spec["hf_id"])
         except Exception:
+            logger.debug("Couldn't resolve size for a custom model id = %s", spec["hf_id"])
             return None
 
     def get_installed_info(self, instance: str) -> bool | InstallServiceProgress | ServiceOptions:
