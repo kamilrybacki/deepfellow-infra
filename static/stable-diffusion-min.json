@@ -1,0 +1,85 @@
+{
+    "models": [
+        {
+            "name": "Plant Milk Walnut",
+            "filetype": "Stable-diffusion",
+            "type": "txt2img",
+            "url": "https://civitai.com/api/download/models/1714002?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+            "filename": "plantMilkModelSuite_walnut.safetensors",
+            "model_url": "https://civitai.com/models/1162518?modelVersionId=1714002",
+            "size": "6.46GB"
+        },
+        {
+            "name": "Fantastic Landscapes",
+            "filetype": "Lora",
+            "type": "lora",
+            "url": "https://civitai.com/api/download/models/180314?type=Model&format=SafeTensor",
+            "filename": "FantasticLandscapes.safetensors",
+            "model_url": "https://civitai.com/models/160272/lora-fantastic-landscapes",
+            "size": "36.11MB"
+        },
+        {
+            "name": "Pixiv AenuaV1",
+            "filetype": "Lora",
+            "type": "lora",
+            "url": "https://civitai.com/api/download/models/694191?type=Model&format=SafeTensor",
+            "filename": "AenuaV1.safetensors",
+            "model_url": "https://civitai.com/models/620966?modelVersionId=694191",
+            "size": "435.34MB"
+        },
+        {
+            "name": "Minecraft square style",
+            "filetype": "Lora",
+            "type": "lora",
+            "url": "https://civitai.com/api/download/models/1145880?type=Model&format=SafeTensor",
+            "filename": "minecraft filter [IL]_1.safetensors",
+            "model_url": "https://civitai.com/models/113741/minecraft-square-style",
+            "size": "54.77MB"
+        },
+        {
+            "name": "SDXL Lighting 8 step",
+            "filetype": "Stable-diffusion",
+            "type": "txt2img",
+            "url": "https://huggingface.co/ByteDance/SDXL-Lightning/resolve/main/sdxl_lightning_8step.safetensors?download=true",
+            "filename": "sdxl_lightning_8step.safetensors",
+            "model_url": "https://huggingface.co/ByteDance/SDXL-Lightning",
+            "size": "6.94GB"
+        },
+        {
+            "name": "Semi-realistic",
+            "filetype": "Stable-diffusion",
+            "type": "txt2img",
+            "url": "https://civitai.com/api/download/models/2202259?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+            "filename": "semi-realistic.safetensors",
+            "model_url": "https://civitai.com/models/1945811/semi-real-illustrious-or-mm",
+            "size": "6.94GB"
+        },
+        {
+            "name": "CyberRealistic-XL-FP16",
+            "filetype": "Stable-diffusion",
+            "type": "txt2img",
+            "url": "https://civitai.com/api/download/models/2152184?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+            "filename": "cyberrealistic-xl-fp16.safetensors",
+            "model_url": "https://civitai.com/models/312530/cyberrealistic-xl",
+            "size": "6.46GB"
+        },
+        {
+            "name": "CyberRealistic-XL-FP32",
+            "filetype": "Stable-diffusion",
+            "type": "txt2img",
+            "url": "https://civitai.com/api/download/models/2152184?type=Model&format=SafeTensor&size=pruned&fp=fp32",
+            "filename": "cyberrealistic-xl-fp32.safetensors",
+            "model_url": "https://civitai.com/models/312530/cyberrealistic-xl",
+            "size": "12.92GB"
+        },
+        {
+            "name": "yomama-2.5D",
+            "filetype": "Stable-diffusion",
+            "type": "txt2img",
+            "url": "https://civitai.com/api/download/models/1085088?type=Model&format=SafeTensor&size=pruned&fp=fp16",
+            "filename": "yomama-25d.safetensors",
+            "model_url": "https://civitai.com/models/959233/yomama-25d-illustrious-pony?modelVersionId=1085088",
+            "size": "6.46GB"
+        }
+    ]
+}

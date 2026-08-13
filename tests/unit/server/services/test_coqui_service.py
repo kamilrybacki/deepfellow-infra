@@ -15,6 +15,7 @@ from server.models.services import InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import Instance, InstanceConfig
 from server.services.coqui_service import (
     CoquiCmdOptions,
+    CoquiModel,
     CoquiOptions,
     CoquiService,
     DownloadedInfo,
@@ -300,7 +301,7 @@ def test_get_installed_info_calls_helper_when_not_installed(svc: CoquiService) -
 
 
 def test_generate_instance_config_none_info(svc: CoquiService) -> None:
-    config = svc._generate_instance_config(None, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", None, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options is None
     assert config.models == []
@@ -310,10 +311,46 @@ def test_generate_instance_config_with_info(svc: CoquiService) -> None:
     info = _make_installed_info()
     info.models["model1"] = _make_model_installed_info("model1")
 
-    config = svc._generate_instance_config(info, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options == info.options
     assert len(config.models or []) == 1
+
+
+def test_generate_instance_config_embeds_definition_when_in_registry(svc: CoquiService) -> None:
+    info = _make_installed_info()
+    info.models["model1"] = _make_model_installed_info("model1")
+    svc.models["default"]["model1"] = CoquiModel(docker_name="model1", default_speaker="spk1", model_type="tts", size="1 GB")
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert (config.models or [])[0].definition == {
+        "docker_name": "model1",
+        "default_speaker": "spk1",
+        "response_format": "mp3",
+        "model_type": "tts",
+        "language": None,
+        "size": "1 GB",
+    }
+
+
+def test_generate_instance_config_omits_definition_when_missing_from_registry(svc: CoquiService) -> None:
+    info = _make_installed_info()
+    info.models["ghost-model"] = _make_model_installed_info("ghost-model")
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert (config.models or [])[0].definition is None
+
+
+def test_restore_model_definition_reinstates_model(svc: CoquiService) -> None:
+    definition = {"docker_name": "ghost-model", "default_speaker": "spk1", "model_type": "tts", "size": "2 GB"}
+
+    svc._restore_model_definition("default", "ghost-model", definition)  # pyright: ignore[reportPrivateUsage]
+
+    assert svc.models["default"]["ghost-model"] == CoquiModel(
+        docker_name="ghost-model", default_speaker="spk1", model_type="tts", size="2 GB"
+    )
 
 
 def test_load_download_info_returns_dataclass(svc: CoquiService) -> None:

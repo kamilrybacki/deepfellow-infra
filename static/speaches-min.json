@@ -1,0 +1,1234 @@
+{
+    "tts": [
+        {
+            "name": "speaches-ai/Kokoro-82M-v1.0-ONNX-fp16",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/Kokoro-82M-v1.0-ONNX",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/Kokoro-82M-v1.0-ONNX-int8",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-ar_JO-kareem-low",
+            "size": "61MB"
+        },
+        {
+            "name": "speaches-ai/piper-ar_JO-kareem-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-ca_ES-upc_ona-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-ca_ES-upc_ona-x_low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-ca_ES-upc_pau-x_low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-cs_CZ-jirka-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-cs_CZ-jirka-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-cy_GB-gwryw_gogleddol-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-da_DK-talesyntese-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-de_DE-eva_k-x_low",
+            "size": "20MB"
+        },
+        {
+            "name": "speaches-ai/piper-de_DE-karlsson-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-de_DE-kerstin-low",
+            "size": "61MB"
+        },
+        {
+            "name": "speaches-ai/piper-de_DE-mls-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-de_DE-pavoque-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-de_DE-ramona-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-de_DE-thorsten-high",
+            "size": "109MB"
+        },
+        {
+            "name": "speaches-ai/piper-de_DE-thorsten-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-de_DE-thorsten-medium",
+            "size": "61MB"
+        },
+        {
+            "name": "speaches-ai/piper-de_DE-thorsten_emotional-medium",
+            "size": "74MB"
+        },
+        {
+            "name": "speaches-ai/piper-el_GR-rapunzelina-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_GB-alan-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_GB-alan-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_GB-alba-medium",
+            "size": "61MB"
+        },
+        {
+            "name": "speaches-ai/piper-en_GB-aru-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_GB-cori-high",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_GB-cori-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_GB-jenny_dioco-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_GB-northern_english_male-medium",
+            "size": "61MB"
+        },
+        {
+            "name": "speaches-ai/piper-en_GB-semaine-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_GB-southern_english_female-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_GB-vctk-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_US-amy-low",
+            "size": "61MB"
+        },
+        {
+            "name": "speaches-ai/piper-en_US-amy-medium",
+            "size": "61MB"
+        },
+        {
+            "name": "speaches-ai/piper-en_US-arctic-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_US-bryce-medium",
+            "size": "61MB"
+        },
+        {
+            "name": "speaches-ai/piper-en_US-danny-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_US-hfc_female-medium",
+            "size": "61MB"
+        },
+        {
+            "name": "speaches-ai/piper-en_US-hfc_male-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_US-joe-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_US-john-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_US-kathleen-low",
+            "size": "61MB"
+        },
+        {
+            "name": "speaches-ai/piper-en_US-kristin-medium",
+            "size": "61MB"
+        },
+        {
+            "name": "speaches-ai/piper-en_US-kusal-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_US-l2arctic-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_US-lessac-high",
+            "size": "109MB"
+        },
+        {
+            "name": "speaches-ai/piper-en_US-lessac-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_US-lessac-medium",
+            "size": "61MB"
+        },
+        {
+            "name": "speaches-ai/piper-en_US-libritts-high",
+            "size": "131MB"
+        },
+        {
+            "name": "speaches-ai/piper-en_US-libritts_r-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_US-ljspeech-high",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_US-ljspeech-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_US-norman-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_US-ryan-high",
+            "size": "116MB"
+        },
+        {
+            "name": "speaches-ai/piper-en_US-ryan-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-en_US-ryan-medium",
+            "size": "61MB"
+        },
+        {
+            "name": "speaches-ai/piper-es_ES-carlfm-x_low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-es_ES-davefx-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-es_ES-mls_10246-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-es_ES-mls_9972-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-es_ES-sharvard-medium",
+            "size": "74MB"
+        },
+        {
+            "name": "speaches-ai/piper-es_MX-ald-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-es_MX-claude-high",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-fa_IR-amir-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-fa_IR-gyro-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-fi_FI-harri-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-fi_FI-harri-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-fr_FR-gilles-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-fr_FR-mls-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-fr_FR-mls_1840-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-fr_FR-siwis-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-fr_FR-siwis-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-fr_FR-tom-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-fr_FR-upmc-medium",
+            "size": "74MB"
+        },
+        {
+            "name": "speaches-ai/piper-hu_HU-anna-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-hu_HU-berta-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-hu_HU-imre-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-is_IS-bui-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-is_IS-salka-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-is_IS-steinn-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-is_IS-ugla-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-it_IT-paola-medium",
+            "size": "61MB"
+        },
+        {
+            "name": "speaches-ai/piper-it_IT-riccardo-x_low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-ka_GE-natia-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-kk_KZ-iseke-x_low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-kk_KZ-issai-high",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-kk_KZ-raya-x_low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-lb_LU-marylux-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-lv_LV-aivars-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-ne_NP-google-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-ne_NP-google-x_low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-nl_BE-nathalie-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-nl_BE-nathalie-x_low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-nl_BE-rdh-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-nl_BE-rdh-x_low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-nl_NL-mls-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-nl_NL-mls_5809-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-nl_NL-mls_7432-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-no_NO-talesyntese-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-pl_PL-darkman-medium",
+            "size": "61MB"
+        },
+        {
+            "name": "speaches-ai/piper-pl_PL-gosia-medium",
+            "size": "61MB"
+        },
+        {
+            "name": "speaches-ai/piper-pl_PL-mc_speech-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-pl_PL-mls_6892-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-pt_BR-edresson-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-pt_BR-faber-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-zh_CN-huayan-x_low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-ro_RO-mihai-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-ru_RU-denis-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-ru_RU-dmitri-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-ru_RU-irina-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-ru_RU-ruslan-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-sk_SK-lili-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-sl_SI-artur-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-sr_RS-serbski_institut-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-sv_SE-nst-medium",
+            "size": "61MB"
+        },
+        {
+            "name": "speaches-ai/piper-sw_CD-lanfrica-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-tr_TR-dfki-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-tr_TR-fahrettin-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-tr_TR-fettah-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-uk_UA-lada-x_low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-uk_UA-ukrainian_tts-medium",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-vi_VN-25hours_single-low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-vi_VN-vais1000-medium",
+            "size": "61MB"
+        },
+        {
+            "name": "speaches-ai/piper-vi_VN-vivos-x_low",
+            "size": ""
+        },
+        {
+            "name": "speaches-ai/piper-zh_CN-huayan-medium",
+            "size": "61MB"
+        },
+        {
+            "name": "Stoned-Code/piper-en_US-glados-medium",
+            "size": "61MB"
+        }
+    ],
+    "stt": [
+        {
+            "name": "Systran/faster-whisper-large-v3",
+            "size": "2.9GB"
+        },
+        {
+            "name": "deepdml/faster-whisper-large-v3-turbo-ct2",
+            "size": "1.6GB"
+        },
+        {
+            "name": "mort666/faster-whisper-large-v2-th",
+            "size": ""
+        },
+        {
+            "name": "good-tape/faster-whisper-large-v3",
+            "size": ""
+        },
+        {
+            "name": "Zoont/faster-whisper-large-v3-turbo-int8-ct2",
+            "size": ""
+        },
+        {
+            "name": "KBLab/kb-whisper-base",
+            "size": ""
+        },
+        {
+            "name": "KBLab/kb-whisper-large",
+            "size": ""
+        },
+        {
+            "name": "KBLab/kb-whisper-small",
+            "size": ""
+        },
+        {
+            "name": "deepdml/faster-distil-whisper-large-v3.5",
+            "size": "1.5GB"
+        },
+        {
+            "name": "Vinxscribe/biodatlab-whisper-th-medium-faster",
+            "size": "1.5GB"
+        },
+        {
+            "name": "amir-eghtedar/whisper-large-fa-v1-fp16",
+            "size": ""
+        },
+        {
+            "name": "guillaumekln/faster-whisper-tiny",
+            "size": "75MB"
+        },
+        {
+            "name": "guillaumekln/faster-whisper-tiny.en",
+            "size": "75MB"
+        },
+        {
+            "name": "guillaumekln/faster-whisper-base.en",
+            "size": "141MB"
+        },
+        {
+            "name": "guillaumekln/faster-whisper-base",
+            "size": "142MB"
+        },
+        {
+            "name": "guillaumekln/faster-whisper-small.en",
+            "size": "464MB"
+        },
+        {
+            "name": "guillaumekln/faster-whisper-small",
+            "size": "464MB"
+        },
+        {
+            "name": "guillaumekln/faster-whisper-medium.en",
+            "size": "1.5GB"
+        },
+        {
+            "name": "guillaumekln/faster-whisper-medium",
+            "size": "1.5GB"
+        },
+        {
+            "name": "guillaumekln/faster-whisper-large-v2",
+            "size": "2.9GB"
+        },
+        {
+            "name": "guillaumekln/faster-whisper-large-v1",
+            "size": "2.9GB"
+        },
+        {
+            "name": "smcproject/vegam-whisper-medium-ml",
+            "size": ""
+        },
+        {
+            "name": "smcproject/vegam-whisper-medium-ml-fp16",
+            "size": ""
+        },
+        {
+            "name": "smcproject/vegam-whisper-medium-ml-int8",
+            "size": ""
+        },
+        {
+            "name": "smcproject/vegam-whisper-medium-ml-int8_float16",
+            "size": ""
+        },
+        {
+            "name": "bofenghuang/whisper-large-v2-cv11-french-ct2",
+            "size": ""
+        },
+        {
+            "name": "bofenghuang/whisper-large-v2-cv11-german-ct2",
+            "size": ""
+        },
+        {
+            "name": "arc-r/faster-whisper-large-v2-mix-jp",
+            "size": ""
+        },
+        {
+            "name": "arc-r/faster-whisper-large-v2-jp",
+            "size": ""
+        },
+        {
+            "name": "arc-r/faster-whisper-large-v2-Ko",
+            "size": ""
+        },
+        {
+            "name": "arc-r/faster-whisper-large-zh-cv11",
+            "size": ""
+        },
+        {
+            "name": "dwhoelz/whisper-large-pt-cv11-ct2",
+            "size": ""
+        },
+        {
+            "name": "dwhoelz/whisper-medium-pt-ct2",
+            "size": ""
+        },
+        {
+            "name": "jerichosiahaya/faster-whisper-medium-id",
+            "size": ""
+        },
+        {
+            "name": "YassineKader/faster-whisper-small-haitian",
+            "size": ""
+        },
+        {
+            "name": "arminhaberl/faster-whisper-tiny",
+            "size": "75MB"
+        },
+        {
+            "name": "arminhaberl/faster-whisper-small",
+            "size": ""
+        },
+        {
+            "name": "arminhaberl/faster-whisper-medium",
+            "size": ""
+        },
+        {
+            "name": "arminhaberl/faster-whisper-large-v2",
+            "size": ""
+        },
+        {
+            "name": "arminhaberl/faster-whisper-large-v1",
+            "size": ""
+        },
+        {
+            "name": "arminhaberl/faster-whisper-base",
+            "size": ""
+        },
+        {
+            "name": "deepsync/whisper-large-v2-custom-hi",
+            "size": ""
+        },
+        {
+            "name": "davidggphy/whisper-small-dv-ct2",
+            "size": ""
+        },
+        {
+            "name": "mukowaty/faster-whisper-int8",
+            "size": ""
+        },
+        {
+            "name": "lorneluo/faster-whisper-large-v2",
+            "size": ""
+        },
+        {
+            "name": "lorneluo/whisper-small-ct2-int8",
+            "size": ""
+        },
+        {
+            "name": "Sagicc/faster-whisper-large-v2-sr",
+            "size": ""
+        },
+        {
+            "name": "bababababooey/faster-whisper-large-v3",
+            "size": ""
+        },
+        {
+            "name": "gradjitta/ct2-whisper-large-v3",
+            "size": ""
+        },
+        {
+            "name": "flyingleafe/faster-whisper-large-v3",
+            "size": ""
+        },
+        {
+            "name": "avans06/faster-whisper-large-v3",
+            "size": ""
+        },
+        {
+            "name": "Sagicc/faster-whisper-large-v3-sr",
+            "size": ""
+        },
+        {
+            "name": "BBLL3456/faster-whisper-large-V3",
+            "size": ""
+        },
+        {
+            "name": "trungkienbkhn/faster-whisper-large-v3",
+            "size": ""
+        },
+        {
+            "name": "Systran/faster-whisper-large-v2",
+            "size": "2.9GB"
+        },
+        {
+            "name": "Systran/faster-whisper-large-v1",
+            "size": "2.9GB"
+        },
+        {
+            "name": "Systran/faster-whisper-medium",
+            "size": "1.5GB"
+        },
+        {
+            "name": "Systran/faster-whisper-medium.en",
+            "size": "1.5GB"
+        },
+        {
+            "name": "Systran/faster-whisper-base",
+            "size": "142MB"
+        },
+        {
+            "name": "Systran/faster-whisper-tiny",
+            "size": "75MB"
+        },
+        {
+            "name": "Systran/faster-whisper-small",
+            "size": "464MB"
+        },
+        {
+            "name": "Systran/faster-whisper-base.en",
+            "size": "141MB"
+        },
+        {
+            "name": "Systran/faster-whisper-tiny.en",
+            "size": "75MB"
+        },
+        {
+            "name": "Systran/faster-whisper-small.en",
+            "size": "464MB"
+        },
+        {
+            "name": "lukas-jkl/faster-whisper-v3",
+            "size": ""
+        },
+        {
+            "name": "srd4/faster-whisper-large-v2",
+            "size": ""
+        },
+        {
+            "name": "Sagicc/faster-whisper-medium-sr",
+            "size": ""
+        },
+        {
+            "name": "srd4/faster-whisper-medium",
+            "size": ""
+        },
+        {
+            "name": "Systran/faster-distil-whisper-large-v2",
+            "size": "1.5GB"
+        },
+        {
+            "name": "Systran/faster-distil-whisper-medium.en",
+            "size": "756MB"
+        },
+        {
+            "name": "Systran/faster-distil-whisper-small.en",
+            "size": "321MB"
+        },
+        {
+            "name": "JhonVanced/faster-whisper-large-v2",
+            "size": ""
+        },
+        {
+            "name": "JhonVanced/faster-whisper-large-v3",
+            "size": ""
+        },
+        {
+            "name": "JhonVanced/faster-whisper-large-v3-ja",
+            "size": ""
+        },
+        {
+            "name": "JhonVanced/whisper-large-v3-japanese-4k-steps-ct2",
+            "size": ""
+        },
+        {
+            "name": "firelily/quick-listing",
+            "size": ""
+        },
+        {
+            "name": "Sagicc/faster-whisper-large-sr-v2",
+            "size": ""
+        },
+        {
+            "name": "Necklace/faster-nb-whisper-large",
+            "size": ""
+        },
+        {
+            "name": "jvh/whisper-base-quant-ct2",
+            "size": ""
+        },
+        {
+            "name": "jvh/whisper-large-v2-quant-ct2",
+            "size": ""
+        },
+        {
+            "name": "jvh/whisper-medium-quant-ct2",
+            "size": ""
+        },
+        {
+            "name": "jvh/whisper-large-v3-quant-ct2",
+            "size": ""
+        },
+        {
+            "name": "distil-whisper/distil-large-v3-ct2",
+            "size": ""
+        },
+        {
+            "name": "Systran/faster-distil-whisper-large-v3",
+            "size": "1.5GB"
+        },
+        {
+            "name": "Conner/docuvet-large-whisper",
+            "size": ""
+        },
+        {
+            "name": "mmalyska/distil-whisper-large-v3-pl-ct2",
+            "size": ""
+        },
+        {
+            "name": "srivatsavdamaraju/api",
+            "size": ""
+        },
+        {
+            "name": "aTrain-core/faster-distil-whisper-large-v2",
+            "size": ""
+        },
+        {
+            "name": "aTrain-core/faster-whisper-large-v3",
+            "size": ""
+        },
+        {
+            "name": "Einstellung/faster-distil-whisper-large-v3-es",
+            "size": ""
+        },
+        {
+            "name": "kotoba-tech/kotoba-whisper-v1.0-faster",
+            "size": ""
+        },
+        {
+            "name": "JhonVanced/sin2piusc-whisper-large-v2-10k-ct2",
+            "size": ""
+        },
+        {
+            "name": "JhonVanced/sin2piusc-whisper-large-v2-10k-ct2-int8_float32",
+            "size": ""
+        },
+        {
+            "name": "Ruben9999/whp",
+            "size": ""
+        },
+        {
+            "name": "ubunto/audio",
+            "size": ""
+        },
+        {
+            "name": "RaivisDejus/whisper-large-v3-lv-ailab-ct2",
+            "size": ""
+        },
+        {
+            "name": "jkawamoto/whisper-tiny-ct2",
+            "size": ""
+        },
+        {
+            "name": "kotoba-tech/kotoba-whisper-v2.0-faster",
+            "size": ""
+        },
+        {
+            "name": "kotoba-tech/kotoba-whisper-bilingual-v1.0-faster",
+            "size": ""
+        },
+        {
+            "name": "deepdml/whisper-large-v3-turbo",
+            "size": ""
+        },
+        {
+            "name": "jootanehorror/faster-whisper-large-v3-turbo-ct2",
+            "size": ""
+        },
+        {
+            "name": "lukas-jkl/faster-whisper-large-v3-turbo",
+            "size": ""
+        },
+        {
+            "name": "jkawamoto/whisper-large-v3-ct2",
+            "size": ""
+        },
+        {
+            "name": "sasikr2/whisper-large-v3-turbo-ct2",
+            "size": ""
+        },
+        {
+            "name": "aTrain-core/faster-whisper-large-v3-turbo",
+            "size": ""
+        },
+        {
+            "name": "Infomaniak-AI/faster-whisper-large-v3-turbo",
+            "size": ""
+        },
+        {
+            "name": "imonkeycorp/whisper-large-v3-transform",
+            "size": ""
+        },
+        {
+            "name": "devilteo911/whisper-small-ita-ct2",
+            "size": ""
+        },
+        {
+            "name": "fatymatariq/faster-distil-whisper-large-v2",
+            "size": ""
+        },
+        {
+            "name": "beydogan/whisper-large-v3-turbo-german-ct2-16",
+            "size": ""
+        },
+        {
+            "name": "beydogan/whisper-large-v3-turbo-german-ct2",
+            "size": ""
+        },
+        {
+            "name": "adminbr/whisper-small-pt-ct2",
+            "size": ""
+        },
+        {
+            "name": "qbsmlabs/PhoWhisper-small",
+            "size": ""
+        },
+        {
+            "name": "qbsmlabs/PhoWhisper-medium",
+            "size": ""
+        },
+        {
+            "name": "qbsmlabs/PhoWhisper-large",
+            "size": ""
+        },
+        {
+            "name": "asadfgglie/faster-whisper-large-v3-zh-TW",
+            "size": ""
+        },
+        {
+            "name": "suzii/vi-whisper-large-v3-turbo-v1-ct2",
+            "size": ""
+        },
+        {
+            "name": "gongting/faster-whisper-large-v2",
+            "size": ""
+        },
+        {
+            "name": "collabora/faster-whisper-small-hindi",
+            "size": ""
+        },
+        {
+            "name": "ChrisTorng/whisper-large-v3-turbo-common_voice_19_0-zh-TW-ct2",
+            "size": ""
+        },
+        {
+            "name": "KBLab/kb-whisper-medium",
+            "size": ""
+        },
+        {
+            "name": "KBLab/kb-whisper-tiny",
+            "size": ""
+        },
+        {
+            "name": "gongting/faster-whisper-large-v3",
+            "size": ""
+        },
+        {
+            "name": "PierreMesure/kb-whisper-large-ct2",
+            "size": ""
+        },
+        {
+            "name": "PierreMesure/kb-whisper-medium-ct2",
+            "size": ""
+        },
+        {
+            "name": "PierreMesure/kb-whisper-small-ct2",
+            "size": ""
+        },
+        {
+            "name": "PierreMesure/kb-whisper-tiny-ct2",
+            "size": ""
+        },
+        {
+            "name": "mpasila/faster-whisper-Visual-novel-transcriptor",
+            "size": ""
+        },
+        {
+            "name": "jestillore/kb-whisper-small-ct2",
+            "size": ""
+        },
+        {
+            "name": "jestillore/kb-whisper-medium-ct2",
+            "size": ""
+        },
+        {
+            "name": "jestillore/kb-whisper-large-ct2",
+            "size": ""
+        },
+        {
+            "name": "fiifinketia/whisper-large-v3-turbo-akan",
+            "size": ""
+        },
+        {
+            "name": "distil-whisper/distil-large-v3.5-ct2",
+            "size": ""
+        },
+        {
+            "name": "sorendal/skyrim-whisper-small-int8",
+            "size": ""
+        },
+        {
+            "name": "sorendal/skyrim-whisper-base-int8",
+            "size": ""
+        },
+        {
+            "name": "Polopopi/Haru",
+            "size": ""
+        },
+        {
+            "name": "sorendal/skyrim-whisper-distil-small",
+            "size": ""
+        },
+        {
+            "name": "sorendal/skyrim-whisper-distil-small-int8",
+            "size": ""
+        },
+        {
+            "name": "sorendal/skyrim-whisper-tiny",
+            "size": ""
+        },
+        {
+            "name": "sorendal/skyrim-whisper-tiny-int8",
+            "size": ""
+        },
+        {
+            "name": "k1nto/Belle-whisper-large-v3-zh-punct-ct2",
+            "size": ""
+        },
+        {
+            "name": "Kelno/whisper-large-v3-french-distil-dec16-ct2",
+            "size": ""
+        },
+        {
+            "name": "erax-ai/EraX-WoW-Turbo-V1.1-CT2",
+            "size": ""
+        },
+        {
+            "name": "sorendal/skyrim-whisper-medium.en",
+            "size": ""
+        },
+        {
+            "name": "sorendal/skyrim-whisper-medium.en-int8",
+            "size": ""
+        },
+        {
+            "name": "Purfview/faster-distil-whisper-large-v3.5",
+            "size": ""
+        },
+        {
+            "name": "Luigi/whisper-small-zh_tw-ct2",
+            "size": ""
+        },
+        {
+            "name": "Vinxscribe/biodatlab-whisper-th-large-v3-faster",
+            "size": ""
+        },
+        {
+            "name": "Vinxscribe/kotoba-whisper-v2.2-faster",
+            "size": ""
+        },
+        {
+            "name": "theSuperShane/whisper-large-v3-ja",
+            "size": ""
+        },
+        {
+            "name": "john2223/medium-model",
+            "size": ""
+        },
+        {
+            "name": "pariya47/distill-whisper-th-large-v3-ct2",
+            "size": ""
+        },
+        {
+            "name": "collabora/faster-whisper-large-v2-hindi",
+            "size": ""
+        },
+        {
+            "name": "collabora/faster-whisper-medium-hindi",
+            "size": ""
+        },
+        {
+            "name": "jayant-yadav/ggml-kb-whisper-large_strict",
+            "size": ""
+        },
+        {
+            "name": "q-henric/kb-whisper-large",
+            "size": ""
+        },
+        {
+            "name": "jestillore/kb-whisper-large-strict-ct2",
+            "size": ""
+        },
+        {
+            "name": "Hexoplon/nb-whisper-large-distil-turbo-beta-ct2",
+            "size": ""
+        },
+        {
+            "name": "ragunath-ravi/quantized-whisper-mini-ta",
+            "size": ""
+        },
+        {
+            "name": "phate334/Breeze-ASR-25-ct2",
+            "size": ""
+        },
+        {
+            "name": "SoybeanMilk/faster-whisper-Breeze-ASR-25",
+            "size": ""
+        },
+        {
+            "name": "hasin023/faster-regional-ct2-cpu",
+            "size": ""
+        },
+        {
+            "name": "apigordyn/faster-whisper-large-v3-backup",
+            "size": ""
+        },
+        {
+            "name": "chris365312/whisper-large-v3-de-at-ct2",
+            "size": ""
+        },
+        {
+            "name": "Ash8181/whisper-large-v3-russian-ct2",
+            "size": ""
+        },
+        {
+            "name": "avazir/faster-distil-whisper-large-v3-ru",
+            "size": ""
+        },
+        {
+            "name": "avazir/faster-distil-whisper-large-v3-ru-int8",
+            "size": ""
+        },
+        {
+            "name": "syvai/faster-hviske-v3-conversation",
+            "size": ""
+        },
+        {
+            "name": "leophill/whisper-large-v3-turbo-sw-kinyarwanda-ct2",
+            "size": ""
+        },
+        {
+            "name": "leophill/whisper-large-v3-sn-kinyarwanda-ct2",
+            "size": ""
+        },
+        {
+            "name": "BabelfishAI/faster-whisper-cripser-ct2",
+            "size": ""
+        },
+        {
+            "name": "TopherAU/faster-whisper-distil-medium.en-int8",
+            "size": ""
+        },
+        {
+            "name": "TheTobyB/whisper-large-v3-turbo-german-ct2",
+            "size": ""
+        },
+        {
+            "name": "rtlingo/mobiuslabsgmbh-faster-whisper-large-v3-turbo",
+            "size": ""
+        },
+        {
+            "name": "RaivisDejus/whisper-large-v3-lv-ailab-ct2-int8",
+            "size": ""
+        },
+        {
+            "name": "TheChola/whisper-large-v3-turbo-german-faster-whisper",
+            "size": ""
+        },
+        {
+            "name": "nebi/whisper-large-v3-turbo-swiss-german-ct2",
+            "size": ""
+        },
+        {
+            "name": "nebi/whisper-large-v3-turbo-swiss-german-ct2-int8",
+            "size": ""
+        },
+        {
+            "name": "nekusu/faster-whisper-large-v3-turbo-latam-int8-ct2",
+            "size": ""
+        }
+    ]
+}

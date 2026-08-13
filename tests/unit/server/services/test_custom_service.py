@@ -154,7 +154,7 @@ def test_get_installed_info_when_installed_returns_spec(svc: CustomService) -> N
 
 
 def test_generate_instance_config_without_info(svc: CustomService) -> None:
-    config = svc._generate_instance_config(None, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", None, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options is None
     assert config.models == []
@@ -166,7 +166,7 @@ def test_generate_instance_config_with_info(svc: CustomService) -> None:
     mock_model_info.options = InstallModelIn(spec={})
     installed = InstalledInfo(models={"lemmatizer": mock_model_info}, options=InstallServiceIn(spec={}))
 
-    config = svc._generate_instance_config(installed, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", installed, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options == installed.options
     assert config.models is not None

@@ -314,7 +314,7 @@ def test_get_installed_info_when_installed_returns_spec(openai_svc: OpenAIServic
 
 
 def test_generate_instance_config_with_none_returns_empty_config(openai_svc: OpenAIService) -> None:
-    config = openai_svc._generate_instance_config(None, None)  # pyright: ignore[reportPrivateUsage]
+    config = openai_svc._generate_instance_config("default", None, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options is None
     assert config.models == []
@@ -334,7 +334,7 @@ def test_generate_instance_config_with_info_includes_options_and_models(openai_s
         registration_id="reg-1",
     )
     info = InstalledInfo(models={"gpt-4o": model_info}, options=options, parsed_options=parsed)
-    config = openai_svc._generate_instance_config(info, None)  # pyright: ignore[reportPrivateUsage]
+    config = openai_svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options == options
     assert config.models is not None

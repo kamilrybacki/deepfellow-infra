@@ -4,11 +4,12 @@
 """Coqui service."""
 
 import asyncio
+import json
 import shlex
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 from aiohttp import ClientSession
 from fastapi import HTTPException, Request
@@ -16,6 +17,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from server.applicationcontext import get_base_url
+from server.config import get_main_dir
 from server.docker import (
     DockerImage,
     DockerOptions,
@@ -71,6 +73,33 @@ class CoquiConst(BaseModel):
     models: dict[str, CoquiModel]
 
 
+class CoquiRegistryEntry(TypedDict):
+    name: str
+    docker_name: str
+    default_speaker: str
+    model_type: str
+    size: str
+
+
+class CoquiRegistry(TypedDict):
+    models: list[CoquiRegistryEntry]
+
+
+def _read_models() -> dict[str, CoquiModel]:
+    coqui_path = get_main_dir() / "./static/coqui-min.json"
+    with coqui_path.open(encoding="utf-8") as f:
+        registry: CoquiRegistry = json.loads(f.read())
+        return {
+            entry["name"]: CoquiModel(
+                docker_name=entry["docker_name"],
+                default_speaker=entry["default_speaker"],
+                model_type=entry["model_type"],
+                size=entry["size"],
+            )
+            for entry in registry["models"]
+        }
+
+
 _const = CoquiConst(
     # Images are pinned to a commit SHA (no semver releases upstream) — check for newer builds at:
     # https://github.com/idiap/coqui-ai-TTS/pkgs/container/coqui-tts
@@ -79,14 +108,7 @@ _const = CoquiConst(
         "cpu": DockerImage(name="ghcr.io/idiap/coqui-tts-cpu:ca2cf5155bca892ea820ad384400efbfac41b178", size="3.9 GB"),
         "gpu": DockerImage(name="ghcr.io/idiap/coqui-tts:ca2cf5155bca892ea820ad384400efbfac41b178", size="14.5 GB"),
     },
-    models={
-        "tts_models/en/vctk/vits": CoquiModel(
-            docker_name="en-vctk-vits",
-            default_speaker="p225",
-            model_type="tts",
-            size="152MB",
-        ),
-    },
+    models=_read_models(),
 )
 
 
@@ -163,7 +185,6 @@ class CoquiService(Base2Service[InstalledInfo, DownloadedInfo]):
     _installing: set[tuple[str, str]]
 
     def _after_init(self) -> None:
-        self.models = {}
         self._installing = set()
         self.load_default_models("default")
 
@@ -208,12 +229,26 @@ class CoquiService(Base2Service[InstalledInfo, DownloadedInfo]):
         installed = self.get_instance_info(instance).installed
         return self._get_service_installed_info(instance) if installed is None else installed.options.spec
 
-    def _generate_instance_config(self, info: InstalledInfo | None, custom: list[CustomModel] | None) -> InstanceConfig:
+    def _generate_instance_config(self, instance: str, info: InstalledInfo | None, custom: list[CustomModel] | None) -> InstanceConfig:
         return InstanceConfig(
             options=info.options if info else None,
-            models=[ModelConfig(model_id=x.id, options=x.options) for x in info.models.values()] if info else [],
+            models=[
+                ModelConfig(
+                    model_id=x.id,
+                    options=x.options,
+                    definition=self.models[instance][x.id].model_dump(mode="json")
+                    if x.id in self.models[instance]
+                    else self._get_persisted_model_definition(instance, x.id),
+                )
+                for x in info.models.values()
+            ]
+            if info
+            else [],
             custom=custom,
         )
+
+    def _restore_model_definition(self, instance: str, model_id: str, definition: dict[str, Any]) -> None:
+        self.models[instance][model_id] = CoquiModel.model_validate(definition)
 
     def _load_download_info(self, data: dict[str, Any]) -> DownloadedInfo:
         return DownloadedInfo(**data)
@@ -317,7 +352,7 @@ class CoquiService(Base2Service[InstalledInfo, DownloadedInfo]):
         if model_id not in self.models[instance]:
             raise HTTPException(status_code=400, detail="Model not found")
 
-        model = _const.models[model_id]
+        model = self.models[instance][model_id]
         installed = info.models[model_id].get_info() if model_id in info.models else self._get_model_installed_info(instance, model_id)
         return RetrieveModelOut(
             id=model_id,
@@ -340,10 +375,10 @@ class CoquiService(Base2Service[InstalledInfo, DownloadedInfo]):
         if model_id in info.models or key in self._installing:
             return PromiseWithProgress(value=InstallModelOut(status="OK", details="Already installed or being installed right now."))
 
-        if model_id not in _const.models:
+        if model_id not in self.models[instance]:
             raise HTTPException(400, "Model not found")
 
-        model = _const.models[model_id]
+        model = self.models[instance][model_id]
         self._installing.add(key)
 
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:

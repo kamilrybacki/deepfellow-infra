@@ -262,7 +262,7 @@ def test_get_installed_info_calls_helper_when_none(svc: LLamacppService) -> None
 
 
 def test_generate_instance_config_none_info(svc: LLamacppService) -> None:
-    config = svc._generate_instance_config(None, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", None, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options is None
     assert config.models == []
@@ -272,10 +272,42 @@ def test_generate_instance_config_with_info(svc: LLamacppService) -> None:
     info = _make_installed_info(svc)
     info.models["m1"] = _make_model_installed_info("m1")
 
-    config = svc._generate_instance_config(info, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options == info.options
     assert len(config.models or []) == 1
+
+
+def test_generate_instance_config_embeds_definition_when_in_registry(svc: LLamacppService) -> None:
+    info = _make_installed_info(svc)
+    info.models["m1"] = _make_model_installed_info("m1")
+    svc.models["default"]["m1"] = LlamacppModel(url="https://example.com/m1.gguf", size="1 GB")
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert (config.models or [])[0].definition == {
+        "url": "https://example.com/m1.gguf",
+        "size": "1 GB",
+        "custom": None,
+        "jinja": False,
+    }
+
+
+def test_generate_instance_config_omits_definition_when_missing_from_registry(svc: LLamacppService) -> None:
+    info = _make_installed_info(svc)
+    info.models["ghost-model"] = _make_model_installed_info("ghost-model")
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert (config.models or [])[0].definition is None
+
+
+def test_restore_model_definition_reinstates_model(svc: LLamacppService) -> None:
+    definition = {"url": "https://example.com/ghost.gguf", "size": "2 GB"}
+
+    svc._restore_model_definition("default", "ghost-model", definition)  # pyright: ignore[reportPrivateUsage]
+
+    assert svc.models["default"]["ghost-model"] == LlamacppModel(url="https://example.com/ghost.gguf", size="2 GB")
 
 
 def test_load_download_info_returns_dataclass(svc: LLamacppService) -> None:

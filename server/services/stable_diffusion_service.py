@@ -22,6 +22,7 @@ from PIL import Image
 from pydantic import BaseModel, Field, ValidationError
 
 from server.applicationcontext import get_base_url
+from server.config import get_main_dir
 from server.docker import (
     DockerImage,
     DockerOptions,
@@ -122,6 +123,37 @@ class StableDiffusionConst(BaseModel):
     models: dict[str, StableDiffusionModel]
 
 
+class StableDiffusionRegistryEntry(TypedDict):
+    name: str
+    filetype: FileType
+    type: ModelType
+    url: str
+    filename: str
+    size: str
+    model_url: NotRequired[str]
+
+
+class StableDiffusionRegistry(TypedDict):
+    models: list[StableDiffusionRegistryEntry]
+
+
+def _read_models() -> dict[str, StableDiffusionModel]:
+    sd_path = get_main_dir() / "./static/stable-diffusion-min.json"
+    with sd_path.open(encoding="utf-8") as f:
+        registry: StableDiffusionRegistry = json.loads(f.read())
+        return {
+            entry["name"]: StableDiffusionModel(
+                filetype=entry["filetype"],
+                type=entry["type"],
+                url=entry["url"],
+                filename=entry["filename"],
+                model_url=entry.get("model_url"),
+                size=entry["size"],
+            )
+            for entry in registry["models"]
+        }
+
+
 _const = StableDiffusionConst(
     images={
         "gpu": DockerImage(
@@ -131,80 +163,7 @@ _const = StableDiffusionConst(
             name="vladmandic/sdnext-cuda:latest@sha256:10f9ab600c245b9ce83be5a55abb64b46e115ef8508f5ffc69eed8fa0fc28ce8", size="9.4 GB"
         ),
     },
-    models={
-        "Plant Milk Walnut": StableDiffusionModel(
-            filetype="Stable-diffusion",
-            type="txt2img",
-            url="https://civitai.com/api/download/models/1714002?type=Model&format=SafeTensor&size=pruned&fp=fp16",
-            filename="plantMilkModelSuite_walnut.safetensors",
-            model_url="https://civitai.com/models/1162518?modelVersionId=1714002",
-            size="6.46GB",
-        ),
-        "Fantastic Landscapes": StableDiffusionModel(
-            filetype="Lora",
-            type="lora",
-            url="https://civitai.com/api/download/models/180314?type=Model&format=SafeTensor",
-            filename="FantasticLandscapes.safetensors",
-            model_url="https://civitai.com/models/160272/lora-fantastic-landscapes",
-            size="36.11MB",
-        ),
-        "Pixiv AenuaV1": StableDiffusionModel(
-            filetype="Lora",
-            type="lora",
-            url="https://civitai.com/api/download/models/694191?type=Model&format=SafeTensor",
-            filename="AenuaV1.safetensors",
-            model_url="https://civitai.com/models/620966?modelVersionId=694191",
-            size="435.34MB",
-        ),
-        "Minecraft square style": StableDiffusionModel(
-            filetype="Lora",
-            type="lora",
-            url="https://civitai.com/api/download/models/1145880?type=Model&format=SafeTensor",
-            filename="minecraft filter [IL]_1.safetensors",
-            model_url="https://civitai.com/models/113741/minecraft-square-style",
-            size="54.77MB",
-        ),
-        "SDXL Lighting 8 step": StableDiffusionModel(
-            filetype="Stable-diffusion",
-            type="txt2img",
-            url="https://huggingface.co/ByteDance/SDXL-Lightning/resolve/main/sdxl_lightning_8step.safetensors?download=true",
-            filename="sdxl_lightning_8step.safetensors",
-            model_url="https://huggingface.co/ByteDance/SDXL-Lightning",
-            size="6.94GB",
-        ),
-        "Semi-realistic": StableDiffusionModel(
-            filetype="Stable-diffusion",
-            type="txt2img",
-            url="https://civitai.com/api/download/models/2202259?type=Model&format=SafeTensor&size=pruned&fp=fp16",
-            filename="semi-realistic.safetensors",
-            model_url="https://civitai.com/models/1945811/semi-real-illustrious-or-mm",
-            size="6.94GB",
-        ),
-        "CyberRealistic-XL-FP16": StableDiffusionModel(
-            filetype="Stable-diffusion",
-            type="txt2img",
-            url="https://civitai.com/api/download/models/2152184?type=Model&format=SafeTensor&size=pruned&fp=fp16",
-            filename="cyberrealistic-xl-fp16.safetensors",
-            model_url="https://civitai.com/models/312530/cyberrealistic-xl",
-            size="6.46GB",
-        ),
-        "CyberRealistic-XL-FP32": StableDiffusionModel(
-            filetype="Stable-diffusion",
-            type="txt2img",
-            url="https://civitai.com/api/download/models/2152184?type=Model&format=SafeTensor&size=pruned&fp=fp32",
-            filename="cyberrealistic-xl-fp32.safetensors",
-            model_url="https://civitai.com/models/312530/cyberrealistic-xl",
-            size="12.92GB",
-        ),
-        "yomama-2.5D": StableDiffusionModel(
-            filetype="Stable-diffusion",
-            type="txt2img",
-            url="https://civitai.com/api/download/models/1085088?type=Model&format=SafeTensor&size=pruned&fp=fp16",
-            filename="yomama-25d.safetensors",
-            model_url="https://civitai.com/models/959233/yomama-25d-illustrious-pony?modelVersionId=1085088",
-            size="6.46GB",
-        ),
-    },
+    models=_read_models(),
 )
 
 
@@ -271,7 +230,6 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
     _installing: set[tuple[str, str]]
 
     def _after_init(self) -> None:
-        self.models = {}
         self._installing = set()
         self.load_default_models("default")
 
@@ -338,12 +296,26 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
         installed = self.get_instance_info(instance).installed
         return self._get_service_installed_info(instance) if installed is None else installed.options.spec
 
-    def _generate_instance_config(self, info: InstalledInfo | None, custom: list[CustomModel] | None) -> InstanceConfig:
+    def _generate_instance_config(self, instance: str, info: InstalledInfo | None, custom: list[CustomModel] | None) -> InstanceConfig:
         return InstanceConfig(
             options=info.options if info else None,
-            models=[ModelConfig(model_id=x.id, options=x.options) for x in info.models.values()] if info else [],
+            models=[
+                ModelConfig(
+                    model_id=x.id,
+                    options=x.options,
+                    definition=self.models[instance][x.id].model_dump(mode="json")
+                    if x.id in self.models[instance]
+                    else self._get_persisted_model_definition(instance, x.id),
+                )
+                for x in info.models.values()
+            ]
+            if info
+            else [],
             custom=custom,
         )
+
+    def _restore_model_definition(self, instance: str, model_id: str, definition: dict[str, Any]) -> None:
+        self.models[instance][model_id] = StableDiffusionModel.model_validate(definition)
 
     async def update_config(self) -> None:
         """Edit SD Next config file."""

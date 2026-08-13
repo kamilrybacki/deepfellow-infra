@@ -164,7 +164,6 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
         return self.hardware.gpus
 
     def _after_init(self) -> None:
-        self.models = {}
         self.load_default_models("default")
         self._vram_cache = {}
         self._installing = set()
@@ -242,12 +241,26 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
         installed = self.get_instance_info(instance).installed
         return self._get_service_installed_info(instance) if installed is None else installed.options.spec
 
-    def _generate_instance_config(self, info: InstalledInfo | None, custom: list[CustomModel] | None) -> InstanceConfig:
+    def _generate_instance_config(self, instance: str, info: InstalledInfo | None, custom: list[CustomModel] | None) -> InstanceConfig:
         return InstanceConfig(
             options=info.options if info else None,
-            models=[ModelConfig(model_id=x.id, options=x.options) for x in info.models.values()] if info else [],
+            models=[
+                ModelConfig(
+                    model_id=x.id,
+                    options=x.options,
+                    definition=self.models[instance][x.id].model_dump(mode="json")
+                    if x.id in self.models[instance]
+                    else self._get_persisted_model_definition(instance, x.id),
+                )
+                for x in info.models.values()
+            ]
+            if info
+            else [],
             custom=custom,
         )
+
+    def _restore_model_definition(self, instance: str, model_id: str, definition: dict[str, Any]) -> None:
+        self.models[instance][model_id] = LlamacppModel.model_validate(definition)
 
     def _load_download_info(self, data: dict[str, Any]) -> DownloadedInfo:
         return DownloadedInfo(**data)

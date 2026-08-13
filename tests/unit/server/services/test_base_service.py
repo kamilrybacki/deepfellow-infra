@@ -152,7 +152,7 @@ class _Base2ImplWithCustom(Base2Service):  # pyright: ignore[reportMissingTypeAr
     def _load_download_info(self, data: dict[str, Any]) -> dict[str, Any]:
         return data
 
-    def _generate_instance_config(self, info: Any, custom: Any) -> InstanceConfig:
+    def _generate_instance_config(self, instance: Any, info: Any, custom: Any) -> InstanceConfig:
         return InstanceConfig()
 
     async def _install_instance(self, instance: str, options: InstallServiceIn) -> Any:
@@ -207,7 +207,7 @@ class _Base2Impl(Base2Service):  # pyright: ignore[reportMissingTypeArgument]
     def _load_download_info(self, data: dict[str, Any]) -> dict[str, Any]:
         return data
 
-    def _generate_instance_config(self, info: Any, custom: Any) -> InstanceConfig:
+    def _generate_instance_config(self, instance: Any, info: Any, custom: Any) -> InstanceConfig:
         return InstanceConfig()
 
     async def _install_instance(self, instance: str, options: InstallServiceIn) -> Any:
@@ -232,6 +232,13 @@ class _Base2Impl(Base2Service):  # pyright: ignore[reportMissingTypeArgument]
         pass
 
 
+class _Base2ImplPersisting(_Base2Impl):
+    """Base2Service variant that overrides `_restore_model_definition`, like the 7 registry-backed services."""
+
+    def _restore_model_definition(self, instance: str, model_id: str, definition: dict[str, Any]) -> None:
+        pass
+
+
 @pytest.fixture
 def base_svc() -> _BaseImpl:
     return _BaseImpl()
@@ -252,6 +259,11 @@ def base2_deps() -> dict[str, Any]:
 @pytest.fixture
 def base2_svc(base2_deps: dict[str, Any]) -> _Base2Impl:
     return _Base2Impl(**base2_deps)
+
+
+@pytest.fixture
+def base2_svc_persisting(base2_deps: dict[str, Any]) -> _Base2ImplPersisting:
+    return _Base2ImplPersisting(**base2_deps)
 
 
 @pytest.fixture
@@ -726,6 +738,38 @@ async def test_load_model_exception_is_caught(base2_svc: _Base2Impl) -> None:
 
 
 @pytest.mark.asyncio
+async def test_load_model_restores_missing_definition_from_snapshot(base2_svc: _Base2Impl) -> None:
+    value = InstallModelOut(status="OK", details="done")
+    promise: PromiseWithProgress[InstallModelOut, StreamChunk] = PromiseWithProgress(value=value)
+    base2_svc.models = {"default": {}}
+    model = ModelConfig(model_id="m1", options=InstallModelIn(), definition={"hf_id": "m1"})
+
+    with (
+        patch.object(base2_svc, "_install_model", new=AsyncMock(return_value=promise)),
+        patch.object(base2_svc, "_restore_model_definition") as restore_mock,
+    ):
+        await base2_svc.load_model("default", model)
+
+    restore_mock.assert_called_once_with("default", "m1", {"hf_id": "m1"})
+
+
+@pytest.mark.asyncio
+async def test_load_model_skips_restore_when_already_in_registry(base2_svc: _Base2Impl) -> None:
+    value = InstallModelOut(status="OK", details="done")
+    promise: PromiseWithProgress[InstallModelOut, StreamChunk] = PromiseWithProgress(value=value)
+    base2_svc.models = {"default": {"m1": object()}}
+    model = ModelConfig(model_id="m1", options=InstallModelIn(), definition={"hf_id": "m1"})
+
+    with (
+        patch.object(base2_svc, "_install_model", new=AsyncMock(return_value=promise)),
+        patch.object(base2_svc, "_restore_model_definition") as restore_mock,
+    ):
+        await base2_svc.load_model("default", model)
+
+    restore_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_load_instance_skips_when_no_options(base2_svc: _Base2Impl) -> None:
     await base2_svc.load_instance("default", InstanceConfig(options=None))
 
@@ -802,12 +846,159 @@ async def test_load_service_loads_instances(base2_svc: _Base2Impl, base2_deps: d
 
 
 @pytest.mark.asyncio
+async def test_load_service_backfills_when_definition_missing(
+    base2_svc_persisting: _Base2ImplPersisting, base2_deps: dict[str, Any]
+) -> None:
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    installed_value: dict[str, Any] = {}
+    promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value=installed_value)
+    config: ServiceRawConfig = {
+        "downloaded": None,
+        "service_downloaded": False,
+        "instances": {
+            "default": {
+                "options": {"stream": False, "ignore_warnings": False, "spec": {}},
+                "models": [{"model_id": "m1", "options": {}, "definition": None}],
+                "custom": None,
+            }
+        },
+    }
+
+    with (
+        patch.object(base2_svc_persisting, "_install_instance", new=AsyncMock(return_value=promise)),
+        patch.object(base2_svc_persisting, "_install_model", new=AsyncMock(return_value=promise)),
+        patch.object(base2_svc_persisting, "_save", new=AsyncMock()) as save_mock,
+    ):
+        await base2_svc_persisting.load_service(config)
+
+    save_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_load_service_skips_backfill_for_non_persisting_service(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """A service that never overrides `_restore_model_definition` (e.g. custom/mcp/remote) never backfills.
+
+    Its models never carry a definition, so treating a missing definition as a backfill signal
+    would trigger a full regenerate-from-live-state `_save()` on every single startup.
+    """
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    installed_value: dict[str, Any] = {}
+    promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value=installed_value)
+    config: ServiceRawConfig = {
+        "downloaded": None,
+        "service_downloaded": False,
+        "instances": {
+            "default": {
+                "options": {"stream": False, "ignore_warnings": False, "spec": {}},
+                "models": [{"model_id": "m1", "options": {}, "definition": None}],
+                "custom": None,
+            }
+        },
+    }
+
+    with (
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(return_value=promise)),
+        patch.object(base2_svc, "_install_model", new=AsyncMock(return_value=promise)),
+        patch.object(base2_svc, "_save", new=AsyncMock()) as save_mock,
+    ):
+        await base2_svc.load_service(config)
+
+    save_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_load_service_skips_backfill_when_definitions_present(
+    base2_svc_persisting: _Base2ImplPersisting, base2_deps: dict[str, Any]
+) -> None:
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    installed_value: dict[str, Any] = {}
+    promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value=installed_value)
+    config: ServiceRawConfig = {
+        "downloaded": None,
+        "service_downloaded": False,
+        "instances": {
+            "default": {
+                "options": {"stream": False, "ignore_warnings": False, "spec": {}},
+                "models": [{"model_id": "m1", "options": {}, "definition": {"hf_id": "m1"}}],
+                "custom": None,
+            }
+        },
+    }
+
+    with (
+        patch.object(base2_svc_persisting, "_install_instance", new=AsyncMock(return_value=promise)),
+        patch.object(base2_svc_persisting, "_install_model", new=AsyncMock(return_value=promise)),
+        patch.object(base2_svc_persisting, "_save", new=AsyncMock()) as save_mock,
+    ):
+        await base2_svc_persisting.load_service(config)
+
+    save_mock.assert_not_called()
+
+    assert base2_svc_persisting.instances_info["default"].installed is installed_value
+
+
+@pytest.mark.asyncio
 async def test_save_calls_service_provider(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
     base2_deps["service_provider"].save_service_config = AsyncMock()
 
     await base2_svc._save()  # pyright: ignore[reportPrivateUsage]
 
     assert base2_deps["service_provider"].save_service_config.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_save_preserves_model_that_failed_to_load(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    persisted_model = ModelConfig(model_id="m1", options=InstallModelIn(), definition={"hf_id": "m1"})
+    base2_svc.instances_info["default"].config.models = [persisted_model]
+
+    with patch.object(base2_svc, "_install_model", new=AsyncMock(side_effect=RuntimeError("boom"))):
+        await base2_svc.load_model("default", persisted_model)
+
+    # The service's live registry no longer has the model (it failed to load), matching a real
+    # `_generate_instance_config` implementation that only reports live-registered models.
+    with patch.object(base2_svc, "_generate_instance_config", return_value=InstanceConfig(options=InstallServiceIn(spec={}), models=[])):
+        await base2_svc._save()  # pyright: ignore[reportPrivateUsage]
+
+    saved_models = base2_svc.instances_info["default"].config.models
+    assert saved_models is not None
+    assert [m.model_id for m in saved_models] == ["m1"]
+    assert saved_models[0].definition == {"hf_id": "m1"}
+
+
+@pytest.mark.asyncio
+async def test_load_model_success_clears_failed_marker(base2_svc: _Base2Impl) -> None:
+    model = ModelConfig(model_id="m1", options=InstallModelIn())
+
+    with patch.object(base2_svc, "_install_model", new=AsyncMock(side_effect=RuntimeError("boom"))):
+        await base2_svc.load_model("default", model)
+
+    assert "m1" in base2_svc._failed_models.get("default", set())  # pyright: ignore[reportPrivateUsage]
+
+    value = InstallModelOut(status="OK", details="done")
+    promise: PromiseWithProgress[InstallModelOut, StreamChunk] = PromiseWithProgress(value=value)
+
+    with patch.object(base2_svc, "_install_model", new=AsyncMock(return_value=promise)):
+        await base2_svc.load_model("default", model)
+
+    assert "m1" not in base2_svc._failed_models.get("default", set())  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_uninstall_model_stops_preserving_failed_model(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    persisted_model = ModelConfig(model_id="m1", options=InstallModelIn(), definition={"hf_id": "m1"})
+    base2_svc.instances_info["default"].config.models = [persisted_model]
+
+    with patch.object(base2_svc, "_install_model", new=AsyncMock(side_effect=RuntimeError("boom"))):
+        await base2_svc.load_model("default", persisted_model)
+
+    await base2_svc.uninstall_model("default", "m1", UninstallModelIn(purge=False))
+
+    with patch.object(base2_svc, "_generate_instance_config", return_value=InstanceConfig(options=InstallServiceIn(spec={}), models=[])):
+        await base2_svc._save()  # pyright: ignore[reportPrivateUsage]
+
+    assert base2_svc.instances_info["default"].config.models == []
 
 
 def test_service_config_returns_config(base2_svc: _Base2Impl) -> None:
@@ -1456,6 +1647,28 @@ async def test_update_instance_reloads_preserved_models(base2_svc: _Base2Impl, b
         await result_promise.wait()
 
     load_model_mock.assert_awaited_once_with("default", preserved)
+
+
+@pytest.mark.asyncio
+async def test_update_instance_retries_previously_failed_model(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_svc.instances_info["default"].installed = object()
+    persisted_model = ModelConfig(model_id="m1", options=InstallModelIn(), definition={"hf_id": "m1"})
+    base2_svc.instances_info["default"].config.models = [persisted_model]
+    base2_svc._failed_models["default"] = {"m1"}  # pyright: ignore[reportPrivateUsage]
+    promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value={})
+
+    with (
+        patch.object(base2_svc, "_uninstall_instance", new=AsyncMock()),
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(return_value=promise)),
+        # `m1` failed to load before the update, so it's absent from the live registry `_generate_instance_config` reports.
+        patch.object(base2_svc, "_generate_instance_config", return_value=InstanceConfig(models=[])),
+        patch.object(base2_svc, "load_model", new=AsyncMock()) as load_model_mock,
+    ):
+        result_promise = await base2_svc.update_instance("default", InstallServiceIn(spec={}))
+        await result_promise.wait()
+
+    load_model_mock.assert_awaited_once_with("default", persisted_model)
 
 
 @pytest.mark.asyncio

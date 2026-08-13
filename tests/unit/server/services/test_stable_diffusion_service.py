@@ -329,7 +329,7 @@ def test_get_installed_info_delegates_when_not_installed(svc: StableDiffusionSer
 
 
 def test_generate_instance_config_no_info(svc: StableDiffusionService) -> None:
-    config = svc._generate_instance_config(None, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", None, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options is None
     assert config.models == []
@@ -338,7 +338,7 @@ def test_generate_instance_config_no_info(svc: StableDiffusionService) -> None:
 def test_generate_instance_config_with_info_no_models(svc: StableDiffusionService) -> None:
     info = _make_installed_info()
 
-    config = svc._generate_instance_config(info, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
     assert config.options == info.options
     assert config.models == []
 
@@ -353,9 +353,68 @@ def test_generate_instance_config_with_models(svc: StableDiffusionService) -> No
         model_path=Path("/tmp/m1.safetensors"),
         registration_id="reg-1",
     )
-    config = svc._generate_instance_config(info, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
 
     assert len(config.models or []) == 1
+
+
+def test_generate_instance_config_embeds_definition_when_in_registry(svc: StableDiffusionService) -> None:
+    info = _make_installed_info()
+    info.models["m1"] = ModelInstalledInfo(
+        id="m1",
+        type="txt2img",
+        registered_name="m1",
+        options=InstallModelIn(spec={}),
+        model_path=Path("/tmp/m1.safetensors"),
+        registration_id="reg-1",
+    )
+    svc.models["default"]["m1"] = StableDiffusionModel(
+        filetype="Diffusers", type="txt2img", url="https://example.com/m1", filename="m1.safetensors", size="1 GB"
+    )
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert (config.models or [])[0].definition == {
+        "filetype": "Diffusers",
+        "type": "txt2img",
+        "url": "https://example.com/m1",
+        "filename": "m1.safetensors",
+        "model_url": None,
+        "size": "1 GB",
+        "custom": None,
+    }
+
+
+def test_generate_instance_config_omits_definition_when_missing_from_registry(svc: StableDiffusionService) -> None:
+    info = _make_installed_info()
+    info.models["ghost-model"] = ModelInstalledInfo(
+        id="ghost-model",
+        type="txt2img",
+        registered_name="ghost-model",
+        options=InstallModelIn(spec={}),
+        model_path=Path("/tmp/ghost.safetensors"),
+        registration_id="reg-1",
+    )
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert (config.models or [])[0].definition is None
+
+
+def test_restore_model_definition_reinstates_model(svc: StableDiffusionService) -> None:
+    definition = {
+        "filetype": "Diffusers",
+        "type": "txt2img",
+        "url": "https://example.com/ghost",
+        "filename": "ghost.safetensors",
+        "size": "2 GB",
+    }
+
+    svc._restore_model_definition("default", "ghost-model", definition)  # pyright: ignore[reportPrivateUsage]
+
+    assert svc.models["default"]["ghost-model"] == StableDiffusionModel(
+        filetype="Diffusers", type="txt2img", url="https://example.com/ghost", filename="ghost.safetensors", size="2 GB"
+    )
 
 
 def test_load_download_info_returns_downloaded_info(svc: StableDiffusionService) -> None:

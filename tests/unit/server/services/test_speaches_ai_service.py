@@ -312,7 +312,7 @@ def test_get_installed_info_delegates_when_not_installed(svc: SpeachesAIService)
 
 
 def test_generate_instance_config_no_info(svc: SpeachesAIService) -> None:
-    config = svc._generate_instance_config(None, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", None, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options is None
     assert config.models == []
@@ -322,10 +322,44 @@ def test_generate_instance_config_with_info_and_models(svc: SpeachesAIService) -
     info = _make_installed_info()
     info.models["my-tts"] = _make_model_installed_info("my-tts")
 
-    config = svc._generate_instance_config(info, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options == info.options
     assert len(config.models or []) == 1
+
+
+def test_generate_instance_config_embeds_definition_when_in_registry(svc: SpeachesAIService) -> None:
+    info = _make_installed_info()
+    info.models["my-tts"] = _make_model_installed_info("my-tts")
+    svc.models["default"]["my-tts"] = SpeachesModel(id="my-tts", type="tts", size="1 GB")
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert (config.models or [])[0].definition == {
+        "id": "my-tts",
+        "type": "tts",
+        "size": "1 GB",
+        "custom": None,
+        "default_model": None,
+        "langs_models": {},
+    }
+
+
+def test_generate_instance_config_omits_definition_when_missing_from_registry(svc: SpeachesAIService) -> None:
+    info = _make_installed_info()
+    info.models["ghost-model"] = _make_model_installed_info("ghost-model")
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert (config.models or [])[0].definition is None
+
+
+def test_restore_model_definition_reinstates_model(svc: SpeachesAIService) -> None:
+    definition = {"id": "ghost-model", "type": "tts", "size": "2 GB", "custom": None, "default_model": None, "langs_models": {}}
+
+    svc._restore_model_definition("default", "ghost-model", definition)  # pyright: ignore[reportPrivateUsage]
+
+    assert svc.models["default"]["ghost-model"] == SpeachesModel(id="ghost-model", type="tts", size="2 GB")
 
 
 def test_load_download_info_returns_downloaded_info(svc: SpeachesAIService) -> None:

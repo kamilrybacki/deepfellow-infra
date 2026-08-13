@@ -1420,7 +1420,7 @@ def test_model_installed_info_get_info() -> None:
 
 
 def test_generate_instance_config_none_info(svc: SglangService) -> None:
-    config = svc._generate_instance_config(None, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", None, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options is None
     assert config.models == []
@@ -1430,7 +1430,7 @@ def test_generate_instance_config_with_info(svc: SglangService) -> None:
     info = _make_installed_info()
     info.models["m1"] = _make_model_installed_info("m1")
 
-    config = svc._generate_instance_config(info, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options == info.options
     assert len(config.models or []) == 1
