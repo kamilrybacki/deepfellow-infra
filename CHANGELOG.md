@@ -6,11 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-### Fixed
-- vLLM model install no longer silently swallows a failed Docker container stop during cleanup — the failure is now logged so an orphaned container can be found and removed.
-- vLLM model installation no longer gets stuck permanently in "installing" state if the request is cancelled during a graceful shutdown while GPU/quantization checks are still running.
-- vLLM's KV-cache-overflow retry logic no longer intercepts unrelated Docker startup failures; only the specific "estimated maximum model length" error now triggers a retry with an adjusted `--max-model-len`.
-
 ### Added
 - New `just get-llamacpp-models` recipe generates `static/llamacpp-min.json`, a registry of GGUF models discovered on HuggingFace for the llama.cpp backend, mirroring the existing `get-vllm-models`/`get-ollama-models` tooling. Every quant a repo ships is listed as a separate entry (not just one picked tier); multimodal projector files, split (multi-part) GGUF shards, multi-component pipeline files, non-chat repos (image/video diffusion, TTS, ASR, OCR), and embedding-only repos (including the `bge-`/`gte-`/`e5-` family prefixes, not just repos with "embed" in the name) are excluded since llama.cpp can't serve them as standalone chat models.
 
@@ -26,6 +21,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - A model definition snapshot from an older schema no longer aborts loading the rest of an instance's models: restoring it is now covered by the same error handling as the model install itself.
 - A model that fails to (re)load is no longer permanently dropped from `config.json` the next time any unrelated action (installing another model, uninstalling a model, editing a custom model, etc.) triggers a config save — it stays persisted so it keeps getting a retry on every future load, until it's explicitly uninstalled.
 - Refreshing the Ollama catalog no longer makes an already-installed model disappear from `list_models`/`get_model` at runtime when it has dropped out of the static and dynamic catalog: the persisted definition is now re-applied after the catalog rebuild, matching the existing restore-on-load behavior.
+- Fixed the Ollama install progress bar getting stuck at 100% forever when a service install's post-processing step (e.g. saving config) failed after an install/uninstall/reinstall cycle.
+- vLLM model install no longer silently swallows a failed Docker container stop during cleanup — the failure is now logged so an orphaned container can be found and removed.
+- vLLM model installation no longer gets stuck permanently in "installing" state if the request is cancelled during a graceful shutdown while GPU/quantization checks are still running.
+- vLLM's KV-cache-overflow retry logic no longer intercepts unrelated Docker startup failures; only the specific "estimated maximum model length" error now triggers a retry with an adjusted `--max-model-len`.
 
 ## [0.31.0] - 2026-08-06
 

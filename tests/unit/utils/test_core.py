@@ -548,6 +548,32 @@ async def test_cancel_propagates_through_chain():
         await child.wait()
 
 
+@pytest.mark.asyncio
+async def test_next_invokes_on_error_when_func_raises():
+    """A failure inside the chained callback (e.g. a save() after a successful install) must still
+    trigger on_error, or state like an "installing" flag is left set forever (DFINFRA-279)."""
+
+    class MyModel(BaseModel):
+        value: int
+
+    async def work(_stream: Stream[StreamChunk]) -> MyModel:
+        return MyModel(value=1)
+
+    async def failing_step(_model: MyModel) -> MyModel:
+        raise RuntimeError("save failed")
+
+    on_error = MagicMock()
+
+    parent: PromiseWithProgress[MyModel, StreamChunk] = PromiseWithProgress(func=work)
+    child = parent.next(failing_step, on_error)
+
+    with pytest.raises(RuntimeError, match="save failed"):
+        await child.wait()
+
+    on_error.assert_called_once()
+    assert isinstance(on_error.call_args.args[0], RuntimeError)
+
+
 @pytest.mark.parametrize(
     ("machine", "expected"),
     [
