@@ -6,7 +6,10 @@
 import asyncio
 import json
 import logging
-from collections.abc import Awaitable, Callable
+import os
+import uuid
+from collections.abc import Awaitable, Callable, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, TypedDict, cast
 
@@ -19,19 +22,30 @@ logger = logging.getLogger("uvicorn.error")
 
 
 FIRST_CONFIG_VERSION = "v1"
-ACTUAL_CONFIG_VERSION = "v3"
+ACTUAL_CONFIG_VERSION = "v4"
+_MAX_WARNING_MESSAGE_LEN = 2000
 
 
-type ConfigVersions = Literal["v1", "v2", "v3"]
+type ConfigVersions = Literal["v1", "v2", "v3", "v4"]
 
 
 ServiceRawConfig = JsonSerializable
+
+
+class WarningEntry(TypedDict):
+    id: str
+    created_at: str
+    service_id: str
+    instance: str | None
+    model_id: str | None
+    message: str
 
 
 class FileContent(TypedDict):
     version: ConfigVersions
     services: dict[str, ServiceRawConfig]
     cloud_enabled: bool
+    warnings: list[WarningEntry]
 
 
 class ServiceProvider:
@@ -41,6 +55,12 @@ class ServiceProvider:
 
     def _get_file_path(self) -> Path:
         return (self.config.get_storage_dir() / "./services.json").resolve()
+
+    def convert_v3_to_v4_config(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Convert v3 to v4 config - adds the warnings list."""
+        new_data = data.copy()
+        new_data.setdefault("warnings", [])
+        return new_data
 
     def convert_v2_to_v3_config(self, data: dict[str, Any]) -> dict[str, Any]:
         """Convert v2 to v3 config - adds cloud_enabled flag."""
@@ -78,48 +98,63 @@ class ServiceProvider:
 
     async def load(self) -> FileContent:
         """Load settings file content."""
+        async with self.file_lock:
+            data_out = await self._load_and_migrate_locked()
+        logger.debug("Leaving read/write service.json file")
+        return data_out
+
+    async def _load_and_migrate_locked(self) -> FileContent:
+        """Read the file and apply pending migrations. Caller must hold ``file_lock``."""
         update_config: bool = False
         fpath = self._get_file_path()
-        async with self.file_lock:
-            logger.debug("Enter to read/write service.json file")
-            try:
-                async with aiofiles.open(fpath, encoding="utf-8") as f:
-                    logger.debug("Starting reading service.json file")
-                    content = await f.read()
-                    logger.debug("Ending reading service.json file")
-                    data: dict[str, Any] = json.loads(content)
+        logger.debug("Enter to read/write service.json file")
+        try:
+            async with aiofiles.open(fpath, encoding="utf-8") as f:
+                logger.debug("Starting reading service.json file")
+                content = await f.read()
+                logger.debug("Ending reading service.json file")
+                data: dict[str, Any] = json.loads(content)
 
-                    if "services" not in data:
-                        data["services"] = {}
+                if "services" not in data:
+                    data["services"] = {}
+                if "warnings" not in data:
+                    data["warnings"] = []
 
-                    version: ConfigVersions = data.get("version", FIRST_CONFIG_VERSION)
-                    if version == "v1":
-                        logger.debug("Migrate service.json from v1 to v2 version")
-                        data = self.convert_v1_to_v2_config(data)
-                        update_config = True
-                    if version in ("v1", "v2"):
-                        logger.debug("Migrate service.json from v2 to v3 version")
-                        data = self.convert_v2_to_v3_config(data)
-                        update_config = True
+                version: ConfigVersions = data.get("version", FIRST_CONFIG_VERSION)
+                if version == "v1":
+                    logger.debug("Migrate service.json from v1 to v2 version")
+                    data = self.convert_v1_to_v2_config(data)
+                    update_config = True
+                if version in ("v1", "v2"):
+                    logger.debug("Migrate service.json from v2 to v3 version")
+                    data = self.convert_v2_to_v3_config(data)
+                    update_config = True
+                if version in ("v1", "v2", "v3"):
+                    logger.debug("Migrate service.json from v3 to v4 version")
+                    data = self.convert_v3_to_v4_config(data)
+                    update_config = True
 
-                    data_out = cast("FileContent", data)
-            except FileNotFoundError:
-                return {"version": ACTUAL_CONFIG_VERSION, "services": {}, "cloud_enabled": False}
+                data_out = cast("FileContent", data)
+        except FileNotFoundError:
+            return {"version": ACTUAL_CONFIG_VERSION, "services": {}, "cloud_enabled": False, "warnings": []}
 
-            if "version" not in data or data["version"] != ACTUAL_CONFIG_VERSION:
-                update_config = True
-                data["version"] = ACTUAL_CONFIG_VERSION
+        if "version" not in data or data["version"] != ACTUAL_CONFIG_VERSION:
+            update_config = True
+            data["version"] = ACTUAL_CONFIG_VERSION
 
-            if update_config:
-                logger.debug("Config update")
-                await self.save(data_out)
-
-        logger.debug("Leaving read/write service.json file")
+        if update_config:
+            logger.debug("Config update")
+            await self._save_locked(data_out)
 
         return data_out
 
     async def save(self, content: FileContent) -> None:
         """Save settings file content."""
+        async with self.file_lock:
+            await self._save_locked(content)
+
+    async def _save_locked(self, content: FileContent) -> None:
+        """Write the file. Caller must hold ``file_lock``."""
         fpath = self._get_file_path()
         json_data = json.dumps(content, indent=2)
         logger.debug("Staring writing service.json file")
@@ -129,19 +164,30 @@ class ServiceProvider:
     async def _write_file(self, path: str, data: str) -> None:
         fpath = Path(path)
         fpath.parent.mkdir(parents=True, exist_ok=True)
-        async with aiofiles.open(fpath, mode="w", encoding="utf-8") as f:
-            await f.write(data)
+        tmp_path = fpath.with_name(f"{fpath.name}.tmp")
+        try:
+            async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
+                await f.write(data)
+            await asyncio.to_thread(os.replace, tmp_path, fpath)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
     async def _modify(self, func: Callable[[FileContent], Literal[False] | FileContent | Awaitable[Literal[False] | FileContent]]) -> None:
-        content = await self.load()
-        maybe_new_content = func(content)
-        if asyncio.iscoroutine(maybe_new_content):
-            new_content = cast("Literal[False] | FileContent", await maybe_new_content)
-        else:
-            new_content = cast("Literal[False] | FileContent", maybe_new_content)
-        if new_content is not False:
-            async with self.file_lock:
-                await self.save(new_content)
+        """Read, mutate and write back the config as a single atomic unit under ``file_lock``.
+
+        Holding the lock across the whole cycle (not just the save) prevents two concurrent
+        callers from each reading the same snapshot and one overwriting the other's change.
+        """
+        async with self.file_lock:
+            content = await self._load_and_migrate_locked()
+            maybe_new_content = func(content)
+            if asyncio.iscoroutine(maybe_new_content):
+                new_content = cast("Literal[False] | FileContent", await maybe_new_content)
+            else:
+                new_content = cast("Literal[False] | FileContent", maybe_new_content)
+            if new_content is not False:
+                await self._save_locked(new_content)
 
     async def save_service_config(self, service_id: str, data: ServiceRawConfig) -> None:
         """Save service config."""
@@ -167,11 +213,112 @@ class ServiceProvider:
         await self._modify(handler)
 
     async def clear_service_config(self, service_id: str) -> None:
-        """Clear service config."""
+        """Clear service config, dropping any warnings recorded for it (it no longer exists to recover)."""
 
         async def handler(content: FileContent) -> Literal[False] | FileContent:
+            changed = False
             if service_id in content["services"]:
                 del content["services"][service_id]
+                changed = True
+            before = len(content["warnings"])
+            content["warnings"] = [w for w in content["warnings"] if w["service_id"] != service_id]
+            changed = changed or len(content["warnings"]) != before
+            return content if changed else False
+
+        await self._modify(handler)
+
+    async def add_warning(self, service_id: str, message: str, *, instance: str | None = None, model_id: str | None = None) -> None:
+        """Record a warning so a failure isn't visible only in the server logs.
+
+        Replaces any existing warning for the same (service_id, instance, model_id) instead of
+        appending a duplicate, so a failure that recurs across restarts doesn't pile up rows.
+        """
+        entry: WarningEntry = {
+            "id": str(uuid.uuid4()),
+            "created_at": datetime.now(UTC).isoformat(),
+            "service_id": service_id,
+            "instance": instance,
+            "model_id": model_id,
+            "message": message[:_MAX_WARNING_MESSAGE_LEN],
+        }
+
+        async def handler(content: FileContent) -> FileContent:
+            content["warnings"] = [
+                w
+                for w in content["warnings"]
+                if not (w["service_id"] == service_id and w["instance"] == instance and w["model_id"] == model_id)
+            ]
+            content["warnings"].append(entry)
+            return content
+
+        await self._modify(handler)
+
+    async def list_warnings(self) -> list[WarningEntry]:
+        """List all recorded warnings."""
+        content = await self.load()
+        return content["warnings"]
+
+    async def dismiss_warning(self, warning_id: str) -> bool:
+        """Dismiss a warning by id. Returns False if no warning with that id exists."""
+        removed = False
+
+        async def handler(content: FileContent) -> Literal[False] | FileContent:
+            nonlocal removed
+            before = len(content["warnings"])
+            content["warnings"] = [w for w in content["warnings"] if w["id"] != warning_id]
+            removed = len(content["warnings"]) != before
+            if not removed:
+                return False
+            return content
+
+        await self._modify(handler)
+        return removed
+
+    async def dismiss_all_warnings(self) -> None:
+        """Dismiss every recorded warning."""
+
+        async def handler(content: FileContent) -> Literal[False] | FileContent:
+            if not content["warnings"]:
+                return False
+            content["warnings"] = []
+            return content
+
+        await self._modify(handler)
+
+    async def dismiss_warnings_matching(self, service_id: str, *, instance: str | None = None, model_id: str | None = None) -> None:
+        """Auto-dismiss warnings that exactly match (service_id, instance, model_id), e.g. once the thing recovers."""
+        await self.dismiss_warnings_matching_any(service_id, [(instance, model_id)])
+
+    async def dismiss_warnings_matching_any(self, service_id: str, keys: Sequence[tuple[str | None, str | None]]) -> None:
+        """Auto-dismiss warnings matching any of the given (instance, model_id) pairs, in a single write.
+
+        Equivalent to calling ``dismiss_warnings_matching`` once per pair, but does one read-modify-write
+        cycle of services.json instead of one per pair.
+        """
+
+        async def handler(content: FileContent) -> Literal[False] | FileContent:
+            before = len(content["warnings"])
+            content["warnings"] = [
+                w for w in content["warnings"] if not (w["service_id"] == service_id and (w["instance"], w["model_id"]) in keys)
+            ]
+            if len(content["warnings"]) == before:
+                return False
+            return content
+
+        await self._modify(handler)
+
+    async def dismiss_warnings_for_instance(self, service_id: str, instance: str) -> None:
+        """Dismiss every warning for a service's instance regardless of which model it names.
+
+        Used when the instance itself is uninstalled: at that point no single (instance, model_id)
+        warning can ever auto-clear again since the model it names is gone too.
+        """
+
+        async def handler(content: FileContent) -> Literal[False] | FileContent:
+            before = len(content["warnings"])
+            content["warnings"] = [w for w in content["warnings"] if not (w["service_id"] == service_id and w["instance"] == instance)]
+            if len(content["warnings"]) == before:
+                return False
             return content
 
         await self._modify(handler)

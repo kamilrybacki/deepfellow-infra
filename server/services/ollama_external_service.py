@@ -139,6 +139,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
     support_responses: bool
     support_messages: bool
     _installing: set[tuple[str, str]]
+    _persists_model_definitions = False
 
     def _after_init(self) -> None:
         self._sync_tasks: dict[str, asyncio.Task[None]] = {}

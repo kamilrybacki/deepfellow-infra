@@ -62,6 +62,7 @@ from server.utils.core import (
     StreamChunkProgress,
     SuccessDownloadPacket,
     convert_size_to_bytes,
+    load_json_registry,
     try_parse_pydantic,
 )
 from server.utils.loading import Progress
@@ -137,21 +138,23 @@ class StableDiffusionRegistry(TypedDict):
     models: list[StableDiffusionRegistryEntry]
 
 
+def _build_models(registry: StableDiffusionRegistry) -> dict[str, StableDiffusionModel]:
+    return {
+        entry["name"]: StableDiffusionModel(
+            filetype=entry["filetype"],
+            type=entry["type"],
+            url=entry["url"],
+            filename=entry["filename"],
+            model_url=entry.get("model_url"),
+            size=entry["size"],
+        )
+        for entry in registry["models"]
+    }
+
+
 def _read_models() -> dict[str, StableDiffusionModel]:
     sd_path = get_main_dir() / "./static/stable-diffusion-min.json"
-    with sd_path.open(encoding="utf-8") as f:
-        registry: StableDiffusionRegistry = json.loads(f.read())
-        return {
-            entry["name"]: StableDiffusionModel(
-                filetype=entry["filetype"],
-                type=entry["type"],
-                url=entry["url"],
-                filename=entry["filename"],
-                model_url=entry.get("model_url"),
-                size=entry["size"],
-            )
-            for entry in registry["models"]
-        }
+    return load_json_registry(sd_path, "stable-diffusion", _build_models, {})
 
 
 _const = StableDiffusionConst(

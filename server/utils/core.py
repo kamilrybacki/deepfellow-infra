@@ -335,6 +335,23 @@ def convert_size_to_bytes(size_str: str) -> None | int:
         return None
 
 
+def load_json_registry[T](path: Path, registry_name: str, builder: Callable[[Any], T], default: T) -> T:
+    """Read, parse and build a bundled static registry file (e.g. ``static/ollama-min.json``).
+
+    These files ship with the app, so a missing/corrupt one is a packaging defect, not a runtime
+    condition to recover from gracefully — but it should still degrade the one dependent service to an
+    empty registry instead of crashing the whole server at import time. Any failure (missing file,
+    invalid JSON, unexpected shape) is logged and swallowed.
+    """
+    try:
+        with path.open(encoding="utf-8") as f:
+            data = json.loads(f.read())
+        return builder(data)
+    except Exception:
+        logger.exception(f"Failed to load {registry_name} registry from {path}")  # noqa: G004
+        return default
+
+
 class StreamChunkFinish(TypedDict):
     type: Literal["finish"]
     status: Literal["ok", "error"]

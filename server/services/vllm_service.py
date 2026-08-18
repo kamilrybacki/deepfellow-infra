@@ -694,6 +694,64 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
         )
 
+    async def _start_vllm_container_with_retry(
+        self,
+        docker_options: DockerOptions,
+        model_id: str,
+        docker_model_path: Path,
+        parsed_model_options: VllmModelOptions,
+        quantization: str | None,
+        gpu_memory_utilization: float | None,
+        user_model_length: int | None,
+        use_gpu: bool,
+    ) -> tuple[int, int | None]:
+        """Start the vLLM container, tearing it down on any failure.
+
+        If startup fails because the model's default context length needs more KV cache than is
+        free, retries once with `--max-model-len` lowered to vLLM's own suggestion. Any other
+        failure (including a retry that still doesn't fit) is translated into a clear "not enough
+        GPU VRAM" or "missing model files" AppError when recognized, instead of the raw docker/vLLM
+        traceback.
+        Returns (docker_exposed_port, effective user_model_length).
+        """
+        try:
+            docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
+        except Exception as exc:
+            await self.docker_service.stop_docker(docker_options)
+            if missing_files_msg := self._diagnose_missing_model_files(model_id, str(exc)):
+                raise AppError(missing_files_msg) from exc
+            suggested_max_length = self._parse_kv_cache_max_len_suggestion(str(exc)) if use_gpu and user_model_length is None else None
+            if suggested_max_length is None:
+                if use_gpu and (vram_msg := self._diagnose_insufficient_vram(model_id, str(exc))):
+                    raise AppError(vram_msg) from exc
+                raise
+            logger.warning(
+                "vLLM rejected the model's default context length for %r (insufficient KV cache memory); retrying with --max-model-len %d.",
+                model_id,
+                suggested_max_length,
+            )
+            user_model_length = suggested_max_length
+            vllm_command = self._build_vllm_command(
+                docker_model_path=docker_model_path,
+                model_id=model_id,
+                opts=parsed_model_options,
+                quantization=quantization,
+                gpu_memory_utilization=gpu_memory_utilization,
+                user_model_length=user_model_length,
+                use_gpu=use_gpu,
+            )
+            docker_options.command = " ".join(vllm_command)
+            try:
+                docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
+            except Exception as retry_exc:
+                await self.docker_service.stop_docker(docker_options)
+                if missing_files_msg := self._diagnose_missing_model_files(model_id, str(retry_exc)):
+                    raise AppError(missing_files_msg) from retry_exc
+                if vram_msg := self._diagnose_insufficient_vram(model_id, str(retry_exc)):
+                    raise AppError(vram_msg) from retry_exc
+                raise
+        return docker_exposed_port, user_model_length
+
     async def _install_model(  # noqa: C901
         self, instance: str, model_id: str, options: InstallModelIn
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
@@ -789,38 +847,19 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     },
                 )
                 try:
-                    docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
-                except AppError as exc:
-                    await self._stop_docker(docker_options)
-                    docker_stopped = True
-                    suggested_max_length = (
-                        self._parse_kv_cache_max_len_suggestion(str(exc)) if use_gpu and user_model_length is None else None
-                    )
-                    if suggested_max_length is None:
-                        raise
-                    msg = (
-                        f"vLLM rejected the model's default context length for {model_id!r} "
-                        f"(insufficient KV cache memory); retrying with --max-model-len {suggested_max_length}."
-                    )
-                    logger.warning(msg)
-                    user_model_length = suggested_max_length
-                    vllm_command = self._build_vllm_command(
-                        docker_model_path=docker_model_path,
+                    docker_exposed_port, user_model_length = await self._start_vllm_container_with_retry(
+                        docker_options=docker_options,
                         model_id=model_id,
-                        opts=parsed_model_options,
+                        docker_model_path=docker_model_path,
+                        parsed_model_options=parsed_model_options,
                         quantization=quantization,
                         gpu_memory_utilization=gpu_memory_utilization,
                         user_model_length=user_model_length,
                         use_gpu=use_gpu,
                     )
-                    docker_options.command = " ".join(vllm_command)
-                    docker_stopped = False
-                    try:
-                        docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
-                    except AppError:
-                        await self._stop_docker(docker_options)
-                        docker_stopped = True
-                        raise
+                except Exception:
+                    docker_stopped = True
+                    raise
                 registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
                 container_host = self.docker_service.get_container_host(subnet, docker_options.name)
                 container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
@@ -932,6 +971,45 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         """
         if m := re.search(r"estimated maximum model length is (\d+)", raw):
             return int(m.group(1))
+        return None
+
+    _VRAM_INSUFFICIENT_PATTERNS = (
+        "larger than the available kv cache memory",
+        "no available memory for the cache blocks",
+        "cuda out of memory",
+        "cuda error: out of memory",
+    )
+
+    @classmethod
+    def _diagnose_insufficient_vram(cls, model_id: str, raw: str) -> str | None:
+        """Return a user-facing message if *raw* indicates the GPU doesn't have enough free VRAM for the model."""
+        lower = raw.lower()
+        if any(p in lower for p in cls._VRAM_INSUFFICIENT_PATTERNS):
+            return (
+                f"Not enough GPU VRAM to run {model_id!r}. Try a smaller or quantized model, reduce the "
+                "max context length, or free VRAM by stopping other running models."
+            )
+        return None
+
+    _MISSING_FILES_PATTERNS = (
+        "localentrynotfounderror",
+        "outgoing traffic has been disabled",
+        "couldn't connect to 'https://huggingface.co'",
+    )
+
+    @classmethod
+    def _diagnose_missing_model_files(cls, model_id: str, raw: str) -> str | None:
+        """Return a user-facing message if *raw* indicates vLLM couldn't find required files in the local download.
+
+        The container always runs with `HF_HUB_OFFLINE=1` (only the pre-downloaded model directory is mounted in),
+        so this happens when the download is incomplete or missing files vLLM expects, not a real network outage.
+        """
+        lower = raw.lower()
+        if any(p in lower for p in cls._MISSING_FILES_PATTERNS):
+            return (
+                f"Model {model_id!r} is missing files it needs to start (the download may be incomplete or "
+                "the repository layout isn't fully supported). Try prune and install model again"
+            )
         return None
 
     @staticmethod

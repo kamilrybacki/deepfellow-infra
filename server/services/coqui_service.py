@@ -4,7 +4,6 @@
 """Coqui service."""
 
 import asyncio
-import json
 import shlex
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
@@ -52,6 +51,7 @@ from server.utils.core import (
     StreamChunk,
     StreamChunkProgress,
     Utils,
+    load_json_registry,
     try_parse_pydantic,
 )
 
@@ -85,19 +85,21 @@ class CoquiRegistry(TypedDict):
     models: list[CoquiRegistryEntry]
 
 
+def _build_models(registry: CoquiRegistry) -> dict[str, CoquiModel]:
+    return {
+        entry["name"]: CoquiModel(
+            docker_name=entry["docker_name"],
+            default_speaker=entry["default_speaker"],
+            model_type=entry["model_type"],
+            size=entry["size"],
+        )
+        for entry in registry["models"]
+    }
+
+
 def _read_models() -> dict[str, CoquiModel]:
     coqui_path = get_main_dir() / "./static/coqui-min.json"
-    with coqui_path.open(encoding="utf-8") as f:
-        registry: CoquiRegistry = json.loads(f.read())
-        return {
-            entry["name"]: CoquiModel(
-                docker_name=entry["docker_name"],
-                default_speaker=entry["default_speaker"],
-                model_type=entry["model_type"],
-                size=entry["size"],
-            )
-            for entry in registry["models"]
-        }
+    return load_json_registry(coqui_path, "coqui", _build_models, {})
 
 
 _const = CoquiConst(

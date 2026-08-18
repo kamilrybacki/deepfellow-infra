@@ -130,6 +130,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     yield
     # Shutdown: stop all services gracefully if enabled
     logger.debug("Shutdown all containers gracefully")
+    await services_manager.drain_warning_tasks()
     if config.is_stop_containers_on_shutdown_enabled():
         await services_manager.stop_all_services()
 

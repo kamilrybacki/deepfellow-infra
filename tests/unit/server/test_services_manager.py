@@ -23,6 +23,7 @@ from server.models.services import (
     RetrieveServiceOut,
     UninstallServiceIn,
 )
+from server.services.base2_service import Base2Service
 from server.services.mcp_service import McpService
 from server.services.ollama_service import OllamaService
 from server.services_manager import ServicesManager
@@ -104,6 +105,23 @@ def test_register_service_duplicate_raises(services_manager: ServicesManager):
 
     with pytest.raises(RuntimeError):
         services_manager.register_service(svc)
+
+
+@pytest.mark.asyncio
+async def test_drain_warning_tasks_awaits_base2_services_only(services_manager: ServicesManager):
+    base2_svc = MagicMock(spec=Base2Service)
+    base2_svc.drain_warning_tasks = AsyncMock()
+    services_manager.services["llamacpp"] = base2_svc
+    services_manager.services["ollama"] = FakeService("ollama")
+
+    await services_manager.drain_warning_tasks()
+
+    base2_svc.drain_warning_tasks.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_drain_warning_tasks_noop_when_no_services(services_manager: ServicesManager):
+    await services_manager.drain_warning_tasks()
 
 
 @pytest.mark.asyncio

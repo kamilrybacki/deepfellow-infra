@@ -7,11 +7,14 @@ import {
   SidebarGroupLabel,
   SidebarHeader,
   SidebarMenu,
+  SidebarMenuBadge,
   SidebarMenuButton,
   SidebarMenuItem,
 } from "@/components/ui/sidebar";
+import { apiClient } from "@/deepfellow/client";
+import { useQuery } from "@tanstack/react-query";
 import { Link, useRouterState } from "@tanstack/react-router";
-import { FileText, Server, Settings } from "lucide-react";
+import { FileText, Server, Settings, TriangleAlert } from "lucide-react";
 /*
 DeepFellow Software Framework.
 Copyright © 2025 Simplito sp. z o.o.
@@ -37,6 +40,11 @@ const navigationItems = [
     icon: Settings,
   },
   {
+    title: "Warnings",
+    url: "/dashboard/warnings",
+    icon: TriangleAlert,
+  },
+  {
     title: "Documentation",
     url: "/docs",
     icon: FileText,
@@ -51,6 +59,13 @@ interface AppSidebarProps extends React.ComponentProps<typeof Sidebar> {
 export function AppSidebar({ onLogout, ...props }: AppSidebarProps) {
   const routerState = useRouterState();
   const currentPath = routerState.location.pathname;
+
+  const { data: warnings } = useQuery({
+    queryKey: ["admin", "warnings"],
+    queryFn: () => apiClient.listAdminWarnings(),
+    refetchInterval: 30000,
+  });
+  const warningsCount = warnings?.list.length ?? 0;
 
   return (
     <Sidebar collapsible="offcanvas" {...props}>
@@ -98,6 +113,10 @@ export function AppSidebar({ onLogout, ...props }: AppSidebarProps) {
                         </Link>
                       )}
                     </SidebarMenuButton>
+                    {item.url === "/dashboard/warnings" &&
+                      warningsCount > 0 && (
+                        <SidebarMenuBadge>{warningsCount}</SidebarMenuBadge>
+                      )}
                   </SidebarMenuItem>
                 );
               })}

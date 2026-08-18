@@ -4,7 +4,7 @@
 import json
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -122,12 +122,12 @@ async def test_load_file_not_found_returns_defaults(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_load_current_version(tmp_path: Path):
     provider = make_provider(tmp_path)
-    content: dict[str, Any] = {"version": "v3", "services": {}, "cloud_enabled": False}
+    content: dict[str, Any] = {"version": "v4", "services": {}, "cloud_enabled": False, "warnings": []}
     (tmp_path / "services.json").write_text(json.dumps(content))
 
     result = await provider.load()
 
-    assert result["version"] == "v3"
+    assert result["version"] == "v4"
     assert result["services"] == {}
 
 
@@ -208,6 +208,21 @@ async def test_write_file_creates_directories(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_write_file_removes_tmp_file_on_failure(tmp_path: Path):
+    provider = make_provider(tmp_path)
+    target = tmp_path / "file.json"
+
+    with (
+        patch("server.serviceprovider.os.replace", side_effect=OSError("disk full")),
+        pytest.raises(OSError, match="disk full"),
+    ):
+        await provider._write_file(str(target), '{"ok": true}')  # pyright: ignore[reportPrivateUsage]
+
+    assert not target.with_name("file.json.tmp").exists()
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
 async def test_modify_with_sync_handler(tmp_path: Path):
     provider = make_provider(tmp_path)
     (tmp_path / "services.json").write_text(json.dumps({"version": "v3", "services": {}, "cloud_enabled": False}))
@@ -240,17 +255,17 @@ async def test_modify_with_async_handler(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_modify_handler_returns_false_skips_save(tmp_path: Path):
     provider = make_provider(tmp_path)
-    original = {"version": "v3", "services": {}, "cloud_enabled": False}
+    original = {"version": "v4", "services": {}, "cloud_enabled": False, "warnings": []}
     (tmp_path / "services.json").write_text(json.dumps(original))
 
-    provider.save = AsyncMock()
+    provider._save_locked = AsyncMock()  # pyright: ignore[reportPrivateUsage]
 
     def handler(content: Any) -> Any:
         return False
 
     await provider._modify(handler)  # pyright: ignore[reportPrivateUsage]
 
-    assert provider.save.await_count == 0
+    assert provider._save_locked.await_count == 0  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
@@ -313,3 +328,239 @@ async def test_clear_service_config_nonexistent(tmp_path: Path):
 
     saved = json.loads((tmp_path / "services.json").read_text())
     assert saved["services"] == {}
+
+
+def test_convert_v3_to_v4_adds_warnings(tmp_path: Path):
+    provider = make_provider(tmp_path)
+    data: dict[str, Any] = {"version": "v3", "services": {}, "cloud_enabled": False}
+
+    result = provider.convert_v3_to_v4_config(data)
+
+    assert result["warnings"] == []
+    assert "warnings" not in data
+
+
+@pytest.mark.asyncio
+async def test_load_v3_migrates_to_v4(tmp_path: Path):
+    provider = make_provider(tmp_path)
+    content: dict[str, Any] = {"version": "v3", "services": {}, "cloud_enabled": False}
+    (tmp_path / "services.json").write_text(json.dumps(content))
+
+    result = await provider.load()
+
+    assert result["version"] == ACTUAL_CONFIG_VERSION
+    assert result["warnings"] == []
+    saved = json.loads((tmp_path / "services.json").read_text())
+    assert saved["warnings"] == []
+
+
+@pytest.mark.asyncio
+async def test_add_warning_appends_entry(tmp_path: Path):
+    provider = make_provider(tmp_path)
+    (tmp_path / "services.json").write_text(json.dumps({"version": "v4", "services": {}, "cloud_enabled": False, "warnings": []}))
+
+    await provider.add_warning("ollama", "boom", instance="default", model_id="m1")
+
+    saved = json.loads((tmp_path / "services.json").read_text())
+    assert len(saved["warnings"]) == 1
+    entry = saved["warnings"][0]
+    assert entry["service_id"] == "ollama"
+    assert entry["message"] == "boom"
+    assert entry["instance"] == "default"
+    assert entry["model_id"] == "m1"
+    assert entry["id"]
+    assert entry["created_at"]
+
+
+@pytest.mark.asyncio
+async def test_list_warnings_returns_all(tmp_path: Path):
+    provider = make_provider(tmp_path)
+    (tmp_path / "services.json").write_text(json.dumps({"version": "v4", "services": {}, "cloud_enabled": False, "warnings": []}))
+
+    await provider.add_warning("ollama", "first")
+    await provider.add_warning("vllm", "second")
+
+    result = await provider.list_warnings()
+
+    assert [w["message"] for w in result] == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_dismiss_warning_removes_matching_entry(tmp_path: Path):
+    provider = make_provider(tmp_path)
+    (tmp_path / "services.json").write_text(json.dumps({"version": "v4", "services": {}, "cloud_enabled": False, "warnings": []}))
+
+    await provider.add_warning("ollama", "first")
+    await provider.add_warning("vllm", "second")
+    warning_id = (await provider.list_warnings())[0]["id"]
+
+    removed = await provider.dismiss_warning(warning_id)
+
+    assert removed is True
+    result = await provider.list_warnings()
+    assert [w["message"] for w in result] == ["second"]
+
+
+@pytest.mark.asyncio
+async def test_dismiss_warning_nonexistent_is_noop(tmp_path: Path):
+    provider = make_provider(tmp_path)
+    (tmp_path / "services.json").write_text(json.dumps({"version": "v4", "services": {}, "cloud_enabled": False, "warnings": []}))
+    await provider.add_warning("ollama", "first")
+
+    provider._save_locked = AsyncMock()  # pyright: ignore[reportPrivateUsage]
+    removed = await provider.dismiss_warning("nonexistent")
+
+    assert removed is False
+    assert provider._save_locked.await_count == 0  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_dismiss_all_warnings_removes_everything(tmp_path: Path):
+    provider = make_provider(tmp_path)
+    (tmp_path / "services.json").write_text(json.dumps({"version": "v4", "services": {}, "cloud_enabled": False, "warnings": []}))
+
+    await provider.add_warning("ollama", "first")
+    await provider.add_warning("vllm", "second")
+
+    await provider.dismiss_all_warnings()
+
+    result = await provider.list_warnings()
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_dismiss_all_warnings_empty_is_noop(tmp_path: Path):
+    provider = make_provider(tmp_path)
+    (tmp_path / "services.json").write_text(json.dumps({"version": "v4", "services": {}, "cloud_enabled": False, "warnings": []}))
+
+    provider._save_locked = AsyncMock()  # pyright: ignore[reportPrivateUsage]
+    await provider.dismiss_all_warnings()
+
+    assert provider._save_locked.await_count == 0  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_dismiss_warnings_matching_removes_exact_match(tmp_path: Path):
+    provider = make_provider(tmp_path)
+    (tmp_path / "services.json").write_text(json.dumps({"version": "v4", "services": {}, "cloud_enabled": False, "warnings": []}))
+
+    await provider.add_warning("ollama", "model failed", instance="default", model_id="m1")
+    await provider.add_warning("ollama", "other model failed", instance="default", model_id="m2")
+    await provider.add_warning("ollama", "service failed")
+
+    await provider.dismiss_warnings_matching("ollama", instance="default", model_id="m1")
+
+    result = await provider.list_warnings()
+    assert [w["message"] for w in result] == ["other model failed", "service failed"]
+
+
+@pytest.mark.asyncio
+async def test_dismiss_warnings_matching_service_level_only(tmp_path: Path):
+    provider = make_provider(tmp_path)
+    (tmp_path / "services.json").write_text(json.dumps({"version": "v4", "services": {}, "cloud_enabled": False, "warnings": []}))
+
+    await provider.add_warning("ollama", "model failed", instance="default", model_id="m1")
+    await provider.add_warning("ollama", "service failed")
+
+    await provider.dismiss_warnings_matching("ollama")
+
+    result = await provider.list_warnings()
+    assert [w["message"] for w in result] == ["model failed"]
+
+
+@pytest.mark.asyncio
+async def test_dismiss_warnings_matching_no_match_is_noop(tmp_path: Path):
+    provider = make_provider(tmp_path)
+    (tmp_path / "services.json").write_text(json.dumps({"version": "v4", "services": {}, "cloud_enabled": False, "warnings": []}))
+    await provider.add_warning("ollama", "model failed", instance="default", model_id="m1")
+
+    provider._save_locked = AsyncMock()  # pyright: ignore[reportPrivateUsage]
+    await provider.dismiss_warnings_matching("ollama", instance="default", model_id="does-not-exist")
+
+    assert provider._save_locked.await_count == 0  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_dismiss_warnings_matching_any_removes_both_keys_in_one_write(tmp_path: Path):
+    provider = make_provider(tmp_path)
+    (tmp_path / "services.json").write_text(json.dumps({"version": "v4", "services": {}, "cloud_enabled": False, "warnings": []}))
+
+    await provider.add_warning("ollama", "service failed")
+    await provider.add_warning("ollama", "instance failed", instance="default")
+    await provider.add_warning("ollama", "model failed", instance="default", model_id="m1")
+
+    with patch.object(provider, "_save_locked", wraps=provider._save_locked) as save_locked:  # pyright: ignore[reportPrivateUsage]
+        await provider.dismiss_warnings_matching_any("ollama", [(None, None), ("default", None)])
+
+    save_locked.assert_awaited_once()
+    result = await provider.list_warnings()
+    assert [w["message"] for w in result] == ["model failed"]
+
+
+@pytest.mark.asyncio
+async def test_dismiss_warnings_matching_any_no_match_is_noop(tmp_path: Path):
+    provider = make_provider(tmp_path)
+    (tmp_path / "services.json").write_text(json.dumps({"version": "v4", "services": {}, "cloud_enabled": False, "warnings": []}))
+    await provider.add_warning("ollama", "model failed", instance="default", model_id="m1")
+
+    provider._save_locked = AsyncMock()  # pyright: ignore[reportPrivateUsage]
+    await provider.dismiss_warnings_matching_any("ollama", [(None, None), ("other-instance", None)])
+
+    assert provider._save_locked.await_count == 0  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_dismiss_warnings_for_instance_removes_all_models(tmp_path: Path):
+    provider = make_provider(tmp_path)
+    (tmp_path / "services.json").write_text(json.dumps({"version": "v4", "services": {}, "cloud_enabled": False, "warnings": []}))
+
+    await provider.add_warning("ollama", "m1 failed", instance="default", model_id="m1")
+    await provider.add_warning("ollama", "m2 failed", instance="default", model_id="m2")
+    await provider.add_warning("ollama", "other instance failed", instance="other", model_id="m1")
+    await provider.add_warning("llamacpp", "unrelated service failed", instance="default", model_id="m1")
+
+    await provider.dismiss_warnings_for_instance("ollama", "default")
+
+    result = await provider.list_warnings()
+    assert [w["message"] for w in result] == ["other instance failed", "unrelated service failed"]
+
+
+@pytest.mark.asyncio
+async def test_dismiss_warnings_for_instance_no_match_is_noop(tmp_path: Path):
+    provider = make_provider(tmp_path)
+    (tmp_path / "services.json").write_text(json.dumps({"version": "v4", "services": {}, "cloud_enabled": False, "warnings": []}))
+    await provider.add_warning("ollama", "m1 failed", instance="default", model_id="m1")
+
+    provider._save_locked = AsyncMock()  # pyright: ignore[reportPrivateUsage]
+    await provider.dismiss_warnings_for_instance("ollama", "does-not-exist")
+
+    assert provider._save_locked.await_count == 0  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_add_warning_replaces_existing_entry_for_same_key(tmp_path: Path):
+    provider = make_provider(tmp_path)
+    (tmp_path / "services.json").write_text(json.dumps({"version": "v4", "services": {}, "cloud_enabled": False, "warnings": []}))
+
+    await provider.add_warning("ollama", "first failure", instance="default", model_id="m1")
+    await provider.add_warning("ollama", "second failure", instance="default", model_id="m1")
+
+    result = await provider.list_warnings()
+    assert len(result) == 1
+    assert result[0]["message"] == "second failure"
+
+
+@pytest.mark.asyncio
+async def test_clear_service_config_drops_its_warnings(tmp_path: Path):
+    provider = make_provider(tmp_path)
+    (tmp_path / "services.json").write_text(
+        json.dumps({"version": "v4", "services": {"ollama": {"foo": "bar"}}, "cloud_enabled": False, "warnings": []})
+    )
+
+    await provider.add_warning("ollama", "model failed", instance="default", model_id="m1")
+    await provider.add_warning("llamacpp", "unrelated service failed", instance="default", model_id="m1")
+
+    await provider.clear_service_config("ollama")
+
+    result = await provider.list_warnings()
+    assert [w["message"] for w in result] == ["unrelated service failed"]
