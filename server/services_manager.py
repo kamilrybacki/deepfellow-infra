@@ -30,6 +30,7 @@ from server.models.services import (
     UninstallServiceIn,
 )
 from server.serviceprovider import ServiceRawConfig
+from server.services.base2_service import Base2Service
 from server.services.base_service import BaseService
 from server.utils.core import PromiseWithProgress, StreamChunk
 
@@ -73,6 +74,12 @@ class ServicesManager:
         if service_id in self.services:
             raise RuntimeError("Service already registered", service_id)
         self.services[service_id] = service
+
+    async def drain_warning_tasks(self) -> None:
+        """Await every service's pending fire-and-forget warning writes so shutdown doesn't drop them."""
+        drains = [service.drain_warning_tasks() for service in self.services.values() if isinstance(service, Base2Service)]
+        if drains:
+            await asyncio.gather(*drains)
 
     async def load_service(self, service_id: str, service_cfg: ServiceRawConfig) -> None:
         """Load service."""

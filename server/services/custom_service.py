@@ -125,6 +125,7 @@ class DownloadedInfo:
 class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
     models: dict[str, dict[str, "SrvCustomModel"]]
     _installing: set[tuple[str, str]]
+    _persists_model_definitions = False
 
     def _after_init(self) -> None:
         self.load_default_models("default")

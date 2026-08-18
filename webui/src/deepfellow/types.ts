@@ -277,3 +277,17 @@ export type ConvertedMcpConfig =
   | ConvertedUserMcpConfig
   | ConvertedProxyMcpConfig
   | ConvertedCustomMcpConfig;
+
+// Warnings
+export interface ServiceWarning {
+  id: string;
+  created_at: string;
+  service_id: string;
+  instance?: string | null;
+  model_id?: string | null;
+  message: string;
+}
+
+export interface ListWarningsOut {
+  list: ServiceWarning[];
+}

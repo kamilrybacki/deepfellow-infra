@@ -163,6 +163,7 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
     models: dict[str, dict[str, RemoteModel]]
     options_class: type[T_Options]  # set by each subclass to parse frontend input
     _installing: set[tuple[str, str]]
+    _persists_model_definitions = False
 
     def _after_init(self) -> None:
         self._installing = set()

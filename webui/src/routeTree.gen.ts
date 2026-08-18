@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as SignInRouteImport } from './routes/sign-in'
 import { Route as DashboardRouteImport } from './routes/dashboard'
 import { Route as DashboardIndexRouteImport } from './routes/dashboard/index'
+import { Route as DashboardWarningsRouteImport } from './routes/dashboard/warnings'
 import { Route as DashboardConfigRouteImport } from './routes/dashboard/config'
 import { Route as DashboardServicesServiceIdRouteImport } from './routes/dashboard/services/$serviceId'
 
@@ -30,6 +31,11 @@ const DashboardIndexRoute = DashboardIndexRouteImport.update({
   path: '/',
   getParentRoute: () => DashboardRoute,
 } as any)
+const DashboardWarningsRoute = DashboardWarningsRouteImport.update({
+  id: '/warnings',
+  path: '/warnings',
+  getParentRoute: () => DashboardRoute,
+} as any)
 const DashboardConfigRoute = DashboardConfigRouteImport.update({
   id: '/config',
   path: '/config',
@@ -46,12 +52,14 @@ export interface FileRoutesByFullPath {
   '/dashboard': typeof DashboardRouteWithChildren
   '/sign-in': typeof SignInRoute
   '/dashboard/config': typeof DashboardConfigRoute
+  '/dashboard/warnings': typeof DashboardWarningsRoute
   '/dashboard/': typeof DashboardIndexRoute
   '/dashboard/services/$serviceId': typeof DashboardServicesServiceIdRoute
 }
 export interface FileRoutesByTo {
   '/sign-in': typeof SignInRoute
   '/dashboard/config': typeof DashboardConfigRoute
+  '/dashboard/warnings': typeof DashboardWarningsRoute
   '/dashboard': typeof DashboardIndexRoute
   '/dashboard/services/$serviceId': typeof DashboardServicesServiceIdRoute
 }
@@ -60,6 +68,7 @@ export interface FileRoutesById {
   '/dashboard': typeof DashboardRouteWithChildren
   '/sign-in': typeof SignInRoute
   '/dashboard/config': typeof DashboardConfigRoute
+  '/dashboard/warnings': typeof DashboardWarningsRoute
   '/dashboard/': typeof DashboardIndexRoute
   '/dashboard/services/$serviceId': typeof DashboardServicesServiceIdRoute
 }
@@ -69,12 +78,14 @@ export interface FileRouteTypes {
     | '/dashboard'
     | '/sign-in'
     | '/dashboard/config'
+    | '/dashboard/warnings'
     | '/dashboard/'
     | '/dashboard/services/$serviceId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/sign-in'
     | '/dashboard/config'
+    | '/dashboard/warnings'
     | '/dashboard'
     | '/dashboard/services/$serviceId'
   id:
@@ -82,6 +93,7 @@ export interface FileRouteTypes {
     | '/dashboard'
     | '/sign-in'
     | '/dashboard/config'
+    | '/dashboard/warnings'
     | '/dashboard/'
     | '/dashboard/services/$serviceId'
   fileRoutesById: FileRoutesById
@@ -114,6 +126,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof DashboardIndexRouteImport
       parentRoute: typeof DashboardRoute
     }
+    '/dashboard/warnings': {
+      id: '/dashboard/warnings'
+      path: '/warnings'
+      fullPath: '/dashboard/warnings'
+      preLoaderRoute: typeof DashboardWarningsRouteImport
+      parentRoute: typeof DashboardRoute
+    }
     '/dashboard/config': {
       id: '/dashboard/config'
       path: '/config'
@@ -133,12 +152,14 @@ declare module '@tanstack/react-router' {
 
 interface DashboardRouteChildren {
   DashboardConfigRoute: typeof DashboardConfigRoute
+  DashboardWarningsRoute: typeof DashboardWarningsRoute
   DashboardIndexRoute: typeof DashboardIndexRoute
   DashboardServicesServiceIdRoute: typeof DashboardServicesServiceIdRoute
 }
 
 const DashboardRouteChildren: DashboardRouteChildren = {
   DashboardConfigRoute: DashboardConfigRoute,
+  DashboardWarningsRoute: DashboardWarningsRoute,
   DashboardIndexRoute: DashboardIndexRoute,
   DashboardServicesServiceIdRoute: DashboardServicesServiceIdRoute,
 }

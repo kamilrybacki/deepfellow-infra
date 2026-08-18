@@ -957,15 +957,55 @@ async def test_install_model_reraises_when_retry_also_fails(svc: VllmService, de
     assert deps["docker_service"].stop_docker.call_count == 2
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "ValueError: ... is larger than the available KV cache memory (3.37 GiB) ...",
+        "No available memory for the cache blocks.",
+        "torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB",
+        "CUDA error: out of memory",
+    ],
+)
+def test_diagnose_insufficient_vram_matches_known_patterns(raw: str) -> None:
+    msg = VllmService._diagnose_insufficient_vram("my-model", raw)  # pyright: ignore[reportPrivateUsage]
+    assert msg is not None
+    assert "my-model" in msg
+    assert "VRAM" in msg
+
+
+def test_diagnose_insufficient_vram_returns_none_for_unrelated_error() -> None:
+    assert VllmService._diagnose_insufficient_vram("my-model", "connection refused") is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "huggingface_hub.errors.LocalEntryNotFoundError: Cannot find the requested files in the disk cache "
+        "and outgoing traffic has been disabled.",
+        "OSError: We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.",
+    ],
+)
+def test_diagnose_missing_model_files_matches_known_patterns(raw: str) -> None:
+    msg = VllmService._diagnose_missing_model_files("my-model", raw)  # pyright: ignore[reportPrivateUsage]
+    assert msg is not None
+    assert "my-model" in msg
+    assert "missing files" in msg
+
+
+def test_diagnose_missing_model_files_returns_none_for_unrelated_error() -> None:
+    assert VllmService._diagnose_missing_model_files("my-model", "connection refused") is None  # pyright: ignore[reportPrivateUsage]
+
+
 @pytest.mark.asyncio
-async def test_install_model_kv_cache_handler_does_not_catch_runtime_error(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+async def test_install_model_raises_friendly_error_when_retry_fails_on_vram(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
     nvidia = MagicMock(spec=NvidiaGpuInfo)
     deps["hardware"].gpus = [nvidia]
     svc2 = VllmService(**deps)
     installed = _make_installed_info(hardware=True)
     svc2.instances_info["default"].installed = installed
-    not_app_error = RuntimeError("the estimated maximum model length is 110256.")
-    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=not_app_error)
+    kv_cache_error = RuntimeError("the estimated maximum model length is 4096.")
+    vram_error = RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[kv_cache_error, vram_error])
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
     deps["docker_service"].stop_docker = AsyncMock()
@@ -978,11 +1018,110 @@ async def test_install_model_kv_cache_handler_does_not_catch_runtime_error(svc: 
         patch.object(svc2, "is_given_hardware_support_gpu", return_value=True),
     ):
         promise = await svc2._install_model("default", model_id, InstallModelIn(spec={"gpu_memory_utilization": 0.5}))  # pyright: ignore[reportPrivateUsage]
-        with pytest.raises(RuntimeError):
+        with pytest.raises(AppError, match="Not enough GPU VRAM"):
             await promise.wait()
 
-    assert not isinstance(deps["docker_service"].install_and_run_docker.side_effect, AppError)
+    assert deps["docker_service"].install_and_run_docker.call_count == 2
+    assert deps["docker_service"].stop_docker.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_install_model_raises_friendly_error_on_vram_when_max_model_length_is_explicit(
+    svc: VllmService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    nvidia = MagicMock(spec=NvidiaGpuInfo)
+    deps["hardware"].gpus = [nvidia]
+    svc2 = VllmService(**deps)
+    installed = _make_installed_info(hardware=True)
+    svc2.instances_info["default"].installed = installed
+    vram_error = RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=vram_error)
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "container"
+    deps["docker_service"].stop_docker = AsyncMock()
+    model_id = next(iter(svc2.models["default"]))
+
+    with (
+        patch.object(svc2, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc2, "get_specified_hardware_parts", return_value=[nvidia]),
+        patch.object(svc2, "is_given_hardware_support_gpu", return_value=True),
+    ):
+        promise = await svc2._install_model(  # pyright: ignore[reportPrivateUsage]
+            "default", model_id, InstallModelIn(spec={"gpu_memory_utilization": 0.5, "max_model_length": 4096})
+        )
+        with pytest.raises(AppError, match="Not enough GPU VRAM"):
+            await promise.wait()
+
     assert deps["docker_service"].install_and_run_docker.call_count == 1
+    assert deps["docker_service"].stop_docker.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_install_model_raises_friendly_error_when_retry_fails_on_missing_files(
+    svc: VllmService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    nvidia = MagicMock(spec=NvidiaGpuInfo)
+    deps["hardware"].gpus = [nvidia]
+    svc2 = VllmService(**deps)
+    installed = _make_installed_info(hardware=True)
+    svc2.instances_info["default"].installed = installed
+    kv_cache_error = RuntimeError("the estimated maximum model length is 4096.")
+    missing_files_error = RuntimeError(
+        "huggingface_hub.errors.LocalEntryNotFoundError: Cannot find the requested files in the disk cache "
+        "and outgoing traffic has been disabled."
+    )
+    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[kv_cache_error, missing_files_error])
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "container"
+    deps["docker_service"].stop_docker = AsyncMock()
+    model_id = next(iter(svc2.models["default"]))
+
+    with (
+        patch.object(svc2, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc2, "get_specified_hardware_parts", return_value=[nvidia]),
+        patch.object(svc2, "is_given_hardware_support_gpu", return_value=True),
+    ):
+        promise = await svc2._install_model("default", model_id, InstallModelIn(spec={"gpu_memory_utilization": 0.5}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(AppError, match="missing files"):
+            await promise.wait()
+
+    assert deps["docker_service"].install_and_run_docker.call_count == 2
+    assert deps["docker_service"].stop_docker.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_install_model_raises_friendly_error_when_model_files_are_missing(
+    svc: VllmService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    nvidia = MagicMock(spec=NvidiaGpuInfo)
+    deps["hardware"].gpus = [nvidia]
+    svc2 = VllmService(**deps)
+    installed = _make_installed_info(hardware=True)
+    svc2.instances_info["default"].installed = installed
+    missing_files_error = RuntimeError(
+        "huggingface_hub.errors.LocalEntryNotFoundError: Cannot find the requested files in the disk cache "
+        "and outgoing traffic has been disabled."
+    )
+    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=missing_files_error)
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "container"
+    deps["docker_service"].stop_docker = AsyncMock()
+    model_id = next(iter(svc2.models["default"]))
+
+    with (
+        patch.object(svc2, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc2, "get_specified_hardware_parts", return_value=[nvidia]),
+        patch.object(svc2, "is_given_hardware_support_gpu", return_value=True),
+    ):
+        promise = await svc2._install_model("default", model_id, InstallModelIn(spec={"gpu_memory_utilization": 0.5}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(AppError, match="missing files"):
+            await promise.wait()
+
+    assert deps["docker_service"].install_and_run_docker.call_count == 1
+    assert deps["docker_service"].stop_docker.call_count == 1
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,7 @@ import type {
   ConvertedMcpConfig,
   GpuStats,
   InfraSettings,
+  ListWarningsOut,
   McpOAuthStartOut,
   McpOAuthStatus,
   MeshTopologyNode,
@@ -575,6 +576,21 @@ export class DeepFellowClient {
 
   async getMeshTopology(): Promise<MeshTopologyNode[]> {
     return this.makeRequest<MeshTopologyNode[]>("/admin/mesh/topology");
+  }
+
+  async listAdminWarnings(): Promise<ListWarningsOut> {
+    return this.makeRequest<ListWarningsOut>("/admin/warnings");
+  }
+
+  async dismissAdminWarning(warningId: string): Promise<void> {
+    return this.makeRequest<void>(
+      `/admin/warnings/${encodeURIComponent(warningId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  async dismissAllAdminWarnings(): Promise<void> {
+    return this.makeRequest<void>("/admin/warnings", { method: "DELETE" });
   }
 
   async getSettings(): Promise<InfraSettings> {

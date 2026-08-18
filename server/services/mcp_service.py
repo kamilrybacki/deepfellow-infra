@@ -546,6 +546,7 @@ async def _fetch_tools_from_sse_endpoint(sse_url: str, extra_headers: dict[str, 
 class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
     models: dict[str, dict[str, SrvMcpModel]]
     _installing: set[tuple[str, str]]
+    _persists_model_definitions = False
 
     def _after_init(self) -> None:
         self._background_tasks: set[asyncio.Task[None]] = set()

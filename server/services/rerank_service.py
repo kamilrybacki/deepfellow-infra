@@ -4,7 +4,6 @@
 """Rerank service."""
 
 import asyncio
-import json
 import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -52,6 +51,7 @@ from server.utils.core import (
     StreamChunkProgress,
     convert_size_to_bytes,
     fetch_from,
+    load_json_registry,
     try_parse_pydantic,
 )
 from server.utils.hardware import GpuInfo, HardwarePartInfo, NvidiaGpuInfo
@@ -82,11 +82,13 @@ class RerankRegistry(TypedDict):
     models: list[RerankRegistryEntry]
 
 
+def _build_models(registry: RerankRegistry) -> dict[str, RerankModel]:
+    return {entry["name"]: RerankModel(type="rerank", size=entry["size"]) for entry in registry["models"]}
+
+
 def _read_models() -> dict[str, RerankModel]:
     rerank_path = get_main_dir() / "./static/rerank-min.json"
-    with rerank_path.open(encoding="utf-8") as f:
-        registry: RerankRegistry = json.loads(f.read())
-        return {entry["name"]: RerankModel(type="rerank", size=entry["size"]) for entry in registry["models"]}
+    return load_json_registry(rerank_path, "rerank", _build_models, {})
 
 
 _const = RerankConst(

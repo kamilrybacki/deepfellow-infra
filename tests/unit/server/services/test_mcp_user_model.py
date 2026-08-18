@@ -39,10 +39,13 @@ def deps() -> dict[str, Any]:
     docker_svc.build_image = AsyncMock()
     docker_svc.uninstall_docker = AsyncMock()
     docker_svc.get_local_docker_image_size = AsyncMock(return_value=None)
+    service_provider = MagicMock()
+    service_provider.add_warning = AsyncMock()
+    service_provider.dismiss_warnings_matching = AsyncMock()
     return {
         "config": MagicMock(),
         "endpoint_registry": MagicMock(),
-        "service_provider": MagicMock(),
+        "service_provider": service_provider,
         "model_downloader": MagicMock(),
         "docker_service": docker_svc,
         "hardware": MagicMock(gpus=[], nvidia_gpus=[]),

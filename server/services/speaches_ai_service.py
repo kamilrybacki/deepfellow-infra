@@ -4,7 +4,6 @@
 """Speaches AI service."""
 
 import asyncio
-import json
 import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -50,6 +49,7 @@ from server.utils.core import (
     StreamChunk,
     StreamChunkProgress,
     convert_size_to_bytes,
+    load_json_registry,
     try_parse_pydantic,
 )
 from server.utils.loading import Progress
@@ -77,13 +77,15 @@ class SpeachesRegistry(TypedDict):
     stt: list[SpeachesRegistryEntry]
 
 
+def _build_speech_models(registry: SpeachesRegistry) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    tts = [(entry["name"], entry["size"]) for entry in registry["tts"]]
+    stt = [(entry["name"], entry["size"]) for entry in registry["stt"]]
+    return tts, stt
+
+
 def _read_speech_models() -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     speaches_path = get_main_dir() / "./static/speaches-min.json"
-    with speaches_path.open(encoding="utf-8") as f:
-        registry: SpeachesRegistry = json.loads(f.read())
-        tts = [(entry["name"], entry["size"]) for entry in registry["tts"]]
-        stt = [(entry["name"], entry["size"]) for entry in registry["stt"]]
-        return tts, stt
+    return load_json_registry(speaches_path, "speaches", _build_speech_models, ([], []))
 
 
 _speech_models, _transcriptions_models = _read_speech_models()

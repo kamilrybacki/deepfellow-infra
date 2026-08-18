@@ -34,11 +34,34 @@ class ApplicationContext:
         """Load single service."""
         start = time.time()
         logger.info(f"{service_id} loading...")  # noqa: G004
+        if service_id not in self.services_manager.services:
+            logger.warning(f"{service_id} is present in the persisted config but is not registered in this build")  # noqa: G004
+            await self._record_warning_safely(
+                service_id, f"Service '{service_id}' is present in the persisted config but is not registered in this build."
+            )
+            return
         try:
             await self.services_manager.load_service(service_id, service_cfg)
             logger.info(f"{service_id} fully loaded in {round(time.time() - start, 1)}s")  # noqa: G004
-        except Exception:
+        except Exception as exc:
             logger.exception(f"{service_id} error occurs during loading {round(time.time() - start, 1)}s")  # noqa: G004
+            await self._record_warning_safely(service_id, f"Service '{service_id}' failed to load: {exc}")
+            return
+        await self._dismiss_warnings_safely(service_id)
+
+    async def _record_warning_safely(self, service_id: str, message: str) -> None:
+        """Record a warning, but never let a failure to record one abort startup or masquerade as a load failure."""
+        try:
+            await self.service_provider.add_warning(service_id, message)
+        except Exception:
+            logger.exception(f"{service_id} failed to record warning")  # noqa: G004
+
+    async def _dismiss_warnings_safely(self, service_id: str) -> None:
+        """Dismiss recovered warnings, but never let a failure here be reported as a load failure."""
+        try:
+            await self.service_provider.dismiss_warnings_matching(service_id)
+        except Exception:
+            logger.exception(f"{service_id} failed to dismiss warnings")  # noqa: G004
 
     async def load_services(self) -> None:
         """Load all service from bootstrap."""

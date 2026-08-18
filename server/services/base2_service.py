@@ -143,6 +143,12 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
     _reconciliation_tasks: dict[str, "asyncio.Task[None]"]
     _crash_poll_state: dict[tuple[str, str], int]
     _failed_models: dict[str, set[str]]
+    _warning_tasks: set["asyncio.Task[None]"]
+
+    _persists_model_definitions: bool = True
+    """Override to False for services whose ``_generate_instance_config`` never populates ``ModelConfig.definition``
+    (e.g. it has no registry snapshot to persist). Otherwise ``load_service`` treats every model as needing a
+    backfill save on every startup, forever."""
 
     def __init__(
         self,
@@ -168,6 +174,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         self.images_download_progress = {}
         self._log_cache = {}
         self._failed_models = {}
+        self._warning_tasks = set()
         self._after_init()
 
     def _after_init(self) -> None:
@@ -350,6 +357,22 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             return None
         return next((m.definition for m in persisted.config.models or [] if m.model_id == model_id), None)
 
+    def _record_warning_in_background(self, message: str, *, instance: str | None = None, model_id: str | None = None) -> None:
+        """Fire-and-forget a warning write from a synchronous callback, e.g. a promise's on_error."""
+        task = asyncio.create_task(self.service_provider.add_warning(self.get_type(), message, instance=instance, model_id=model_id))
+        self._warning_tasks.add(task)
+        task.add_done_callback(self._on_warning_task_done)
+
+    def _on_warning_task_done(self, task: "asyncio.Task[None]") -> None:
+        self._warning_tasks.discard(task)
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            logger.exception("Failed to record warning in background", exc_info=exc)
+
+    async def drain_warning_tasks(self) -> None:
+        """Await pending fire-and-forget warning writes so shutdown doesn't drop them."""
+        if self._warning_tasks:
+            await asyncio.gather(*self._warning_tasks, return_exceptions=True)
+
     async def load_model(self, instance: str, model: ModelConfig) -> None:
         """Load single model."""
         logger.info(f"{self.get_id(instance)} loading model {model.model_id}")  # noqa: G004
@@ -360,10 +383,26 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
                 )
                 self._restore_model_definition(instance, model.model_id, model.definition)
             await (await self._install_model(instance, model.model_id, model.options)).wait()
-            self._failed_models.get(instance, set()).discard(model.model_id)
-        except Exception:
+        except Exception as exc:
             logger.exception(f"{self.get_id(instance)} get error while loading model {model.model_id}")  # noqa: G004
             self._failed_models.setdefault(instance, set()).add(model.model_id)
+            try:
+                await self.service_provider.add_warning(
+                    self.get_type(),
+                    f"Model '{model.model_id}' failed to load on instance '{instance}': {exc}",
+                    instance=instance,
+                    model_id=model.model_id,
+                )
+            except Exception:
+                logger.exception(f"{self.get_id(instance)} failed to record warning for model {model.model_id}")  # noqa: G004
+            return
+
+        if instance_failures := self._failed_models.get(instance):
+            instance_failures.discard(model.model_id)
+        try:
+            await self.service_provider.dismiss_warnings_matching(self.get_type(), instance=instance, model_id=model.model_id)
+        except Exception:
+            logger.exception(f"{self.get_id(instance)} failed to dismiss warnings for model {model.model_id} after successful load")  # noqa: G004
 
     async def load_instance(self, instance: str, instance_data: InstanceConfig) -> None:
         """Load instance of service."""
@@ -391,8 +430,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         msg = f"{self.get_type()} service installed."
         logger.info(msg)
         if cfg.instances:
-            persists_definitions = type(self)._restore_model_definition is not Base2Service._restore_model_definition
-            needs_backfill = persists_definitions and any(
+            needs_backfill = self._persists_model_definitions and any(
                 m.definition is None for instance in cfg.instances.values() for m in instance.models or []
             )
             tasks = [asyncio.create_task(self.load_instance(name, instance)) for name, instance in cfg.instances.items()]
@@ -454,10 +492,15 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             if save:
                 await self._save()
             self.instances_info[instance].installing = None
+            try:
+                await self.service_provider.dismiss_warnings_matching_any(self.get_type(), [(None, None), (instance, None)])
+            except Exception:
+                logger.exception(f"{self.get_id(instance)} failed to dismiss warnings after successful install")  # noqa: G004
             return InstallServiceOut(status="OK")
 
-        def on_error(_e: Exception) -> None:
+        def on_error(e: Exception) -> None:
             self.instances_info[instance].installing = None
+            self._record_warning_in_background(f"Service instance '{instance}' failed to install: {e}", instance=instance)
 
         promise = await self._install_instance(instance, options)
         next_promise = promise.next(func, on_error)
@@ -489,10 +532,15 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
                 await self.load_model(instance, model)
             await self._save()
             self.instances_info[instance].installing = None
+            try:
+                await self.service_provider.dismiss_warnings_matching_any(self.get_type(), [(None, None), (instance, None)])
+            except Exception:
+                logger.exception(f"{self.get_id(instance)} failed to dismiss warnings after successful update")  # noqa: G004
             return InstallServiceOut(status="OK")
 
-        def on_error(_e: Exception) -> None:
+        def on_error(e: Exception) -> None:
             self.instances_info[instance].installing = None
+            self._record_warning_in_background(f"Service instance '{instance}' failed to update: {e}", instance=instance)
 
         promise = await self._install_instance(instance, options)
         next_promise = promise.next(func, on_error)
@@ -516,6 +564,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         """Uninstall the service."""
         await self._uninstall_instance(instance, options)
         self._failed_models.pop(instance, None)
+        await self.service_provider.dismiss_warnings_for_instance(self.get_type(), instance)
         await self._save()
 
     @abstractmethod
@@ -596,17 +645,24 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         installing_model_progress = self.get_instance_info(instance).installing_model_progress
 
         async def func(data: InstallModelOut) -> InstallModelOut:
-            self._failed_models.get(instance, set()).discard(model_id)
+            if instance_failures := self._failed_models.get(instance):
+                instance_failures.discard(model_id)
             await self._save()
+            try:
+                await self.service_provider.dismiss_warnings_matching(self.get_type(), instance=instance, model_id=model_id)
+            except Exception:
+                logger.exception(f"{self.get_id(instance)} failed to dismiss warnings for model {model_id} after successful install")  # noqa: G004
             msg = f"{model_id} model installed."
             logger.debug(msg)
             with contextlib.suppress(KeyError):
                 del installing_model_progress[model_id]
             return data
 
-        def on_error(_e: Exception) -> None:
+        def on_error(e: Exception) -> None:
             with contextlib.suppress(KeyError):
                 del installing_model_progress[model_id]
+            error = str(e)
+            self._record_warning_in_background(error, instance=instance, model_id=model_id)
 
         promise = await self._install_model(instance, model_id, options)
 
@@ -623,7 +679,12 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
     async def uninstall_model(self, instance: str, model_id: str, options: UninstallModelIn) -> None:
         """Uninstall the model."""
         await self._uninstall_model(instance, model_id, options)
-        self._failed_models.get(instance, set()).discard(model_id)
+        if instance_failures := self._failed_models.get(instance):
+            instance_failures.discard(model_id)
+        try:
+            await self.service_provider.dismiss_warnings_matching(self.get_type(), instance=instance, model_id=model_id)
+        except Exception:
+            logger.exception(f"{self.get_id(instance)} failed to dismiss warnings for model {model_id} after uninstall")  # noqa: G004
         await self._save()
 
     @abstractmethod

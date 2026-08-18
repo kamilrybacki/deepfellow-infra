@@ -29,6 +29,7 @@ from server.utils.core import (
     fetch_from,
     get_cpu_architecture,
     get_os,
+    load_json_registry,
     make_http_request,
     stream_fetch_from,
 )
@@ -407,6 +408,42 @@ async def test_stream_fetch_from():
 )
 def test_convert_size_to_bytes(size_str: str, expected: int | None):
     assert convert_size_to_bytes(size_str) == expected
+
+
+def test_load_json_registry_builds_from_valid_file(tmp_path: Path):
+    path = tmp_path / "registry.json"
+    path.write_text('{"models": ["a", "b"]}')
+
+    result = load_json_registry(path, "test", lambda data: data["models"], [])
+
+    assert result == ["a", "b"]
+
+
+def test_load_json_registry_missing_file_returns_default():
+    result = load_json_registry(Path("/does/not/exist.json"), "test", lambda data: data["models"], [])
+
+    assert result == []
+
+
+def test_load_json_registry_invalid_json_returns_default(tmp_path: Path):
+    path = tmp_path / "registry.json"
+    path.write_text("not json")
+
+    result = load_json_registry(path, "test", lambda data: data["models"], [])
+
+    assert result == []
+
+
+def test_load_json_registry_builder_error_returns_default(tmp_path: Path):
+    path = tmp_path / "registry.json"
+    path.write_text('{"unexpected": true}')
+
+    def builder(data: dict[str, object]) -> list[str]:
+        return data["models"]  # type: ignore[return-value]
+
+    result = load_json_registry(path, "test", builder, [])
+
+    assert result == []
 
 
 @pytest.mark.asyncio
