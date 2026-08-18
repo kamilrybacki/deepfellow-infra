@@ -236,9 +236,12 @@ async def download_file(url: str, file_path: Path, headers: dict[str, str]) -> A
                 yield DownloadedPacket(downloaded_bytes_size)
 
 
-async def fetch_from(url: str, method: str = "GET", data: JsonSerializable | None = None) -> FetchResult:
+async def fetch_from(url: str, method: str = "GET", data: JsonSerializable | None = None, timeout: int | None = None) -> FetchResult:
     """Make HTTP request to host on given port."""
-    async with aiohttp.ClientSession() as session, session.request(method, url, json=data) as response:
+    async with (
+        aiohttp.ClientSession() as session,
+        session.request(method, url, json=data, timeout=ClientTimeout(timeout) if timeout is not None else None) as response,
+    ):
         return FetchResult(status_code=response.status, data=await response.text())
 
 

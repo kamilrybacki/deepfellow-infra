@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from aiohttp import ClientTimeout
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -340,6 +341,27 @@ async def test_fetch_from():
 
     assert result.status_code == 200
     assert result.data == '{"ok": true}'
+    assert mock_session.request.call_args.kwargs["timeout"] is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_from_passes_client_timeout_when_given():
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.text = AsyncMock(return_value="")
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+    mock_session = AsyncMock()
+    mock_session.request = MagicMock(return_value=mock_resp)
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("server.utils.core.aiohttp.ClientSession", return_value=mock_session):
+        await fetch_from("http://example.com/api", timeout=10)
+
+    client_timeout = mock_session.request.call_args.kwargs["timeout"]
+    assert isinstance(client_timeout, ClientTimeout)
+    assert client_timeout.total == 10
 
 
 @pytest.mark.asyncio

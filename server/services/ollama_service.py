@@ -675,6 +675,26 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             return
         await self._stop_docker(installed.docker)
 
+    async def _unload_model_from_vram(self, model_id: str, ollama_name: str, base_url: str) -> None:
+        """Force-unload the model from VRAM by setting its keep_alive to 0."""
+        try:
+            result = await fetch_from(f"{base_url}/api/generate", "POST", {"model": ollama_name, "keep_alive": 0}, timeout=10)
+        except Exception:
+            logger.warning("Failed to unload model %r from VRAM", model_id, exc_info=True)
+            return
+        if result.status_code != 200:
+            logger.warning("Failed to unload model %r from VRAM: %s (%s)", model_id, result.data, result.status_code)
+
+    async def _delete_ollama_model(self, model_id: str, base_url: str) -> None:
+        """Delete a model from the Ollama instance, logging failures instead of raising."""
+        try:
+            result = await fetch_from(f"{base_url}/api/delete", "DELETE", {"name": model_id}, timeout=15)
+        except Exception:
+            logger.warning("Failed to delete model %r from Ollama", model_id, exc_info=True)
+            return
+        if result.status_code != 200:
+            logger.warning("Failed to delete model %r from Ollama: %s (%s)", model_id, result.data, result.status_code)
+
     def get_docker_compose_file_path(self, instance: str, model_id: str | None) -> Path:
         """Get docker compose file path."""
         info = self.get_instance_installed_info(instance)
@@ -1362,8 +1382,10 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         info = self.get_instance_installed_info(instance)
         if (instance, model_id) in self._installing:
             raise HTTPException(409, f"Model {model_id!r} is currently being installed; cancel the install before deleting")
+        ollama_name = model_id
         if model_id in info.models:
             model = info.models[model_id]
+            ollama_name = model.internal_name or model_id
             del info.models[model_id]
             if model.type == "llm":
                 self.endpoint_registry.unregister_chat_completion(model.registered_name, model.registration_id)
@@ -1371,24 +1393,29 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                 self.endpoint_registry.unregister_embeddings(model.registered_name, model.registration_id)
             if model.type == "txt2img":
                 self.endpoint_registry.unregister_image_generations(model.registered_name, model.registration_id)
+            await self._unload_model_from_vram(model_id, ollama_name, info.base_url)
 
         if options.purge and model_id in self.models_downloaded:
             model = self.models[instance][model_id]
             tasks: list[asyncio.Task[Any]] = []
 
-            tasks.append(asyncio.create_task(fetch_from(f"{info.base_url}/api/delete", "DELETE", {"name": model_id})))
+            tasks.append(asyncio.create_task(self._delete_ollama_model(ollama_name, info.base_url)))
 
             await self.remove_modelfile(model_id, instance)
 
             del self.models_downloaded[model_id]
 
             if not model.hash:
+                await asyncio.gather(*tasks)
                 return
 
             for alias_model_id, alias_model in self.models[instance].items():
                 if alias_model.hash == model.hash and model_id != alias_model_id:
+                    alias_ollama_name = (
+                        (info.models[alias_model_id].internal_name or alias_model_id) if alias_model_id in info.models else alias_model_id
+                    )
                     await self._uninstall_model(instance, alias_model_id, UninstallModelIn(purge=False))
-                    tasks.append(asyncio.create_task(fetch_from(f"{info.base_url}/api/delete", "DELETE", {"name": alias_model_id})))
+                    tasks.append(asyncio.create_task(self._delete_ollama_model(alias_ollama_name, info.base_url)))
                     if alias_model_id in self.models_downloaded:
                         del self.models_downloaded[alias_model_id]
 

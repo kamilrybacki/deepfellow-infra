@@ -1161,7 +1161,9 @@ async def test_uninstall_model_unregisters_llm_and_removes_from_info(svc: Ollama
     svc.instances_info["default"].installed = installed
     svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm", hash="abc", context=4096)
 
-    await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=False))  # pyright: ignore[reportPrivateUsage]
+    with patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=200, data="")
+        await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=False))  # pyright: ignore[reportPrivateUsage]
 
     assert "test-llm" not in installed.models
     assert deps["endpoint_registry"].unregister_chat_completion.call_count == 1
@@ -1190,7 +1192,7 @@ async def test_uninstall_model_purges_model_data(svc: OllamaService) -> None:
         mock_fetch.return_value = FetchResult(status_code=200, data="")
         await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=True))  # pyright: ignore[reportPrivateUsage]
 
-    assert mock_fetch.call_count == 1
+    assert mock_fetch.call_count == 2  # unload from VRAM + delete
     assert "test-llm" not in svc.models_downloaded
 
 
@@ -1202,6 +1204,176 @@ async def test_uninstall_model_does_nothing_for_unknown_model_id(svc: OllamaServ
     await svc._uninstall_model("default", "unknown-model", UninstallModelIn(purge=False))  # pyright: ignore[reportPrivateUsage]
 
     assert deps["endpoint_registry"].unregister_chat_completion.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_uninstall_model_unloads_from_vram_when_not_purging(svc: OllamaService) -> None:
+    installed = _make_installed_info(svc)
+    installed.models["test-llm"] = ModelInstalledInfo(
+        id="test-llm",
+        registered_name="test-llm",
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+        internal_name=None,
+    )
+    svc.instances_info["default"].installed = installed
+
+    with patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=200, data="")
+        await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=False))  # pyright: ignore[reportPrivateUsage]
+
+    assert mock_fetch.call_args == call("http://localhost:11434/api/generate", "POST", {"model": "test-llm", "keep_alive": 0}, timeout=10)
+
+
+@pytest.mark.asyncio
+async def test_uninstall_model_unload_uses_internal_name_when_set(svc: OllamaService) -> None:
+    installed = _make_installed_info(svc)
+    installed.models["test-llm"] = ModelInstalledInfo(
+        id="test-llm",
+        registered_name="test-llm",
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+        internal_name="test-llm-customcontextlength",
+    )
+    svc.instances_info["default"].installed = installed
+
+    with patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=200, data="")
+        await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=False))  # pyright: ignore[reportPrivateUsage]
+
+    assert mock_fetch.call_args == call(
+        "http://localhost:11434/api/generate", "POST", {"model": "test-llm-customcontextlength", "keep_alive": 0}, timeout=10
+    )
+
+
+@pytest.mark.asyncio
+async def test_uninstall_model_unloads_from_vram_when_purging(svc: OllamaService) -> None:
+    installed = _make_installed_info(svc)
+    installed.models["test-llm"] = ModelInstalledInfo(
+        id="test-llm",
+        registered_name="test-llm",
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="",
+        internal_name="test-llm-customcontextlength",
+    )
+    svc.instances_info["default"].installed = installed
+    svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm", hash="abc", context=4096)
+    svc.models_downloaded["test-llm"] = DownloadedInfo()
+
+    with (
+        patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
+        patch.object(svc, "remove_modelfile", new_callable=AsyncMock),
+    ):
+        mock_fetch.return_value = FetchResult(status_code=200, data="")
+        await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert mock_fetch.call_args_list == [
+        call(f"{installed.base_url}/api/generate", "POST", {"model": "test-llm-customcontextlength", "keep_alive": 0}, timeout=10),
+        call(f"{installed.base_url}/api/delete", "DELETE", {"name": "test-llm-customcontextlength"}, timeout=15),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_uninstall_model_logs_warning_when_unload_from_vram_raises(svc: OllamaService, caplog: pytest.LogCaptureFixture) -> None:
+    installed = _make_installed_info(svc)
+    installed.models["test-llm"] = ModelInstalledInfo(
+        id="test-llm",
+        registered_name="test-llm",
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+        internal_name=None,
+    )
+    svc.instances_info["default"].installed = installed
+
+    with (
+        patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
+        caplog.at_level("WARNING", logger="uvicorn.error"),
+    ):
+        mock_fetch.side_effect = ConnectionError("boom")
+        await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=False))  # pyright: ignore[reportPrivateUsage]
+
+    assert "Failed to unload model 'test-llm' from VRAM" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_uninstall_model_logs_warning_when_unload_from_vram_fails(svc: OllamaService, caplog: pytest.LogCaptureFixture) -> None:
+    installed = _make_installed_info(svc)
+    installed.models["test-llm"] = ModelInstalledInfo(
+        id="test-llm",
+        registered_name="test-llm",
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+        internal_name=None,
+    )
+    svc.instances_info["default"].installed = installed
+
+    with (
+        patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
+        caplog.at_level("WARNING", logger="uvicorn.error"),
+    ):
+        mock_fetch.return_value = FetchResult(status_code=500, data="boom")
+        await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=False))  # pyright: ignore[reportPrivateUsage]
+
+    assert "Failed to unload model 'test-llm' from VRAM" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_uninstall_model_logs_warning_when_delete_raises(svc: OllamaService, caplog: pytest.LogCaptureFixture) -> None:
+    installed = _make_installed_info(svc)
+    installed.models["test-llm"] = ModelInstalledInfo(
+        id="test-llm",
+        registered_name="test-llm",
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+        internal_name=None,
+    )
+    svc.instances_info["default"].installed = installed
+    svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm", hash="", context=4096)
+    svc.models_downloaded["test-llm"] = DownloadedInfo()
+
+    with (
+        patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
+        patch.object(svc, "remove_modelfile", new_callable=AsyncMock),
+        caplog.at_level("WARNING", logger="uvicorn.error"),
+    ):
+        mock_fetch.side_effect = [FetchResult(status_code=200, data=""), ConnectionError("boom")]
+        await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert "test-llm" not in svc.models_downloaded
+    assert "Failed to delete model 'test-llm' from Ollama" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_uninstall_model_logs_warning_when_delete_fails(svc: OllamaService, caplog: pytest.LogCaptureFixture) -> None:
+    installed = _make_installed_info(svc)
+    installed.models["test-llm"] = ModelInstalledInfo(
+        id="test-llm",
+        registered_name="test-llm",
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+        internal_name=None,
+    )
+    svc.instances_info["default"].installed = installed
+    svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm", hash="", context=4096)
+    svc.models_downloaded["test-llm"] = DownloadedInfo()
+
+    with (
+        patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
+        patch.object(svc, "remove_modelfile", new_callable=AsyncMock),
+        caplog.at_level("WARNING", logger="uvicorn.error"),
+    ):
+        mock_fetch.side_effect = [FetchResult(status_code=200, data=""), FetchResult(status_code=500, data="boom")]
+        await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert "test-llm" not in svc.models_downloaded
+    assert "Failed to delete model 'test-llm' from Ollama" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1797,10 +1969,13 @@ async def test_uninstall_model_unregisters_embedding_endpoint(svc: OllamaService
     svc.instances_info["default"].installed = installed
     svc.models["default"]["test-emb"] = OllamaModel(id="test-emb", size="500MB", type="embedding", hash="def", context=None)
 
-    await svc._uninstall_model("default", "test-emb", UninstallModelIn(purge=False))  # pyright: ignore[reportPrivateUsage]
+    with patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=200, data="")
+        await svc._uninstall_model("default", "test-emb", UninstallModelIn(purge=False))  # pyright: ignore[reportPrivateUsage]
 
     assert deps["endpoint_registry"].unregister_embeddings.call_count == 1
     assert deps["endpoint_registry"].unregister_embeddings.call_args == call("test-emb", "reg-emb")
+    assert mock_fetch.call_args == call(f"{installed.base_url}/api/generate", "POST", {"model": "test-emb", "keep_alive": 0}, timeout=10)
 
 
 @pytest.mark.asyncio
@@ -1817,10 +1992,13 @@ async def test_uninstall_model_unregisters_txt2img_endpoint(svc: OllamaService, 
     svc.instances_info["default"].installed = installed
     svc.models["default"]["test-img"] = OllamaModel(id="test-img", size="2GB", type="txt2img", hash="ghi", context=None)
 
-    await svc._uninstall_model("default", "test-img", UninstallModelIn(purge=False))  # pyright: ignore[reportPrivateUsage]
+    with patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=200, data="")
+        await svc._uninstall_model("default", "test-img", UninstallModelIn(purge=False))  # pyright: ignore[reportPrivateUsage]
 
     assert deps["endpoint_registry"].unregister_image_generations.call_count == 1
     assert deps["endpoint_registry"].unregister_image_generations.call_args == call("test-img", "reg-img")
+    assert mock_fetch.call_args == call(f"{installed.base_url}/api/generate", "POST", {"model": "test-img", "keep_alive": 0}, timeout=10)
 
 
 @pytest.mark.asyncio
@@ -1847,7 +2025,7 @@ async def test_uninstall_model_purge_returns_early_when_no_hash(svc: OllamaServi
         await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=True))  # pyright: ignore[reportPrivateUsage]
 
     assert "test-llm" not in svc.models_downloaded
-    assert mock_fetch.call_count == 1  # only the main model delete, no alias deletes
+    assert mock_fetch.call_count == 2  # unload from VRAM + the main model delete, no alias deletes
 
 
 @pytest.mark.asyncio
@@ -1876,6 +2054,48 @@ async def test_uninstall_model_purge_also_removes_aliases_sharing_same_hash(svc:
 
     assert "test-llm-alias" not in svc.models_downloaded
     assert mock_fetch.call_count >= 2  # main model + alias
+
+
+@pytest.mark.asyncio
+async def test_uninstall_model_purge_recurses_into_installed_alias_and_unloads_it_from_vram(svc: OllamaService) -> None:
+    installed = _make_installed_info(svc)
+    installed.models["test-llm"] = ModelInstalledInfo(
+        id="test-llm",
+        registered_name="test-llm",
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="",
+        internal_name=None,
+    )
+    installed.models["test-llm-alias"] = ModelInstalledInfo(
+        id="test-llm-alias",
+        registered_name="test-llm-alias",
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-alias",
+        internal_name="test-llm-alias-customcontextlength",
+    )
+    svc.instances_info["default"].installed = installed
+    svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm", hash="shared-hash", context=4096)
+    svc.models["default"]["test-llm-alias"] = OllamaModel(id="test-llm-alias", size="1GB", type="llm", hash="shared-hash", context=4096)
+    svc.models_downloaded["test-llm"] = DownloadedInfo()
+    svc.models_downloaded["test-llm-alias"] = DownloadedInfo()
+    with (
+        patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
+        patch.object(svc, "remove_modelfile", new_callable=AsyncMock),
+    ):
+        mock_fetch.return_value = FetchResult(status_code=200, data="")
+
+        await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert "test-llm-alias" not in installed.models
+    assert "test-llm-alias" not in svc.models_downloaded
+    assert call(
+        f"{installed.base_url}/api/generate", "POST", {"model": "test-llm-alias-customcontextlength", "keep_alive": 0}, timeout=10
+    ) in (mock_fetch.call_args_list)
+    assert call(f"{installed.base_url}/api/delete", "DELETE", {"name": "test-llm-alias-customcontextlength"}, timeout=15) in (
+        mock_fetch.call_args_list
+    )
 
 
 @pytest.mark.asyncio
