@@ -907,11 +907,12 @@ async def test_install_and_run_docker_not_running_no_diff_port_available(docker_
         patch.object(docker_service, "create_compose_file", new_callable=AsyncMock, return_value=11434) as mock_create,
         patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock, return_value=True),
     ):
-        port = await docker_service.install_and_run_docker(options)
+        port, restarted = await docker_service.install_and_run_docker(options)
 
     assert mock_start.call_count == 1
     assert mock_create.call_count == 0
     assert port == 11434
+    assert restarted is True
 
 
 @pytest.mark.asyncio
@@ -928,11 +929,12 @@ async def test_install_and_run_docker_not_running_no_diff_port_taken(docker_serv
         patch.object(docker_service, "start_docker_compose", new_callable=AsyncMock, return_value="") as mock_start,
         patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock, return_value=True),
     ):
-        port = await docker_service.install_and_run_docker(options)
+        port, restarted = await docker_service.install_and_run_docker(options)
 
     assert mock_create.call_count == 1
     assert mock_start.call_count == 1
     assert port == 22222
+    assert restarted is True
 
 
 @pytest.mark.asyncio
@@ -948,11 +950,12 @@ async def test_install_and_run_docker_not_running_has_difference(docker_service:
         patch.object(docker_service, "start_docker_compose", new_callable=AsyncMock, return_value="") as mock_start,
         patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock, return_value=True),
     ):
-        port = await docker_service.install_and_run_docker(options)
+        port, restarted = await docker_service.install_and_run_docker(options)
 
     assert mock_create.call_count == 1
     assert mock_start.call_count == 1
     assert port == 55555
+    assert restarted is True
 
 
 @pytest.mark.asyncio
@@ -969,12 +972,13 @@ async def test_install_and_run_docker_running_has_difference(docker_service: Doc
         patch.object(docker_service, "start_docker_compose", new_callable=AsyncMock, return_value="") as mock_start,
         patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock, return_value=True),
     ):
-        port = await docker_service.install_and_run_docker(options)
+        port, restarted = await docker_service.install_and_run_docker(options)
 
     assert mock_stop.call_count == 1
     assert mock_create.call_count == 1
     assert mock_start.call_count == 1
     assert port == 66666
+    assert restarted is True
 
 
 @pytest.mark.asyncio
@@ -991,12 +995,13 @@ async def test_install_and_run_docker_running_no_difference(docker_service: Dock
         patch.object(docker_service, "start_docker_compose", new_callable=AsyncMock) as mock_start,
         patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock, return_value=True),
     ):
-        port = await docker_service.install_and_run_docker(options)
+        port, restarted = await docker_service.install_and_run_docker(options)
 
     assert mock_stop.call_count == 0
     assert mock_create.call_count == 0
     assert mock_start.call_count == 0
     assert port == 11434
+    assert restarted is False
 
 
 @pytest.mark.asyncio
@@ -1027,9 +1032,10 @@ async def test_install_and_run_docker_subnet_mode_port_is_minus_one(docker_servi
         patch.object(docker_service, "has_docker_compose_difference", new_callable=AsyncMock, return_value=(False, None)),
         patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock, return_value=True),
     ):
-        port = await docker_service.install_and_run_docker(options)
+        port, restarted = await docker_service.install_and_run_docker(options)
 
     assert port == -1
+    assert restarted is False
 
 
 @pytest.mark.asyncio

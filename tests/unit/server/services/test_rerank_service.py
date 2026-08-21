@@ -794,7 +794,7 @@ async def test_uninstall_model_purge_with_none_model_path_does_not_raise(svc: Re
 async def test_install_instance_calls_docker_and_returns_installed_info(svc: RerankService, deps: dict[str, Any]) -> None:
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-rerank"
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8089)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8089, True))
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 8089
     options = InstallServiceIn(spec={})
@@ -816,15 +816,15 @@ async def test_install_instance_calls_docker_and_returns_installed_info(svc: Rer
 async def test_install_instance_sets_keep_alive_env_var(svc: RerankService, deps: dict[str, Any]) -> None:
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-rerank"
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8089)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8089, True))
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 8089
     options = InstallServiceIn(spec={"keep_alive": 60})
     captured: list[Any] = []
 
-    async def capture(docker_opts: Any) -> int:
+    async def capture(docker_opts: Any) -> tuple[int, bool]:
         captured.append(docker_opts)
-        return 8089
+        return (8089, True)
 
     deps["docker_service"].install_and_run_docker = capture
 
@@ -847,7 +847,7 @@ async def test_install_instance_loads_default_models_when_missing(svc: RerankSer
     del svc.models["default"]
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-rerank-extra"
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8089)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8089, True))
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 8089
     options = InstallServiceIn(spec={})

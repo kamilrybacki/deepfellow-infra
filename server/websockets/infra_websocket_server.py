@@ -15,7 +15,16 @@ from server.models.mesh import CheckMeshConnection, MeshInfo, MeshInfoInfra, Mes
 from server.utils.core import make_http_request
 from server.utils.exceptions import ApiError
 from server.utils.json_rpc_server import JsonRpcServer
-from server.websockets.models import AncestorInfo, InitRequest, InitResponse, TopologyUpdateRequest, UpdateModelsRequest, UsageChangeRequest
+from server.websockets.models import (
+    AncestorInfo,
+    AncestorsNotification,
+    InitRequest,
+    InitResponse,
+    TopologyUpdateRequest,
+    UpdateModelsRequest,
+    UsageChangeRequest,
+    WarmChangeRequest,
+)
 from server.websockets.parent_infra_group import ParentInfraGroup
 from server.websockets.websocket_server import WebSocketContext, WebSocketServer
 
@@ -47,6 +56,7 @@ class InfraWebsocketServer(WebSocketServer[InfraWsData]):
         self._nested_topology: dict[str, TopologyUpdateRequest] = {}
         self.server = JsonRpcServer[InfraWsData](lambda method, params, context: self._handle_json_rpc_request(method, params, context))
         parent_infra.get_children = lambda: dict(self._nested_topology)
+        parent_infra.on_mesh_visibility_changed = self.broadcast_ancestors_to_children
 
     @property
     def _own_ancestors(self) -> list[AncestorInfo]:
@@ -82,6 +92,8 @@ class InfraWebsocketServer(WebSocketServer[InfraWsData]):
             return await self._on_init(self._try_parse(params, InitRequest), context)
         if method == "usage_change":
             return self._on_usage_change(self._try_parse(params, UsageChangeRequest), context)
+        if method == "warm_change":
+            return self._on_warm_change(self._try_parse(params, WarmChangeRequest), context)
         if method == "update_models":
             return self._on_update_models(self._try_parse(params, UpdateModelsRequest), context)
         if method == "topology_update":
@@ -121,12 +133,40 @@ class InfraWebsocketServer(WebSocketServer[InfraWsData]):
         self._send_topology_update("join", params.url, params.name, params.models, clean_children)
         msg = f"Connected with subinfra {params.name} on {params.url}."
         logger.info(msg)
-        own = AncestorInfo(
+        return InitResponse(ancestors=self._ancestors_for_children())
+
+    def _own_ancestor_info(self) -> AncestorInfo:
+        return AncestorInfo(
             url=self.config.infra_url,
             name=self.config.name,
-            models=self.endpoint_registry.list_models(),
+            api_key=self.config.infra_api_key.get_secret_value(),
+            models=self.endpoint_registry.list_own_models(),
         )
-        return InitResponse(ancestors=[own, *self._own_ancestors])
+
+    def _ancestors_for_children(self) -> list[AncestorInfo]:
+        """Own + further ancestors' info to expose to connecting/connected subinfras.
+
+        Empty when `share_models_downstream` is off: subinfras then see no ancestor models at all
+        (neither in the mesh topology's model listing nor as routable proxy endpoints), but can
+        still connect and have their own models used upward as before — this setting only gates
+        the downward direction.
+        """
+        if not self.config.share_models_downstream:
+            return []
+        return [self._own_ancestor_info(), *self._own_ancestors]
+
+    def broadcast_ancestors_to_children(self) -> None:
+        """Push the current ancestor list to every already-connected, authorized subinfra.
+
+        Called whenever this node's own model list changes, or when it receives a fresh ancestor
+        list from further up the mesh — either can change what a child should see as "the models
+        available above me".
+        """
+        notification = AncestorsNotification(ancestors=self._ancestors_for_children())
+        payload = notification.model_dump_json()
+        for conn in self.connections:
+            if conn.data.authorized:
+                conn.send(payload)
 
     def _on_topology_update(self, params: TopologyUpdateRequest, context: InfraWsData) -> Literal["OK"]:
         if not context.authorized:
@@ -171,6 +211,12 @@ class InfraWebsocketServer(WebSocketServer[InfraWsData]):
         if not context.authorized:
             raise ApiError(code=3, message="Not authorized")
         self.endpoint_registry.update_usage(params)
+        return "OK"
+
+    def _on_warm_change(self, params: WarmChangeRequest, context: InfraWsData) -> Literal["OK"]:
+        if not context.authorized:
+            raise ApiError(code=3, message="Not authorized")
+        self.endpoint_registry.update_warm(params.id, params.warm)
         return "OK"
 
     def _on_update_models(self, params: UpdateModelsRequest, context: InfraWsData) -> Literal["OK"]:

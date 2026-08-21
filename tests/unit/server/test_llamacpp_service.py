@@ -227,7 +227,7 @@ async def test_get_docker_logs_cache_hit_skips_run_command(mock_utils: MagicMock
     mock_utils.run_command = AsyncMock(return_value=MagicMock(stdout="log", stderr=""))
 
     svc = object.__new__(LLamacppService)
-    svc._log_cache = {"my-container": (time.monotonic(), "cached log")}  # pyright: ignore[reportPrivateUsage]
+    svc._log_cache = {"my-container": (time.monotonic(), "cached log", 8.0)}  # pyright: ignore[reportPrivateUsage]
 
     result = await svc._get_docker_logs("my-container")  # pyright: ignore[reportPrivateUsage]
 
@@ -261,7 +261,7 @@ async def test_get_docker_logs_cache_expired_calls_run_command(mock_utils: Magic
     mock_utils.run_command = AsyncMock(return_value=mock_result)
 
     svc = object.__new__(LLamacppService)
-    svc._log_cache = {"my-container": (time.monotonic() - 100, "stale log")}  # pyright: ignore[reportPrivateUsage]
+    svc._log_cache = {"my-container": (time.monotonic() - 100, "stale log", 8.0)}  # pyright: ignore[reportPrivateUsage]
 
     result = await svc._get_docker_logs("my-container")  # pyright: ignore[reportPrivateUsage]
 

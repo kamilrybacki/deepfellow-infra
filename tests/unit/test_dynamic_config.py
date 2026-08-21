@@ -39,6 +39,7 @@ def _make_config(storage_dir: Path | None = None, **overrides: object) -> MagicM
     mock.infra_api_key = SecretStr("")
     mock.connect_to_mesh_url = ""
     mock.connect_to_mesh_key = SecretStr("")
+    mock.share_models_downstream = True
     mock.hugging_face_token = SecretStr("")
     mock.civitai_token = SecretStr("")
     mock.adapter_registry_url = ""

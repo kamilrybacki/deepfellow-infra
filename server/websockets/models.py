@@ -13,11 +13,26 @@ from server.models.api import Model, RegistrationId
 class AncestorInfo(BaseModel):
     url: str
     name: str
+    api_key: str = ""
     models: list[Model] = []
 
 
 class InitResponse(BaseModel):
     ancestors: list[AncestorInfo]
+
+
+class AncestorsNotification(BaseModel):
+    """Unsolicited push from a parent to an already-connected child.
+
+    Tells the child that the set of ancestor-exposed models (parent's own + parent's own
+    ancestors) has changed. Sent as a bare JSON object over the same websocket used for the
+    request/response JSON-RPC
+    traffic, distinguished from a JSON-RPC response by the `type` discriminator (a JSON-RPC
+    response never has a `type` field).
+    """
+
+    type: Literal["ancestors_update"] = "ancestors_update"
+    ancestors: list[AncestorInfo] = []
 
 
 class TopologyUpdateRequest(BaseModel):
@@ -41,6 +56,11 @@ class InitRequest(BaseModel):
 class UsageChangeRequest(BaseModel):
     id: RegistrationId
     usage: int
+
+
+class WarmChangeRequest(BaseModel):
+    id: RegistrationId
+    warm: bool
 
 
 class UpdateModelsRequest(BaseModel):

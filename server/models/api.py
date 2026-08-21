@@ -3,6 +3,7 @@
 
 """Models for chat completions."""
 
+import logging
 from abc import abstractmethod
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, Union
@@ -11,7 +12,9 @@ from uuid import uuid4
 from aiohttp import FormData
 from fastapi import File as FastApiFile
 from fastapi import UploadFile
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+logger = logging.getLogger("uvicorn.error")
 
 LLM_ENDPOINTS = ["/v1/completions", "/v1/chat/completions", "/v1/responses", "/v1/messages", "/api/chat"]
 LLM_SUFFIX_MAP: tuple[tuple[str, str], ...] = (
@@ -428,12 +431,59 @@ type ModelId = str
 type RegistrationId = str
 
 
+_MAX_REASONABLE_CAPACITY = 100_000
+
+
 class Model(BaseModel):
     id: RegistrationId
     name: ModelId
     type: ModelType
     props: ModelProps
     usage: int
+    capacity: int | None = None
+    capacity_known: bool = False
+    warm: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_non_positive_capacity_to_unknown(cls, data: Any) -> Any:  # noqa: ANN401
+        # A peer is untrusted input: a malformed/buggy `capacity` (e.g. 0) must degrade to
+        # "unknown" (capacity=None, capacity_known=False) rather than crash mesh sync, unlike
+        # our own internal RegisteredModel construction, which raises on the same condition to
+        # catch the bug at its source. This must run on the *raw* input, before capacity=None
+        # is normalized away, so a genuinely `capacity=None, capacity_known=True` peer (meaning
+        # "unbounded", e.g. a cloud/proxy backend) is left untouched instead of being coerced
+        # down to "unknown" alongside the malformed case.
+        if not isinstance(data, dict):
+            return data
+        capacity = data.get("capacity")
+        if capacity is None:
+            return data
+        # Peers may serialize capacity as a JSON float (5.0) or numeric string ("5", "5.0")
+        # depending on what touched the payload upstream; those are coercible and must reach
+        # pydantic's normal int coercion rather than being treated the same as a genuinely
+        # malformed value. A bool is technically an int subclass but never a legitimate capacity,
+        # so it's excluded up front rather than silently coerced (True/False -> 1/0). Only a
+        # value that isn't even numeric, or is non-positive once coerced, counts as malformed here.
+        try:
+            coerced = None if isinstance(capacity, bool) else int(float(capacity))
+        except (TypeError, ValueError, OverflowError):
+            coerced = None
+        # No real backend serves more than a few thousand concurrent requests; anything past this
+        # is a corrupted/malicious value, not a legitimate capacity.
+        if coerced is None or coerced <= 0 or coerced > _MAX_REASONABLE_CAPACITY or float(coerced) != float(capacity):
+            logger.warning(
+                "Peer model %r reported a non-positive or non-numeric capacity (%r); coercing to unknown",
+                data.get("name") or data.get("id"),
+                capacity,
+            )
+            data = {**data, "capacity": None, "capacity_known": False}
+        elif not data.get("capacity_known", False):
+            # A valid, in-range capacity implies capacity_known=True: a peer that reports a real
+            # value but leaves capacity_known unset/false is inconsistent, not "unbounded" or
+            # "unknown" — force it consistent rather than silently trusting the mismatched flag.
+            data = {**data, "capacity_known": True}
+        return data
 
 
 class ApiModel(BaseModel):

@@ -15,7 +15,14 @@ from server.websockets.infra_websocket_server import (
     InfraWebsocketServer,
     InfraWsData,
 )
-from server.websockets.models import InitRequest, InitResponse, TopologyUpdateRequest, UpdateModelsRequest, UsageChangeRequest
+from server.websockets.models import (
+    InitRequest,
+    InitResponse,
+    TopologyUpdateRequest,
+    UpdateModelsRequest,
+    UsageChangeRequest,
+    WarmChangeRequest,
+)
 
 MESH_KEY = "secret-key"
 
@@ -35,6 +42,8 @@ def make_server() -> InfraWebsocketServer:
     config.mesh_key.get_secret_value.return_value = MESH_KEY
     config.infra_url = "http://test-infra"
     config.name = "test-infra"
+    config.infra_api_key.get_secret_value.return_value = "api-key"
+    config.share_models_downstream = True
     parent_infra = MagicMock()
     endpoint_registry = MagicMock()
     return InfraWebsocketServer(
@@ -142,6 +151,19 @@ async def test_dispatch_usage_change():
     result = await server._handle_json_rpc_request("usage_change", params, ctx)  # pyright: ignore[reportPrivateUsage]
 
     assert server._on_usage_change.call_count == 1  # pyright: ignore[reportPrivateUsage]
+    assert result == "OK"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_warm_change():
+    server = make_server()
+    server._on_warm_change = MagicMock(return_value="OK")  # pyright: ignore[reportPrivateUsage]
+    params = {"id": "reg-1", "warm": True}
+    ctx = InfraWsData(authorized=make_authorized())
+
+    result = await server._handle_json_rpc_request("warm_change", params, ctx)  # pyright: ignore[reportPrivateUsage]
+
+    assert server._on_warm_change.call_count == 1  # pyright: ignore[reportPrivateUsage]
     assert result == "OK"
 
 
@@ -306,6 +328,29 @@ def test_on_usage_change_unauthorised_raises():
 
     with pytest.raises(ApiError) as exc_info:
         server._on_usage_change(params, ctx)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.code == 3
+
+
+def test_on_warm_change_authorised():
+    server = make_server()
+    ctx = InfraWsData(authorized=make_authorized())
+    params = WarmChangeRequest(id="reg-1", warm=True)
+
+    result = server._on_warm_change(params, ctx)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == "OK"
+    assert cast("MagicMock", server.endpoint_registry).update_warm.call_count == 1
+    assert cast("MagicMock", server.endpoint_registry).update_warm.call_args == call(params.id, params.warm)
+
+
+def test_on_warm_change_unauthorised_raises():
+    server = make_server()
+    ctx = InfraWsData(authorized=None)
+    params = WarmChangeRequest(id="reg-1", warm=True)
+
+    with pytest.raises(ApiError) as exc_info:
+        server._on_warm_change(params, ctx)  # pyright: ignore[reportPrivateUsage]
 
     assert exc_info.value.code == 3
 
@@ -481,3 +526,50 @@ def test_get_mesh_info_mixed_connections():
     assert len(info.connections) == 1
     assert info.connections[0].name == "infra-a"
     assert info.connections[0].url == "http://a"
+
+
+# --- downward ancestor propagation ---
+
+
+def test_ancestors_for_children_empty_when_share_disabled():
+    server = make_server()
+    server.config.share_models_downstream = False  # type: ignore[attr-defined]
+
+    assert server._ancestors_for_children() == []  # pyright: ignore[reportPrivateUsage]
+
+
+def test_ancestors_for_children_includes_own_and_further_ancestors():
+    server = make_server()
+    server.config.share_models_downstream = True  # type: ignore[attr-defined]
+    server.parent_infra.ancestors = []  # type: ignore[attr-defined]
+
+    result = server._ancestors_for_children()  # pyright: ignore[reportPrivateUsage]
+
+    assert [a.url for a in result] == ["http://test-infra"]
+
+
+def test_broadcast_ancestors_to_children_sends_only_to_authorized_connections():
+    server = make_server()
+    server.parent_infra.ancestors = []  # type: ignore[attr-defined]
+
+    authorized_ctx = make_context(make_authorized())
+    unauthorized_ctx = make_context(None)
+    server.connections = {authorized_ctx, unauthorized_ctx}  # type: ignore[assignment]
+
+    server.broadcast_ancestors_to_children()
+
+    authorized_ctx.send.assert_called_once()
+    unauthorized_ctx.send.assert_not_called()
+
+
+def test_broadcast_ancestors_to_children_sends_empty_list_when_share_disabled():
+    server = make_server()
+    server.config.share_models_downstream = False  # type: ignore[attr-defined]
+
+    authorized_ctx = make_context(make_authorized())
+    server.connections = {authorized_ctx}  # type: ignore[assignment]
+
+    server.broadcast_ancestors_to_children()
+
+    sent_payload = authorized_ctx.send.call_args[0][0]
+    assert '"ancestors":[]' in sent_payload

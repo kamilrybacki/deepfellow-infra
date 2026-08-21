@@ -19,12 +19,39 @@ from server.models.api import (
     FunctionToolCall,
     ImagesRequest,
     McpToolCall,
+    Model,
+    ModelProps,
     Reasoning,
     ReasoningConfig,
     ReasoningContentItem,
     ReasoningSummary,
     ResponsesRequest,
 )
+
+
+def _make_model(**overrides: object) -> Model:
+    props = ModelProps(private=False, type="llm", endpoints=["chat"])
+    defaults: dict[str, object] = {"id": "rid", "name": "model", "type": "llm", "props": props, "usage": 0}
+    defaults.update(overrides)
+    return Model(**defaults)  # pyright: ignore[reportArgumentType]
+
+
+def test_model_valid_capacity_forces_capacity_known_true() -> None:
+    model = _make_model(capacity=5, capacity_known=False)
+    assert model.capacity == 5
+    assert model.capacity_known is True
+
+
+def test_model_non_positive_capacity_coerced_to_unknown() -> None:
+    model = _make_model(capacity=0, capacity_known=True)
+    assert model.capacity is None
+    assert model.capacity_known is False
+
+
+def test_model_unbounded_capacity_left_untouched() -> None:
+    model = _make_model(capacity=None, capacity_known=True)
+    assert model.capacity is None
+    assert model.capacity_known is True
 
 
 def _make_filter(type_: str, key: str = "score", value: int = 10) -> ComparisonFilter:

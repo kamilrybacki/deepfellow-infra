@@ -17,7 +17,7 @@ from typing import Annotated, Any, Literal, NamedTuple, TypedDict
 import aiofiles
 import aiohttp
 from fastapi import HTTPException
-from pydantic import BaseModel, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints
 
 from server.applicationcontext import get_base_url
 from server.config import get_main_dir
@@ -79,6 +79,7 @@ from server.utils.vram_calculator import (
 logger = logging.getLogger("uvicorn.error")
 
 _PROGRESS_LOG_STEP = 0.1  # log every ~10% of progress so the console isn't flooded with updates
+_WARMTH_POLL_INTERVAL_SECONDS = 15  # matches the staleness already tolerated for the UI's loaded-model display
 
 
 type Quantization = Literal[
@@ -184,7 +185,7 @@ class ModelInstalledInfo:
 
 class OllamaOptions(BaseModel):
     hardware: str | bool | None = None
-    num_parallel: int | None = None  # 3
+    num_parallel: int | None = Field(default=None, ge=0)  # 1
     keep_alive: str = ""  # 60m
     is_flash_attention: bool | None = None  # False
     max_loaded_models: int | None = None  # 1
@@ -270,6 +271,8 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
     _arch_cache: dict[tuple[str, str], ArchParams]
     _vram_cache: dict[tuple[str, str], float]
     _installing: set[tuple[str, str]]
+    _warmth_poll_tasks: dict[str, asyncio.Task[None]]
+    _ps_query_failing: set[str]
 
     @property
     def _supported_gpus(self) -> list[GpuInfo]:
@@ -283,6 +286,8 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         self._arch_cache = {}
         self._vram_cache = {}
         self._installing = set()
+        self._warmth_poll_tasks = {}
+        self._ps_query_failing = set()
 
     def load_default_models(self, instance: str) -> None:
         """Load default models to instance (merges static catalog with dynamic overlay, restoring any installed model dropped from both)."""
@@ -344,7 +349,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                     name="num_parallel",
                     description="Maximum number of parallel requests (OLLAMA_NUM_PARALLEL)",
                     required=False,
-                    default="3",
+                    default="1",
                 ),
                 ServiceField(
                     type="text",
@@ -567,6 +572,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             options.spec["hardware"] = options.spec.get("gpu", self.docker_service.has_gpu_support)
         options.spec["hardware"] = self.canonicalize_hardware_spec(options.spec["hardware"])
         await self.validate_docker_image_version(options.spec.get("image_version"), options.spec.get("hardware"))
+        try_parse_pydantic(OllamaOptions, options.spec)
 
     async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
@@ -606,7 +612,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                     "start_period": "10s",
                 },
             )
-            docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
+            docker_exposed_port, _ = await self.docker_service.install_and_run_docker(docker_options)
             container_host = self.docker_service.get_container_host(subnet, docker_options.name)
             container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
             info = InstalledInfo(
@@ -621,12 +627,14 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                 base_url=get_base_url(container_host, container_port),
             )
             stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
+            self._start_warmth_poll_task(instance)
 
             return info
 
         return PromiseWithProgress(func=func)
 
     async def _uninstall_instance(self, instance: str, options: UninstallServiceIn) -> None:  # noqa: C901
+        self._stop_warmth_poll_task(instance)
         installed = self.get_instance_info(instance).installed
         if installed:
             models = list(installed.models.copy().values())
@@ -673,6 +681,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         installed = self.get_instance_info(instance).installed
         if not installed:
             return
+        self._stop_warmth_poll_task(instance)
         await self._stop_docker(installed.docker)
 
     async def _unload_model_from_vram(self, model_id: str, ollama_name: str, base_url: str) -> None:
@@ -813,6 +822,50 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             logger.debug("VRAM estimate failed for Ollama model %r on instance %r (arch=%r)", model_name, instance, arch, exc_info=True)
             return None
 
+    def _start_warmth_poll_task(self, instance: str) -> None:
+        """Start (or restart) the background task that syncs registry warm state from Ollama's `/api/ps`."""
+        if instance in self._warmth_poll_tasks:
+            self._warmth_poll_tasks[instance].cancel()
+
+        async def _poll_loop() -> None:
+            while True:
+                await asyncio.sleep(_WARMTH_POLL_INTERVAL_SECONDS)
+                info = self.instances_info.get(instance)
+                if not info or not info.installed:
+                    break
+                try:
+                    await self._sync_warm_state(instance, info.installed)
+                except Exception:
+                    logger.exception(f"{self.get_id(instance)} warmth poll tick failed")  # noqa: G004
+
+        def _forget_if_current(finished: asyncio.Task[None]) -> None:
+            # Only drop the dict entry if it still points at this task: a restart may have
+            # already replaced it with a newer one by the time this one finishes/cancels.
+            if self._warmth_poll_tasks.get(instance) is finished:
+                del self._warmth_poll_tasks[instance]
+            if not finished.cancelled() and (exc := finished.exception()):
+                logger.error(f"{self.get_id(instance)} warmth poll task died unexpectedly", exc_info=exc)  # noqa: G004
+
+        task = asyncio.create_task(_poll_loop())
+        task.add_done_callback(_forget_if_current)
+        self._warmth_poll_tasks[instance] = task
+
+    def _stop_warmth_poll_task(self, instance: str) -> None:
+        if instance in self._warmth_poll_tasks:
+            self._warmth_poll_tasks[instance].cancel()
+            del self._warmth_poll_tasks[instance]
+
+    async def _sync_warm_state(self, instance: str, info: InstalledInfo) -> None:
+        """Reflect Ollama's live loaded/evicted model state into the endpoint registry's warm flag."""
+        loaded = await self._get_loaded_models(instance)
+        if loaded is None:
+            return
+        for model_id, model_info in info.models.items():
+            if not model_info.registration_id:
+                continue
+            ollama_name = model_info.internal_name or model_id
+            self.endpoint_registry.update_warm(model_info.registration_id, ollama_name in loaded)
+
     async def get_loaded_model_info(self, instance: str) -> dict[str, int] | None:
         """Return {model_name: context_length} for models currently loaded in VRAM. None if not applicable."""
         loaded = await self._get_loaded_models(instance)
@@ -828,9 +881,11 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         try:
             result = await fetch_from(f"{info.base_url}/api/ps")
             if result.status_code != 200:
+                self._log_ps_query_failure("Ollama /api/ps on instance %r returned status %d", instance, result.status_code)
                 return None
             data = json.loads(result.data)
             models = data.get("models", [])
+            self._ps_query_failing.discard(instance)
             return {
                 m["name"].removesuffix(":latest"): LoadedModelInfo(
                     context_length=m.get("context_length", 0),
@@ -839,7 +894,20 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                 for m in models
             }
         except Exception:
+            self._log_ps_query_failure("Failed to query Ollama /api/ps on instance %r", instance, exc_info=True)
             return None
+
+    def _log_ps_query_failure(self, message: str, instance: str, *args: Any, exc_info: bool = False) -> None:
+        """Warn once per instance on the first /api/ps failure, then drop to debug until it recovers.
+
+        Polled every _WARMTH_POLL_INTERVAL_SECONDS; a stuck-but-installed instance would
+        otherwise log a WARNING (with a full stack trace) forever.
+        """
+        if instance in self._ps_query_failing:
+            logger.debug(message, instance, *args, exc_info=exc_info)
+        else:
+            self._ps_query_failing.add(instance)
+            logger.warning(message, instance, *args, exc_info=exc_info)
 
     def _effective_context(self, model_context: int | None, parsed_options: OllamaOptions) -> int:
         """Return the context Ollama runs with for an idle model: native window capped by the service context."""
@@ -1308,6 +1376,26 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
 
                     context_window = model_form_context_window or service_form_context_window or default_context_window
                     context_window = min(context_window, max_context_window)
+                    # `or` (not `is not None`) is intentional here: Ollama's OLLAMA_NUM_PARALLEL=0 means
+                    # "auto", so an explicit 0 must fall through to the configured default just like None does.
+                    #
+                    # WARNING for reviewers: `self.config.ollama_num_parallel` is a *conservative
+                    # approximation* of "auto", not Ollama's real behavior. Ollama's own auto-scaling
+                    # picks up to 4 concurrent requests depending on available VRAM at load time; this
+                    # gateway has no visibility into that and cannot replicate it, so it substitutes its
+                    # own configured default (1 unless overridden) instead. Pros: never overcommits VRAM
+                    # by assuming a higher concurrency than what's actually available - safe by
+                    # construction. Cons: on hardware where Ollama would genuinely auto-scale to 2-4, this
+                    # under-reports capacity and causes earlier-than-necessary spillover to other
+                    # backends. If this is set to 4, the CHANGELOG default is now wrong, but treat this as
+                    # accepted routing-side conservatism, not a bug, unless the user explicitly wants
+                    # capacity to track Ollama's real auto behavior.
+                    capacity = info.parsed_options.num_parallel or self.config.ollama_num_parallel
+                    # Ollama lazily loads a model into memory on its first inference request, so a
+                    # freshly-installed model is never warm yet - registering it as warm here would win
+                    # ranking over an actually-warm instance and route the first requests into a cold load.
+                    # The warmth-poll task (already running per-instance) corrects this to `True` within one
+                    # tick once `/api/ps` confirms it's genuinely loaded (or leaves it `False` otherwise).
                     if model.type == "llm":
                         model_info.registration_id = self.endpoint_registry.register_chat_completion_as_proxy(
                             model=registered_name,
@@ -1323,7 +1411,9 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                             responses=ProxyOptions(url=f"{info.base_url}/v1/responses", rewrite_model_to=rewrite_model_to),
                             messages=ProxyOptions(url=f"{info.base_url}/v1/messages", rewrite_model_to=rewrite_model_to),
                             ollama_chat=ProxyOptions(url=f"{info.base_url}/api/chat", rewrite_model_to=rewrite_model_to),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                            registration_options=RegistrationOptions(
+                                origin="local", owned_by=self.get_type(), capacity_state=capacity, warm=False
+                            ),
                         )
                     if model.type == "embedding":
                         model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
@@ -1336,7 +1426,9 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 max_context_window=max_context_window,
                             ),
                             options=ProxyOptions(url=f"{info.base_url}/v1/embeddings", rewrite_model_to=rewrite_model_to),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                            registration_options=RegistrationOptions(
+                                origin="local", owned_by=self.get_type(), capacity_state=capacity, warm=False
+                            ),
                         )
                     if model.type == "txt2img":
                         model_info.registration_id = self.endpoint_registry.register_image_generations_as_proxy(
@@ -1349,7 +1441,9 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 max_context_window=max_context_window,
                             ),
                             options=ProxyOptions(url=f"{info.base_url}/v1/images/generations", rewrite_model_to=rewrite_model_to),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                            registration_options=RegistrationOptions(
+                                origin="local", owned_by=self.get_type(), capacity_state=capacity, warm=False
+                            ),
                         )
                     input_stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
 

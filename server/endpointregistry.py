@@ -6,18 +6,19 @@
 import asyncio
 import json
 import logging
+import random
 import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, cast
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import aiohttp
 from aiohttp import JsonPayload
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, TypeAdapter, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError, field_validator
 
 from server.config import AppSettings
 from server.metrics_registry import MetricsRegistry
@@ -47,7 +48,7 @@ from server.models.api import (
 )
 from server.models.common import JsonSerializable, StarletteResponse
 from server.utils.core import HttpClientError, HttpResponse, Utils, make_http_request
-from server.websockets.models import RegistrationId, UsageChangeRequest
+from server.websockets.models import RegistrationId, UsageChangeRequest, WarmChangeRequest
 from server.websockets.parent_infra_group import ParentInfraGroup
 
 if TYPE_CHECKING:
@@ -59,6 +60,28 @@ T = TypeVar("T")
 type EndpointCallback[T] = Callable[[T, Request | None], Awaitable[StarletteResponse]]
 type CustomEndpointCallback = Callable[[Request], Awaitable[StarletteResponse]]
 type McpEndpointCallback = Callable[[Request], Awaitable[StarletteResponse]]
+
+type CapacityState = int | Literal["unbounded", "unknown"]
+"""A backend's routing concurrency limit: a positive int (known, finite), "unbounded" (no
+concurrency concept, e.g. a cloud/proxy backend), or "unknown" (we tried and failed to
+determine it, e.g. a vLLM log-parse miss). Kept internal-only: the wire/mesh schema
+(`server/models/api.py::Model`) still serializes this as a `capacity`/`capacity_known` pair for
+rolling-upgrade compatibility across mesh peers on different versions; `_capacity_state_from_pair`
+and `_capacity_pair_from_state` convert at that boundary."""
+
+_ALL_SATURATED_WARNING_INTERVAL_SECONDS = 60.0  # avoid flooding logs while a model stays saturated under peak load
+
+
+def _capacity_state_from_pair(capacity: int | None, capacity_known: bool) -> CapacityState:
+    if capacity is not None:
+        return capacity
+    return "unbounded" if capacity_known else "unknown"
+
+
+def _capacity_pair_from_state(state: CapacityState) -> tuple[int | None, bool]:
+    if isinstance(state, int):
+        return state, True
+    return None, state == "unbounded"
 
 
 _MCP_PROXY_MAX_BODY_BYTES = 10 * 1024 * 1024  # generous for MCP JSON-RPC payloads; bounds the buffering needed for a 401-retry replay
@@ -95,20 +118,124 @@ class RegisteredModel[T](BaseModel):
     created: int
     owned_by: str
     healthy: bool = False
+    capacity_state: CapacityState = "unbounded"
+    warm: bool = True
+
+    @field_validator("capacity_state")
+    @classmethod
+    def _validate_capacity_state(cls, v: CapacityState) -> CapacityState:
+        if isinstance(v, int) and v <= 0:
+            raise ValueError("capacity_state must be a positive integer, 'unbounded', or 'unknown' (zero/negative is not a valid cap)")
+        return v
 
 
 class RegistrationOptions(NamedTuple):
+    """Options for `Endpoint.add_model`.
+
+    `capacity_state="unbounded"` (the default) means the registration is genuinely unbounded (no
+    concurrency concept, e.g. a cloud/proxy backend). A service that tries and fails to determine
+    a real capacity (e.g. a vLLM log-parse miss) must explicitly pass `capacity_state="unknown"`
+    to rank in the worst routing tier instead of being treated as unbounded (see `_rank_key`).
+    """
+
     origin: str
     id: RegistrationId | None = None
     usage: int | None = None
     send_notification: bool = True
     owned_by: str = "local"
+    capacity_state: CapacityState = "unbounded"
+    warm: bool = True
 
 
 class RegistryEntry(NamedTuple):
     model_id: ModelId
     endpoint: "Endpoint[Any]"
     registered_model: RegisteredModel[Any]
+
+
+def _rank_key(x: RegisteredModel[Any]) -> tuple[int, float]:
+    """Sort key ranking warm before cold, then higher capacity before lower.
+
+    `capacity_state` distinguishes "no explicit cap" for backends with no concurrency concept at
+    all (cloud/proxy, genuinely `"unbounded"`) from backends whose capacity we *tried* and failed
+    to determine (e.g. a vLLM log-parse miss, `"unknown"`). These rank differently: a genuinely
+    unbounded backend (`0.0`) ranks below every known finite capacity but above the
+    unknown/failed tier (`+inf`), so it acts as an overflow valve for finite backends without
+    ever being preferred over a real parse failure.
+    """
+    match x.capacity_state:
+        case int() as capacity:
+            capacity_key = -capacity
+        case "unbounded":
+            capacity_key = 0.0
+        case "unknown":
+            capacity_key = float("inf")
+        case _:
+            msg = f"Unknown capacity_state: {x.capacity_state!r}"
+            raise ValueError(msg)
+    return (0 if x.warm else 1, capacity_key)
+
+
+def _saturation_threshold(x: RegisteredModel[Any]) -> float | None:
+    """Usage level at which `x` is considered saturated, or None if it has no explicit cap."""
+    if not isinstance(x.capacity_state, int):
+        return None
+    return x.capacity_state if x.origin == "local" else x.capacity_state * 0.9
+
+
+def _group_by_rank(candidates: list[RegisteredModel[Any]]) -> list[list[RegisteredModel[Any]]]:
+    """Group ranked candidates into consecutive equal-rank tiers, preserving rank order."""
+    groups: list[list[RegisteredModel[Any]]] = []
+    for x in sorted(candidates, key=_rank_key):
+        if groups and _rank_key(groups[-1][0]) == _rank_key(x):
+            groups[-1].append(x)
+        else:
+            groups.append([x])
+    return groups
+
+
+def _pick_ranked_model[T](
+    model_id: ModelId, candidates: list[RegisteredModel[T]], all_saturated_warning_last_logged: dict[ModelId, float]
+) -> RegisteredModel[T]:
+    """Pick a candidate: pack onto the top-ranked tier until saturated, then spill over to the next tier.
+
+    Packing within a tier is deterministic (by registration id), not randomized - shuffling
+    would spread requests evenly instead of packing, defeating warmth-aware routing. Only the
+    all-saturated fallback below, which no longer benefits from packing, uses a random
+    tie-break among equally-loaded candidates instead of a deterministic one.
+    """
+    groups = _group_by_rank(candidates)
+    for group in groups:
+        if _saturation_threshold(group[0]) is None:
+            # No candidate in this tier has an explicit cap (all share the same rank key,
+            # so either all or none do) - there's no saturation threshold to pack against,
+            # so fall back to least-loaded instead of an arbitrary pick.
+            return min(group, key=lambda x: x.usage)
+        # Pack onto the same candidate (by id, for a stable order across calls) until it
+        # saturates, then spill over to the next one.
+        for x in sorted(group, key=lambda c: c.id):
+            # Every member of a tier shares the same rank key, so either all of them have a
+            # saturation threshold or none do; the `is None` branch above already handled the
+            # latter case, so `threshold` here is always a real number.
+            threshold = _saturation_threshold(x)
+            if threshold is not None and x.usage < threshold:
+                return x
+    shuffled = list(candidates)
+    random.shuffle(shuffled)
+    least_loaded = min(shuffled, key=lambda x: x.usage)
+    last_logged = all_saturated_warning_last_logged.get(model_id, 0.0)
+    now = time.time()
+    if now - last_logged >= _ALL_SATURATED_WARNING_INTERVAL_SECONDS:
+        all_saturated_warning_last_logged[model_id] = now
+        logger.warning(
+            "All %d candidate(s) for model %r are saturated; routing to least-loaded anyway (id=%s usage=%s capacity_state=%s)",
+            len(candidates),
+            least_loaded.name,
+            least_loaded.id,
+            least_loaded.usage,
+            least_loaded.capacity_state,
+        )
+    return least_loaded
 
 
 class Endpoint[T]:
@@ -120,6 +247,7 @@ class Endpoint[T]:
         self.registry = registry
         self.parent_infra = parent_infra
         self.models = dict[ModelId, dict[RegistrationId, RegisteredModel[T]]]()
+        self._all_saturated_warning_last_logged: dict[ModelId, float] = {}
 
     def add_model(
         self, model_id: ModelId, props: ModelProps, endpoint: T, type: str, options: RegistrationOptions | None
@@ -135,6 +263,8 @@ class Endpoint[T]:
             usage=options.usage if options and options.usage is not None else 0,
             created=int(time.time()),
             owned_by=options.owned_by if options else "local",
+            capacity_state=options.capacity_state if options else "unbounded",
+            warm=options.warm if options else True,
         )
         if model_id not in self.models:
             self.models[model_id] = {}
@@ -167,23 +297,35 @@ class Endpoint[T]:
         filter: Callable[[T], bool] | None = None,
         registration_id: RegistrationId | None = None,
     ) -> RegisteredModel[T] | None:
-        """Get model from registry."""
+        """Get model from registry.
+
+        Selection among candidates ranks warm registrations before cold ones, then higher
+        capacity before lower (see `_rank_key` for how `capacity_state` is ranked). Requests
+        pack onto the top-ranked registration (deterministically, by registration id) until it
+        crosses its saturation threshold (100% of capacity for locally-registered instances,
+        ~90% for mesh-sourced ones, to cover mesh usage propagation lag) and only then spill
+        over to the next-ranked registration. If every candidate is saturated, routes to
+        whichever has the lowest usage instead of refusing the request, with a random tie-break
+        among equally-loaded candidates in that fallback case.
+        """
         if model_id not in self.models:
             return None
-        lowest: RegisteredModel[T] | None = None
-        for x in self.models[model_id].values():
-            if (not filter or filter(x.endpoint)) and (lowest is None or x.usage < lowest.usage):
-                if registration_id:
-                    if x.id == registration_id:
-                        return x
-                else:
-                    if x.usage == 0:
-                        logger.debug(f"Choosen model origin={x.origin} id={x.id} name={x.name} usage={x.usage}")  # noqa: G004
-                        return x
-                    lowest = x
-        if lowest:
-            logger.debug(f"Choosen model origin={lowest.origin} id={lowest.id} name={lowest.name} usage={lowest.usage}")  # noqa: G004
-        return lowest
+        candidates = [x for x in self.models[model_id].values() if not filter or filter(x.endpoint)]
+        if not candidates:
+            return None
+        if registration_id:
+            return next((x for x in candidates if x.id == registration_id), None)
+
+        chosen = _pick_ranked_model(model_id, candidates, self._all_saturated_warning_last_logged)
+        logger.debug(
+            "Choosen model origin=%s id=%s name=%s usage=%s capacity_state=%s",
+            chosen.origin,
+            chosen.id,
+            chosen.name,
+            chosen.usage,
+            chosen.capacity_state,
+        )
+        return chosen
 
     def is_model_private(self, model: dict[RegistrationId, RegisteredModel[T]]) -> bool:
         """Return is model private."""
@@ -263,11 +405,23 @@ class Endpoint[T]:
             self._build_api_model(model_id, model) for model_id, model in self.models.items() if any(reg.healthy for reg in model.values())
         ]
 
-    def list_models(self) -> list[Model]:
-        """List models from registry."""
+    def list_models(self, exclude_owned_by: frozenset[str] = frozenset({"mesh-ancestor"})) -> list[Model]:
+        """List models from registry, for reporting this node's own aggregate to the rest of the mesh.
+
+        By default excludes only models proxied in from a mesh ancestor (`owned_by="mesh-ancestor"`):
+        those are already reported by that ancestor itself further up the `AncestorInfo` chain, so
+        echoing them back here would re-offer them to the very peer that sent them (upward) or
+        duplicate them alongside their real ancestor entry (downward). Callers that need this node's
+        genuinely-own models — e.g. to report downward to children — must also exclude `"mesh"`
+        (models proxied up from a child), otherwise a child's own model gets echoed back down to it
+        under the same registration id as its local entry, corrupting that entry on removal.
+        """
         res = list[Model]()
         for model_id, map in self.models.items():
             for item in map.values():
+                if item.owned_by in exclude_owned_by:
+                    continue
+                capacity, capacity_known = _capacity_pair_from_state(item.capacity_state)
                 res.append(
                     Model(
                         id=item.id,
@@ -275,6 +429,9 @@ class Endpoint[T]:
                         type=cast("ModelType", item.type.split("-")[0]),
                         props=item.props,
                         usage=item.usage,
+                        capacity=capacity,
+                        capacity_known=capacity_known,
+                        warm=item.warm,
                     )
                 )
         return res
@@ -503,6 +660,7 @@ class EndpointRegistry:
         self.rerank_endpoints = Endpoint[SimpleEndpoint[RerankRequest]](self.registry, self.parent_infra)
         self.mcp_endpoints = Endpoint[McpEndpoint](self.registry, self.parent_infra)
         self.response_item_store = ResponseItemStore()
+        self._proxy_api_keys = dict[str, str]()
 
     def get_models(self) -> ApiModels:
         """Get models for api."""
@@ -544,6 +702,27 @@ class EndpointRegistry:
         models.extend(self.rerank_endpoints.list_models())
         models.extend(self.custom_endpoints.list_models())
         models.extend(self.mcp_endpoints.list_models())
+        return models
+
+    def list_own_models(self) -> list[Model]:
+        """List only this node's genuinely-own models — excludes both mesh directions.
+
+        Unlike `list_models()`, which reports everything routable through this node (including
+        models proxied up from children) for this node's own upward report, this excludes
+        `owned_by in {"mesh", "mesh-ancestor"}` entirely. Used to build what this node exposes
+        downward to its children as "its own" models — reusing `list_models()` there would echo
+        a child's model back down to it under the same registration id as its local entry.
+        """
+        exclude = frozenset({"mesh", "mesh-ancestor"})
+        models = list[Model]()
+        models.extend(self.chat_completion_endpoints.list_models(exclude))
+        models.extend(self.embeddings_endpoints.list_models(exclude))
+        models.extend(self.audio_speech_endpoints.list_models(exclude))
+        models.extend(self.audio_transcriptions_endpoints.list_models(exclude))
+        models.extend(self.images_generations_endpoints.list_models(exclude))
+        models.extend(self.rerank_endpoints.list_models(exclude))
+        models.extend(self.custom_endpoints.list_models(exclude))
+        models.extend(self.mcp_endpoints.list_models(exclude))
         return models
 
     def model_exists(self, model_id: ModelId) -> bool:
@@ -934,33 +1113,80 @@ class EndpointRegistry:
             entry.registered_model.usage = usage.usage
             self._refresh_usage(entry.registered_model)
 
-    def update_models(self, prev_list: list[Model], new_list: list[Model], api_url: str, api_key: str) -> None:
-        """Update models, it remove old models and add new ones."""
+    def update_warm(self, registration_id: RegistrationId, warm: bool) -> None:
+        """Update whether a registration's model is currently loaded/warm on its backend."""
+        entry = self.registry.get(registration_id, None)
+        if entry and entry.registered_model.warm != warm:
+            entry.registered_model.warm = warm
+            self.parent_infra.send_warm(WarmChangeRequest(id=registration_id, warm=warm))
+
+    def update_models(self, prev_list: list[Model], new_list: list[Model], api_url: str, api_key: str, owned_by: str = "mesh") -> None:
+        """Update models, it remove old models and add new ones.
+
+        `owned_by` distinguishes the direction the models came from: `"mesh"` for models proxied
+        up from a subinfra (the default, existing behavior), `"mesh-ancestor"` for models proxied
+        down from a parent/ancestor (see `ParentInfra._apply_ancestors`). `list_models()` excludes
+        the latter so they aren't echoed back to whoever they came from.
+
+        Defensive against a mesh peer on a version that doesn't (yet, or anymore) filter what it
+        reports: a registration id is only ever registered or removed here if the existing registry
+        entry for that id (if any) has the same `owned_by` as this call. This stops a peer from
+        overwriting or deleting an entry that actually belongs to a different origin (e.g. this
+        node's own local model, or one proxied from a different direction) just because it happens
+        to reuse the same id.
+
+        `api_key` is compared against the last key seen for `api_url`: an unchanged model list
+        alone would otherwise never re-run `_register_proxy`, so a peer rotating its API key
+        (e.g. `infra_api_key`) would leave every already-registered proxy endpoint calling out
+        with the stale `Authorization` header until the model happened to be re-registered for an
+        unrelated reason (e.g. a reconnect).
+        """
+        key_changed = self._proxy_api_keys.get(api_url) != api_key
+        self._proxy_api_keys[api_url] = api_key
         registered = set[RegistrationId]()
         changed = False
         for model in new_list:
             registered.add(model.id)
-            if model.id not in self.registry:
-                changed = True
-                logger.info(f"Register new model origin={api_url} id={model.id} name={model.name} type={model.type}")  # noqa: G004
-                self._register_proxy(
-                    model_id=model.name,
-                    type=model.type,
-                    props=model.props,
-                    url=api_url,
-                    api_key=api_key,
-                    registration_options=RegistrationOptions(
-                        id=model.id,
-                        origin=api_url,
-                        usage=model.usage,
-                        send_notification=False,
-                        owned_by="mesh",
-                    ),
+            existing = self.registry.get(model.id)
+            if existing is not None and existing.registered_model.owned_by != owned_by:
+                logger.warning(
+                    "Ignoring model id collision: id=%s from origin=%s owned_by=%r conflicts with "
+                    "existing registration owned_by=%r origin=%s",
+                    model.id,
+                    api_url,
+                    owned_by,
+                    existing.registered_model.owned_by,
+                    existing.registered_model.origin,
                 )
+                continue
+            if existing is None:
+                logger.info(f"Register new model origin={api_url} id={model.id} name={model.name} type={model.type}")  # noqa: G004
+            elif key_changed:
+                logger.info(f"Refresh proxy credentials origin={api_url} id={model.id} name={model.name} type={model.type}")  # noqa: G004
+                existing.endpoint.remove_model(model_id=existing.model_id, registration_id=model.id, send_notification=False)
+            else:
+                continue
+            changed = True
+            self._register_proxy(
+                model_id=model.name,
+                type=model.type,
+                props=model.props,
+                url=api_url,
+                api_key=api_key,
+                registration_options=RegistrationOptions(
+                    id=model.id,
+                    origin=api_url,
+                    usage=model.usage,
+                    send_notification=False,
+                    owned_by=owned_by,
+                    capacity_state=_capacity_state_from_pair(model.capacity, model.capacity_known),
+                    warm=model.warm,
+                ),
+            )
         for model in prev_list:
             if model.id not in registered:
                 prev = self.registry.get(model.id, None)
-                if prev:
+                if prev and prev.registered_model.owned_by == owned_by:
                     changed = True
                     logger.info(f"Remove old model origin={api_url} id={model.id} name={model.name} type={model.type}")  # noqa: G004
                     prev.endpoint.remove_model(model_id=prev.model_id, registration_id=model.id, send_notification=False)

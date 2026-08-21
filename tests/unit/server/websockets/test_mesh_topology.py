@@ -28,6 +28,8 @@ def _make_server(
     config.connect_to_mesh_url = connect_to_mesh_url
     config.infra_url = infra_url
     config.name = name
+    config.infra_api_key.get_secret_value.return_value = "api-key"
+    config.share_models_downstream = True
 
     parent_infra = MagicMock()
     parent_infra.enabled = parent_enabled
@@ -155,6 +157,8 @@ async def test_on_start_stores_ancestors_from_init_response() -> None:
     parent.config = config
     parent.task_manager = task_manager
     parent._ancestors = []  # type: ignore[misc]
+    parent._registered_ancestor_models = {}  # type: ignore[misc]
+    parent.on_ancestors_changed = lambda: None  # type: ignore[misc]
     parent.process_loop = True
 
     endpoint_registry = MagicMock()
@@ -401,6 +405,8 @@ async def test_on_start_sends_children_from_get_children() -> None:
     parent.config = config
     parent.task_manager = MagicMock()
     parent._ancestors = []  # type: ignore[misc]
+    parent._registered_ancestor_models = {}  # type: ignore[misc]
+    parent.on_ancestors_changed = lambda: None  # type: ignore[misc]
     parent.process_loop = True
 
     endpoint_registry = MagicMock()

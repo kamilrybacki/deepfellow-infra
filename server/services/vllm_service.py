@@ -22,7 +22,7 @@ from server.docker import (
     DockerImage,
     DockerOptions,
 )
-from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
+from server.endpointregistry import CapacityState, ProxyOptions, RegistrationId, RegistrationOptions
 from server.models.api import EMBEDDINGS_ENDPOINTS, LLM_ENDPOINTS, ModelProps
 from server.models.models import (
     CustomModelField,
@@ -159,6 +159,8 @@ class ModelInstalledInfo:
     base_url: str
     gpu_memory_utilization: float | None
     model_type: Literal["llm", "reranker", "embedding"] = "llm"
+    capacity: int | None = None
+    capacity_known: bool = False
 
     def get_info(self) -> ModelInfo:
         """Get info."""
@@ -325,6 +327,9 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     definition=self.models[instance][x.id].model_dump(mode="json")
                     if x.id in self.models[instance]
                     else self._get_persisted_model_definition(instance, x.id),
+                    capacity=x.capacity,
+                    capacity_known=x.capacity_known,
+                    gpu_memory_utilization=x.gpu_memory_utilization,
                 )
                 for x in info.models.values()
             ]
@@ -577,8 +582,12 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         free_fraction = max(0.0, stats.total_vram_gb - stats.used_vram_gb) / stats.total_vram_gb
         return round(min(self._default_gpu_memory_utilization, free_fraction * self._gpu_memory_free_safety_margin), 2)
 
-    async def _get_gpu_memory_utilization(self, parsed_model_options: VllmModelOptions, model: VllmModel) -> float:
+    async def _get_gpu_memory_utilization(
+        self, instance: str, model_id: str, parsed_model_options: VllmModelOptions, model: VllmModel
+    ) -> float:
         gpu_memory_utilization = parsed_model_options.gpu_memory_utilization or model.gpu_memory_utilization
+        if gpu_memory_utilization is None:
+            gpu_memory_utilization = self._get_persisted_model_gpu_memory_utilization(instance, model_id)
         if gpu_memory_utilization is None:
             gpu_memory_utilization = await self._get_default_gpu_memory_utilization()
         if self.gpu_memory_utilization + gpu_memory_utilization > 1:
@@ -661,21 +670,25 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         model_id: str,
         context_window: int | None,
         max_context_window: int | None,
+        capacity: int | None,
     ) -> RegistrationId:
         """Register the model in the endpoint registry based on its type."""
+        # vLLM always has a real, finite concurrency limit; `capacity is None` here means we
+        # failed to determine it (docker-log fetch or parse failure), never that it's unbounded.
+        capacity_state: CapacityState = capacity if capacity is not None else "unknown"
         if model.model_type == "reranker":
             return self.endpoint_registry.register_rerank_as_proxy(
                 model=registered_name,
                 props=ModelProps(private=True, type="rerank", endpoints=["/v1/rerank"]),
                 options=ProxyOptions(url=f"{model_info.base_url}/v1/rerank", rewrite_model_to=model_id),
-                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), capacity_state=capacity_state),
             )
         if model.model_type == "embedding":
             return self.endpoint_registry.register_embeddings_as_proxy(
                 model=registered_name,
                 props=ModelProps(private=True, type="embedding", endpoints=EMBEDDINGS_ENDPOINTS),
                 options=ProxyOptions(url=f"{model_info.base_url}/v1/embeddings", rewrite_model_to=model_id),
-                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), capacity_state=capacity_state),
             )
         return self.endpoint_registry.register_chat_completion_as_proxy(
             model=registered_name,
@@ -691,7 +704,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             responses=ProxyOptions(url=f"{model_info.base_url}/v1/responses", rewrite_model_to=model_id),
             messages=ProxyOptions(url=f"{model_info.base_url}/v1/messages", rewrite_model_to=model_id),
             ollama_chat=None,
-            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), capacity_state=capacity_state),
         )
 
     async def _start_vllm_container_with_retry(
@@ -704,7 +717,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         gpu_memory_utilization: float | None,
         user_model_length: int | None,
         use_gpu: bool,
-    ) -> tuple[int, int | None]:
+    ) -> tuple[int, int | None, bool]:
         """Start the vLLM container, tearing it down on any failure.
 
         If startup fails because the model's default context length needs more KV cache than is
@@ -712,10 +725,10 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         failure (including a retry that still doesn't fit) is translated into a clear "not enough
         GPU VRAM" or "missing model files" AppError when recognized, instead of the raw docker/vLLM
         traceback.
-        Returns (docker_exposed_port, effective user_model_length).
+        Returns (docker_exposed_port, effective user_model_length, whether the container was (re)started).
         """
         try:
-            docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
+            docker_exposed_port, restarted = await self.docker_service.install_and_run_docker(docker_options)
         except Exception as exc:
             await self.docker_service.stop_docker(docker_options)
             if missing_files_msg := self._diagnose_missing_model_files(model_id, str(exc)):
@@ -742,7 +755,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             )
             docker_options.command = " ".join(vllm_command)
             try:
-                docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
+                docker_exposed_port, restarted = await self.docker_service.install_and_run_docker(docker_options)
             except Exception as retry_exc:
                 await self.docker_service.stop_docker(docker_options)
                 if missing_files_msg := self._diagnose_missing_model_files(model_id, str(retry_exc)):
@@ -750,7 +763,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                 if vram_msg := self._diagnose_insufficient_vram(model_id, str(retry_exc)):
                     raise AppError(vram_msg) from retry_exc
                 raise
-        return docker_exposed_port, user_model_length
+        return docker_exposed_port, user_model_length, restarted
 
     async def _install_model(  # noqa: C901
         self, instance: str, model_id: str, options: InstallModelIn
@@ -772,7 +785,9 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         gpu_memory_utilization: float | None = None
         try:
             use_gpu = self.is_given_hardware_support_gpu(info.parsed_options.hardware)
-            gpu_memory_utilization = await self._get_gpu_memory_utilization(parsed_model_options, model) if use_gpu else None
+            gpu_memory_utilization = (
+                await self._get_gpu_memory_utilization(instance, model_id, parsed_model_options, model) if use_gpu else None
+            )
             user_model_length = parsed_model_options.max_model_length or model.max_model_len or None
             quantization = await self._get_quantization(parsed_model_options, model)
         except BaseException:
@@ -847,7 +862,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     },
                 )
                 try:
-                    docker_exposed_port, user_model_length = await self._start_vllm_container_with_retry(
+                    docker_exposed_port, user_model_length, restarted = await self._start_vllm_container_with_retry(
                         docker_options=docker_options,
                         model_id=model_id,
                         docker_model_path=docker_model_path,
@@ -860,6 +875,9 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                 except Exception:
                     docker_stopped = True
                     raise
+                capacity, capacity_known = await self._resolve_model_capacity(
+                    instance, model_id, "vLLM", docker_options.container_name or "", restarted, self._parse_max_concurrency
+                )
                 registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
                 container_host = self.docker_service.get_container_host(subnet, docker_options.name)
                 container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
@@ -882,6 +900,8 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     base_url=get_base_url(container_host, container_port),
                     gpu_memory_utilization=gpu_memory_utilization,
                     model_type=model.model_type,
+                    capacity=capacity,
+                    capacity_known=capacity_known,
                 )
                 model_info.registration_id = self._register_model_endpoint(
                     model_info=model_info,
@@ -890,6 +910,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     model_id=model_id,
                     context_window=context_window,
                     max_context_window=max_context_window,
+                    capacity=capacity,
                 )
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
                 self.models_downloaded[model_id] = DownloadedInfo(str(local_model_path))
@@ -960,6 +981,38 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             if model_path := model.model_path:
                 shutil.rmtree(Path(model_path))
             del self.models_downloaded[model_id]
+
+    @staticmethod
+    def _parse_max_concurrency(raw: str) -> int | None:
+        """Parse vLLM's dynamically-computed max concurrency from its KV-cache startup log line.
+
+        vLLM logs e.g. "Maximum concurrency for 4096 tokens per request: 12.34x" once it has sized
+        the KV cache from real free VRAM; the trailing multiplier is the number of concurrent
+        max-length requests the instance can serve. On (re)start it may log this line more than
+        once (e.g. across a KV-cache-too-small retry), so the *last* occurrence reflects the
+        config the instance actually launched with. A failed parse (e.g. the log format changed
+        across a vLLM version) falls back to `None` rather than failing install; `None` here means
+        "failed to determine," never "unbounded" - callers must treat it as unknown capacity.
+        """
+        matches = list(re.finditer(r"[Mm]aximum concurrency for [\d,]+ tokens per request:\s*([\d.]+)x", raw))
+        if not matches:
+            return None
+        captured = matches[-1].group(1)
+        try:
+            raw_concurrency = float(captured)
+        except (ValueError, OverflowError):
+            logger.warning("Failed to parse vLLM's reported max concurrency %r as a number; capacity will be unknown.", captured)
+            return None
+        if raw_concurrency < 1:
+            logger.warning(
+                "vLLM reported maximum concurrency of %.2fx, which is below 1; treating capacity as 1 instead of unknown.",
+                raw_concurrency,
+            )
+        try:
+            return max(1, round(raw_concurrency))
+        except OverflowError:
+            logger.warning("vLLM's reported max concurrency %.2fx overflowed rounding; capacity will be unknown.", raw_concurrency)
+            return None
 
     @staticmethod
     def _parse_kv_cache_max_len_suggestion(raw: str) -> int | None:

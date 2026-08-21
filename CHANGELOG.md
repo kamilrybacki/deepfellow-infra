@@ -6,36 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- New `just get-llamacpp-models` recipe generates `static/llamacpp-min.json`, a registry of GGUF models discovered on HuggingFace for the llama.cpp backend, mirroring the existing `get-vllm-models`/`get-ollama-models` tooling. Every quant a repo ships is listed as a separate entry (not just one picked tier); multimodal projector files, split (multi-part) GGUF shards, multi-component pipeline files, non-chat repos (image/video diffusion, TTS, ASR, OCR), and embedding-only repos (including the `bge-`/`gte-`/`e5-` family prefixes, not just repos with "embed" in the name) are excluded since llama.cpp can't serve them as standalone chat models.
+- New **Warnings** page in the WebUI (and `GET`/`DELETE /admin/warnings` API) surfaces failures that used to be visible only in the server logs: a service or model that fails to load, or a service present in `config.json` but no longer recognized in this build (e.g. after a downgrade), is now recorded as a dismissible warning. Warnings persist across restarts and are automatically cleared once the service or model successfully (re)loads, so they don't need to be manually dismissed once resolved.
+- The sidebar's **Warnings** entry now shows a badge with the current warning count, so an unresolved failure is visible without opening the page.
+- A subinfra connected to the mesh can now see and route to its parent's (and further ancestors') models, not just the other way around — both when it first connects and live as those models change — gated by a new `share_models_downstream` config option (on by default).
+- A service instance that fails to install or update is now also recorded as a warning, matching the existing behavior for a model that fails to install.
+
+### Changed
+- Model request routing now prefers already-warm, higher-capacity instances and packs traffic onto the fewest of them before spilling over, instead of always spreading load evenly across every registered instance regardless of how much concurrent load each can actually take.
+- Model registries for llama.cpp, Coqui, rerank, Speaches, and Stable Diffusion are now loaded from `static/*-min.json` files instead of hardcoded in the service code
+- Previously installed models keep working after the maintained registry list is refreshed or pruned.
+- llama.cpp's default model list now loads from `static/llamacpp-min.json` at startup instead of being hardcoded in source, matching how vLLM and Ollama already manage their default model lists.
+- vLLM service's hardware-support guard and GPU-utilization release logic are each backed by a single shared implementation instead of duplicated copies, removing the risk of the copies drifting apart on future changes.
+- SGLang instances now report their KV-cache-sized `max_running_requests` from startup logs as routing capacity, same as vLLM, so capacity- and warmth-aware routing packs traffic onto them instead of treating them as unbounded.
+- Ollama's "Maximum parallel requests" field default in the WebUI is now `1` instead of `3`, matching the actual fallback (`OLLAMA_NUM_PARALLEL` unset defaults to 1) - a newly created Ollama instance that doesn't override this field now gets `OLLAMA_NUM_PARALLEL=1` instead of `3`.
+- Warmth-aware routing now correctly tracks a backend's loaded/evicted model state from right after instance install, treats a backend with no reported concurrency number as unknown capacity (ranked last, never counted as saturated) rather than unbounded, treats Ollama's `OLLAMA_NUM_PARALLEL=0` ("auto") as bounded at DeepFellow's configured `OLLAMA_NUM_PARALLEL` default (conservatively `1`, not Ollama's own real auto-scaling behavior of up to 4 concurrent requests depending on available VRAM) rather than zero capacity, no longer registers a freshly-installed Ollama model as warm before it has actually loaded, no longer downgrades a mesh peer's genuinely unbounded backend (e.g. a cloud/proxy model with no concurrency cap) to "unknown capacity" on receipt, rejects a llama.cpp instance's invalid `num_parallel` (0 or negative) at both setup and update time instead of failing later during model registration and leaving an orphaned Docker container behind, no longer orphans a llama.cpp model's Docker container when a failure occurs between starting it and registering it, and no longer lets a misconfigured `OLLAMA_NUM_PARALLEL=0` in DeepFellow's own environment (as opposed to a per-instance override, which was already handled) silently fail every Ollama model install on that instance.
+
 ### Fixed
 - vLLM service now logs a debug message when it can't resolve a custom model's size or can't determine its VRAM usage from container logs, instead of silently returning `None`.
 - vLLM model install no longer silently swallows a failed Docker container stop during cleanup — the failure is now logged so an orphaned container can be found and removed.
 - vLLM model installation no longer gets stuck permanently in "installing" state if the request is cancelled during a graceful shutdown while GPU/quantization checks are still running.
 - vLLM's KV-cache-overflow retry logic no longer intercepts unrelated Docker startup failures; only the specific "estimated maximum model length" error now triggers a retry with an adjusted `--max-model-len`.
 - Uninstalling an Ollama model (without purging) now unloads it from VRAM; previously it kept occupying VRAM until the whole Ollama container was restarted.
-
-### Added
-- New **Warnings** page in the WebUI (and `GET`/`DELETE /admin/warnings` API) surfaces failures that used to be visible only in the server logs: a service or model that fails to load, or a service present in `config.json` but no longer recognized in this build (e.g. after a downgrade), is now recorded as a dismissible warning. Warnings persist across restarts and are automatically cleared once the service or model successfully (re)loads, so they don't need to be manually dismissed once resolved.
-- The sidebar's **Warnings** entry now shows a badge with the current warning count, so an unresolved failure is visible without opening the page.
-- A service instance that fails to install or update is now also recorded as a warning, matching the existing behavior for a model that fails to install.
-- New `just get-llamacpp-models` recipe generates `static/llamacpp-min.json`, a registry of GGUF models discovered on HuggingFace for the llama.cpp backend, mirroring the existing `get-vllm-models`/`get-ollama-models` tooling. Every quant a repo ships is listed as a separate entry (not just one picked tier); multimodal projector files, split (multi-part) GGUF shards, multi-component pipeline files, non-chat repos (image/video diffusion, TTS, ASR, OCR), and embedding-only repos (including the `bge-`/`gte-`/`e5-` family prefixes, not just repos with "embed" in the name) are excluded since llama.cpp can't serve them as standalone chat models.
-
-### Changed
-- Model registries for llama.cpp, Coqui, rerank, Speaches, and Stable Diffusion are now loaded from `static/*-min.json` files instead of hardcoded in the service code
-- Previously installed models keep working after the maintained registry list is refreshed or pruned.
-- llama.cpp's default model list now loads from `static/llamacpp-min.json` at startup instead of being hardcoded in source, matching how vLLM and Ollama already manage their default model lists.
-- vLLM service's hardware-support guard and GPU-utilization release logic are each backed by a single shared implementation instead of duplicated copies, removing the risk of the copies drifting apart on future changes.
-
-### Fixed
 - Persisted model definitions no longer get wiped when a model drops out of the live registry (e.g. after a catalog refresh): the config snapshot now falls back to the last-persisted definition instead of overwriting it with `null`.
 - Backfilling missing `definition` fields into `config.json` on startup no longer drops a model that failed to come up on that boot (transient error): the regenerated config now preserves that model's last-persisted entry instead of omitting it, so it keeps getting retried on future loads.
 - A model definition snapshot from an older schema no longer aborts loading the rest of an instance's models: restoring it is now covered by the same error handling as the model install itself.
 - A model that fails to (re)load is no longer permanently dropped from `config.json` the next time any unrelated action (installing another model, uninstalling a model, editing a custom model, etc.) triggers a config save — it stays persisted so it keeps getting a retry on every future load, until it's explicitly uninstalled.
 - Refreshing the Ollama catalog no longer makes an already-installed model disappear from `list_models`/`get_model` at runtime when it has dropped out of the static and dynamic catalog: the persisted definition is now re-applied after the catalog rebuild, matching the existing restore-on-load behavior.
 - Fixed the Ollama install progress bar getting stuck at 100% forever when a service install's post-processing step (e.g. saving config) failed after an install/uninstall/reinstall cycle.
-- vLLM service now logs a debug message when it can't resolve a custom model's size or can't determine its VRAM usage from container logs, instead of silently returning `None`.
-- vLLM model install no longer silently swallows a failed Docker container stop during cleanup — the failure is now logged so an orphaned container can be found and removed.
-- vLLM model installation no longer gets stuck permanently in "installing" state if the request is cancelled during a graceful shutdown while GPU/quantization checks are still running.
-- vLLM's KV-cache-overflow retry logic no longer intercepts unrelated Docker startup failures; only the specific "estimated maximum model length" error now triggers a retry with an adjusted `--max-model-len`.
+- Rotating `infra_api_key` no longer leaves already-connected subinfras calling ancestor-proxied models with the old key: a proxy registration is now refreshed whenever the reporting peer's API key changes, not only when the model id itself is new.
 
 ## [0.31.0] - 2026-08-06
 

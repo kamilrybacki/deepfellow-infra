@@ -6,7 +6,14 @@
 from typing import Literal
 
 from server.utils.json_rpc_client import JsonRpcClient
-from server.websockets.models import InitRequest, InitResponse, TopologyUpdateRequest, UpdateModelsRequest, UsageChangeRequest
+from server.websockets.models import (
+    InitRequest,
+    InitResponse,
+    TopologyUpdateRequest,
+    UpdateModelsRequest,
+    UsageChangeRequest,
+    WarmChangeRequest,
+)
 
 
 class InfraClient:
@@ -27,6 +34,10 @@ class InfraClient:
     async def usage_change(self, params: UsageChangeRequest) -> Literal["OK"]:
         """Inform about usage change."""
         return await self.client.request("usage_change", params)
+
+    async def warm_change(self, params: WarmChangeRequest) -> Literal["OK"]:
+        """Inform about warm-state change."""
+        return await self.client.request("warm_change", params)
 
     async def update_models(self, params: UpdateModelsRequest) -> Literal["OK"]:
         """Inform about new list of models."""

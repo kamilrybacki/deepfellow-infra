@@ -23,7 +23,7 @@ from server.docker import (
     DockerImage,
     DockerOptions,
 )
-from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
+from server.endpointregistry import CapacityState, ProxyOptions, RegistrationId, RegistrationOptions
 from server.models.api import EMBEDDINGS_ENDPOINTS, LLM_ENDPOINTS, ModelProps
 from server.models.models import (
     CustomModelField,
@@ -200,6 +200,8 @@ class ModelInstalledInfo:
     base_url: str
     gpu_memory_utilization: float | None
     model_type: Literal["llm", "reranker", "embedding"] = "llm"
+    capacity: int | None = None
+    capacity_known: bool = False
 
     def get_info(self) -> ModelInfo:
         """Get info."""
@@ -371,7 +373,18 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
     ) -> InstanceConfig:
         return InstanceConfig(
             options=info.options if info else None,
-            models=[ModelConfig(model_id=x.id, options=x.options) for x in info.models.values()] if info else [],
+            models=[
+                ModelConfig(
+                    model_id=x.id,
+                    options=x.options,
+                    capacity=x.capacity,
+                    capacity_known=x.capacity_known,
+                    gpu_memory_utilization=x.gpu_memory_utilization,
+                )
+                for x in info.models.values()
+            ]
+            if info
+            else [],
             custom=custom,
         )
 
@@ -622,8 +635,12 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
         free_fraction = max(0.0, stats.total_vram_gb - stats.used_vram_gb) / stats.total_vram_gb
         return round(min(self._default_gpu_memory_utilization, free_fraction * self._gpu_memory_free_safety_margin), 2)
 
-    async def _get_gpu_memory_utilization(self, parsed_model_options: SglangModelOptions, model: SglangModel) -> float:
+    async def _get_gpu_memory_utilization(
+        self, instance: str, model_id: str, parsed_model_options: SglangModelOptions, model: SglangModel
+    ) -> float:
         gpu_memory_utilization = parsed_model_options.gpu_memory_utilization or model.gpu_memory_utilization
+        if gpu_memory_utilization is None:
+            gpu_memory_utilization = self._get_persisted_model_gpu_memory_utilization(instance, model_id)
         if gpu_memory_utilization is None:
             gpu_memory_utilization = await self._get_default_gpu_memory_utilization()
         if self.gpu_memory_utilization + gpu_memory_utilization > 1:
@@ -785,14 +802,19 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
         model_id: str,
         context_window: int | None,
         max_context_window: int | None,
+        capacity: int | None,
     ) -> RegistrationId:
         """Register the model in the endpoint registry based on its type."""
+        # SGLang always sizes a real, finite `max_running_requests` from KV-cache memory at startup;
+        # `capacity is None` here means we failed to determine it (docker-log fetch or parse failure),
+        # never that it's unbounded.
+        capacity_state: CapacityState = capacity if capacity is not None else "unknown"
         if model.model_type == "reranker":
             return self.endpoint_registry.register_rerank_as_proxy(
                 model=registered_name,
                 props=ModelProps(private=True, type="rerank", endpoints=["/v1/rerank"]),
                 options=ProxyOptions(url=f"{model_info.base_url}/v1/rerank", rewrite_model_to=model_id),
-                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), capacity_state=capacity_state),
                 normalize_sglang_response=True,
             )
         if model.model_type == "embedding":
@@ -800,7 +822,7 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                 model=registered_name,
                 props=ModelProps(private=True, type="embedding", endpoints=EMBEDDINGS_ENDPOINTS),
                 options=ProxyOptions(url=f"{model_info.base_url}/v1/embeddings", rewrite_model_to=model_id),
-                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), capacity_state=capacity_state),
             )
         return self.endpoint_registry.register_chat_completion_as_proxy(
             model=registered_name,
@@ -816,13 +838,37 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
             responses=ProxyOptions(url=f"{model_info.base_url}/v1/responses", rewrite_model_to=model_id),
             messages=ProxyOptions(url=f"{model_info.base_url}/v1/messages", rewrite_model_to=model_id),
             ollama_chat=None,
-            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), capacity_state=capacity_state),
         )
 
     @staticmethod
     def _is_embedding_mismatch_error(raw: str) -> bool:
         """Return whether container logs report the engine rejected the resolved `--is-embedding` choice."""
         return "relaunch without --is-embedding" in raw.lower()
+
+    @staticmethod
+    def _parse_max_concurrency(raw: str) -> int | None:
+        """Parse SGLang's dynamically-computed max running requests from its KV-cache startup log line.
+
+        SGLang logs e.g. "max_total_num_tokens=665690, chunked_prefill_size=8192, max_prefill_tokens=16384,
+        max_running_requests=4096, context_len=65536, available_gpu_mem=13.50 GB" once it has sized the KV
+        cache from real free VRAM; `max_running_requests` is the number of concurrent requests the instance
+        can serve. On (re)start it may log this line more than once (e.g. across an embedding-flag retry),
+        so the *last* occurrence reflects the config the instance actually launched with. A missing log line
+        (e.g. the log format changed across an SGLang version) falls back to `None` rather than failing
+        install; `None` here means "failed to determine," never "unbounded" - callers must treat it as
+        unknown capacity.
+        """
+        matches = list(re.finditer(r"max_running_requests=(\d+)", raw))
+        if not matches:
+            return None
+        raw_concurrency = int(matches[-1].group(1))
+        if raw_concurrency < 1:
+            logger.warning(
+                "SGLang reported max_running_requests=%d, which is below 1; treating capacity as 1 instead of unknown.",
+                raw_concurrency,
+            )
+        return max(1, raw_concurrency)
 
     async def _install_model(
         self, instance: str, model_id: str, options: InstallModelIn
@@ -843,7 +889,7 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         gpu_memory_utilization: float | None = None
         try:
-            gpu_memory_utilization = await self._get_gpu_memory_utilization(parsed_model_options, model)
+            gpu_memory_utilization = await self._get_gpu_memory_utilization(instance, model_id, parsed_model_options, model)
             max_model_length = parsed_model_options.max_model_length or model.max_model_len or None
             quantization = await self._get_quantization(parsed_model_options, model)
         except Exception:
@@ -910,7 +956,11 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                         "start_period": "240s",
                     },
                 )
-                docker_exposed_port = await self._start_container_with_embedding_fallback(docker_options, sglang_command)
+                docker_exposed_port, restarted = await self._start_container_with_embedding_fallback(docker_options, sglang_command)
+
+                capacity, capacity_known = await self._resolve_model_capacity(
+                    instance, model_id, "SGLang", docker_options.container_name or "", restarted, self._parse_max_concurrency
+                )
 
                 registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
                 container_host = self.docker_service.get_container_host(subnet, docker_options.name)
@@ -934,6 +984,8 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                     base_url=get_base_url(container_host, container_port),
                     gpu_memory_utilization=gpu_memory_utilization,
                     model_type=model.model_type,
+                    capacity=capacity,
+                    capacity_known=capacity_known,
                 )
                 model_info.registration_id = self._register_model_endpoint(
                     model_info=model_info,
@@ -942,6 +994,7 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                     model_id=model_id,
                     context_window=context_window,
                     max_context_window=max_context_window,
+                    capacity=capacity,
                 )
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
                 self.models_downloaded[model_id] = DownloadedInfo(str(local_model_path))
@@ -959,12 +1012,13 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         return PromiseWithProgress(func=func)
 
-    async def _start_container_with_embedding_fallback(self, docker_options: DockerOptions, sglang_command: list[str]) -> int:
+    async def _start_container_with_embedding_fallback(self, docker_options: DockerOptions, sglang_command: list[str]) -> tuple[int, bool]:
         """Start the container, retrying once without `--is-embedding` if the engine rejects it.
 
         Our `--is-embedding` heuristic (model_type/reranker-family based) isn't perfect; when SGLang
         itself rejects the flag at startup, retrying without it lets the install succeed without
         requiring the user to intervene.
+        Returns (docker_exposed_port, whether the container was (re)started).
         """
         try:
             return await self.docker_service.install_and_run_docker(docker_options)

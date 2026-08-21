@@ -50,6 +50,7 @@ class DynamicSettings(BaseModel):
 
     connect_to_mesh_url: str = ""
     connect_to_mesh_key: SecretStr = SecretStr("")
+    share_models_downstream: bool = True
 
     hugging_face_token: SecretStr = SecretStr("")
     civitai_token: SecretStr = SecretStr("")

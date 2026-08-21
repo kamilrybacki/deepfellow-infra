@@ -98,6 +98,26 @@ def test_send_models_list_broadcasts_to_all() -> None:
     p2.send_models_list.assert_called_once()
 
 
+def test_send_models_list_also_fires_mesh_visibility_callback() -> None:
+    p1 = _make_parent("http://a.url")
+    group = ParentInfraGroup([p1])
+    callback = MagicMock()
+    group.on_mesh_visibility_changed = callback
+    group.send_models_list()
+    callback.assert_called_once()
+
+
+def test_on_mesh_visibility_changed_setter_propagates_to_all_parents() -> None:
+    p1 = _make_parent("http://a.url")
+    p2 = _make_parent("http://b.url")
+    group = ParentInfraGroup([p1, p2])
+    callback = MagicMock()
+    group.on_mesh_visibility_changed = callback
+    assert p1.on_ancestors_changed is callback
+    assert p2.on_ancestors_changed is callback
+    assert group.on_mesh_visibility_changed is callback
+
+
 def test_send_usage_broadcasts_to_all() -> None:
     p1 = _make_parent("http://a.url")
     p2 = _make_parent("http://b.url")
@@ -106,6 +126,16 @@ def test_send_usage_broadcasts_to_all() -> None:
     group.send_usage(usage)
     p1.send_usage.assert_called_once_with(usage)
     p2.send_usage.assert_called_once_with(usage)
+
+
+def test_send_warm_broadcasts_to_all() -> None:
+    p1 = _make_parent("http://a.url")
+    p2 = _make_parent("http://b.url")
+    group = ParentInfraGroup([p1, p2])
+    warm = MagicMock()
+    group.send_warm(warm)
+    p1.send_warm.assert_called_once_with(warm)
+    p2.send_warm.assert_called_once_with(warm)
 
 
 # --- check_subinfra_connection ---

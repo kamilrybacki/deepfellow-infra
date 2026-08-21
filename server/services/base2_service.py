@@ -10,7 +10,7 @@ import shutil
 import time
 import uuid
 from abc import abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generic, Protocol, TypeVar, cast
@@ -54,6 +54,9 @@ class ModelConfig(BaseModel):
     model_id: str
     options: InstallModelIn
     definition: dict[str, Any] | None = None
+    capacity: int | None = None
+    capacity_known: bool = False
+    gpu_memory_utilization: float | None = None
 
 
 class CustomModel(BaseModel):
@@ -121,6 +124,8 @@ class Instance[InstalledInfoType]:
 
 
 _LOG_CACHE_TTL = 8.0
+_FAILED_LOG_CACHE_TTL = 1.0
+_DOCKER_LOGS_TAIL_LINES = 1000  # generous for a startup capacity line; bounds memory on a long-running container
 _RECONCILE_INTERVAL_SECONDS = 90
 _RECONCILE_DEAD_THRESHOLD = 3
 
@@ -138,7 +143,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
     instances_info: dict[str, Instance[InstalledInfoType]]
     images_download_progress: dict[str, Stream[StreamChunk]]
     models_download_progress: dict[str, Stream[StreamChunk]]
-    _log_cache: dict[str, tuple[float, str]]
+    _log_cache: dict[str, tuple[float, str, float]]
     _installing: set[tuple[str, str]]
     _reconciliation_tasks: dict[str, "asyncio.Task[None]"]
     _crash_poll_state: dict[tuple[str, str], int]
@@ -266,14 +271,76 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             logger.warning(f"{self.get_id(instance)} model {model_id} container is dead, released VRAM bookkeeping")  # noqa: G004
 
     async def _get_docker_logs(self, container_name: str) -> str:
-        """Return raw docker logs output, with TTL caching per container."""
+        """Return raw docker logs output, with TTL caching per container.
+
+        Tailed to the last `_DOCKER_LOGS_TAIL_LINES` lines: this is only ever used to find a
+        single startup-time capacity line (see `_get_max_concurrency_from_logs`), and an
+        untailed `docker logs` on a long-running container can read hundreds of MB into memory
+        on every restart. A failed or empty read (non-zero exit code, or no output at all —
+        e.g. a race right after the container restarts, before the backend has logged anything)
+        is cached only briefly (`_FAILED_LOG_CACHE_TTL`) rather than for the full TTL, so a
+        container stuck in that state doesn't spawn a `docker logs` subprocess on every poll
+        tick, while a real startup log that lands moments later is still picked up quickly.
+        """
         cached = self._log_cache.get(container_name)
-        if cached and (time.monotonic() - cached[0]) < _LOG_CACHE_TTL:
+        if cached and (time.monotonic() - cached[0]) < cached[2]:
             return cached[1]
-        result = await Utils.run_command(["docker", "logs", container_name])
+        result = await Utils.run_command(["docker", "logs", "--tail", str(_DOCKER_LOGS_TAIL_LINES), container_name])
         raw = result.stdout + result.stderr
-        self._log_cache[container_name] = (time.monotonic(), raw)
+        if result.exit_code != 0:
+            logger.warning("docker logs failed for %r (exit %d): %s", container_name, result.exit_code, result.stderr)
+        ttl = _LOG_CACHE_TTL if result.exit_code == 0 and raw else _FAILED_LOG_CACHE_TTL
+        self._log_cache[container_name] = (time.monotonic(), raw, ttl)
         return raw
+
+    async def _get_max_concurrency_from_logs(
+        self, container_name: str, backend_name: str, parse: Callable[[str], int | None]
+    ) -> int | None:
+        """Return a backend's reported max concurrency for a running container, or None if unavailable."""
+        try:
+            raw = await self._get_docker_logs(container_name)
+        except Exception:
+            logger.exception("Failed to read docker logs for %r; %s capacity will be unknown", container_name, backend_name)
+            return None
+        return parse(raw)
+
+    async def _resolve_model_capacity(
+        self,
+        instance: str,
+        model_id: str,
+        backend_name: str,
+        container_name: str,
+        restarted: bool,
+        parse: Callable[[str], int | None],
+    ) -> tuple[int | None, bool]:
+        """Determine a model's concurrency capacity, re-parsing logs only if the container was actually (re)started.
+
+        A container that's still running from before this process started never rewrote its
+        startup capacity line, so re-reading its logs can't recover it (see `_get_docker_logs`);
+        the last persisted value is reused instead, which is safe because an unchanged config
+        implies an unchanged real capacity.
+        """
+        if restarted:
+            self._log_cache.pop(container_name, None)
+            capacity = await self._get_max_concurrency_from_logs(container_name, backend_name, parse)
+            capacity_known = capacity is not None
+            if capacity is None:
+                logger.warning(
+                    "Could not determine %s concurrency for %r from its startup logs after a real (re)start; "
+                    "capacity will be treated as unknown and this instance will be deprioritized for routing.",
+                    backend_name,
+                    model_id,
+                )
+            return capacity, capacity_known
+
+        capacity, capacity_known = self._get_persisted_model_capacity(instance, model_id)
+        if capacity is not None:
+            logger.debug("Container for %r wasn't (re)started; reusing last known %s concurrency %s.", model_id, backend_name, capacity)
+        elif not capacity_known:
+            logger.warning(
+                "Could not determine %s concurrency for %r: container already running, no prior known value.", backend_name, model_id
+            )
+        return capacity, capacity_known
 
     def load_default_models(self, instance: str) -> None:
         """Load default models to instance."""
@@ -356,6 +423,28 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         if not persisted:
             return None
         return next((m.definition for m in persisted.config.models or [] if m.model_id == model_id), None)
+
+    def _get_persisted_model_capacity(self, instance: str, model_id: str) -> tuple[int | None, bool]:
+        """Look up the last-persisted capacity for a model, from a prior successful detection."""
+        persisted = self.instances_info.get(instance)
+        if not persisted:
+            return None, False
+        match = next((m for m in persisted.config.models or [] if m.model_id == model_id), None)
+        return (match.capacity, match.capacity_known) if match else (None, False)
+
+    def _get_persisted_model_gpu_memory_utilization(self, instance: str, model_id: str) -> float | None:
+        """Look up the last-persisted auto-computed GPU utilization for a model, from a prior successful install.
+
+        Reusing this avoids spurious docker-compose diffs on reload: the auto-tuned default is sized off
+        currently-free VRAM (see `VllmService._get_default_gpu_memory_utilization`), which keeps shrinking
+        once the model's own container is already running and holding memory, making every reload look like
+        a config change and forcing an unnecessary container restart.
+        """
+        persisted = self.instances_info.get(instance)
+        if not persisted:
+            return None
+        match = next((m for m in persisted.config.models or [] if m.model_id == model_id), None)
+        return match.gpu_memory_utilization if match else None
 
     def _record_warning_in_background(self, message: str, *, instance: str | None = None, model_id: str | None = None) -> None:
         """Fire-and-forget a warning write from a synchronous callback, e.g. a promise's on_error."""
