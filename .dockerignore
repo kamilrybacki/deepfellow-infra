@@ -25,6 +25,17 @@ static/logo512.png
 static/manifest.json
 static/robots.txt
 
+# The DeepFellow Dashboard, from webui2/, emits a different set of names than the legacy UI.
+# Without these, a stray dashboard build left in static/ would enter the build context of a LEGACY image.
+static/apple-touch-icon.png
+static/favicon.svg
+static/icon-192.png
+static/icon-512.png
+static/manifest.webmanifest
+static/runtimeInjectedEnv.json
+static/tray-icon.png
+static/tray-icon@2x.png
+
 # Do not match pyproject.* files
 !pyproject.toml
 
@@ -37,3 +48,7 @@ LICENSE.md
 !webui/
 webui/dist
 webui/node_modules
+
+!webui2/
+webui2/dist
+webui2/node_modules

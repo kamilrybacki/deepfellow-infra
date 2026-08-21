@@ -26,8 +26,25 @@ memory
 /static/manifest.json
 /static/robots.txt
 
+# The DeepFellow Dashboard, from webui2/, emits a different set of names than the legacy UI.
+# They are listed here for the same reason as the names above: a UI build's output is generated, never committed.
+# `apps/deepFellow/dashboard/src/_tests/singleInstanceBuildScripts.spec.ts` in the Modular Frontend repository pins
+# the nine names that build emits, so a rename there fails a test rather than silently leaving a file untracked here.
+# The ninth is favicon.ico, which both UIs emit, so it is already in the list above.
+/static/apple-touch-icon.png
+/static/favicon.svg
+/static/icon-192.png
+/static/icon-512.png
+/static/manifest.webmanifest
+/static/runtimeInjectedEnv.json
+/static/tray-icon.png
+/static/tray-icon@2x.png
+
 /webui/node_modules
 /webui/dist
+
+/webui2/node_modules
+/webui2/dist
 
 /ollama
 
