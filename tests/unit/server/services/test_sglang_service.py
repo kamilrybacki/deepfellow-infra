@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -92,7 +93,7 @@ def _make_model_installed_info(
 def _setup_install_mocks(svc: SglangService, deps: dict[str, Any], hardware: str | bool | None = True) -> InstalledInfo:
     installed = _make_installed_info(hardware=hardware)
     svc.instances_info["default"].installed = installed
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=30000)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(30000, True))
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
     deps["docker_service"].get_container_host.return_value = "localhost"
@@ -751,6 +752,7 @@ def test_register_model_endpoint_llm_calls_chat_completion_proxy(svc: SglangServ
         model_id="google/test",
         context_window=4096,
         max_context_window=4096,
+        capacity=None,
     )
 
     assert gpu_deps["endpoint_registry"].register_chat_completion_as_proxy.call_count == 1
@@ -769,6 +771,7 @@ def test_register_model_endpoint_reranker_calls_rerank_proxy(svc: SglangService,
         model_id="google/reranker",
         context_window=None,
         max_context_window=None,
+        capacity=None,
     )
 
     assert gpu_deps["endpoint_registry"].register_rerank_as_proxy.call_count == 1
@@ -787,6 +790,7 @@ def test_register_model_endpoint_embedding_calls_embeddings_proxy(svc: SglangSer
         model_id="google/embedder",
         context_window=None,
         max_context_window=None,
+        capacity=None,
     )
 
     assert gpu_deps["endpoint_registry"].register_embeddings_as_proxy.call_count == 1
@@ -806,6 +810,7 @@ def test_register_model_endpoint_llm_uses_v1_paths(svc: SglangService, gpu_deps:
         model_id="google/test",
         context_window=None,
         max_context_window=None,
+        capacity=None,
     )
 
     kwargs = gpu_deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
@@ -813,6 +818,43 @@ def test_register_model_endpoint_llm_uses_v1_paths(svc: SglangService, gpu_deps:
     assert kwargs["completions"].url == "http://localhost:30000/v1/completions"
     assert kwargs["responses"].url == "http://localhost:30000/v1/responses"
     assert kwargs["messages"].url == "http://localhost:30000/v1/messages"
+
+
+def test_register_model_endpoint_passes_capacity_through(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    model = SglangModel(hf_id="google/test", size="1GB", model_type="llm")
+    model_info = _make_model_installed_info("google/test", model_type="llm")
+
+    svc._register_model_endpoint(  # pyright: ignore[reportPrivateUsage]
+        model_info=model_info,
+        model=model,
+        registered_name="google/test",
+        model_id="google/test",
+        context_window=4096,
+        max_context_window=4096,
+        capacity=8,
+    )
+
+    call_kwargs = gpu_deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
+    assert call_kwargs["registration_options"].capacity_state == 8
+
+
+def test_register_model_endpoint_marks_capacity_unknown_when_none(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    """capacity=None from SGLang always means "couldn't determine it", never "no concurrency concept"."""
+    model = SglangModel(hf_id="google/test", size="1GB", model_type="llm")
+    model_info = _make_model_installed_info("google/test", model_type="llm")
+
+    svc._register_model_endpoint(  # pyright: ignore[reportPrivateUsage]
+        model_info=model_info,
+        model=model,
+        registered_name="google/test",
+        model_id="google/test",
+        context_window=4096,
+        max_context_window=4096,
+        capacity=None,
+    )
+
+    call_kwargs = gpu_deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
+    assert call_kwargs["registration_options"].capacity_state == "unknown"
 
 
 @pytest.mark.asyncio
@@ -957,11 +999,11 @@ async def test_install_model_retries_without_is_embedding_flag_on_mismatch(
     svc.instances_info["default"].installed = installed
     observed_commands: list[str] = []
 
-    async def fake_install_and_run_docker(docker_options: Any) -> int:
+    async def fake_install_and_run_docker(docker_options: Any) -> tuple[int, bool]:
         observed_commands.append(docker_options.command)
         if len(observed_commands) == 1:
             raise RuntimeError("Please relaunch without --is-embedding for this model")
-        return 30000
+        return 30000, True
 
     gpu_deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=fake_install_and_run_docker)
     gpu_deps["docker_service"].get_docker_subnet.return_value = None
@@ -1132,7 +1174,7 @@ async def test_get_gpu_memory_utilization_increments_total(svc: SglangService) -
     model = SglangModel(hf_id="google/test", size="1GB")
     opts = SglangModelOptions(gpu_memory_utilization=0.5)
 
-    result = await svc._get_gpu_memory_utilization(opts, model)  # pyright: ignore[reportPrivateUsage]
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
 
     assert result == 0.5
     assert svc.gpu_memory_utilization == 0.5
@@ -1145,7 +1187,7 @@ async def test_get_gpu_memory_utilization_raises_422_when_sum_exceeds_1(svc: Sgl
     opts = SglangModelOptions(gpu_memory_utilization=0.5)
 
     with pytest.raises(HTTPException) as exc_info:
-        await svc._get_gpu_memory_utilization(opts, model)  # pyright: ignore[reportPrivateUsage]
+        await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
 
     assert exc_info.value.status_code == 422
 
@@ -2047,3 +2089,68 @@ async def test_install_model_releases_gpu_without_stopping_container_when_downlo
 
     assert svc.gpu_memory_utilization == 0.0
     gpu_deps["docker_service"].stop_docker.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            "max_total_num_tokens=665690, chunked_prefill_size=8192, max_prefill_tokens=16384, "
+            "max_running_requests=4096, context_len=65536, available_gpu_mem=13.50 GB",
+            4096,
+        ),
+        ("max_running_requests=1", 1),
+        ("max_running_requests=0", 1),
+        ("docker started successfully with no relevant log line", None),
+        (
+            "max_running_requests=32\nrestarting without --is-embedding\nmax_running_requests=64",
+            64,
+        ),
+        ("max_running_requests=abc", None),
+    ],
+)
+def test_parse_max_concurrency(raw: str, expected: int | None) -> None:
+    assert SglangService._parse_max_concurrency(raw) == expected  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_get_max_concurrency_from_logs_returns_parsed_value(svc: SglangService) -> None:
+    with patch.object(svc, "_get_docker_logs", new_callable=AsyncMock, return_value="max_running_requests=8, context_len=4096"):  # pyright: ignore[reportPrivateUsage]
+        result = await svc._get_max_concurrency_from_logs("my-container", "SGLang", svc._parse_max_concurrency)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 8
+
+
+@pytest.mark.asyncio
+async def test_get_max_concurrency_from_logs_returns_none_on_failure(svc: SglangService) -> None:
+    with patch.object(svc, "_get_docker_logs", new_callable=AsyncMock, side_effect=RuntimeError("boom")):  # pyright: ignore[reportPrivateUsage]
+        result = await svc._get_max_concurrency_from_logs("my-container", "SGLang", svc._parse_max_concurrency)  # pyright: ignore[reportPrivateUsage]
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_install_model_invalidates_log_cache_before_reading_capacity(
+    svc: SglangService, gpu_deps: dict[str, Any], tmp_path: Path
+) -> None:
+    """A reinstall on the same deterministic container name must not read the previous container's cached logs."""
+    _setup_install_mocks(svc, gpu_deps)
+    model_id = next(iter(svc.models["default"]))
+    svc._log_cache["container"] = (time.monotonic(), "max_running_requests=2", 8.0)  # pyright: ignore[reportPrivateUsage]
+
+    mock_result = MagicMock()
+    mock_result.stdout = "max_running_requests=16, context_len=4096"
+    mock_result.stderr = ""
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.sglang_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.sglang_service.get_base_url", return_value="http://localhost:30000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+        patch("server.services.base2_service.Utils.run_command", new_callable=AsyncMock, return_value=mock_result),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    call_kwargs = gpu_deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
+    assert call_kwargs["registration_options"].capacity_state == 16

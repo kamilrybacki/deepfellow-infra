@@ -1591,3 +1591,196 @@ async def test_install_model_registration_failure_skips_rollback_when_already_re
             await promise.wait()
 
     assert "test-llm" not in installed.models
+
+
+@pytest.mark.asyncio
+async def test_sync_warm_state_marks_loaded_model_warm(installed: InstalledInfo, svc: OllamaExternalService, deps: dict[str, Any]) -> None:
+    installed.models["test-llm"] = ModelInstalledInfo(
+        id="test-llm", registered_name="test-llm", type="llm", options=InstallModelIn(spec={}), registration_id="reg-1"
+    )
+
+    with patch("server.services.ollama_external_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=200, data=json.dumps({"models": [{"name": "test-llm"}]}))
+        await svc._sync_warm_state(installed)  # pyright: ignore[reportPrivateUsage]
+
+    deps["endpoint_registry"].update_warm.assert_called_once_with("reg-1", True)
+
+
+@pytest.mark.asyncio
+async def test_sync_warm_state_marks_evicted_model_cold(installed: InstalledInfo, svc: OllamaExternalService, deps: dict[str, Any]) -> None:
+    installed.models["test-llm"] = ModelInstalledInfo(
+        id="test-llm", registered_name="test-llm", type="llm", options=InstallModelIn(spec={}), registration_id="reg-1"
+    )
+
+    with patch("server.services.ollama_external_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=200, data=json.dumps({"models": []}))
+        await svc._sync_warm_state(installed)  # pyright: ignore[reportPrivateUsage]
+
+    deps["endpoint_registry"].update_warm.assert_called_once_with("reg-1", False)
+
+
+@pytest.mark.asyncio
+async def test_sync_warm_state_skips_model_without_registration_id(
+    installed: InstalledInfo, svc: OllamaExternalService, deps: dict[str, Any]
+) -> None:
+    installed.models["test-llm"] = ModelInstalledInfo(
+        id="test-llm", registered_name="test-llm", type="llm", options=InstallModelIn(spec={}), registration_id=""
+    )
+
+    with patch("server.services.ollama_external_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=200, data=json.dumps({"models": [{"name": "test-llm"}]}))
+        await svc._sync_warm_state(installed)  # pyright: ignore[reportPrivateUsage]
+
+    deps["endpoint_registry"].update_warm.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sync_warm_state_no_op_when_poll_fails(installed: InstalledInfo, svc: OllamaExternalService, deps: dict[str, Any]) -> None:
+    installed.models["test-llm"] = ModelInstalledInfo(
+        id="test-llm", registered_name="test-llm", type="llm", options=InstallModelIn(spec={}), registration_id="reg-1"
+    )
+
+    with patch("server.services.ollama_external_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=503, data="")
+        await svc._sync_warm_state(installed)  # pyright: ignore[reportPrivateUsage]
+
+    deps["endpoint_registry"].update_warm.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_loaded_model_names_returns_none_on_exception(svc: OllamaExternalService) -> None:
+    with patch("server.services.ollama_external_service.fetch_from", side_effect=ConnectionError("refused")):
+        result = await svc._get_loaded_model_names("http://localhost:11434")  # pyright: ignore[reportPrivateUsage]
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_start_warmth_poll_task_restarts_existing_task(svc: OllamaExternalService, installed: InstalledInfo) -> None:
+    svc._start_warmth_poll_task("default")  # pyright: ignore[reportPrivateUsage]
+    first_task = svc._warmth_poll_tasks["default"]  # pyright: ignore[reportPrivateUsage]
+
+    svc._start_warmth_poll_task("default")  # pyright: ignore[reportPrivateUsage]
+    second_task = svc._warmth_poll_tasks["default"]  # pyright: ignore[reportPrivateUsage]
+
+    await asyncio.gather(first_task, return_exceptions=True)
+    assert first_task is not second_task
+    assert first_task.cancelled()
+    assert svc._warmth_poll_tasks["default"] is second_task  # pyright: ignore[reportPrivateUsage]
+
+    svc._stop_warmth_poll_task("default")  # pyright: ignore[reportPrivateUsage]
+    await asyncio.gather(second_task, return_exceptions=True)
+    assert second_task.cancelled()
+    assert "default" not in svc._warmth_poll_tasks  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_warmth_poll_loop_ticks_and_stops_once_instance_uninstalled(svc: OllamaExternalService, installed: InstalledInfo) -> None:
+    calls = 0
+
+    async def fake_sync(_info: InstalledInfo) -> None:
+        nonlocal calls
+        calls += 1
+        svc.instances_info["default"].installed = None
+
+    with (
+        patch("server.services.ollama_external_service.asyncio.sleep", new_callable=AsyncMock),
+        patch.object(svc, "_sync_warm_state", new=AsyncMock(side_effect=fake_sync)),  # pyright: ignore[reportPrivateUsage]
+    ):
+        svc._start_warmth_poll_task("default")  # pyright: ignore[reportPrivateUsage]
+        task = svc._warmth_poll_tasks["default"]  # pyright: ignore[reportPrivateUsage]
+        await asyncio.wait_for(task, timeout=1)
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_warmth_poll_loop_breaks_when_not_installed(svc: OllamaExternalService) -> None:
+    with patch("server.services.ollama_external_service.asyncio.sleep", new_callable=AsyncMock):
+        svc._start_warmth_poll_task("default")  # pyright: ignore[reportPrivateUsage]
+        task = svc._warmth_poll_tasks["default"]  # pyright: ignore[reportPrivateUsage]
+        await asyncio.wait_for(task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_warmth_poll_loop_logs_and_continues_on_tick_exception(svc: OllamaExternalService, installed: InstalledInfo) -> None:
+    calls = 0
+
+    async def fake_sync(_info: InstalledInfo) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("boom")
+        svc.instances_info["default"].installed = None
+
+    with (
+        patch("server.services.ollama_external_service.asyncio.sleep", new_callable=AsyncMock),
+        patch.object(svc, "_sync_warm_state", new=AsyncMock(side_effect=fake_sync)),  # pyright: ignore[reportPrivateUsage]
+    ):
+        svc._start_warmth_poll_task("default")  # pyright: ignore[reportPrivateUsage]
+        task = svc._warmth_poll_tasks["default"]  # pyright: ignore[reportPrivateUsage]
+        await asyncio.wait_for(task, timeout=1)
+
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_warmth_poll_task_logs_error_on_unexpected_death(svc: OllamaExternalService, installed: InstalledInfo) -> None:
+    with (
+        patch("server.services.ollama_external_service.asyncio.sleep", new=AsyncMock(side_effect=RuntimeError("boom"))),
+        patch("server.services.ollama_external_service.logger") as mock_logger,
+    ):
+        svc._start_warmth_poll_task("default")  # pyright: ignore[reportPrivateUsage]
+        task = svc._warmth_poll_tasks["default"]  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await task
+
+    assert mock_logger.error.call_count == 1
+    assert "default" not in svc._warmth_poll_tasks  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_stop_instance_stops_warmth_poll_task(svc: OllamaExternalService) -> None:
+    async def never_ends() -> None:
+        await asyncio.sleep(9999)
+
+    task = asyncio.create_task(never_ends())
+    svc._warmth_poll_tasks["default"] = task  # pyright: ignore[reportPrivateUsage]
+
+    await svc.stop_instance("default")
+
+    await asyncio.sleep(0)
+    assert task.cancelled()
+    assert "default" not in svc._warmth_poll_tasks  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_uninstall_instance_cancels_active_warmth_poll_task(svc: OllamaExternalService) -> None:
+    svc.instances_info["default"].installed = _make_installed_info()
+
+    async def never_ends() -> None:
+        await asyncio.sleep(9999)
+
+    task = asyncio.create_task(never_ends())
+    svc._warmth_poll_tasks["default"] = task  # pyright: ignore[reportPrivateUsage]
+
+    with patch.object(svc, "_uninstall_model", new_callable=AsyncMock):  # pyright: ignore[reportPrivateUsage]
+        await svc._uninstall_instance("default", UninstallServiceIn(purge=False))  # pyright: ignore[reportPrivateUsage]
+
+    await asyncio.sleep(0)
+    assert task.cancelled()
+    assert "default" not in svc._warmth_poll_tasks  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_install_instance_starts_warmth_poll_task(svc: OllamaExternalService) -> None:
+    with patch("server.services.ollama_external_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=200, data=json.dumps({"version": "0.5.0"}))
+        with (
+            patch.object(svc, "_sync_models_from_external_ollama", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+            patch.object(svc, "_start_warmth_poll_task") as mock_start,  # pyright: ignore[reportPrivateUsage]
+        ):
+            promise = await svc.install_instance("default", InstallServiceIn(spec={"url": "http://localhost:11434"}), None)
+            await promise.wait()
+
+    mock_start.assert_called_once_with("default")

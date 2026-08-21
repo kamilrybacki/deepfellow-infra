@@ -993,7 +993,7 @@ async def test_install_instance_returns_installed_info(svc: SpeachesAIService, d
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-speaches"
     deps["docker_service"].get_user_for_docker = AsyncMock(return_value="0:0")
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8000)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True))
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 8000
     options = InstallServiceIn(spec={"hardware": False})
@@ -1015,7 +1015,7 @@ async def test_install_instance_calls_docker_install(svc: SpeachesAIService, dep
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-speaches"
     deps["docker_service"].get_user_for_docker = AsyncMock(return_value="0:0")
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8000)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True))
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 8000
     options = InstallServiceIn(spec={"hardware": False})
@@ -1038,7 +1038,7 @@ async def test_install_instance_loads_default_models_for_new_instance(svc: Speac
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-speaches-extra"
     deps["docker_service"].get_user_for_docker = AsyncMock(return_value="0:0")
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8000)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True))
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 8000
     options = InstallServiceIn(spec={})

@@ -164,3 +164,19 @@ def test_connect_to_mesh_url_set(monkeypatch: pytest.MonkeyPatch) -> None:
     s = AppSettings()  # pyright: ignore[reportCallIssue]
 
     assert s.connect_to_mesh_url == "http://mesh.url"
+
+
+@pytest.mark.parametrize("bad_value", ["0", "-1"])
+def test_ollama_num_parallel_clamps_non_positive(monkeypatch: pytest.MonkeyPatch, bad_value: str) -> None:
+    """`OLLAMA_NUM_PARALLEL=0` here (this is DeepFellow's own fallback default, not the Ollama
+    env var's "auto" sentinel) must not be allowed to fall through as a real capacity - it would
+    otherwise saturate every Ollama instance that doesn't override `num_parallel` itself. It's
+    clamped to 1 rather than rejected so an otherwise-valid `OLLAMA_NUM_PARALLEL=0` (the Ollama-side
+    "auto" sentinel) doesn't stop the whole application from starting."""
+    for k, v in _REQUIRED_ENV.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("OLLAMA_NUM_PARALLEL", bad_value)
+
+    s = AppSettings()  # pyright: ignore[reportCallIssue]
+
+    assert s.ollama_num_parallel == 1

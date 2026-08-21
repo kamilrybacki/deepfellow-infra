@@ -421,7 +421,7 @@ class CoquiService(Base2Service[InstalledInfo, DownloadedInfo]):
                         "start_period": "5s",
                     },
                 )
-                docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
+                docker_exposed_port, _ = await self.docker_service.install_and_run_docker(docker_options)
                 registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,

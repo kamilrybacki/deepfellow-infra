@@ -423,7 +423,7 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
                 image = DockerImage(name=docker_options.image, size=model.size)
                 await self._download_image_or_set_progress(stream, image)
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
-                docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
+                docker_exposed_port, _ = await self.docker_service.install_and_run_docker(docker_options)
                 container_host = self.docker_service.get_container_host(subnet, docker_options.name)
                 container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
                 info.models[model_id] = model_info = ModelInstalledInfo(

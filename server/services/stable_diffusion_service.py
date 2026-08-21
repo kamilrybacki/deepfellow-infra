@@ -395,7 +395,7 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
                     "start_period": "60s",
                 },
             )
-            docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
+            docker_exposed_port, _ = await self.docker_service.install_and_run_docker(docker_options)
 
             host = self.docker_service.get_container_host(subnet, docker_options.name)
             port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)

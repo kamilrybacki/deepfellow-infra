@@ -3,11 +3,16 @@
 
 """Config."""
 
+import logging
 import os
 from pathlib import Path
 
-from pydantic import AliasChoices, Field, SecretStr, ValidationError
+from pydantic import AliasChoices, Field, SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+
+from server.utils.validators import clamp_non_positive_to_one
+
+logger = logging.getLogger("uvicorn.error")
 
 
 class ConfigError(Exception):
@@ -43,6 +48,7 @@ class AppSettings(BaseSettings):
 
     connect_to_mesh_url: str = ""
     connect_to_mesh_key: SecretStr = SecretStr("")
+    share_models_downstream: bool = True  # expose own + ancestor models to connecting subinfras
 
     hugging_face_token: SecretStr = SecretStr("")
     civitai_token: SecretStr = SecretStr("")
@@ -67,6 +73,14 @@ class AppSettings(BaseSettings):
     ollama_kv_cache_type: str = Field(default="f16", validation_alias=AliasChoices("OLLAMA_KV_CACHE_TYPE"))
     ollama_num_parallel: int = Field(default=1, validation_alias=AliasChoices("OLLAMA_NUM_PARALLEL"))
     ollama_vram_overhead_factor: float = Field(default=1.0, validation_alias=AliasChoices("OLLAMA_VRAM_OVERHEAD_FACTOR"))
+
+    @field_validator("ollama_num_parallel")
+    @classmethod
+    def _clamp_ollama_num_parallel(cls, value: int) -> int:
+        """Clamp non-positive values to 1 instead of rejecting them, since 0 ("auto") is a valid Ollama value."""
+        return clamp_non_positive_to_one(
+            value, logger, 'OLLAMA_NUM_PARALLEL=%r is non-positive; clamping to 1 instead of Ollama\'s real 0 ("auto", up to 4) behavior.'
+        )
 
     model_config = SettingsConfigDict(
         env_file=".env",

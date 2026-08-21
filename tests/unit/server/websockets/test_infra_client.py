@@ -8,7 +8,14 @@ from unittest.mock import AsyncMock, MagicMock, call
 import pytest
 
 from server.websockets.infra_client import InfraClient
-from server.websockets.models import InitRequest, InitResponse, TopologyUpdateRequest, UpdateModelsRequest, UsageChangeRequest
+from server.websockets.models import (
+    InitRequest,
+    InitResponse,
+    TopologyUpdateRequest,
+    UpdateModelsRequest,
+    UsageChangeRequest,
+    WarmChangeRequest,
+)
 
 
 def _make_rpc_client(return_value: object = "OK") -> MagicMock:
@@ -57,6 +64,28 @@ async def test_usage_change_returns_ok() -> None:
     infra = InfraClient(rpc)
 
     result = await infra.usage_change(MagicMock(spec=UsageChangeRequest))
+
+    assert result == "OK"
+
+
+@pytest.mark.asyncio
+async def test_warm_change_calls_warm_change_method() -> None:
+    rpc = _make_rpc_client()
+    infra = InfraClient(rpc)
+    params = MagicMock(spec=WarmChangeRequest)
+
+    await infra.warm_change(params)
+
+    assert rpc.request.await_count == 1
+    assert rpc.request.await_args == call("warm_change", params)
+
+
+@pytest.mark.asyncio
+async def test_warm_change_returns_ok() -> None:
+    rpc = _make_rpc_client("OK")
+    infra = InfraClient(rpc)
+
+    result = await infra.warm_change(MagicMock(spec=WarmChangeRequest))
 
     assert result == "OK"
 

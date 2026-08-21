@@ -4,6 +4,7 @@
 import json
 import logging
 import time
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -11,7 +12,7 @@ import aiohttp
 import pytest
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 import server.endpointregistry as _er_module
 from server.endpointregistry import (
@@ -76,6 +77,7 @@ def make_parent_infra() -> MagicMock:
     pi = MagicMock()
     pi.send_models_list = MagicMock()
     pi.send_usage = MagicMock()
+    pi.send_warm = MagicMock()
     return pi
 
 
@@ -312,9 +314,135 @@ def test_get_model_returns_none_when_model_not_registered():
     assert ep.get_model("gpt-4") is None
 
 
-def test_get_model_returns_model_with_zero_usage_immediately():
+def test_get_model_prefers_higher_capacity_over_lower_when_not_saturated():
     ep = make_endpoint()
-    rid = ep.add_model("gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local", usage=0))
+    ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", usage=3, capacity_state=4),
+    )
+    rid2 = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", usage=0, capacity_state=10),
+    )
+
+    result = ep.get_model("gpt-4")
+
+    assert result is not None
+    assert result.id == rid2
+
+
+def test_get_model_spills_over_when_top_ranked_local_instance_saturated():
+    ep = make_endpoint()
+    ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", usage=4, capacity_state=4),
+    )
+    rid2 = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", usage=1, capacity_state=2),
+    )
+
+    result = ep.get_model("gpt-4")
+
+    assert result is not None
+    assert result.id == rid2
+
+
+def test_get_model_prefers_warm_over_higher_capacity_cold():
+    ep = make_endpoint()
+    ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=100, warm=False),
+    )
+    rid_warm = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=1, warm=True),
+    )
+
+    result = ep.get_model("gpt-4")
+
+    assert result is not None
+    assert result.id == rid_warm
+
+
+def test_get_model_prefers_higher_capacity_among_equally_warm():
+    ep = make_endpoint()
+    ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=2, warm=True),
+    )
+    rid_bigger = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=8, warm=True),
+    )
+
+    result = ep.get_model("gpt-4")
+
+    assert result is not None
+    assert result.id == rid_bigger
+
+
+def test_get_model_packs_onto_same_instance_among_equal_warmth_and_capacity():
+    """Requests must pack onto one instance of an equally-ranked tier until it saturates,
+    not spread randomly across every instance in that tier - see `_pick_ranked_model`."""
+    ep = make_endpoint()
+    ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=4, warm=True),
+    )
+    ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=4, warm=True),
+    )
+
+    seen: set[str] = set()
+    for _ in range(50):
+        result = ep.get_model("gpt-4")
+        assert result is not None
+        seen.add(result.id)
+
+    assert len(seen) == 1
+
+
+def test_get_model_local_registration_usable_up_to_full_capacity():
+    ep = make_endpoint()
+    rid = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=4, usage=3),
+    )
 
     result = ep.get_model("gpt-4")
 
@@ -322,27 +450,492 @@ def test_get_model_returns_model_with_zero_usage_immediately():
     assert result.id == rid
 
 
-def test_get_model_returns_lowest_usage_when_all_busy():
+def test_get_model_mesh_registration_reserves_headroom_below_full_capacity():
     ep = make_endpoint()
     ep.add_model(
         "gpt-4",
         make_props(),
         SimpleEndpoint(on_request=AsyncMock()),
         "llm",
-        RegistrationOptions(origin="local", usage=3),
+        RegistrationOptions(origin="https://peer", capacity_state=10, usage=9, owned_by="mesh"),
+    )
+    rid_fallback = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=1, usage=0),
+    )
+
+    result = ep.get_model("gpt-4")
+
+    assert result is not None
+    assert result.id == rid_fallback
+
+
+def test_get_model_mesh_registration_wins_below_its_headroom_threshold():
+    ep = make_endpoint()
+    rid_mesh = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="https://peer", capacity_state=10, usage=5, owned_by="mesh"),
+    )
+    ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=1, usage=0),
+    )
+
+    result = ep.get_model("gpt-4")
+
+    assert result is not None
+    assert result.id == rid_mesh
+
+
+@pytest.mark.parametrize("bad_capacity", [0, -1])
+def test_registered_model_rejects_non_positive_capacity(bad_capacity: int) -> None:
+    """Construction-time guard: a zero/negative capacity is a programming error, not "unknown" - it
+    must fail loudly here rather than silently saturate the instance (`num_parallel=0` was exactly
+    this bug, now fixed upstream in ollama_service, but this is the last line of defense)."""
+    with pytest.raises(ValidationError):
+        RegisteredModel(
+            id="fake-id",
+            name="gpt-4",
+            origin="local",
+            props=make_props(),
+            type="llm",
+            endpoint=SimpleEndpoint(on_request=AsyncMock()),
+            usage=0,
+            created=0,
+            owned_by="local",
+            capacity_state=bad_capacity,
+        )
+
+
+@pytest.mark.parametrize("bad_capacity", [0, -1])
+def test_model_wire_schema_coerces_non_positive_capacity_to_unknown(bad_capacity: int) -> None:
+    """Unlike the internal `RegisteredModel` boundary, a mesh peer is untrusted input: a
+    malformed `capacity` must degrade to "unknown" rather than raise and break mesh sync."""
+    model = Model(id="id-1", name="gpt-4", type="llm", props=make_props(), usage=0, capacity=bad_capacity, capacity_known=True)
+
+    assert model.capacity is None
+    assert model.capacity_known is False
+
+
+def test_model_wire_schema_coerces_string_capacity_to_unknown() -> None:
+    """A peer sending `capacity` as a non-int (e.g. `"0"`, before Pydantic's own coercion runs)
+    must degrade to "unknown" rather than crash the validator itself with a raw TypeError from
+    comparing a str to an int."""
+    model = Model.model_validate(
+        {"id": "id-1", "name": "gpt-4", "type": "llm", "props": make_props().model_dump(), "usage": 0, "capacity": "0"}
+    )
+
+    assert model.capacity is None
+    assert model.capacity_known is False
+
+
+def test_model_wire_schema_coerces_non_numeric_string_capacity_to_unknown() -> None:
+    """A peer sending a genuinely non-numeric `capacity` string must degrade to "unknown"
+    rather than crash the validator itself with a raw ValueError from `float()`."""
+    model = Model.model_validate(
+        {"id": "id-1", "name": "gpt-4", "type": "llm", "props": make_props().model_dump(), "usage": 0, "capacity": "garbage"}
+    )
+
+    assert model.capacity is None
+    assert model.capacity_known is False
+
+
+@pytest.mark.parametrize("bool_capacity", [True, False])
+def test_model_wire_schema_coerces_bool_capacity_to_unknown(bool_capacity: bool) -> None:
+    """A bool is technically an int subclass but never a legitimate capacity; it must degrade
+    to "unknown" rather than silently pass through pydantic's own bool->int coercion."""
+    model = Model.model_validate(
+        {"id": "id-1", "name": "gpt-4", "type": "llm", "props": make_props().model_dump(), "usage": 0, "capacity": bool_capacity}
+    )
+
+    assert model.capacity is None
+    assert model.capacity_known is False
+
+
+def test_model_wire_schema_accepts_whole_number_float_string_capacity() -> None:
+    """A numeric string like "5.0" is a legitimate capacity serialized as a whole-number float
+    and must reach pydantic's normal int coercion like an equivalent float or int would."""
+    model = Model.model_validate(
+        {
+            "id": "id-1",
+            "name": "gpt-4",
+            "type": "llm",
+            "props": make_props().model_dump(),
+            "usage": 0,
+            "capacity": "5.0",
+            "capacity_known": True,
+        }
+    )
+
+    assert model.capacity == 5
+    assert model.capacity_known is True
+
+
+def test_model_wire_schema_coerces_absurdly_large_capacity_to_unknown() -> None:
+    """A capacity far beyond what any real backend could serve is a corrupted/malicious value,
+    not a legitimate capacity, and must degrade to "unknown" rather than be accepted verbatim."""
+    model = Model.model_validate(
+        {"id": "id-1", "name": "gpt-4", "type": "llm", "props": make_props().model_dump(), "usage": 0, "capacity": 1e20}
+    )
+
+    assert model.capacity is None
+    assert model.capacity_known is False
+
+
+def test_model_wire_schema_rejects_non_dict_item() -> None:
+    """A peer sending a non-dict item in place of a model object must raise a clean
+    ValidationError, not crash the validator itself with a raw AttributeError from calling
+    `.get()` on it."""
+    with pytest.raises(ValidationError):
+        Model.model_validate("notadict")
+
+
+def test_model_wire_schema_preserves_genuinely_unbounded_capacity() -> None:
+    """`capacity=None, capacity_known=True` (e.g. a cloud/proxy peer) must survive the `Model`
+    boundary as-is - it must not collapse to "unknown" (capacity_known=False) alongside the
+    malformed-input case above, since that would flip it to the worst rather than best rank."""
+    model = Model(id="id-1", name="gpt-4", type="llm", props=make_props(), usage=0, capacity=None, capacity_known=True)
+
+    assert model.capacity is None
+    assert model.capacity_known is True
+
+
+def test_get_model_capacity_none_treated_as_unbounded():
+    ep = make_endpoint()
+    rid = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state="unbounded", usage=1000),
+    )
+
+    result = ep.get_model("gpt-4")
+
+    assert result is not None
+    assert result.id == rid
+
+
+def test_get_model_falls_back_to_saturated_candidate_when_only_one_exists():
+    ep = make_endpoint()
+    rid = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=2, usage=2),
+    )
+
+    result = ep.get_model("gpt-4")
+
+    assert result is not None
+    assert result.id == rid
+
+
+def test_get_model_spills_over_from_saturated_warm_tier_to_available_cold_tier():
+    ep = make_endpoint()
+    ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=2, usage=2, warm=True),
+    )
+    rid_cold = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=2, usage=0, warm=False),
+    )
+
+    result = ep.get_model("gpt-4")
+
+    assert result is not None
+    assert result.id == rid_cold
+
+
+def test_get_model_falls_back_to_least_loaded_among_multiple_saturated():
+    ep = make_endpoint()
+    ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=2, usage=9),
+    )
+    rid_less_loaded = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=2, usage=3),
+    )
+
+    result = ep.get_model("gpt-4")
+
+    assert result is not None
+    assert result.id == rid_less_loaded
+
+
+def test_get_model_spills_over_within_same_tier_once_lower_id_candidate_saturates():
+    """The intra-tier packing loop (`_pick_ranked_model`) must actually advance past a saturated,
+    lower-id candidate to the next id-ordered one in the same tier - not just always return the
+    first member, which would make the "then spill over" half of packing untested."""
+    ep = make_endpoint()
+    rid_a = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=4, usage=0, warm=True),
+    )
+    rid_b = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=4, usage=0, warm=True),
+    )
+    lower_id, higher_id = sorted([rid_a, rid_b])
+    ep.models["gpt-4"][lower_id].usage = 4  # saturate whichever candidate packing would try first
+
+    result = ep.get_model("gpt-4")
+
+    assert result is not None
+    assert result.id == higher_id
+
+
+def test_get_model_registration_id_bypasses_ranking_even_when_saturated():
+    """A caller pinning a specific `registration_id` (e.g. sticky routing) must get that exact
+    registration back regardless of ranking or saturation - the ranking/packing logic only
+    applies when no explicit target is given."""
+    ep = make_endpoint()
+    rid_saturated_cold = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=2, usage=2, warm=False),
+    )
+    ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=2, usage=0, warm=True),
+    )
+
+    result = ep.get_model("gpt-4", registration_id=rid_saturated_cold)
+
+    assert result is not None
+    assert result.id == rid_saturated_cold
+
+
+def test_get_model_mesh_registration_capacity_one_boundary():
+    """A mesh registration with capacity=1 has a saturation threshold of 0.9 (90% of 1); usage=0
+    must still be usable (below threshold), while usage=1 must be treated as saturated."""
+    ep = make_endpoint()
+    rid_mesh = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="https://peer", capacity_state=1, usage=0, owned_by="mesh"),
+    )
+
+    result = ep.get_model("gpt-4")
+
+    assert result is not None
+    assert result.id == rid_mesh
+
+    ep.models["gpt-4"][rid_mesh].usage = 1
+    rid_fallback = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=1, usage=0),
+    )
+
+    result = ep.get_model("gpt-4")
+
+    assert result is not None
+    assert result.id == rid_fallback
+
+
+def test_get_model_saturated_fallback_random_tie_break_among_equal_usage():
+    ep = make_endpoint()
+    rid1 = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=2, usage=2),
     )
     rid2 = ep.add_model(
         "gpt-4",
         make_props(),
         SimpleEndpoint(on_request=AsyncMock()),
         "llm",
-        RegistrationOptions(origin="local", usage=1),
+        RegistrationOptions(origin="local", capacity_state=2, usage=2),
+    )
+
+    seen: set[str] = set()
+    for _ in range(50):
+        result = ep.get_model("gpt-4")
+        assert result is not None
+        seen.add(result.id)
+
+    assert seen == {rid1, rid2}
+
+
+def test_get_model_saturated_fallback_searches_across_all_tiers():
+    ep = make_endpoint()
+    ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=2, usage=2, warm=True),
+    )
+    rid_cold_less_loaded = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=1, usage=1, warm=False),
     )
 
     result = ep.get_model("gpt-4")
 
     assert result is not None
-    assert result.id == rid2
+    assert result.id == rid_cold_less_loaded
+
+
+def test_get_model_prefers_known_capacity_over_unknown_capacity():
+    ep = make_endpoint()
+    rid_known = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=1, usage=0),
+    )
+    ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state="unknown", usage=0),
+    )
+
+    result = ep.get_model("gpt-4")
+
+    assert result is not None
+    assert result.id == rid_known
+
+
+def test_get_model_prefers_known_finite_capacity_over_genuinely_unbounded():
+    """A genuinely unbounded backend (e.g. a cloud/proxy model) must not monopolize traffic ahead
+    of a known, finite-capacity local backend - it ranks as overflow, used only once known-capacity
+    backends saturate. See `_rank_key`'s docstring for the reasoning and the tradeoff this implies.
+    """
+    ep = make_endpoint()
+    rid_known = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state=1, usage=0),
+    )
+    ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state="unbounded", usage=0),
+    )
+
+    result = ep.get_model("gpt-4")
+
+    assert result is not None
+    assert result.id == rid_known
+
+
+def test_get_model_treats_genuinely_unbounded_capacity_as_better_than_unknown():
+    """Unbounded still outranks the "failed to determine capacity" tier - it's a real, deliberate
+    capability, not a parse failure, so it must not be lumped in with genuine unknowns.
+    """
+    ep = make_endpoint()
+    rid_unbounded = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state="unbounded", usage=0),
+    )
+    ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state="unknown", usage=0),
+    )
+
+    result = ep.get_model("gpt-4")
+
+    assert result is not None
+    assert result.id == rid_unbounded
+
+
+def test_rank_key_raises_on_invalid_capacity_state():
+    """Defensive fallback: `capacity_state` is pydantic-validated at construction, but `_rank_key`
+    must still fail loudly rather than silently mis-ranking if an invalid value ever slips through.
+    """
+    bogus = SimpleNamespace(capacity_state="bogus", warm=True)
+
+    with pytest.raises(ValueError, match="Unknown capacity_state"):
+        _er_module._rank_key(bogus)  # pyright: ignore[reportPrivateUsage, reportArgumentType]
+
+
+def test_get_model_with_multiple_unbounded_candidates_picks_least_loaded():
+    ep = make_endpoint()
+    ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state="unbounded", usage=5),
+    )
+    rid_least_loaded = ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state="unbounded", usage=1),
+    )
+    ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", capacity_state="unbounded", usage=3),
+    )
+
+    result = ep.get_model("gpt-4")
+
+    assert result is not None
+    assert result.id == rid_least_loaded
 
 
 def test_get_model_with_filter_excludes_non_matching():
@@ -520,6 +1113,76 @@ def test_list_models_returns_registered_model_entries():
 
     assert len(items) == 1
     assert items[0].name == "gpt-4"
+
+
+def test_list_models_includes_capacity():
+    ep = make_endpoint()
+    ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="rid-1", capacity_state=8),
+    )
+
+    items = ep.list_models()
+
+    assert len(items) == 1
+    assert items[0].capacity == 8
+
+
+def test_list_models_includes_capacity_known_and_warm():
+    ep = make_endpoint()
+    ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="rid-1", capacity_state="unknown", warm=False),
+    )
+
+    items = ep.list_models()
+
+    assert len(items) == 1
+    assert items[0].capacity is None
+    assert items[0].capacity_known is False
+    assert items[0].warm is False
+
+
+def test_list_models_excludes_mesh_ancestor_owned_models():
+    ep = make_endpoint()
+    ep.add_model(
+        "local-model", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local", id="rid-local")
+    )
+    ep.add_model(
+        "ancestor-model",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="https://ancestor", id="rid-ancestor", owned_by="mesh-ancestor"),
+    )
+
+    items = ep.list_models()
+
+    assert [item.name for item in items] == ["local-model"]
+
+
+def test_list_models_custom_exclude_owned_by_also_excludes_mesh():
+    ep = make_endpoint()
+    ep.add_model(
+        "local-model", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local", id="rid-local")
+    )
+    ep.add_model(
+        "child-model",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="https://child", id="rid-child", owned_by="mesh"),
+    )
+
+    items = ep.list_models(frozenset({"mesh", "mesh-ancestor"}))
+
+    assert [item.name for item in items] == ["local-model"]
 
 
 def test_list_models_strips_subtype_suffix_from_type():
@@ -723,6 +1386,20 @@ def test_registry_list_models_returns_all():
     names = [m.name for m in models]
     assert "emb" in names
     assert "rnk" in names
+
+
+def test_registry_list_own_models_excludes_both_mesh_directions():
+    reg = make_registry()
+    props = make_props()
+    reg.register_chat_completion("local-model", props, make_chat_endpoint(), RegistrationOptions(origin="local", id="rid-local"))
+    child_model = Model(id="rid-child", name="child-model", type="llm", props=props, usage=0)
+    ancestor_model = Model(id="rid-ancestor", name="ancestor-model", type="llm", props=props, usage=0)
+    reg.update_models([], [child_model], "http://child.example.com/", "childkey")
+    reg.update_models([], [ancestor_model], "http://ancestor.example.com/", "ancestorkey", owned_by="mesh-ancestor")
+
+    names = [m.name for m in reg.list_own_models()]
+
+    assert names == ["local-model"]
 
 
 def test_register_chat_completion_registers_model():
@@ -1059,7 +1736,7 @@ def test_update_models_registers_new_models():
 def test_update_models_removes_old_models():
     reg = make_registry()
     ep = make_chat_endpoint()
-    reg.register_chat_completion("gpt-4", make_props(), ep, RegistrationOptions(origin="local", id="old-id"))
+    reg.register_chat_completion("gpt-4", make_props(), ep, RegistrationOptions(origin="local", id="old-id", owned_by="mesh"))
     old_model = Model(id="old-id", name="gpt-4", type="llm", props=make_props(), usage=0)
 
     reg.update_models([old_model], [], "http://api.example.com/", "mykey")
@@ -1075,6 +1752,139 @@ def test_update_models_registers_new_models_with_mesh_owned_by():
 
     model = reg.get_model("gpt-4")
     assert model.owned_by == "mesh"
+
+
+def test_update_models_registers_new_models_with_explicit_owned_by():
+    reg = make_registry()
+    new_model = Model(id="new-id", name="gpt-4", type="llm", props=make_props(), usage=0)
+
+    reg.update_models([], [new_model], "http://ancestor.example.com/", "mykey", owned_by="mesh-ancestor")
+
+    model = reg.get_model("gpt-4")
+    assert model.owned_by == "mesh-ancestor"
+
+
+def test_update_models_ignores_colliding_id_from_different_owner():
+    """An older/misbehaving mesh peer echoing back an id it doesn't own must not shadow the real owner."""
+    reg = make_registry()
+    ep = make_chat_endpoint()
+    reg.register_chat_completion("gpt-4", make_props(), ep, RegistrationOptions(origin="local", id="shared-id", owned_by="local"))
+    colliding_model = Model(id="shared-id", name="other-model", type="llm", props=make_props(), usage=0)
+
+    reg.update_models([], [colliding_model], "http://ancestor.example.com/", "mykey", owned_by="mesh-ancestor")
+
+    model = reg.get_model("gpt-4")
+    assert model.owned_by == "local"
+    assert not reg.chat_completion_endpoints.has_model("other-model")
+
+
+def test_update_models_does_not_remove_colliding_id_owned_by_someone_else():
+    """A stale ancestor entry must not delete a local model that happens to reuse its id."""
+    reg = make_registry()
+    ep = make_chat_endpoint()
+    reg.register_chat_completion("gpt-4", make_props(), ep, RegistrationOptions(origin="local", id="shared-id", owned_by="local"))
+    stale_ancestor_model = Model(id="shared-id", name="gpt-4", type="llm", props=make_props(), usage=0)
+
+    reg.update_models([stale_ancestor_model], [], "http://ancestor.example.com/", "mykey", owned_by="mesh-ancestor")
+
+    model = reg.get_model("gpt-4")
+    assert model.owned_by == "local"
+
+
+def test_model_deserializes_missing_capacity_field_as_none():
+    """Old peer -> new node: a raw mesh payload without `capacity` degrades to None instead of failing."""
+    raw = {"id": "id-1", "name": "gpt-4", "type": "llm", "props": make_props().model_dump(), "usage": 0}
+
+    model = Model.model_validate(raw)
+
+    assert model.capacity is None
+
+
+def test_model_deserializes_present_capacity_field():
+    """New peer -> old node: an explicit `capacity` field parses through untouched."""
+    raw = {"id": "id-1", "name": "gpt-4", "type": "llm", "props": make_props().model_dump(), "usage": 0, "capacity": 8}
+
+    model = Model.model_validate(raw)
+
+    assert model.capacity == 8
+
+
+def test_update_models_preserves_capacity_from_mesh_child():
+    reg = make_registry()
+    new_model = Model(id="new-id", name="gpt-4", type="llm", props=make_props(), usage=0, capacity=8)
+
+    reg.update_models([], [new_model], "http://api.example.com/", "mykey")
+
+    registered = reg.chat_completion_endpoints.models["gpt-4"]["new-id"]
+    assert registered.capacity_state == 8
+
+
+def test_update_models_defaults_capacity_to_none_when_missing():
+    reg = make_registry()
+    new_model = Model(id="new-id", name="gpt-4", type="llm", props=make_props(), usage=0)
+
+    reg.update_models([], [new_model], "http://api.example.com/", "mykey")
+
+    registered = reg.chat_completion_endpoints.models["gpt-4"]["new-id"]
+    assert registered.capacity_state == "unknown"
+
+
+def test_model_deserializes_missing_capacity_known_and_warm_as_false():
+    """Old peer -> new node: a raw mesh payload missing these fields defaults capacity to unknown and treats the model as cold, not warm."""
+    raw = {"id": "id-1", "name": "gpt-4", "type": "llm", "props": make_props().model_dump(), "usage": 0}
+
+    model = Model.model_validate(raw)
+
+    assert model.capacity_known is False
+    assert model.warm is False
+
+
+def test_update_models_preserves_capacity_known_and_warm_from_mesh_child():
+    reg = make_registry()
+    new_model = Model(id="new-id", name="gpt-4", type="llm", props=make_props(), usage=0, capacity=None, capacity_known=False, warm=False)
+
+    reg.update_models([], [new_model], "http://api.example.com/", "mykey")
+
+    registered = reg.chat_completion_endpoints.models["gpt-4"]["new-id"]
+    assert registered.capacity_state == "unknown"
+    assert registered.warm is False
+
+
+def test_update_warm_updates_model_warm_state():
+    reg = make_registry()
+    ep = make_chat_endpoint()
+    rid = reg.register_chat_completion("gpt-4", make_props(), ep, RegistrationOptions(origin="local", warm=True))
+
+    reg.update_warm(rid, False)
+
+    assert reg.registry[rid].registered_model.warm is False
+
+
+def test_update_warm_no_op_for_unknown_id():
+    reg = make_registry()
+    reg.update_warm("nonexistent", False)  # must not raise
+
+
+def test_update_warm_propagates_to_parent_infra_when_changed():
+    reg = make_registry()
+    ep = make_chat_endpoint()
+    rid = reg.register_chat_completion("gpt-4", make_props(), ep, RegistrationOptions(origin="local", warm=True))
+    reg.parent_infra.send_warm.reset_mock()  # pyright: ignore[reportAttributeAccessIssue]
+
+    reg.update_warm(rid, False)
+
+    assert reg.parent_infra.send_warm.call_count == 1  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_update_warm_does_not_propagate_when_unchanged():
+    reg = make_registry()
+    ep = make_chat_endpoint()
+    rid = reg.register_chat_completion("gpt-4", make_props(), ep, RegistrationOptions(origin="local", warm=True))
+    reg.parent_infra.send_warm.reset_mock()  # pyright: ignore[reportAttributeAccessIssue]
+
+    reg.update_warm(rid, True)
+
+    assert reg.parent_infra.send_warm.call_count == 0  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def test_update_models_sends_models_list_when_changed():
@@ -1098,6 +1908,46 @@ def test_update_models_no_notification_when_nothing_changes():
     reg.update_models([existing], [existing], "http://api.example.com/", "mykey")
 
     assert reg.parent_infra.send_models_list.call_count == 0  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_update_models_refreshes_proxy_when_api_key_rotates():
+    """A rotated peer API key must be re-applied to already-registered proxies, not just to new ones."""
+    reg = make_registry()
+    existing = Model(id="exist-id", name="gpt-4", type="llm", props=make_props(), usage=0)
+    reg.update_models([], [existing], "http://api.example.com/", "oldkey")
+
+    with patch.object(reg, "_register_proxy") as mock_register:
+        reg.update_models([existing], [existing], "http://api.example.com/", "newkey")
+
+    assert mock_register.call_count == 1
+    assert mock_register.call_args.kwargs["api_key"] == "newkey"
+
+
+def test_update_models_no_refresh_when_api_key_unchanged():
+    reg = make_registry()
+    existing = Model(id="exist-id", name="gpt-4", type="llm", props=make_props(), usage=0)
+    reg.update_models([], [existing], "http://api.example.com/", "samekey")
+
+    with patch.object(reg, "_register_proxy") as mock_register:
+        reg.update_models([existing], [existing], "http://api.example.com/", "samekey")
+
+    assert mock_register.call_count == 0
+
+
+def test_update_models_key_rotation_does_not_touch_colliding_id_owned_by_someone_else():
+    """A rotated ancestor key must not re-register an id that collided with a different owner."""
+    reg = make_registry()
+    ep = make_chat_endpoint()
+    reg.register_chat_completion("gpt-4", make_props(), ep, RegistrationOptions(origin="local", id="shared-id", owned_by="local"))
+    colliding_model = Model(id="shared-id", name="other-model", type="llm", props=make_props(), usage=0)
+    reg.update_models([], [colliding_model], "http://ancestor.example.com/", "oldkey", owned_by="mesh-ancestor")
+
+    with patch.object(reg, "_register_proxy") as mock_register:
+        reg.update_models([colliding_model], [colliding_model], "http://ancestor.example.com/", "newkey", owned_by="mesh-ancestor")
+
+    assert mock_register.call_count == 0
+    model = reg.get_model("gpt-4")
+    assert model.owned_by == "local"
 
 
 def test_register_proxy_llm_registers_chat_completion():

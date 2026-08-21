@@ -3,6 +3,7 @@
 
 """Websocket Manager for subinfras."""
 
+import json
 import logging
 from typing import TYPE_CHECKING
 
@@ -13,13 +14,22 @@ from server.utils.core import OneTimeKey
 from server.utils.exceptions import ApiError
 from server.utils.json_rpc_client import JsonRpcClient
 from server.websockets.infra_client import InfraClient
-from server.websockets.models import AncestorInfo, InitRequest, TopologyUpdateRequest, UpdateModelsRequest, UsageChangeRequest
+from server.websockets.models import (
+    AncestorInfo,
+    AncestorsNotification,
+    InitRequest,
+    TopologyUpdateRequest,
+    UpdateModelsRequest,
+    UsageChangeRequest,
+    WarmChangeRequest,
+)
 from server.websockets.websocket_client import WebSocketClient
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from server.endpointregistry import EndpointRegistry
+    from server.models.api import Model
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -36,6 +46,9 @@ class ParentInfra(WebSocketClient):
         self.enabled = self.parent_url != ""
         self.one_time_key = OneTimeKey()
         self._ancestors: list[AncestorInfo] = []
+        self._registered_ancestor_models: dict[str, list[Model]] = {}
+        self.on_ancestors_changed: Callable[[], None] = lambda: None
+        self._warm_change_unsupported = False
         self.get_children: Callable[[], dict[str, TopologyUpdateRequest]] = dict
         uri = f"{self.parent_url}/ws" if self.enabled else ""
         super().__init__(uri)
@@ -51,12 +64,45 @@ class ParentInfra(WebSocketClient):
         self.send(data)
 
     def on_message(self, msg: str | bytes) -> None:
-        """Perform action on new message."""
+        """Perform action on new message.
+
+        An unsolicited `ancestors_update` push (see `AncestorsNotification`) is handled directly;
+        everything else is assumed to be a JSON-RPC response to one of our own pending requests
+        and handed to `JsonRpcClient.resolve`, which does its own parsing/validation.
+        """
+        try:
+            obj = json.loads(msg)
+        except Exception:
+            self.client.resolve(msg)
+            return
+        if isinstance(obj, dict) and obj.get("type") == "ancestors_update":
+            self._apply_ancestors(AncestorsNotification.model_validate(obj).ancestors)
+            return
         self.client.resolve(msg)
 
     def on_disconnect(self) -> None:
         """Perform action on disconnect."""
         self.client.clear()
+        self._apply_ancestors([])
+
+    def _apply_ancestors(self, new_ancestors: list[AncestorInfo]) -> None:
+        """Register/unregister proxy endpoints for models exposed by ancestors, and notify children.
+
+        Ancestor models are registered with `owned_by="mesh-ancestor"` so `EndpointRegistry.list_models()`
+        excludes them from what gets reported back upward (to the very ancestor that sent them) or
+        re-offered downward as if they were this node's own.
+        """
+        self._ancestors = new_ancestors
+        new_by_url = {a.url: a for a in new_ancestors}
+        for url, prev_models in list(self._registered_ancestor_models.items()):
+            if url not in new_by_url:
+                self.endpoint_registry.update_models(prev_models, [], url, "", owned_by="mesh-ancestor")
+                del self._registered_ancestor_models[url]
+        for ancestor in new_ancestors:
+            prev_models = self._registered_ancestor_models.get(ancestor.url, [])
+            self.endpoint_registry.update_models(prev_models, ancestor.models, ancestor.url, ancestor.api_key, owned_by="mesh-ancestor")
+            self._registered_ancestor_models[ancestor.url] = ancestor.models
+        self.on_ancestors_changed()
 
     async def before_loop(self) -> bool:
         """Load models."""
@@ -64,6 +110,7 @@ class ParentInfra(WebSocketClient):
 
     async def on_start(self) -> None:
         """On start functions."""
+        self._warm_change_unsupported = False  # re-probe on each (re)connect in case the peer was upgraded
         try:
             response = await self.infra_client.init(
                 InitRequest(
@@ -76,7 +123,7 @@ class ParentInfra(WebSocketClient):
                     check_key=self.one_time_key.key,
                 )
             )
-            self._ancestors = response.ancestors
+            self._apply_ancestors(response.ancestors)
         except ApiError as e:
             if e.code == 2 and e.message == "Invalid api key":
                 self.process_loop = False
@@ -88,6 +135,31 @@ class ParentInfra(WebSocketClient):
             return
 
         self.task_manager.add_task_safe(self.infra_client.usage_change(usage), "parent_infra.usage_change")
+
+    def send_warm(self, warm: WarmChangeRequest) -> None:
+        """Send warm-state change.
+
+        Older peers that predate `warm_change` reply with a JSON-RPC `-32601 Method not found`
+        error for every call; once that's seen, stop calling `warm_change` on that peer until
+        the next reconnect instead of logging a fresh error on every ~15s warmth poll.
+        """
+        if not self.enabled or not self.ws or self._warm_change_unsupported:
+            return
+
+        async def _send_warm() -> None:
+            try:
+                await self.infra_client.warm_change(warm)
+            except ApiError as e:
+                if e.code != -32601:
+                    raise
+                self._warm_change_unsupported = True
+                logger.warning(
+                    "Mesh peer %r does not support warm_change (older DeepFellow version); "
+                    "no longer sending warm-state updates to it until reconnect.",
+                    self.parent_url,
+                )
+
+        self.task_manager.add_task_safe(_send_warm(), "parent_infra.warm_change")
 
     def send_models_list(self) -> None:
         """Send usage."""

@@ -9,10 +9,10 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 
 from fastapi import HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from server.applicationcontext import get_base_url
 from server.config import get_main_dir
@@ -61,6 +61,7 @@ from server.utils.hardware import GpuInfo, HardwarePartInfo, IntelGpuInfo, Nvidi
 from server.utils.loading import Progress
 from server.utils.registry_client import image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fetch_file_size_from_url
+from server.utils.validators import clamp_non_positive_to_one
 from server.utils.vram_calculator import estimate_vram_gb, parse_cache_type_bits
 
 logger = logging.getLogger("uvicorn.error")
@@ -134,6 +135,12 @@ class LLamacppOptions(BaseModel):
     hardware: str | bool | None = None
     kv_cache_type: str = "f16"
     num_parallel: int = 1
+
+    @field_validator("num_parallel")
+    @classmethod
+    def _clamp_num_parallel(cls, value: int) -> int:
+        """Clamp non-positive values to 1 instead of rejecting them, since older configs may have persisted 0."""
+        return clamp_non_positive_to_one(value, logger, "llama.cpp num_parallel=%r is non-positive; clamping to 1.")
 
 
 class LLamacppModelOptions(BaseModel):
@@ -266,11 +273,12 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
         return DownloadedInfo(**data)
 
     async def _validate_update_options(self, options: InstallServiceIn) -> None:
-        """Normalize the hardware spec and validate the requested image_version, if any."""
+        """Normalize the hardware spec and validate the requested image_version and options spec, if any."""
         if "hardware" not in options.spec:
             options.spec["hardware"] = options.spec.get("gpu", self.docker_service.has_gpu_support)
         options.spec["hardware"] = self.canonicalize_hardware_spec(options.spec["hardware"])
         await self.validate_docker_image_version(options.spec.get("image_version"), options.spec.get("hardware"))
+        try_parse_pydantic(LLamacppOptions, options.spec)
 
     async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
@@ -535,6 +543,10 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         return local_model_path, filename
 
+    @staticmethod
+    def _raise_local_model_path_not_set_up() -> NoReturn:
+        raise HTTPException(400, "Local model path was not set up and not return by downloader.")
+
     async def _install_model(  # noqa: C901
         self, instance: str, model_id: str, options: InstallModelIn
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
@@ -551,6 +563,8 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
         model = self.models[instance][model_id]
 
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
+            docker_options: DockerOptions | None = None
+            model_info: ModelInstalledInfo | None = None
             try:
                 local_model_path, model_filename = await self._download_model_or_set_progress(stream, model, model_id)
 
@@ -558,7 +572,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
 
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
                 if not local_model_path or not model_filename:
-                    raise HTTPException(400, "Local model path was not set up and not return by downloader.")
+                    self._raise_local_model_path_not_set_up()
 
                 max_context_window = await get_gguf_context_window(local_model_path)
                 context_window = max_context_window
@@ -594,7 +608,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
                     hardware=hardware_parts,
                     subnet=subnet,
                 )
-                docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
+                docker_exposed_port, _ = await self.docker_service.install_and_run_docker(docker_options)
                 self._log_cache.pop(docker_options.container_name or "", None)
                 registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
                 container_host = self.docker_service.get_container_host(subnet, docker_options.name)
@@ -612,30 +626,33 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
                     base_url=get_base_url(container_host, container_port),
                     context_window=context_window,
                 )
-                try:
-                    model_info.registration_id = self.endpoint_registry.register_chat_completion_as_proxy(
-                        model=registered_name,
-                        props=ModelProps(
-                            private=True,
-                            type="llm",
-                            endpoints=LLM_ENDPOINTS,
-                            context_window=context_window,
-                            max_context_window=max_context_window,
-                        ),
-                        chat_completions=ProxyOptions(url=f"{model_info.base_url}/v1/chat/completions", rewrite_model_to=model_id),
-                        completions=ProxyOptions(url=f"{model_info.base_url}/v1/completions", rewrite_model_to=model_id),
-                        responses=ProxyOptions(url=f"{model_info.base_url}/v1/responses", rewrite_model_to=model_id),
-                        messages=ProxyOptions(url=f"{model_info.base_url}/v1/messages", rewrite_model_to=model_id),
-                        ollama_chat=None,
-                        registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
-                    )
-                    stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
-                    self.models_downloaded[model_id] = DownloadedInfo(str(local_model_path))
-                    return InstallModelOut(status="OK", details="Installed")
-                except Exception:
-                    if installed.models.get(model_id) is model_info:
-                        installed.models.pop(model_id, None)
-                    raise
+                model_info.registration_id = self.endpoint_registry.register_chat_completion_as_proxy(
+                    model=registered_name,
+                    props=ModelProps(
+                        private=True,
+                        type="llm",
+                        endpoints=LLM_ENDPOINTS,
+                        context_window=context_window,
+                        max_context_window=max_context_window,
+                    ),
+                    chat_completions=ProxyOptions(url=f"{model_info.base_url}/v1/chat/completions", rewrite_model_to=model_id),
+                    completions=ProxyOptions(url=f"{model_info.base_url}/v1/completions", rewrite_model_to=model_id),
+                    responses=ProxyOptions(url=f"{model_info.base_url}/v1/responses", rewrite_model_to=model_id),
+                    messages=ProxyOptions(url=f"{model_info.base_url}/v1/messages", rewrite_model_to=model_id),
+                    ollama_chat=None,
+                    registration_options=RegistrationOptions(
+                        origin="local", owned_by=self.get_type(), capacity_state=installed.parsed_options.num_parallel
+                    ),
+                )
+                stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
+                self.models_downloaded[model_id] = DownloadedInfo(str(local_model_path))
+                return InstallModelOut(status="OK", details="Installed")
+            except BaseException:
+                if model_info is not None and installed.models.get(model_id) is model_info:
+                    installed.models.pop(model_id, None)
+                if docker_options is not None:
+                    await self._stop_docker(docker_options)
+                raise
             finally:
                 self._installing.discard(key)
 

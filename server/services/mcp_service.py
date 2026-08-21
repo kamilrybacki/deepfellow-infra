@@ -1762,7 +1762,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
                 docker_options_edited = deepcopy(docker_options)
                 docker_options_edited.env_vars = docker_options_edited.env_vars | parsed_model_options.envs
-                docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options_edited)
+                docker_exposed_port, _ = await self.docker_service.install_and_run_docker(docker_options_edited)
                 container_host = self.docker_service.get_container_host(subnet, docker_options_edited.name)
                 container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options_edited.image_port)
                 info.models[model_id] = model_info = ModelInstalledInfo(

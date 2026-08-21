@@ -15,7 +15,15 @@ from starlette.testclient import TestClient
 
 from server.api.config import router
 from server.config import AppSettings
-from server.core.dependencies import auth_admin, get_config, get_config_lock, get_otlp_logging, get_parent_infra, get_task_manager
+from server.core.dependencies import (
+    auth_admin,
+    get_config,
+    get_config_lock,
+    get_infra_websocket_server,
+    get_otlp_logging,
+    get_parent_infra,
+    get_task_manager,
+)
 
 
 @pytest.fixture
@@ -41,6 +49,7 @@ def config() -> MagicMock:
     mock.metrics_username = ""
     mock.metrics_password = SecretStr("")
     mock.connect_to_mesh_url = ""
+    mock.share_models_downstream = True
     mock.docker_hub_token = ""
     mock.mcp_sse_session_ttl_seconds = 300
     mock.mcp_sse_max_sessions = 128
@@ -76,8 +85,18 @@ def otlp_logging() -> MagicMock:
 
 
 @pytest.fixture
+def infra_websocket_server() -> MagicMock:
+    return MagicMock()
+
+
+@pytest.fixture
 def client(
-    config: MagicMock, parent_infra: MagicMock, task_manager: MagicMock, config_lock: asyncio.Lock, otlp_logging: MagicMock
+    config: MagicMock,
+    parent_infra: MagicMock,
+    task_manager: MagicMock,
+    config_lock: asyncio.Lock,
+    otlp_logging: MagicMock,
+    infra_websocket_server: MagicMock,
 ) -> Generator[TestClient]:
     app = FastAPI()
     app.include_router(router)
@@ -87,6 +106,7 @@ def client(
     app.dependency_overrides[get_task_manager] = lambda: task_manager
     app.dependency_overrides[get_config_lock] = lambda: config_lock
     app.dependency_overrides[get_otlp_logging] = lambda: otlp_logging
+    app.dependency_overrides[get_infra_websocket_server] = lambda: infra_websocket_server
     with TestClient(app) as c:
         yield c
 
@@ -251,6 +271,36 @@ def test_update_config_otel_change_triggers_otlp_reconfigure(
     parent_infra.reconfigure.assert_not_awaited()
 
 
+def test_update_config_share_models_downstream_change_broadcasts_ancestors(
+    client: TestClient, infra_websocket_server: MagicMock, auth_header: dict[str, str]
+) -> None:
+    with patch("server.api.config.dynamic_config.persist_settings"):
+        resp = client.put("/admin/config", json={"share_models_downstream": False}, headers=auth_header)
+
+    assert resp.status_code == 200
+    infra_websocket_server.broadcast_ancestors_to_children.assert_called_once()
+
+
+def test_update_config_infra_url_change_broadcasts_ancestors(
+    client: TestClient, infra_websocket_server: MagicMock, auth_header: dict[str, str]
+) -> None:
+    with patch("server.api.config.dynamic_config.persist_settings"):
+        resp = client.put("/admin/config", json={"infra_url": "http://new-url:8086"}, headers=auth_header)
+
+    assert resp.status_code == 200
+    infra_websocket_server.broadcast_ancestors_to_children.assert_called_once()
+
+
+def test_update_config_name_change_broadcasts_ancestors(
+    client: TestClient, infra_websocket_server: MagicMock, auth_header: dict[str, str]
+) -> None:
+    with patch("server.api.config.dynamic_config.persist_settings"):
+        resp = client.put("/admin/config", json={"name": "renamed"}, headers=auth_header)
+
+    assert resp.status_code == 200
+    infra_websocket_server.broadcast_ancestors_to_children.assert_called_once()
+
+
 def test_update_config_no_relevant_change_skips_reconfigure(
     client: TestClient, parent_infra: MagicMock, otlp_logging: MagicMock, auth_header: dict[str, str]
 ) -> None:
@@ -320,6 +370,7 @@ async def test_update_config_serializes_concurrent_writes(
     app.dependency_overrides[get_task_manager] = lambda: task_manager
     app.dependency_overrides[get_config_lock] = lambda: shared_lock
     app.dependency_overrides[get_otlp_logging] = lambda: MagicMock()
+    app.dependency_overrides[get_infra_websocket_server] = lambda: MagicMock()
 
     def record_persist(_config: object, _settings: object) -> None:
         nonlocal persist_count

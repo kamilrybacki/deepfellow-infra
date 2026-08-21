@@ -968,8 +968,8 @@ class DockerService:
             msg = f"{msg}:\n{short}"
         raise AppError(msg)
 
-    async def install_and_run_docker(self, options: DockerOptions) -> int:
-        """Run docker compose and return port under it works."""
+    async def install_and_run_docker(self, options: DockerOptions) -> tuple[int, bool]:
+        """Run docker compose and return (port, whether the container was (re)started)."""
         compose_path = self.get_docker_compose_file_path(options.name)
         is_running = await self.is_docker_compose_running(compose_path, options.service_name)
         has_difference, port = await self.has_docker_compose_difference(compose_path, options)
@@ -984,7 +984,7 @@ class DockerService:
             port = -1
         if port is None:
             raise AppError("Engine not available: cannot allocate service port")
-        return port
+        return port, start_output is not None
 
     async def uninstall_docker(self, options: DockerOptions) -> None:
         """Stop docker compose and remove the file."""

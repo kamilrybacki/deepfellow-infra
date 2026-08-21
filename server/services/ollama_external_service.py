@@ -5,6 +5,7 @@
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
@@ -97,6 +98,10 @@ _const = OllamaAiConst(
     models=_read_models(),
 )
 
+logger = logging.getLogger("uvicorn.error")
+
+_WARMTH_POLL_INTERVAL_SECONDS = 15  # matches the staleness already tolerated for the UI's loaded-model display
+
 
 @dataclass
 class ModelInstalledInfo:
@@ -139,12 +144,14 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
     support_responses: bool
     support_messages: bool
     _installing: set[tuple[str, str]]
+    _warmth_poll_tasks: dict[str, asyncio.Task[None]]
     _persists_model_definitions = False
 
     def _after_init(self) -> None:
         self._sync_tasks: dict[str, asyncio.Task[None]] = {}
         self.load_default_models("default")
         self._installing = set()
+        self._warmth_poll_tasks = {}
 
     def load_default_models(self, instance: str) -> None:
         """Load default models to instance."""
@@ -246,6 +253,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         External Ollama service has no containers to stop.
         """
+        self._stop_warmth_poll_task(instance)
 
     def _add_custom_model(self, instance: str, model: CustomModel) -> None:
         parsed = try_parse_pydantic(OllamaCustomModel, model.data)
@@ -311,6 +319,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
             )
             await self._sync_models_from_external_ollama(instance, installed_info, is_initial_sync=True)
             self._start_sync_task(instance, parsed_options.sync_interval)
+            self._start_warmth_poll_task(instance)
             return installed_info
 
         return PromiseWithProgress(func=func)
@@ -332,6 +341,66 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                     pass
 
         self._sync_tasks[instance] = asyncio.create_task(_sync_loop())
+
+    def _start_warmth_poll_task(self, instance: str) -> None:
+        """Start (or restart) the background task that syncs registry warm state from Ollama's `/api/ps`."""
+        if instance in self._warmth_poll_tasks:
+            self._warmth_poll_tasks[instance].cancel()
+
+        async def _poll_loop() -> None:
+            while True:
+                await asyncio.sleep(_WARMTH_POLL_INTERVAL_SECONDS)
+                info = self.instances_info.get(instance)
+                if not info or not info.installed:
+                    break
+                try:
+                    await self._sync_warm_state(info.installed)
+                except Exception:
+                    logger.exception(f"{self.get_id(instance)} warmth poll tick failed")  # noqa: G004
+
+        def _forget_if_current(finished: asyncio.Task[None]) -> None:
+            # Only drop the dict entry if it still points at this task: a restart may have
+            # already replaced it with a newer one by the time this one finishes/cancels.
+            if self._warmth_poll_tasks.get(instance) is finished:
+                del self._warmth_poll_tasks[instance]
+            if not finished.cancelled() and (exc := finished.exception()):
+                logger.error(f"{self.get_id(instance)} warmth poll task died unexpectedly", exc_info=exc)  # noqa: G004
+
+        task = asyncio.create_task(_poll_loop())
+        task.add_done_callback(_forget_if_current)
+        self._warmth_poll_tasks[instance] = task
+
+    def _stop_warmth_poll_task(self, instance: str) -> None:
+        if instance in self._warmth_poll_tasks:
+            self._warmth_poll_tasks[instance].cancel()
+            del self._warmth_poll_tasks[instance]
+
+    async def _sync_warm_state(self, info: InstalledInfo) -> None:
+        """Reflect the external Ollama's live loaded/evicted model state into the endpoint registry's warm flag."""
+        loaded = await self._get_loaded_model_names(info.base_url)
+        if loaded is None:
+            return
+        for model_info in info.models.values():
+            if not model_info.registration_id:
+                continue
+            self.endpoint_registry.update_warm(model_info.registration_id, model_info.id in loaded)
+
+    async def _get_loaded_model_names(self, base_url: str) -> set[str] | None:
+        """Return the set of model names currently loaded in VRAM, or None if the query failed.
+
+        Returning None (rather than an empty set) lets callers tell "confirmed nothing loaded"
+        apart from "failed to ask Ollama", so a transient failure doesn't get treated as an unload.
+        """
+        try:
+            result = await fetch_from(f"{base_url}/api/ps", "GET", None)
+            if result.status_code != 200:
+                logger.warning("Ollama /api/ps at %r returned status %d", base_url, result.status_code)
+                return None
+            data = json.loads(result.data)
+            return {m["name"].removesuffix(":latest") for m in data.get("models", [])}
+        except Exception:
+            logger.warning("Failed to query Ollama /api/ps at %r", base_url, exc_info=True)
+            return None
 
     def _register_synced_model(
         self, instance: str, installed_info: InstalledInfo, model_id: str, size_bytes: int, context_length: int | None = None
@@ -371,7 +440,9 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                     ProxyOptions(url=f"{installed_info.base_url}/v1/messages", rewrite_model_to=model_id) if self.support_messages else None
                 ),
                 ollama_chat=ProxyOptions(url=f"{installed_info.base_url}/api/chat", rewrite_model_to=model_id),
-                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                # Loaded state is unknown until the warmth-poll task (already running per-instance)
+                # confirms it via `/api/ps` - assume cold rather than winning ranking on a guess.
+                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), warm=False),
             )
         if model_type == "embedding":
             model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
@@ -384,7 +455,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                     max_context_window=context_length,
                 ),
                 options=ProxyOptions(url=f"{installed_info.base_url}/v1/embeddings", rewrite_model_to=model_id),
-                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), warm=False),
             )
         installed_info.models[model_id] = model_info
 
@@ -441,6 +512,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
         if instance in self._sync_tasks:
             self._sync_tasks[instance].cancel()
             del self._sync_tasks[instance]
+        self._stop_warmth_poll_task(instance)
 
         installed = self.get_instance_info(instance).installed
         if installed:
@@ -639,7 +711,12 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 else None
                             ),
                             ollama_chat=ProxyOptions(url=f"{info.base_url}/api/chat", rewrite_model_to=model_id),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                            # Ollama lazily loads a model into memory on its first inference request, so a
+                            # freshly-installed model is never warm yet - registering it as warm here would win
+                            # ranking over an actually-warm instance and route the first requests into a cold load.
+                            # The warmth-poll task (already running per-instance) corrects this to `True` within one
+                            # tick once `/api/ps` confirms it's genuinely loaded (or leaves it `False` otherwise).
+                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), warm=False),
                         )
                     if model.type == "embedding":
                         model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
@@ -652,7 +729,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 max_context_window=context_length,
                             ),
                             options=ProxyOptions(url=f"{info.base_url}/v1/embeddings", rewrite_model_to=model_id),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), warm=False),
                         )
                     stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
                     self.models_downloaded[model_id] = DownloadedInfo()

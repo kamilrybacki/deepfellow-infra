@@ -361,7 +361,7 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
                 },
             )
             try:
-                docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
+                docker_exposed_port, _ = await self.docker_service.install_and_run_docker(docker_options)
             except RuntimeError as e:
                 stderr = e.args[1][3] if len(e.args) > 1 and len(e.args[1]) > 3 else ""
                 if "cuda>=" in stderr or "please update your driver" in stderr:

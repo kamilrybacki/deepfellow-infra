@@ -292,7 +292,7 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
                     "start_period": "30s",
                 },
             )
-            docker_exposed_port = await self.docker_service.install_and_run_docker(docker_options)
+            docker_exposed_port, _ = await self.docker_service.install_and_run_docker(docker_options)
             container_host = self.docker_service.get_container_host(subnet, docker_options.name)
             container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
             info = InstalledInfo(

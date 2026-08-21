@@ -13,7 +13,7 @@ from fastapi import HTTPException
 from server.docker import ContainerStatus
 from server.models.models import InstallModelIn, ListModelsFilters, UninstallModelIn
 from server.models.services import GpuStats, InstallServiceIn, UninstallServiceIn
-from server.services.base2_service import CustomModel, Instance, InstanceConfig
+from server.services.base2_service import CustomModel, Instance, InstanceConfig, ModelConfig
 from server.services.vllm_service import (
     DownloadedInfo,
     InstalledInfo,
@@ -86,7 +86,7 @@ def _make_model_installed_info(
 def _setup_install_mocks(svc: VllmService, deps: dict[str, Any], hardware: str | bool | None = False) -> InstalledInfo:
     installed = _make_installed_info(hardware=hardware)
     svc.instances_info["default"].installed = installed
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8000)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True))
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
     deps["docker_service"].get_container_host.return_value = "localhost"
@@ -556,7 +556,7 @@ async def test_get_gpu_memory_utilization_increments_total(svc: VllmService) -> 
     model = VllmModel(hf_id="google/test", size="1GB")
     opts = VllmModelOptions(gpu_memory_utilization=0.5)
 
-    result = await svc._get_gpu_memory_utilization(opts, model)  # pyright: ignore[reportPrivateUsage]
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
 
     assert result == 0.5
     assert svc.gpu_memory_utilization == 0.5
@@ -569,7 +569,7 @@ async def test_get_gpu_memory_utilization_raises_422_when_sum_exceeds_1(svc: Vll
     opts = VllmModelOptions(gpu_memory_utilization=0.5)
 
     with pytest.raises(HTTPException) as exc_info:
-        await svc._get_gpu_memory_utilization(opts, model)  # pyright: ignore[reportPrivateUsage]
+        await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
 
     assert exc_info.value.status_code == 422
 
@@ -608,10 +608,30 @@ async def test_get_gpu_memory_utilization_uses_dynamic_default_when_unset(svc: V
     model = VllmModel(hf_id="google/test", size="1GB")
     opts = VllmModelOptions()
 
-    result = await svc._get_gpu_memory_utilization(opts, model)  # pyright: ignore[reportPrivateUsage]
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
 
     assert result == 0.45
     assert svc.gpu_memory_utilization == 0.45
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_reuses_persisted_value_instead_of_live_default(svc: VllmService, deps: dict[str, Any]) -> None:
+    """A persisted auto-tuned value must be reused so a reload doesn't drift with currently-free VRAM."""
+    svc.gpu_memory_utilization = 0.0
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id="google/test", options=InstallModelIn(spec={}), gpu_memory_utilization=0.33)]
+    )
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions()
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.33
+    deps["hardware"].get_realtime_stats.assert_not_called()
+
+
+def test_get_persisted_model_gpu_memory_utilization_returns_none_for_untracked_instance(svc: VllmService) -> None:
+    assert svc._get_persisted_model_gpu_memory_utilization("no-such-instance", "model") is None  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
@@ -657,6 +677,7 @@ def test_register_model_endpoint_llm_calls_chat_completion_proxy(svc: VllmServic
         model_id="google/test",
         context_window=4096,
         max_context_window=4096,
+        capacity=None,
     )
 
     assert deps["endpoint_registry"].register_chat_completion_as_proxy.call_count == 1
@@ -674,6 +695,7 @@ def test_register_model_endpoint_reranker_calls_rerank_proxy(svc: VllmService, d
         model_id="google/reranker",
         context_window=None,
         max_context_window=None,
+        capacity=None,
     )
 
     assert deps["endpoint_registry"].register_rerank_as_proxy.call_count == 1
@@ -691,11 +713,49 @@ def test_register_model_endpoint_embedding_calls_embeddings_proxy(svc: VllmServi
         model_id="google/embedder",
         context_window=None,
         max_context_window=None,
+        capacity=None,
     )
 
     assert deps["endpoint_registry"].register_embeddings_as_proxy.call_count == 1
     assert deps["endpoint_registry"].register_chat_completion_as_proxy.call_count == 0
     assert deps["endpoint_registry"].register_rerank_as_proxy.call_count == 0
+
+
+def test_register_model_endpoint_passes_capacity_through(svc: VllmService, deps: dict[str, Any]) -> None:
+    model = VllmModel(hf_id="google/test", size="1GB", model_type="llm")
+    model_info = _make_model_installed_info("google/test", model_type="llm")
+
+    svc._register_model_endpoint(  # pyright: ignore[reportPrivateUsage]
+        model_info=model_info,
+        model=model,
+        registered_name="google/test",
+        model_id="google/test",
+        context_window=4096,
+        max_context_window=4096,
+        capacity=8,
+    )
+
+    call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
+    assert call_kwargs["registration_options"].capacity_state == 8
+
+
+def test_register_model_endpoint_marks_capacity_unknown_when_none(svc: VllmService, deps: dict[str, Any]) -> None:
+    """capacity=None from vLLM always means "couldn't determine it", never "no concurrency concept"."""
+    model = VllmModel(hf_id="google/test", size="1GB", model_type="llm")
+    model_info = _make_model_installed_info("google/test", model_type="llm")
+
+    svc._register_model_endpoint(  # pyright: ignore[reportPrivateUsage]
+        model_info=model_info,
+        model=model,
+        registered_name="google/test",
+        model_id="google/test",
+        context_window=4096,
+        max_context_window=4096,
+        capacity=None,
+    )
+
+    call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
+    assert call_kwargs["registration_options"].capacity_state == "unknown"
 
 
 def test_get_image_true_returns_gpu_image(svc: VllmService) -> None:
@@ -750,6 +810,108 @@ async def test_install_model_calls_docker_install(svc: VllmService, deps: dict[s
         await promise.wait()
 
     assert deps["docker_service"].install_and_run_docker.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_install_model_invalidates_log_cache_before_reading_capacity(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """A reinstall on the same deterministic container name must not read the previous container's cached logs."""
+    _setup_install_mocks(svc, deps)
+    model_id = next(iter(svc.models["default"]))
+    svc._log_cache["container"] = (time.monotonic(), "Maximum concurrency for 4096 tokens per request: 2.00x", 8.0)  # pyright: ignore[reportPrivateUsage]
+
+    mock_result = MagicMock()
+    mock_result.stdout = "Maximum concurrency for 4096 tokens per request: 16.00x"
+    mock_result.stderr = ""
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+        patch("server.services.base2_service.Utils.run_command", new_callable=AsyncMock, return_value=mock_result),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
+    assert call_kwargs["registration_options"].capacity_state == 16
+
+
+@pytest.mark.asyncio
+async def test_install_model_reuses_persisted_capacity_when_container_not_restarted(
+    svc: VllmService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    """A no-op reinstall (container already running, config unchanged) must reuse the last known capacity, not re-read logs."""
+    _setup_install_mocks(svc, deps)
+    model_id = next(iter(svc.models["default"]))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, False))
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id=model_id, options=InstallModelIn(spec={}), capacity=16, capacity_known=True)]
+    )
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+        patch("server.services.base2_service.Utils.run_command", new_callable=AsyncMock) as mock_run_command,
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    mock_run_command.assert_not_called()
+    call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
+    assert call_kwargs["registration_options"].capacity_state == 16
+
+
+@pytest.mark.asyncio
+async def test_install_model_capacity_unknown_when_not_restarted_and_never_persisted(
+    svc: VllmService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    """A no-op reinstall with no prior known capacity must leave capacity unknown rather than guessing."""
+    _setup_install_mocks(svc, deps)
+    model_id = next(iter(svc.models["default"]))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, False))
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+        patch("server.services.base2_service.Utils.run_command", new_callable=AsyncMock) as mock_run_command,
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    mock_run_command.assert_not_called()
+    call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
+    assert call_kwargs["registration_options"].capacity_state == "unknown"
+
+
+def test_get_persisted_model_capacity_returns_unknown_for_untracked_instance(svc: VllmService) -> None:
+    assert svc._get_persisted_model_capacity("no-such-instance", "model") == (None, False)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_resolve_model_capacity_not_restarted_reuses_known_none_without_reading_logs(svc: VllmService) -> None:
+    """A persisted `capacity=None, capacity_known=True` (a genuinely-checked-but-unbounded reading) must round-trip as-is."""
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id="m", options=InstallModelIn(spec={}), capacity=None, capacity_known=True)]
+    )
+
+    with patch("server.services.base2_service.Utils.run_command", new_callable=AsyncMock) as mock_run_command:
+        capacity, capacity_known = await svc._resolve_model_capacity(  # pyright: ignore[reportPrivateUsage]
+            "default",
+            "m",
+            "vLLM",
+            "container",
+            False,
+            svc._parse_max_concurrency,  # pyright: ignore[reportPrivateUsage]
+        )
+
+    mock_run_command.assert_not_called()
+    assert capacity is None
+    assert capacity_known is True
 
 
 @pytest.mark.asyncio
@@ -859,6 +1021,46 @@ def test_parse_kv_cache_max_len_suggestion(raw: str, expected: int | None) -> No
     assert VllmService._parse_kv_cache_max_len_suggestion(raw) == expected  # pyright: ignore[reportPrivateUsage]
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("GPU KV cache size: 100,000 tokens, Maximum concurrency for 4096 tokens per request: 12.34x", 12),
+        ("Maximum concurrency for 4096 tokens per request: 1.00x", 1),
+        ("docker started successfully with no relevant log line", None),
+        ("Maximum concurrency for 4096 tokens per request: 0.73x", 1),
+        (
+            "Maximum concurrency for 4096 tokens per request: 4.00x\n"
+            "restarting with smaller max-model-len\n"
+            "Maximum concurrency for 4096 tokens per request: 8.00x",
+            8,
+        ),
+        ("Maximum concurrency for 4096 tokens per request: 1.2.3x", None),
+        # A number long enough that float() rounds it to inf must not raise OverflowError out of round().
+        (f"Maximum concurrency for 4096 tokens per request: {'9' * 400}.0x", None),
+    ],
+)
+def test_parse_max_concurrency(raw: str, expected: int | None) -> None:
+    assert VllmService._parse_max_concurrency(raw) == expected  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_get_max_concurrency_from_logs_returns_parsed_value(svc: VllmService) -> None:
+    with patch.object(
+        svc, "_get_docker_logs", new_callable=AsyncMock, return_value="Maximum concurrency for 4096 tokens per request: 8.00x"
+    ):  # pyright: ignore[reportPrivateUsage]
+        result = await svc._get_max_concurrency_from_logs("my-container", "vLLM", svc._parse_max_concurrency)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 8
+
+
+@pytest.mark.asyncio
+async def test_get_max_concurrency_from_logs_returns_none_on_failure(svc: VllmService) -> None:
+    with patch.object(svc, "_get_docker_logs", new_callable=AsyncMock, side_effect=RuntimeError("boom")):  # pyright: ignore[reportPrivateUsage]
+        result = await svc._get_max_concurrency_from_logs("my-container", "vLLM", svc._parse_max_concurrency)  # pyright: ignore[reportPrivateUsage]
+
+    assert result is None
+
+
 @pytest.mark.asyncio
 async def test_install_model_retries_with_suggested_max_len_on_kv_cache_error(
     svc: VllmService, deps: dict[str, Any], tmp_path: Path
@@ -873,7 +1075,7 @@ async def test_install_model_retries_with_suggested_max_len_on_kv_cache_error(
         "(4.0 GiB KV cache is needed, which is larger than the available KV cache memory (3.37 GiB). "
         "Based on the available memory, the estimated maximum model length is 110256."
     )
-    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[kv_cache_error, 8000])
+    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[kv_cache_error, (8000, True)])
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
     deps["docker_service"].get_container_host.return_value = "localhost"
@@ -1776,7 +1978,7 @@ async def test_resolve_custom_model_size_returns_none_on_exception(svc: VllmServ
 
 @pytest.mark.asyncio
 async def test_get_docker_logs_cache_hit(svc: VllmService) -> None:
-    svc._log_cache["my-container"] = (time.monotonic(), "cached logs")  # pyright: ignore[reportPrivateUsage]
+    svc._log_cache["my-container"] = (time.monotonic(), "cached logs", 8.0)  # pyright: ignore[reportPrivateUsage]
 
     result = await svc._get_docker_logs("my-container")  # pyright: ignore[reportPrivateUsage]
 
@@ -1786,6 +1988,7 @@ async def test_get_docker_logs_cache_hit(svc: VllmService) -> None:
 @pytest.mark.asyncio
 async def test_get_docker_logs_fetches_and_caches(svc: VllmService) -> None:
     mock_result = MagicMock()
+    mock_result.exit_code = 0
     mock_result.stdout = "stdout logs"
     mock_result.stderr = "stderr logs"
 
@@ -1794,6 +1997,41 @@ async def test_get_docker_logs_fetches_and_caches(svc: VllmService) -> None:
 
     assert result == "stdout logsstderr logs"
     assert "my-container" in svc._log_cache  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_get_docker_logs_caches_failed_command_briefly(svc: VllmService) -> None:
+    """A failed read is still cached, but only for the short failed-read TTL - long enough to
+    avoid spawning a fresh `docker logs` subprocess on every poll tick of a stuck container,
+    short enough to pick up the real startup log soon after it becomes available."""
+    mock_result = MagicMock()
+    mock_result.exit_code = 1
+    mock_result.stdout = ""
+    mock_result.stderr = "Error: No such container"
+
+    with patch("server.services.base2_service.Utils.run_command", new_callable=AsyncMock, return_value=mock_result):
+        result = await svc._get_docker_logs("my-container")  # pyright: ignore[reportPrivateUsage]
+
+    assert result == "Error: No such container"
+    cached = svc._log_cache["my-container"]  # pyright: ignore[reportPrivateUsage]
+    assert cached[1] == "Error: No such container"
+    assert cached[2] == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_get_docker_logs_caches_empty_output_briefly(svc: VllmService) -> None:
+    mock_result = MagicMock()
+    mock_result.exit_code = 0
+    mock_result.stdout = ""
+    mock_result.stderr = ""
+
+    with patch("server.services.base2_service.Utils.run_command", new_callable=AsyncMock, return_value=mock_result):
+        result = await svc._get_docker_logs("my-container")  # pyright: ignore[reportPrivateUsage]
+
+    assert result == ""
+    cached = svc._log_cache["my-container"]  # pyright: ignore[reportPrivateUsage]
+    assert cached[1] == ""
+    assert cached[2] == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize(
@@ -2022,7 +2260,7 @@ async def test_install_model_releases_gpu_and_stops_container_when_post_start_fa
     svc2 = VllmService(**deps)
     installed = _make_installed_info(hardware=True)
     svc2.instances_info["default"].installed = installed
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8000)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True))
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
     deps["docker_service"].get_container_host.return_value = "localhost"

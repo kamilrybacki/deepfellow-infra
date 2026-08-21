@@ -77,7 +77,7 @@ def _make_model_installed_info(model_id: str = "test-model", registration_id: st
 def _setup_install_mocks(svc: LLamacppService, deps: dict[str, Any]) -> InstalledInfo:
     installed = _make_installed_info(svc)
     svc.instances_info["default"].installed = installed
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8080)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8080, True))
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
     deps["docker_service"].get_container_host.return_value = "localhost"
@@ -608,6 +608,25 @@ async def test_install_model_registers_endpoint(svc: LLamacppService, deps: dict
 
 
 @pytest.mark.asyncio
+async def test_install_model_registers_capacity_from_num_parallel(svc: LLamacppService, deps: dict[str, Any], tmp_path: Path) -> None:
+    installed = _setup_install_mocks(svc, deps)
+    installed.parsed_options.num_parallel = 4
+    model_id = next(iter(svc.models["default"]))
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=(tmp_path / "model.gguf", "model.gguf")),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.llamacpp_service.get_gguf_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.llamacpp_service.get_base_url", return_value="http://localhost:8080"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
+    assert call_kwargs["registration_options"].capacity_state == 4
+
+
+@pytest.mark.asyncio
 async def test_install_model_records_model_as_downloaded(svc: LLamacppService, deps: dict[str, Any], tmp_path: Path) -> None:
     _setup_install_mocks(svc, deps)
     model_id = next(iter(svc.models["default"]))
@@ -646,9 +665,9 @@ async def test_install_model_appends_ctx_size_when_max_model_length_set(svc: LLa
     model_id = next(iter(svc.models["default"]))
     captured: list[object] = []
 
-    async def capture_docker(opts: object) -> int:
+    async def capture_docker(opts: object) -> tuple[int, bool]:
         captured.append(opts)
-        return 8080
+        return (8080, True)
 
     deps["docker_service"].install_and_run_docker = capture_docker
 
@@ -672,9 +691,9 @@ async def test_install_model_appends_jinja_flag_for_jinja_model(svc: LLamacppSer
     svc.models["default"][jinja_model_id] = LlamacppModel(url="https://example.com/model.gguf", size="1GB", jinja=True)
     captured: list[object] = []
 
-    async def capture_docker(opts: object) -> int:
+    async def capture_docker(opts: object) -> tuple[int, bool]:
         captured.append(opts)
-        return 8080
+        return (8080, True)
 
     deps["docker_service"].install_and_run_docker = capture_docker
 
@@ -733,6 +752,48 @@ async def test_uninstall_model_ignores_unknown_model_id(svc: LLamacppService, de
 
     assert deps["endpoint_registry"].unregister_chat_completion.call_count == 0
     assert deps["docker_service"].uninstall_docker.call_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_num_parallel", [0, -1])
+async def test_install_instance_clamps_non_positive_num_parallel(svc: LLamacppService, bad_num_parallel: int) -> None:
+    """A non-positive `num_parallel` must be clamped to 1 at instance setup rather than rejected -
+    such a value may already be persisted in an existing config.json from before `num_parallel`
+    gained validation, and rejecting it would leave the instance's models unable to load at all."""
+    options = InstallServiceIn(spec={"hardware": False, "num_parallel": bad_num_parallel})
+
+    with (
+        patch.object(svc, "_download_image_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_verify_docker_image", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_instance("default", options)  # pyright: ignore[reportPrivateUsage]
+        installed = await promise.wait()
+
+    assert installed.parsed_options.num_parallel == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_num_parallel", [0, -1])
+async def test_update_instance_clamps_non_positive_num_parallel(svc: LLamacppService, deps: dict[str, Any], bad_num_parallel: int) -> None:
+    """A non-positive `num_parallel` on `update_instance` must be clamped to 1 rather than
+    rejected, consistent with `_install_instance`'s handling of the same value."""
+    svc.instances_info["default"].installed = _make_installed_info(svc)
+    options = InstallServiceIn(spec={"hardware": False, "num_parallel": bad_num_parallel})
+    deps["service_provider"].save_service_config = AsyncMock()
+
+    with (
+        patch.object(svc, "_uninstall_instance", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_download_image_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_verify_docker_image", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc.update_instance("default", options)
+        await promise.wait()
+
+    installed = svc.instances_info["default"].installed
+    assert installed is not None
+    assert installed.parsed_options.num_parallel == 1
 
 
 @pytest.mark.asyncio
@@ -1099,16 +1160,16 @@ async def test_install_model_appends_kv_cache_type_when_not_f16(svc: LLamacppSer
     installed = _make_installed_info(svc)
     installed.parsed_options.kv_cache_type = "q8_0"
     svc.instances_info["default"].installed = installed
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8080)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8080, True))
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 8080
     captured: list[object] = []
 
-    async def capture_docker(opts: object) -> int:
+    async def capture_docker(opts: object) -> tuple[int, bool]:
         captured.append(opts)
-        return 8080
+        return (8080, True)
 
     deps["docker_service"].install_and_run_docker = capture_docker
     model_id = next(iter(svc.models["default"]))
@@ -1136,9 +1197,9 @@ async def test_install_model_appends_parallel_flag_when_num_parallel_gt_1(
     svc.instances_info["default"].installed = installed
     captured: list[object] = []
 
-    async def capture_docker(opts: object) -> int:
+    async def capture_docker(opts: object) -> tuple[int, bool]:
         captured.append(opts)
-        return 8080
+        return (8080, True)
 
     deps["docker_service"].install_and_run_docker = capture_docker
     deps["docker_service"].get_docker_subnet.return_value = None
@@ -1241,6 +1302,7 @@ async def test_install_model_registration_failure_rolls_back_model(svc: LLamacpp
             await promise.wait()
 
     assert model_id not in installed.models
+    assert deps["docker_service"].stop_docker.call_count == 1
 
 
 @pytest.mark.asyncio

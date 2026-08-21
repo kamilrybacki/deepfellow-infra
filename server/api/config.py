@@ -14,11 +14,20 @@ from pydantic import SecretStr, ValidationError
 
 from server import dynamic_config
 from server.config import AppSettings
-from server.core.dependencies import auth_admin, get_config, get_config_lock, get_otlp_logging, get_parent_infra, get_task_manager
+from server.core.dependencies import (
+    auth_admin,
+    get_config,
+    get_config_lock,
+    get_infra_websocket_server,
+    get_otlp_logging,
+    get_parent_infra,
+    get_task_manager,
+)
 from server.dynamic_config import DynamicSettings
 from server.models.config import ConfigEntry, ConfigOut, ConfigRevealOut
 from server.task_manager import TaskManager
 from server.utils.tracing import OtlpLoggingManager
+from server.websockets.infra_websocket_server import InfraWebsocketServer
 from server.websockets.parent_infra_group import ParentInfraGroup
 
 logger = logging.getLogger("uvicorn.error")
@@ -108,6 +117,7 @@ async def update_dynamic_config(
     task_manager: Annotated[TaskManager, Depends(get_task_manager)],
     config_lock: Annotated[asyncio.Lock, Depends(get_config_lock)],
     otlp_logging: Annotated[OtlpLoggingManager, Depends(get_otlp_logging)],
+    infra_websocket_server: Annotated[InfraWebsocketServer, Depends(get_infra_websocket_server)],
     auth: Annotated[str, Depends(auth_admin)],
 ) -> ConfigOut:
     """Apply a partial update to the dynamic settings backed by `config.json`.
@@ -143,6 +153,12 @@ async def update_dynamic_config(
             new_settings.otel_logging_enabled != current.otel_logging_enabled
             or new_settings.otel_exporter_otlp_endpoint != current.otel_exporter_otlp_endpoint
         )
+        ancestor_broadcast_needed = (
+            new_settings.share_models_downstream != current.share_models_downstream
+            or new_settings.infra_api_key.get_secret_value() != current.infra_api_key.get_secret_value()
+            or new_settings.name != current.name
+            or new_settings.infra_url != current.infra_url
+        )
 
         # Persist before mutating in-memory state: the file is the source of truth.
         try:
@@ -157,6 +173,8 @@ async def update_dynamic_config(
                 await parent_infra.reconfigure(config, task_manager)
             if otel_logging_changed:
                 otlp_logging.reconfigure(config)
+            if ancestor_broadcast_needed:
+                infra_websocket_server.broadcast_ancestors_to_children()
         except Exception as e:
             logger.exception("Config saved, but applying it live failed")
             raise HTTPException(

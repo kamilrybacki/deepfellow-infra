@@ -7,7 +7,7 @@ import pytest
 
 from server.models.mesh import CheckMeshConnection
 from server.utils.exceptions import ApiError
-from server.websockets.models import InitRequest, InitResponse, UsageChangeRequest
+from server.websockets.models import AncestorInfo, InitRequest, InitResponse, UsageChangeRequest, WarmChangeRequest
 from server.websockets.parent_infra import ParentInfra
 
 
@@ -26,6 +26,7 @@ def make_parent_infra(url: str = "ws://mesh") -> ParentInfra:
     infra.infra_client = MagicMock()
     infra.infra_client.init = AsyncMock(return_value=InitResponse(ancestors=[]))
     infra.infra_client.usage_change = MagicMock()
+    infra.infra_client.warm_change = AsyncMock()
     infra.infra_client.update_models = MagicMock()
 
     infra.endpoint_registry = MagicMock()
@@ -161,6 +162,103 @@ def test_send_usage_schedules_task_when_connected():
     assert infra.task_manager.add_task_safe.call_count == 1  # pyright: ignore[reportAttributeAccessIssue]
 
 
+def test_send_warm_noop_when_disabled():
+    infra = make_parent_infra(url="")
+    warm = WarmChangeRequest(id="r1", warm=True)
+
+    infra.send_warm(warm)
+
+    assert infra.task_manager.add_task_safe.call_count == 0  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_send_warm_noop_when_ws_is_none():
+    infra = make_parent_infra()
+    assert infra.ws is None
+    warm = WarmChangeRequest(id="r1", warm=True)
+
+    infra.send_warm(warm)
+
+    assert infra.task_manager.add_task_safe.call_count == 0  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_send_warm_schedules_task_when_connected():
+    infra = make_parent_infra()
+    infra.ws = (MagicMock(), MagicMock())
+    warm = WarmChangeRequest(id="r1", warm=False)
+
+    infra.send_warm(warm)
+
+    assert infra.task_manager.add_task_safe.call_count == 1  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_send_warm_schedules_a_task_per_call_within_the_same_synchronous_burst():
+    """Multiple models can flip warm state in the same poll tick, calling `send_warm` several
+    times synchronously before any of the resulting tasks get a chance to run - none of those
+    calls may be dropped, since each carries a different model's state."""
+    infra = make_parent_infra()
+    infra.ws = (MagicMock(), MagicMock())
+
+    infra.send_warm(WarmChangeRequest(id="r1", warm=False))
+    infra.send_warm(WarmChangeRequest(id="r2", warm=True))
+
+    assert infra.task_manager.add_task_safe.call_count == 2  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_send_warm_noop_when_previously_marked_unsupported():
+    infra = make_parent_infra()
+    infra.ws = (MagicMock(), MagicMock())
+    infra._warm_change_unsupported = True  # pyright: ignore[reportPrivateUsage]
+    warm = WarmChangeRequest(id="r1", warm=False)
+
+    infra.send_warm(warm)
+
+    assert infra.task_manager.add_task_safe.call_count == 0  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@pytest.mark.asyncio
+async def test_send_warm_task_succeeds_without_marking_unsupported():
+    infra = make_parent_infra()
+    infra.ws = (MagicMock(), MagicMock())
+    warm = WarmChangeRequest(id="r1", warm=False)
+
+    infra.send_warm(warm)
+    task = infra.task_manager.add_task_safe.call_args[0][0]  # pyright: ignore[reportAttributeAccessIssue]
+    await task
+
+    infra.infra_client.warm_change.assert_awaited_once_with(warm)  # pyright: ignore[reportAttributeAccessIssue]
+    assert infra._warm_change_unsupported is False  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_send_warm_task_marks_unsupported_on_method_not_found():
+    infra = make_parent_infra()
+    infra.ws = (MagicMock(), MagicMock())
+    infra.infra_client.warm_change = AsyncMock(side_effect=ApiError("Method not found", -32601))
+    warm = WarmChangeRequest(id="r1", warm=False)
+
+    infra.send_warm(warm)
+    task = infra.task_manager.add_task_safe.call_args[0][0]  # pyright: ignore[reportAttributeAccessIssue]
+    await task
+
+    assert infra._warm_change_unsupported is True  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_send_warm_task_reraises_other_api_errors_without_marking_unsupported():
+    infra = make_parent_infra()
+    infra.ws = (MagicMock(), MagicMock())
+    infra.infra_client.warm_change = AsyncMock(side_effect=ApiError("Other error", 5))
+    warm = WarmChangeRequest(id="r1", warm=False)
+
+    infra.send_warm(warm)
+    task = infra.task_manager.add_task_safe.call_args[0][0]  # pyright: ignore[reportAttributeAccessIssue]
+
+    with pytest.raises(ApiError):
+        await task
+
+    assert infra._warm_change_unsupported is False  # pyright: ignore[reportPrivateUsage]
+
+
 def test_send_models_list_noop_when_disabled():
     infra = make_parent_infra(url="")
 
@@ -228,3 +326,70 @@ async def test_send_delegates_when_enabled_and_ws_set():
 
     assert mock_queue.put_nowait.call_count == 1
     assert mock_queue.put_nowait.call_args == call("hello")
+
+
+# --- ancestors propagation ---
+
+
+def test_on_message_ancestors_update_applies_ancestors():
+    infra = make_parent_infra()
+    applied: list[object] = []
+    infra._apply_ancestors = lambda ancestors: applied.append(ancestors)  # type: ignore[method-assign]
+
+    infra.on_message('{"type": "ancestors_update", "ancestors": [{"url": "http://root.url", "name": "root"}]}')
+
+    assert len(applied) == 1
+    assert applied[0][0].url == "http://root.url"  # type: ignore[index]
+
+
+def test_on_message_plain_json_dict_forwards_to_resolve():
+    infra = make_parent_infra()
+    infra.client = MagicMock()
+
+    infra.on_message('{"jsonrpc": "2.0", "id": 1, "result": "OK"}')
+
+    infra.client.resolve.assert_called_once()
+
+
+def test_apply_ancestors_registers_new_ancestor_models():
+    infra = make_parent_infra()
+    on_changed = MagicMock()
+    infra.on_ancestors_changed = on_changed
+    ancestor = AncestorInfo(url="http://root.url", name="root", api_key="root-key", models=[])
+
+    infra._apply_ancestors([ancestor])  # pyright: ignore[reportPrivateUsage]
+
+    infra.endpoint_registry.update_models.assert_called_once_with(  # pyright: ignore[reportAttributeAccessIssue]
+        [], [], "http://root.url", "root-key", owned_by="mesh-ancestor"
+    )
+    assert infra.ancestors == [ancestor]
+    on_changed.assert_called_once()
+
+
+def test_apply_ancestors_keeps_ancestor_still_present_in_new_list():
+    infra = make_parent_infra()
+    ancestor = AncestorInfo(url="http://root.url", name="root", api_key="root-key", models=[])
+    infra._apply_ancestors([ancestor])  # pyright: ignore[reportPrivateUsage]
+    infra.endpoint_registry.update_models.reset_mock()  # pyright: ignore[reportAttributeAccessIssue]
+
+    updated_ancestor = AncestorInfo(url="http://root.url", name="root", api_key="root-key", models=[])
+    infra._apply_ancestors([updated_ancestor])  # pyright: ignore[reportPrivateUsage]
+
+    infra.endpoint_registry.update_models.assert_called_once_with(  # pyright: ignore[reportAttributeAccessIssue]
+        [], [], "http://root.url", "root-key", owned_by="mesh-ancestor"
+    )
+    assert infra.ancestors == [updated_ancestor]
+
+
+def test_apply_ancestors_unregisters_ancestor_no_longer_present():
+    infra = make_parent_infra()
+    ancestor = AncestorInfo(url="http://root.url", name="root", api_key="root-key", models=[])
+    infra._apply_ancestors([ancestor])  # pyright: ignore[reportPrivateUsage]
+    infra.endpoint_registry.update_models.reset_mock()  # pyright: ignore[reportAttributeAccessIssue]
+
+    infra._apply_ancestors([])  # pyright: ignore[reportPrivateUsage]
+
+    infra.endpoint_registry.update_models.assert_called_once_with(  # pyright: ignore[reportAttributeAccessIssue]
+        [], [], "http://root.url", "", owned_by="mesh-ancestor"
+    )
+    assert infra.ancestors == []

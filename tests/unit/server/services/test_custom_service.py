@@ -507,7 +507,7 @@ async def test_install_model_success(svc: CustomService, deps: dict[str, Any]) -
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
     deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8090)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True))
     deps["docker_service"].get_container_host.return_value = "172.20.0.1"
     deps["docker_service"].get_container_port.return_value = 8090
     deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
@@ -706,7 +706,7 @@ async def test_install_model_uses_default_prefix_when_no_spec(svc: CustomService
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
     deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8090)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True))
     deps["docker_service"].get_container_host.return_value = "172.20.0.1"
     deps["docker_service"].get_container_port.return_value = 8090
     deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
@@ -723,7 +723,7 @@ async def test_install_model_uses_default_prefix_when_prefix_missing(svc: Custom
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
     deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8090)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True))
     deps["docker_service"].get_container_host.return_value = "172.20.0.1"
     deps["docker_service"].get_container_port.return_value = 8090
     deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
@@ -829,7 +829,7 @@ async def test_install_model_registration_failure_rolls_back_model(svc: CustomSe
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
     deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8090)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True))
     deps["docker_service"].get_container_host.return_value = "172.20.0.1"
     deps["docker_service"].get_container_port.return_value = 8090
     deps["endpoint_registry"].register_custom_endpoint_as_proxy.side_effect = RuntimeError("registry down")
@@ -850,7 +850,7 @@ async def test_install_model_registration_failure_skips_rollback_when_already_re
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
     deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=8090)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True))
     deps["docker_service"].get_container_host.return_value = "172.20.0.1"
     deps["docker_service"].get_container_port.return_value = 8090
 

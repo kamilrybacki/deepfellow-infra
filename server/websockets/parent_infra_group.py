@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Literal
 
 from server.models.api import Model
 from server.models.mesh import CheckMeshConnection
-from server.websockets.models import AncestorInfo, TopologyUpdateRequest, UsageChangeRequest
+from server.websockets.models import AncestorInfo, TopologyUpdateRequest, UsageChangeRequest, WarmChangeRequest
 from server.websockets.parent_infra import ParentInfra
 
 if TYPE_CHECKING:
@@ -24,6 +24,7 @@ class ParentInfraGroup:
         self.parents = parents
         self._endpoint_registry: EndpointRegistry | None = None
         self._get_children: Callable[[], dict[str, TopologyUpdateRequest]] = dict
+        self._on_mesh_visibility_changed: Callable[[], None] = lambda: None
 
     @property
     def enabled(self) -> bool:
@@ -66,15 +67,36 @@ class ParentInfraGroup:
         for parent in self.parents:
             parent.get_children = value
 
+    @property
+    def on_mesh_visibility_changed(self) -> "Callable[[], None]":
+        """Callback fired when the set of models this node exposes to its own children changes.
+
+        That happens either because its own model list changed, or because one of its ancestors
+        pushed a fresh list.
+        """
+        return self._on_mesh_visibility_changed
+
+    @on_mesh_visibility_changed.setter
+    def on_mesh_visibility_changed(self, value: "Callable[[], None]") -> None:
+        self._on_mesh_visibility_changed = value
+        for parent in self.parents:
+            parent.on_ancestors_changed = value
+
     def send_models_list(self) -> None:
-        """Broadcast the models list to all parents."""
+        """Broadcast the models list to all parents, and re-broadcast own+ancestor info to own children."""
         for parent in self.parents:
             parent.send_models_list()
+        self._on_mesh_visibility_changed()
 
     def send_usage(self, usage: UsageChangeRequest) -> None:
         """Broadcast a usage change to all parents."""
         for parent in self.parents:
             parent.send_usage(usage)
+
+    def send_warm(self, warm: WarmChangeRequest) -> None:
+        """Broadcast a warm-state change to all parents."""
+        for parent in self.parents:
+            parent.send_warm(warm)
 
     def send_topology_update(
         self,
@@ -117,6 +139,7 @@ class ParentInfraGroup:
         new_parents = [ParentInfra(config, task_manager, config.connect_to_mesh_url)] if config.connect_to_mesh_url else []
         for parent in new_parents:
             parent.get_children = self._get_children
+            parent.on_ancestors_changed = self._on_mesh_visibility_changed
             if self._endpoint_registry is not None:
                 parent.endpoint_registry = self._endpoint_registry
 

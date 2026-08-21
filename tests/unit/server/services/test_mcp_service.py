@@ -807,7 +807,7 @@ async def test_install_model_missing_required_env_raises_422(svc: McpService) ->
 async def test_install_model_happy_path(svc: McpService, deps: dict[str, Any], tmp_path: Path) -> None:
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     model_id = "open-websearch"
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=12345)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True))
     deps["docker_service"].get_container_host.return_value = "172.20.0.2"
     deps["docker_service"].get_container_port.return_value = 3000
     deps["endpoint_registry"].register_mcp_endpoint_as_proxy.return_value = "reg-id"
@@ -934,7 +934,7 @@ async def test_install_model_sse_transport_uses_sse_proxy(svc: McpService, deps:
             },
         ),
     )
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=12345)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True))
     deps["docker_service"].get_container_host.return_value = "172.20.0.2"
     deps["docker_service"].get_container_port.return_value = 8080
     deps["endpoint_registry"].register_mcp_sse_endpoint_as_proxy.return_value = "sse-reg-id"
@@ -2097,7 +2097,7 @@ async def test_install_model_registration_failure_rolls_back_model_without_unreg
 ) -> None:
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     model_id = "open-websearch"
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=12345)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True))
     deps["docker_service"].get_container_host.return_value = "172.20.0.2"
     deps["docker_service"].get_container_port.return_value = 3000
     deps["endpoint_registry"].register_mcp_endpoint_as_proxy.side_effect = RuntimeError("registry down")
@@ -2123,7 +2123,7 @@ async def test_install_model_post_registration_failure_unregisters_and_rolls_bac
 ) -> None:
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     model_id = "open-websearch"
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=12345)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True))
     deps["docker_service"].get_container_host.return_value = "172.20.0.2"
     deps["docker_service"].get_container_port.return_value = 3000
     deps["endpoint_registry"].register_mcp_endpoint_as_proxy.return_value = "reg-id"
@@ -2152,7 +2152,7 @@ async def test_install_model_registration_failure_skips_rollback_when_already_re
 ) -> None:
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     model_id = "open-websearch"
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=12345)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True))
     deps["docker_service"].get_container_host.return_value = "172.20.0.2"
     deps["docker_service"].get_container_port.return_value = 3000
 

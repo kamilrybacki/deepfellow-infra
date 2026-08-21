@@ -27,6 +27,7 @@ def _make_service() -> OllamaService:
     svc._arch_cache = {}  # pyright: ignore[reportPrivateUsage]
     svc._vram_cache = {}  # pyright: ignore[reportPrivateUsage]
     svc._log_cache = {}  # pyright: ignore[reportPrivateUsage]
+    svc._ps_query_failing = set()  # pyright: ignore[reportPrivateUsage]
     svc.config = MagicMock()
     svc.config.ollama_kv_cache_type = "f16"
     svc.config.ollama_num_parallel = 1
@@ -406,6 +407,27 @@ async def test_get_loaded_models_exception_returns_none(mock_fetch: AsyncMock):
 
 @pytest.mark.asyncio
 @patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock)
+async def test_get_loaded_models_repeated_failure_logs_debug_not_warning(mock_fetch: AsyncMock, caplog: pytest.LogCaptureFixture):
+    """A second consecutive /api/ps failure for the same instance must drop to debug, not warn again."""
+    mock_fetch.return_value = _make_fetch_result(503, {})
+    svc = _make_service()
+
+    with patch.object(svc, "get_instance_installed_info", return_value=_make_installed_info()):
+        with caplog.at_level("WARNING"):
+            await svc._get_loaded_models("default")  # pyright: ignore[reportPrivateUsage]
+        assert len(caplog.records) == 1
+        caplog.clear()
+
+        with caplog.at_level("DEBUG"):
+            result = await svc._get_loaded_models("default")  # pyright: ignore[reportPrivateUsage]
+
+    assert result is None
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelname == "DEBUG"
+
+
+@pytest.mark.asyncio
+@patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock)
 async def test_get_loaded_model_info_maps_to_context_length_for_base_contract(mock_fetch: AsyncMock):
     """The public, base-class-compatible wrapper exposes only {model: context_length}, dict[str, int] | None."""
     mock_fetch.return_value = _make_fetch_result(
@@ -576,7 +598,7 @@ async def test_arch_cache_separate_per_instance():
 async def test_get_docker_logs_cache_hit_skips_run_command(mock_utils: MagicMock):
     mock_utils.run_command = AsyncMock()
     svc = _make_service()
-    svc._log_cache["ollama-default"] = (time.monotonic(), "cached output")  # pyright: ignore[reportPrivateUsage]
+    svc._log_cache["ollama-default"] = (time.monotonic(), "cached output", 8.0)  # pyright: ignore[reportPrivateUsage]
 
     result = await svc._get_docker_logs("ollama-default")  # pyright: ignore[reportPrivateUsage]
 
@@ -607,7 +629,7 @@ async def test_get_docker_logs_expired_cache_refreshes(mock_utils: MagicMock):
     mock_result.stderr = ""
     mock_utils.run_command = AsyncMock(return_value=mock_result)
     svc = _make_service()
-    svc._log_cache["ollama-default"] = (time.monotonic() - 100, "stale logs")  # pyright: ignore[reportPrivateUsage]
+    svc._log_cache["ollama-default"] = (time.monotonic() - 100, "stale logs", 8.0)  # pyright: ignore[reportPrivateUsage]
 
     result = await svc._get_docker_logs("ollama-default")  # pyright: ignore[reportPrivateUsage]
 
