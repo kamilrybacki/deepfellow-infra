@@ -60,6 +60,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - New Google AI embedding and image models: Gemini Embedding 2, the Nano Banana 2/2-Lite/Pro image models, and GA Imagen 4.0 Standard/Ultra.
 - Remote (proxy) MCP servers now support OAuth 2.1 authorization (PKCE): DeepFellow auto-detects when a server requires OAuth, walks discovery/registration per the MCP Authorization spec, and exposes an "Authorize" action in the WebUI; tokens are refreshed automatically in the background.
 - New SGLang service (modeled on the vLLM service) for serving LLM, embedding, and reranker models. Rerank responses are normalized from SGLang's native array shape into the Cohere-style `{"results": [...]}` shape the rest of the API expects.
+- New Docker Model Runner service (modeled on the ollama-external proxy pattern) for serving LLMs via Docker Desktop's built-in Model Runner (`vllm` / `vllm-metal` backend), including GPU-accelerated inference on Apple Silicon via Metal without Ollama. Configurable base URL (default `http://localhost:12434`); models install from a curated built-in catalogue (`static/docker-model-runner-min.json`) and proxy chat/embeddings like other services. Requires Docker Desktop 4.40+ with Docker Model Runner enabled; the `vllm-metal` backend requires macOS on Apple Silicon.
 
 ### Changed
 - Direct (non-dev) dependencies still in the `0.x` series are now pinned with `~=` instead of `>=` in `pyproject.toml`, so `uv lock` can only pick up patch-level updates for them, not minor bumps that may break compatibility.
