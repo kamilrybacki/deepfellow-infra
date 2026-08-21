@@ -203,7 +203,7 @@ def test_get_installed_info_installed(svc: DockerModelRunnerService) -> None:
 
 
 def test_generate_instance_config_none_info(svc: DockerModelRunnerService) -> None:
-    config = svc._generate_instance_config(None, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", None, None)  # pyright: ignore[reportPrivateUsage]
     assert config.options is None
     assert config.models == []
 
@@ -211,7 +211,7 @@ def test_generate_instance_config_none_info(svc: DockerModelRunnerService) -> No
 def test_generate_instance_config_with_info(svc: DockerModelRunnerService) -> None:
     installed = _make_installed_info()
     installed.models["ai/llama3.2"] = _make_model_installed_info()
-    config = svc._generate_instance_config(installed, None)  # pyright: ignore[reportPrivateUsage]
+    config = svc._generate_instance_config("default", installed, None)  # pyright: ignore[reportPrivateUsage]
     assert config.options is not None
     assert config.models is not None
     assert len(config.models) == 1
