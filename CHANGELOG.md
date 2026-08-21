@@ -36,6 +36,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Refreshing the Ollama catalog no longer makes an already-installed model disappear from `list_models`/`get_model` at runtime when it has dropped out of the static and dynamic catalog: the persisted definition is now re-applied after the catalog rebuild, matching the existing restore-on-load behavior.
 - Fixed the Ollama install progress bar getting stuck at 100% forever when a service install's post-processing step (e.g. saving config) failed after an install/uninstall/reinstall cycle.
 - Rotating `infra_api_key` no longer leaves already-connected subinfras calling ancestor-proxied models with the old key: a proxy registration is now refreshed whenever the reporting peer's API key changes, not only when the model id itself is new.
+- Fixed a `pyright` type-check failure on `main` caused by Docker Model Runner's `_generate_instance_config` override not matching its base class signature.
 
 ## [0.31.0] - 2026-08-06
 
