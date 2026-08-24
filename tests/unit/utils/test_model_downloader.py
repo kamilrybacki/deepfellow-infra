@@ -182,6 +182,7 @@ async def test_hf_repo_downloader_get_filenames_parses_file_list() -> None:
         {"type": "directory", "path": "some-dir", "size": 0},
     ]
     mock_response = AsyncMock()
+    mock_response.status = 200
     mock_response.json = AsyncMock(return_value=response_data)
 
     with patch("server.utils.model_downloader.ClientSession", make_client_session_mock(mock_response)):
@@ -192,28 +193,46 @@ async def test_hf_repo_downloader_get_filenames_parses_file_list() -> None:
 
 
 @pytest.mark.asyncio
-async def test_hf_repo_downloader_get_filenames_http_error_returns_empty() -> None:
+async def test_hf_repo_downloader_get_filenames_raises_http_client_error_on_non_200_status() -> None:
+    mock_response = AsyncMock()
+    mock_response.status = 404
+    mock_response.text = AsyncMock(return_value="Not Found")
+    mock_response.headers = CIMultiDictProxy(CIMultiDict())
+
+    with (
+        patch("server.utils.model_downloader.ClientSession", make_client_session_mock(mock_response)),
+        pytest.raises(HttpClientError) as exc_info,
+    ):
+        await HuggingFaceRepoDownloader.get_filenames("user/repo")
+
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_hf_repo_downloader_get_filenames_network_error_propagates() -> None:
     mock_client_session = MagicMock()
     mock_client_session.return_value.__aenter__ = AsyncMock(side_effect=RuntimeError("network error"))
     mock_client_session.return_value.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("server.utils.model_downloader.ClientSession", mock_client_session):
-        filenames, size = await HuggingFaceRepoDownloader.get_filenames("user/repo")
-
-    assert filenames == []
-    assert size == 0
+    with (
+        patch("server.utils.model_downloader.ClientSession", mock_client_session),
+        pytest.raises(RuntimeError, match="network error"),
+    ):
+        await HuggingFaceRepoDownloader.get_filenames("user/repo")
 
 
 @pytest.mark.asyncio
-async def test_hf_repo_downloader_get_filenames_invalid_size_falls_back_to_empty() -> None:
+async def test_hf_repo_downloader_get_filenames_invalid_size_raises() -> None:
     response_data = [{"type": "file", "path": "model.bin", "size": "not-a-number"}]
     mock_response = AsyncMock()
+    mock_response.status = 200
     mock_response.json = AsyncMock(return_value=response_data)
 
-    with patch("server.utils.model_downloader.ClientSession", make_client_session_mock(mock_response)):
-        filenames, _size = await HuggingFaceRepoDownloader.get_filenames("user/repo")
-
-    assert filenames == []
+    with (
+        patch("server.utils.model_downloader.ClientSession", make_client_session_mock(mock_response)),
+        pytest.raises(ValueError, match="not-a-number"),
+    ):
+        await HuggingFaceRepoDownloader.get_filenames("user/repo")
 
 
 @pytest.mark.asyncio
@@ -273,6 +292,47 @@ async def test_hf_repo_downloader_download_raises_http_exception_on_client_error
         pytest.raises(HTTPException) as exc_info,
     ):
         async for _ in dl.download("https://huggingface.co/user/repo", model_dir, temp_dir):
+            pass
+
+    assert exc_info.value.status_code == 500
+
+
+@pytest.mark.asyncio
+async def test_hf_repo_downloader_download_maps_401_from_get_filenames_to_404_not_found(tmp_path: Path) -> None:
+    dl = _make_hf_repo_dl()
+    model_dir = tmp_path / "models"
+    temp_dir = tmp_path / "temp"
+
+    async def failing_get_filenames(model_id: str) -> tuple[list[str], int]:
+        raise HttpClientError(
+            message="error", status_code=401, headers=CIMultiDictProxy(CIMultiDict()), body="Invalid username or password."
+        )
+
+    with (
+        patch.object(HuggingFaceRepoDownloader, "get_filenames", new=AsyncMock(side_effect=failing_get_filenames)),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        async for _ in dl.download("user/repo", model_dir, temp_dir):
+            pass
+
+    assert exc_info.value.status_code == 404
+    assert "user/repo" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_hf_repo_downloader_download_other_status_from_get_filenames_goes_through_raise_http_error(tmp_path: Path) -> None:
+    dl = _make_hf_repo_dl()
+    model_dir = tmp_path / "models"
+    temp_dir = tmp_path / "temp"
+
+    async def failing_get_filenames(model_id: str) -> tuple[list[str], int]:
+        raise make_http_error("Invalid credentials in Authorization header")
+
+    with (
+        patch.object(HuggingFaceRepoDownloader, "get_filenames", new=AsyncMock(side_effect=failing_get_filenames)),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        async for _ in dl.download("user/repo", model_dir, temp_dir):
             pass
 
     assert exc_info.value.status_code == 500
