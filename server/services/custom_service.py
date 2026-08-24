@@ -288,6 +288,7 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         if parsed.id in self.models[instance]:
             raise HTTPException(400, "Model with given id already exists.")
+        self._check_prefix_collision(instance, parsed.default_prefix, exclude_model_id=None)
         name = normalize_name(f"{parsed.id}-{instance}")
         subnet = self.docker_service.get_docker_subnet()
         self.models[instance][parsed.id] = SrvCustomModel(
@@ -327,7 +328,56 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
         parsed = try_parse_pydantic(SrvCustomCustomModel, model.data)
         if installed and parsed.id in installed.models:
             raise HTTPException(400, "Cannot remove custom model, it is in use, uninstall it first.")
-        del self.models[instance][parsed.id]
+        # A model that failed to register (e.g. a prefix collision caught by load_instance) is
+        # persisted in config.custom but never made it into self.models - removing it must still
+        # succeed, not KeyError, so its persisted entry can actually be pruned.
+        if instance in self.models and parsed.id in self.models[instance]:
+            del self.models[instance][parsed.id]
+
+    async def get_duplicate_spec(self, instance: str, model_id: str) -> dict[str, Any]:
+        """Return a full add-model spec for duplicating `model_id`, custom-backed or catalog."""
+        model = self.models.get(instance, {}).get(model_id)
+        if model is None:
+            raise HTTPException(400, "Model not found")
+        if model.custom:
+            definition = self.get_custom_model_definition(model.custom)
+            if definition is None:
+                raise HTTPException(404, f"Custom model definition for {model_id} not found.")
+            return dict(definition)
+        # Catalog model: `options` may be a callable resolving hardware/env-dependent docker options
+        # from install-time fields - use the current install options if installed, else field defaults.
+        installed = self.get_instance_info(instance).installed
+        installed_model = installed.models.get(model_id) if installed else None
+        install_spec: dict[str, Any] = (installed_model.options.spec or {}) if installed_model else {}
+        docker_options = model.options(install_spec) if isinstance(model.options, Callable) else model.options
+        command = docker_options.command if isinstance(docker_options.command, str) else None
+        healthcheck = docker_options.healthcheck or {}
+        hardware_spec = self.canonicalize_hardware_spec(install_spec["hardware"]) if "hardware" in install_spec else None
+        return {
+            "id": model_id,
+            "private": True,
+            "default_prefix": model.default_prefix,
+            "size": model.size,
+            "image": docker_options.image,
+            "image_port": docker_options.image_port,
+            "command": command,
+            "hardware": hardware_spec,
+            # `docker_options.volumes` is already a fully-expanded `host:container` bind mount (see
+            # e.g. lemmatizer's `generate_docker_options`), but `_add_custom_model` always re-prefixes
+            # whatever it receives with the duplicate's own working directory, assuming a bare
+            # container path - strip the host side back off so it gets that raw form, not a
+            # three-segment, two-colon string Compose can't parse.
+            "volumes": [v.split(":", 1)[1] if ":" in v else v for v in (docker_options.volumes or [])],
+            # `generate_docker_options` callables (e.g. lemmatizer/bge_m3/doc_chunker) default several
+            # env vars to actual int/bool literals, not strings - `SrvCustomCustomModel.envs` is
+            # `dict[str, str]`, so these must be stringified or add_custom_model's validation rejects
+            # them ("envs.<key>: Input should be a valid string").
+            "envs": {key: str(value) for key, value in docker_options.env_vars.items()} if docker_options.env_vars else None,
+            "healthcheck_cmd": healthcheck.get("test"),
+            "healthcheck_start_period": healthcheck.get("start_period"),
+            "description": model.description,
+            "repository_url": model.repository_url,
+        }
 
     async def list_models(self, input_instance: str | list[str] | None, filters: ListModelsFilters) -> ListModelsOut:
         """List models."""
@@ -359,6 +409,8 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
                             downloaded=model_id in self.models_downloaded,
                             size=model.size,
                             custom=model.custom,
+                            default_prefix=model.default_prefix,
+                            effective_prefix=(info.models[model_id].prefix if model_id in info.models else model.default_prefix),
                             spec=model.model_spec,
                             has_docker=True,
                             description=model.description or None,
@@ -386,6 +438,8 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
             downloaded=model_id in self.models_downloaded,
             size=model.size,
             custom=model.custom,
+            default_prefix=model.default_prefix,
+            effective_prefix=(info.models[model_id].prefix if model_id in info.models else model.default_prefix),
             spec=model.model_spec,
             has_docker=True,
             description=model.description or None,

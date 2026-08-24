@@ -165,6 +165,75 @@ async def test_update_user_model_overwrites_dockerfile_and_removes_old_image(svc
     deps["docker_service"].remove_image.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_update_user_model_restores_dockerfile_when_remove_image_fails(svc: McpService, tmp_path: Path, deps: dict[str, Any]) -> None:
+    """Editing a user server writes the new Dockerfile to the same path the old one lived at (the id -
+    and so the directory - is immutable). If removing the old image then fails, the new content must
+    not linger on disk under the old model's identity - otherwise a later rollback-rebuild (edit_model's
+    except branch, which reinstalls the old model_id from whatever's on disk) would silently build the
+    new, partially-applied command under the old model's name with no error surfaced anywhere."""
+    with patch.object(svc, "_get_working_dir", return_value=tmp_path):
+        svc._add_custom_model("default", _make_user_model(command="npx -y old-server"))  # pyright: ignore[reportPrivateUsage]
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].remove_image = AsyncMock(side_effect=RuntimeError("image in use"))
+
+    custom_id = "uuid-user-1"
+    new_data = {
+        "kind": "user",
+        "id": "my-server",
+        "name": "My Server",
+        "variant": "node-headless",
+        "command": "npx -y new-server",
+    }
+    old_model = CustomModel(
+        id=custom_id,
+        data={"kind": "user", "id": "my-server", "name": "My Server", "variant": "node-headless", "command": "npx -y old-server"},
+    )
+    with (
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),
+        pytest.raises(RuntimeError, match="image in use"),
+    ):
+        await svc._update_custom_model("default", old_model, new_data)  # pyright: ignore[reportPrivateUsage]
+
+    dockerfile = tmp_path / "models" / "default" / "my-server" / "Dockerfile"
+    assert '["npx -y old-server"]' in dockerfile.read_text()
+    assert "my-server" in svc.models["default"]
+    assert svc.models["default"]["my-server"].command == "npx -y old-server"
+
+
+@pytest.mark.asyncio
+async def test_update_user_model_remove_image_fails_with_no_prior_dockerfile(svc: McpService, tmp_path: Path, deps: dict[str, Any]) -> None:
+    """No prior Dockerfile on disk (e.g. its directory was wiped out-of-band) means there's nothing to
+    restore on a failed remove_image - the new Dockerfile the edit just wrote is left in place, and the
+    original exception still propagates instead of being masked by a restore attempt."""
+    with patch.object(svc, "_get_working_dir", return_value=tmp_path):
+        svc._add_custom_model("default", _make_user_model(command="npx -y old-server"))  # pyright: ignore[reportPrivateUsage]
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].remove_image = AsyncMock(side_effect=RuntimeError("image in use"))
+    (tmp_path / "models" / "default" / "my-server" / "Dockerfile").unlink()
+
+    custom_id = "uuid-user-1"
+    new_data = {
+        "kind": "user",
+        "id": "my-server",
+        "name": "My Server",
+        "variant": "node-headless",
+        "command": "npx -y new-server",
+    }
+    old_model = CustomModel(
+        id=custom_id,
+        data={"kind": "user", "id": "my-server", "name": "My Server", "variant": "node-headless", "command": "npx -y old-server"},
+    )
+    with (
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),
+        pytest.raises(RuntimeError, match="image in use"),
+    ):
+        await svc._update_custom_model("default", old_model, new_data)  # pyright: ignore[reportPrivateUsage]
+
+    dockerfile = tmp_path / "models" / "default" / "my-server" / "Dockerfile"
+    assert '["npx -y new-server"]' in dockerfile.read_text()
+
+
 def test_remove_user_model_deletes_dockerfile_dir(svc: McpService, tmp_path: Path) -> None:
     """7.6 - removing a user server deletes the Dockerfile directory."""
     with patch.object(svc, "_get_working_dir", return_value=tmp_path):
@@ -282,18 +351,127 @@ def test_add_user_model_initialises_instance_dict(svc: McpService, tmp_path: Pat
     assert "my-server" in svc.models["other-instance"]
 
 
+_IMAGE_MODEL_DATA: dict[str, Any] = {
+    "id": "some-model",
+    "default_prefix": "some-model",
+    "size": "1GB",
+    "image": "img:latest",
+    "image_port": 8000,
+}
+
+
 @pytest.mark.asyncio
-async def test_update_non_user_kind_raises_400(svc: McpService, tmp_path: Path) -> None:
-    """Line 520: editing a non-user-kind model raises 400."""
-    custom_model = CustomModel(
-        id="uuid-custom",
-        data={"kind": "custom", "id": "some-model", "name": "Some Model", "image": "img:latest"},
-    )
+async def test_update_image_kind_model_succeeds(svc: McpService) -> None:
+    """DFINFRA-271: plain docker-image ("kind" is None) MCP servers are no longer rejected outright."""
+    model = CustomModel(id="uuid-custom", data=dict(_IMAGE_MODEL_DATA))
+    svc._add_custom_model("default", model)  # pyright: ignore[reportPrivateUsage]
+
+    new_data = {**_IMAGE_MODEL_DATA, "image": "img:v2"}
+    await svc._update_custom_model("default", model, new_data)  # pyright: ignore[reportPrivateUsage]
+
+    assert svc.models["default"]["some-model"].options.image == "img:v2"  # pyright: ignore[reportOptionalMemberAccess]
+
+
+@pytest.mark.asyncio
+async def test_update_image_kind_model_when_not_in_models_dict(svc: McpService) -> None:
+    """Mirrors the `user`/`proxy` kinds' equivalent case: if the model is registered in `config.custom`
+    but missing from the live `self.models` registry (e.g. a definition restored from disk that hasn't
+    been re-added yet), the update skips the (non-existent) delete and just adds the new one."""
+    model = CustomModel(id="uuid-custom", data=dict(_IMAGE_MODEL_DATA))
+    svc.models.clear()
+
+    await svc._update_custom_model("default", model, {**_IMAGE_MODEL_DATA, "image": "img:v2"})  # pyright: ignore[reportPrivateUsage]
+
+    assert "some-model" in svc.models["default"]
+    assert svc.models["default"]["some-model"].options.image == "img:v2"  # pyright: ignore[reportOptionalMemberAccess]
+
+
+@pytest.mark.asyncio
+async def test_update_image_kind_model_id_change_raises_400(svc: McpService) -> None:
+    model = CustomModel(id="uuid-custom", data=dict(_IMAGE_MODEL_DATA))
+    svc._add_custom_model("default", model)  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(HTTPException) as exc_info:
+        await svc._update_custom_model("default", model, {**_IMAGE_MODEL_DATA, "id": "renamed"})  # pyright: ignore[reportPrivateUsage]
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_image_kind_model_installed_raises_400(svc: McpService) -> None:
+    model = CustomModel(id="uuid-custom", data=dict(_IMAGE_MODEL_DATA))
+    svc._add_custom_model("default", model)  # pyright: ignore[reportPrivateUsage]
+
+    installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    installed.models["some-model"] = MagicMock()
+    svc.instances_info["default"].installed = installed
+
     with pytest.raises(HTTPException) as exc_info:
         await svc._update_custom_model(  # pyright: ignore[reportPrivateUsage]
-            "default", custom_model, {"kind": "custom", "id": "some-model", "name": "x", "image": "img:latest"}
+            "default", model, {**_IMAGE_MODEL_DATA, "image": "img:v2"}
         )
     assert exc_info.value.status_code == 400
+    assert "Uninstall it first" in str(exc_info.value.detail)
+
+
+def test_add_image_model_prefix_collision_raises_400(svc: McpService) -> None:
+    """Duplicating a plain docker-image model without changing `default_prefix` must be rejected on
+    add, not just on a later edit - `_add_image_model` previously had no prefix-collision check at all."""
+    model = CustomModel(id="uuid-a", data=dict(_IMAGE_MODEL_DATA))
+    svc._add_custom_model("default", model)  # pyright: ignore[reportPrivateUsage]
+
+    colliding = CustomModel(id="uuid-b", data={**_IMAGE_MODEL_DATA, "id": "other-model"})
+    with pytest.raises(HTTPException) as exc_info:
+        svc._add_custom_model("default", colliding)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_image_kind_model_prefix_collision_raises_400(svc: McpService) -> None:
+    model = CustomModel(id="uuid-a", data=dict(_IMAGE_MODEL_DATA))
+    other = CustomModel(id="uuid-b", data={**_IMAGE_MODEL_DATA, "id": "other-model", "default_prefix": "other-model"})
+    svc._add_custom_model("default", model)  # pyright: ignore[reportPrivateUsage]
+    svc._add_custom_model("default", other)  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(HTTPException) as exc_info:
+        await svc._update_custom_model(  # pyright: ignore[reportPrivateUsage]
+            "default", model, {**_IMAGE_MODEL_DATA, "default_prefix": "other-model"}
+        )
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_image_kind_model_rejects_invalid_data_before_any_mutation(svc: McpService) -> None:
+    """Invalid new data (fails SrvMcpCustomModel validation) is rejected before the old registration
+    is ever removed - the model is left exactly as it was, not merely "restored" after a rollback."""
+    model = CustomModel(id="uuid-custom", data=dict(_IMAGE_MODEL_DATA))
+    svc._add_custom_model("default", model)  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(HTTPException):
+        await svc._update_custom_model(  # pyright: ignore[reportPrivateUsage]
+            "default", model, {**_IMAGE_MODEL_DATA, "image_port": "not-an-int"}
+        )
+
+    assert svc.models["default"]["some-model"].options.image == "img:latest"  # pyright: ignore[reportOptionalMemberAccess]
+
+
+@pytest.mark.asyncio
+async def test_update_image_kind_model_restores_old_on_add_failure(svc: McpService, deps: dict[str, Any]) -> None:
+    """The new registration is built (and can fail) before the old one is ever removed - a failure
+    here (e.g. the docker subnet lookup itself failing) leaves the original model untouched, with no
+    delete-then-rollback window and no need to re-add it."""
+    model = CustomModel(id="uuid-custom", data=dict(_IMAGE_MODEL_DATA))
+    svc._add_custom_model("default", model)  # pyright: ignore[reportPrivateUsage]
+
+    deps["docker_service"].get_docker_subnet.side_effect = RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await svc._update_custom_model(  # pyright: ignore[reportPrivateUsage]
+            "default", model, {**_IMAGE_MODEL_DATA, "image": "img:v2"}
+        )
+
+    assert "some-model" in svc.models["default"]
+    assert svc.models["default"]["some-model"].options.image == "img:latest"  # pyright: ignore[reportOptionalMemberAccess]
 
 
 @pytest.mark.asyncio
@@ -428,17 +606,18 @@ def _make_proxy_model(
     server_url: str = "https://example.com/mcp",
     transport: str = "streamable_http",
     custom_id: str = "uuid-proxy-1",
+    default_prefix: str | None = None,
 ) -> CustomModel:
-    return CustomModel(
-        id=custom_id,
-        data={
-            "kind": "proxy",
-            "id": model_id,
-            "name": name,
-            "server_url": server_url,
-            "transport": transport,
-        },
-    )
+    data: dict[str, Any] = {
+        "kind": "proxy",
+        "id": model_id,
+        "name": name,
+        "server_url": server_url,
+        "transport": transport,
+    }
+    if default_prefix is not None:
+        data["default_prefix"] = default_prefix
+    return CustomModel(id=custom_id, data=data)
 
 
 def test_srv_mcp_proxy_model_valid() -> None:
@@ -499,6 +678,77 @@ def test_add_proxy_model_prefix_collision_raises_400(svc: McpService) -> None:
     with pytest.raises(HTTPException) as exc_info:
         svc._add_custom_model("default", _make_proxy_model(model_id="remote_mcp", custom_id="uuid-2"))  # pyright: ignore[reportPrivateUsage]
     assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_check_prefix_collision_uses_installed_prefix_not_stale_default(svc: McpService) -> None:
+    """Once a model's live install-time prefix has moved away from its `default_prefix` (via
+    `edit_model_install_options`), `_check_prefix_collision` must guard the live prefix it's actually
+    serving on, not the stale `default_prefix` left behind on the definition - and it must stop
+    guarding the slot that model no longer occupies."""
+    svc.service_provider.save_service_config = AsyncMock()  # type: ignore[method-assign]
+    svc._add_custom_model("default", _make_proxy_model(model_id="model-a", default_prefix="model-a"))  # pyright: ignore[reportPrivateUsage]
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+
+    promise = await svc._install_model("default", "model-a", InstallModelIn(stream=False, spec={}))  # pyright: ignore[reportPrivateUsage]
+    await promise.wait()
+
+    was_installed, promise = await svc.edit_model_install_options(
+        "default", "model-a", InstallModelIn(stream=False, spec={"prefix": "shared"})
+    )
+    await promise.wait()
+    assert was_installed is True
+
+    # A new model can't take the prefix model-a actually moved to, even though model-a's own
+    # `default_prefix` ("model-a") never changed and still says otherwise.
+    with pytest.raises(HTTPException) as exc_info:
+        svc._add_custom_model(  # pyright: ignore[reportPrivateUsage]
+            "default", _make_proxy_model(model_id="model-b", custom_id="uuid-b", default_prefix="shared")
+        )
+    assert exc_info.value.status_code == 400
+
+    # model-a's vacated original slot ("model-a") is free again - no false positive against the
+    # stale `default_prefix` it left behind.
+    svc._add_custom_model(  # pyright: ignore[reportPrivateUsage]
+        "default", _make_proxy_model(model_id="model-c", custom_id="uuid-c", default_prefix="model-a")
+    )
+    assert "model-c" in svc.models["default"]
+
+
+@pytest.mark.asyncio
+async def test_edit_model_uses_recomputed_prefix_when_new_definition_omits_default_prefix(svc: McpService) -> None:
+    """`edit_model` must reinstall under the prefix `update_custom_model` actually computed for the
+    edited definition - including its `normalize_name(id)` fallback when `default_prefix` is cleared
+    - not the prefix from before the edit. Otherwise the model reinstalls on its *old* endpoint while
+    its registry metadata already advertises the new one."""
+    svc.service_provider.save_service_config = AsyncMock()  # type: ignore[method-assign]
+    model = _make_proxy_model(model_id="my-remote-mcp", custom_id="uuid-proxy-1", default_prefix="custom-pfx")
+    svc._add_custom_model("default", model)  # pyright: ignore[reportPrivateUsage]
+    svc.instances_info["default"].config.custom = [model]
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+
+    promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+        "default", "my-remote-mcp", InstallModelIn(stream=False, spec={"prefix": "custom-pfx"})
+    )
+    await promise.wait()
+
+    # The WebUI sends `default_prefix` as absent (not `null`/empty) whenever the field is cleared.
+    new_spec = {
+        "kind": "proxy",
+        "id": "my-remote-mcp",
+        "name": "Remote MCP",
+        "server_url": "https://example.com/mcp",
+        "transport": "streamable_http",
+    }
+    promise = await svc.edit_model("default", "uuid-proxy-1", AddCustomModelIn(spec=new_spec))
+    assert promise is not None
+    await promise.wait()
+
+    recomputed_prefix = svc.models["default"]["my-remote-mcp"].default_prefix
+    assert recomputed_prefix != "custom-pfx"
+    installed = svc.instances_info["default"].installed
+    assert installed is not None
+    assert installed.models["my-remote-mcp"].prefix == recomputed_prefix
 
 
 def test_remove_proxy_model(svc: McpService) -> None:
@@ -611,6 +861,30 @@ async def test_update_proxy_model_replaces_entry(svc: McpService) -> None:
     m = svc.models["default"]["remote-mcp"]
     assert m.proxy_url == "https://new.example.com/mcp"
     assert m.proxy_transport == "sse"
+
+
+@pytest.mark.asyncio
+async def test_update_proxy_model_build_failure_preserves_old_entry(svc: McpService) -> None:
+    """A proxy-kind edit must not remove the old entry from the registry until the replacement has
+    been successfully built - previously _update_custom_model deleted the old entry first (to dodge
+    _add_proxy_model's own "already exists" guard, since the id is unchanged on an edit), so any
+    failure building/validating the new definition left the server missing from the registry - and so
+    from the endpoint list - until a process restart."""
+    svc._add_custom_model("default", _make_proxy_model())  # pyright: ignore[reportPrivateUsage]
+    svc.instances_info["default"].installed = None
+
+    with (
+        patch.object(svc, "_build_proxy_model", side_effect=RuntimeError("boom")),
+        pytest.raises(RuntimeError, match="boom"),
+    ):
+        await svc._update_custom_model(  # pyright: ignore[reportPrivateUsage]
+            "default",
+            _make_proxy_model(),
+            {"kind": "proxy", "id": "remote-mcp", "name": "Updated Remote", "server_url": "https://new.example.com/mcp"},
+        )
+
+    assert "remote-mcp" in svc.models["default"]
+    assert svc.models["default"]["remote-mcp"].proxy_url == "https://example.com/mcp"
 
 
 @pytest.mark.asyncio
@@ -957,6 +1231,30 @@ async def test_update_proxy_model_when_not_in_models_dict(svc: McpService) -> No
             "transport": "streamable_http",
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_update_proxy_model_when_instance_missing_from_models_dict(svc: McpService) -> None:
+    """The instance itself (not just the model entry) can be absent from self.models - e.g. every
+    model for it was already removed - in which case the build-then-swap must still (re)create the
+    instance's dict rather than assume it already exists."""
+    svc._add_custom_model("default", _make_proxy_model())  # pyright: ignore[reportPrivateUsage]
+    svc.instances_info["default"].installed = None
+    del svc.models["default"]
+
+    await svc._update_custom_model(  # pyright: ignore[reportPrivateUsage]
+        "default",
+        _make_proxy_model(),
+        {
+            "kind": "proxy",
+            "id": "remote-mcp",
+            "name": "Remote MCP",
+            "server_url": "https://new.example.com/mcp",
+            "transport": "streamable_http",
+        },
+    )
+
+    assert svc.models["default"]["remote-mcp"].proxy_url == "https://new.example.com/mcp"
 
     assert "remote-mcp" in svc.models["default"]
     assert svc.models["default"]["remote-mcp"].proxy_url == "https://new.example.com/mcp"

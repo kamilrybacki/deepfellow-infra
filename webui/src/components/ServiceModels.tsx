@@ -121,6 +121,28 @@ function configPageToastAction(navigate: ReturnType<typeof useNavigate>) {
   };
 }
 
+// Auto-install submits install-time options directly (no separate "click Install" dialog to fill
+// them in), so without this they'd default to empty - leaving the row's Configuration column blank
+// even though the container is actually running with the definition's own envs/headers/prefix.
+function buildDuplicateInstallSpec(
+  definitionSpec: Record<string, unknown>,
+): Record<string, unknown> {
+  const installSpec: Record<string, unknown> = {};
+  if (
+    typeof definitionSpec.default_prefix === "string" &&
+    definitionSpec.default_prefix.trim()
+  ) {
+    installSpec.prefix = definitionSpec.default_prefix;
+  }
+  if (definitionSpec.envs && typeof definitionSpec.envs === "object") {
+    installSpec.envs = definitionSpec.envs;
+  }
+  if (definitionSpec.headers && typeof definitionSpec.headers === "object") {
+    installSpec.headers = definitionSpec.headers;
+  }
+  return installSpec;
+}
+
 interface ServiceModelsProps {
   serviceId: string;
 }
@@ -144,6 +166,7 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
   const [installingModelId, setInstallingModelId] = useState<string | null>(
     null,
   );
+  const [editingModelId, setEditingModelId] = useState<string | null>(null);
   const [oauthPromptModelId, setOauthPromptModelId] = useState<string | null>(
     null,
   );
@@ -192,6 +215,14 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
   });
 
   const modelsData = modelsQuery.data;
+  const existingModelRefs = useMemo(
+    () =>
+      (modelsData?.list ?? []).map((m) => ({
+        id: m.id,
+        effective_prefix: m.effective_prefix,
+      })),
+    [modelsData],
+  );
 
   const { refetch: refetchModels } = modelsQuery;
   const handleRetryLoadModels = useCallback(() => {
@@ -805,7 +836,7 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
     },
   });
 
-  const updateCustomModelMutation = useMutation({
+  const editCustomModelMutation = useMutation({
     mutationFn: async ({
       customModelId,
       spec,
@@ -813,17 +844,49 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
       customModelId: string;
       spec: Record<string, unknown>;
     }) => {
-      return apiClient.updateCustomModel(serviceId, customModelId, spec);
+      return apiClient.editCustomModel(serviceId, customModelId, spec);
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
       queryClient.invalidateQueries({
         queryKey: ["admin", "services", serviceId, "models"],
       });
-      modal.close();
-      toast.success("Custom model updated successfully");
+      setEditingModelId(null);
+      toast.success(
+        result.reinstalled
+          ? "Settings saved. The service was reinstalled with the new settings."
+          : "Settings saved.",
+      );
     },
     onError: (error) => {
-      toast.error(`Failed to update custom model: ${error.message}`);
+      setEditingModelId(null);
+      toast.error(`Failed to save settings: ${error.message}`);
+    },
+  });
+
+  const editModelInstallOptionsMutation = useMutation({
+    mutationFn: async ({
+      modelId,
+      spec,
+    }: {
+      modelId: string;
+      spec: Record<string, unknown>;
+    }) => {
+      return apiClient.editModelInstallOptions(serviceId, modelId, spec);
+    },
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({
+        queryKey: ["admin", "services", serviceId, "models"],
+      });
+      setEditingModelId(null);
+      toast.success(
+        result.reinstalled
+          ? "Settings saved. The service was reinstalled with the new settings."
+          : "Settings saved.",
+      );
+    },
+    onError: (error) => {
+      setEditingModelId(null);
+      toast.error(`Failed to save settings: ${error.message}`);
     },
   });
 
@@ -880,10 +943,11 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
     },
     onError: (error) => {
       setMcpApiError(error.message || "Failed to add MCP server");
+      toast.error(error.message || "Failed to add MCP server");
     },
   });
 
-  const updateMcpServerMutation = useMutation({
+  const editMcpServerMutation = useMutation({
     mutationFn: async ({
       customModelId,
       spec,
@@ -891,22 +955,26 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
       customModelId: string;
       spec: AddMcpServerSpec | ProxyMcpServerSpec;
     }) => {
-      return apiClient.updateCustomModel(
+      return apiClient.editCustomModel(
         serviceId,
         customModelId,
         spec as unknown as Record<string, unknown>,
       );
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
       queryClient.invalidateQueries({
         queryKey: ["admin", "services", serviceId, "models"],
       });
-      setEditMcpServer(null);
-      setMcpApiError(null);
-      toast.success("MCP server updated. Reinstall to apply changes.");
+      setEditingModelId(null);
+      toast.success(
+        result.reinstalled
+          ? "MCP server updated. It was reinstalled with the new settings."
+          : "MCP server updated.",
+      );
     },
     onError: (error) => {
-      setMcpApiError(error.message || "Failed to update MCP server");
+      setEditingModelId(null);
+      toast.error(error.message || "Failed to update MCP server");
     },
   });
 
@@ -1119,6 +1187,142 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
     [modal, serviceId, installMutation.mutate],
   );
 
+  // A duplicated model installs itself immediately, using the definition's own default prefix/envs -
+  // no separate "click Install" step, unlike a freshly hand-added custom model.
+  const installNewlyDuplicatedModel = useCallback(
+    (newModelId: string, size?: string, spec: Record<string, unknown> = {}) => {
+      // Set the same way handleInstallClick does - if this install trips docker-image warnings,
+      // the WarningsModal's "Continue" button (handleWarningsContinue) reads this ref to know which
+      // install to retry with ignoreWarnings. Without it, "Continue" would either no-op or retry a
+      // stale install left over from an earlier attempt in the same session.
+      pendingInstallationRef.current = { modelId: newModelId, spec, size };
+      const toastId = toast.loading(
+        `Starting installation for ${newModelId}...`,
+      );
+      toastIdsRef.current[newModelId] = toastId;
+      installMutation.mutate({ modelId: newModelId, spec, size });
+    },
+    [installMutation.mutate],
+  );
+
+  const handleEditModelOptionsClick = useCallback(
+    async (model: ServiceModel) => {
+      modal.open(DynamicFormModal, {
+        title: `Edit settings for ${model.id}`,
+        fields: [],
+        isLoading: true,
+        isSubmitting: false,
+        onSubmit: () => {},
+      });
+
+      try {
+        const modelDetail = await apiClient.getAdminServiceModel(
+          serviceId,
+          model.id,
+        );
+        const installedInfo =
+          model.installed && typeof model.installed === "object"
+            ? model.installed
+            : null;
+
+        // Catalog models (no `model.custom`) have no stored definition to duplicate from - fetch one
+        // synthesized from the live model, so "duplicate" can offer the full add-model field set
+        // (image, command, etc.), not just the narrower install-options fields shown for editing.
+        let duplicateSpec: Record<string, unknown> | null = null;
+        if (serviceInfo?.custom_model_spec) {
+          try {
+            const result = await apiClient.getDuplicateSpec(
+              serviceId,
+              model.id,
+            );
+            duplicateSpec = result.spec;
+          } catch (error) {
+            // Duplicate just won't be offered for this model; editing its install options still works.
+            // Still log it - a silent failure here also silently disables the "skip reinstall when
+            // nothing changed" optimization (DynamicFormModal's isUnchanged requires onDuplicate to be
+            // present), so a transient error would otherwise go completely unnoticed.
+            console.error(
+              `Failed to prepare a duplicate spec for ${model.id}:`,
+              error,
+            );
+          }
+        }
+
+        modal.open(DynamicFormModal, {
+          title: `Edit settings for ${modelDetail.id}`,
+          duplicateTitle: `Duplicate ${modelDetail.id}`,
+          fields: modelDetail.spec.fields,
+          initialData: (installedInfo?.spec ?? {}) as Record<string, unknown>,
+          selfModelId: modelDetail.id,
+          deferRender: true,
+          submitLabel: "Save",
+          onSubmit: (spec: Record<string, unknown>) => {
+            const cleanedSpec = Object.fromEntries(
+              Object.entries(spec).filter(
+                ([_, value]) => value !== null && value !== undefined,
+              ),
+            ) as Record<string, unknown>;
+            modal.close();
+            setEditingModelId(modelDetail.id);
+            editModelInstallOptionsMutation.mutate({
+              modelId: modelDetail.id,
+              spec: cleanedSpec,
+            });
+          },
+          ...(duplicateSpec && serviceInfo?.custom_model_spec
+            ? {
+                duplicateFields: serviceInfo.custom_model_spec.fields,
+                duplicateInitialData: duplicateSpec,
+                onDuplicate: (spec: Record<string, unknown>) => {
+                  const cleanedSpec = Object.fromEntries(
+                    Object.entries(spec).filter(
+                      ([_, value]) => value !== null && value !== undefined,
+                    ),
+                  ) as Record<string, unknown>;
+                  const maybeId = cleanedSpec.id;
+                  const newModelId =
+                    typeof maybeId === "string" && maybeId.trim()
+                      ? maybeId.trim()
+                      : null;
+                  // No search-and-focus after duplicating: the new model installs itself
+                  // immediately below, so there's no need to jump to it in the list.
+                  lastAddedCustomModelIdRef.current = null;
+                  addCustomModelMutation.mutate(cleanedSpec, {
+                    onSuccess: () => {
+                      if (newModelId) {
+                        installNewlyDuplicatedModel(
+                          newModelId,
+                          typeof cleanedSpec.size === "string"
+                            ? cleanedSpec.size
+                            : undefined,
+                          buildDuplicateInstallSpec(cleanedSpec),
+                        );
+                      }
+                    },
+                  });
+                },
+              }
+            : {}),
+          existingModels: existingModelRefs,
+          isSubmitting: addCustomModelMutation.isPending,
+        });
+      } catch {
+        modal.close();
+        toast.error("Failed to load model details");
+      }
+    },
+    [
+      modal,
+      serviceId,
+      serviceInfo,
+      existingModelRefs,
+      editModelInstallOptionsMutation.mutate,
+      addCustomModelMutation.mutate,
+      addCustomModelMutation.isPending,
+      installNewlyDuplicatedModel,
+    ],
+  );
+
   const handleWarningsContinue = useCallback(() => {
     if (pendingInstallationRef.current) {
       hasWarningsRef.current = false;
@@ -1253,61 +1457,133 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
     ],
   );
 
-  const handleEditMcpServerClick = useCallback((model: ServiceModel) => {
-    const customModelId = model.custom;
-    if (!customModelId) return;
-    if (model.installed) {
-      toast.error(
-        "Cannot edit: server is currently installed. Uninstall it first.",
-      );
-      return;
-    }
-    setMcpApiError(null);
-    const rawSpec = model.custom_spec;
-    const kind = rawSpec?.kind === "proxy" ? "proxy" : "user";
-    if (kind === "proxy") {
-      setEditMcpServer({
-        customModelId,
-        spec: {
-          kind: "proxy",
-          id: model.id,
-          name: String(rawSpec?.name ?? model.id),
-          server_url: String(rawSpec?.server_url ?? ""),
-          transport:
-            (rawSpec?.transport as ProxyMcpServerSpec["transport"]) ??
-            "streamable_http",
-          default_prefix:
-            rawSpec?.default_prefix != null
-              ? String(rawSpec.default_prefix)
-              : undefined,
-          headers: rawSpec?.headers as Record<string, string> | undefined,
-          oauth: rawSpec?.oauth as ProxyMcpServerSpec["oauth"] | undefined,
-        },
-      });
-    } else {
-      setEditMcpServer({
-        customModelId,
-        spec: {
-          kind: "user",
-          id: model.id,
-          name: model.id,
-          variant: (model.variant ??
-            "node-headless") as AddMcpServerSpec["variant"],
-          command: String(rawSpec?.command ?? model.command ?? ""),
-          base_image:
-            rawSpec?.base_image != null
-              ? String(rawSpec.base_image)
-              : (model.base_image ?? undefined),
-          envs: rawSpec?.envs as Record<string, string> | undefined,
-          default_prefix:
-            rawSpec?.default_prefix != null
-              ? String(rawSpec.default_prefix)
-              : undefined,
-        },
-      });
-    }
-  }, []);
+  const handleEditMcpServerClick = useCallback(
+    (model: ServiceModel) => {
+      const customModelId = model.custom;
+      if (!customModelId) return;
+      setMcpApiError(null);
+      const rawSpec = model.custom_spec;
+      const kind =
+        rawSpec?.kind === "proxy"
+          ? "proxy"
+          : rawSpec?.kind === "user"
+            ? "user"
+            : "docker";
+      if (kind === "docker") {
+        // A plain Docker-image MCP server (no stdio command, no remote URL) - e.g. a duplicated
+        // catalog model like `open-websearch` once it's persisted as its own CustomModel. It has
+        // no `command`/`server_url` of its own, so AddMcpServerModal's stdio/proxy shape doesn't
+        // fit it (its edit form never shows Docker fields); edit it the same way a "custom"
+        // service model is edited instead - the full add-model field set, prefilled from its own
+        // stored definition.
+        if (!serviceInfo?.custom_model_spec) return;
+        modal.open(DynamicFormModal, {
+          title: `Edit MCP server ${model.id}`,
+          duplicateTitle: `Duplicate ${model.id}`,
+          fields: serviceInfo.custom_model_spec.fields,
+          initialData: (rawSpec ?? {}) as Record<string, unknown>,
+          selfModelId: model.id,
+          deferRender: true,
+          submitLabel: "Save",
+          onSubmit: (spec: Record<string, unknown>) => {
+            const cleanedSpec = Object.fromEntries(
+              Object.entries(spec).filter(
+                ([_, value]) => value !== null && value !== undefined,
+              ),
+            ) as Record<string, unknown>;
+            modal.close();
+            setEditingModelId(model.id);
+            editCustomModelMutation.mutate({
+              customModelId,
+              spec: cleanedSpec,
+            });
+          },
+          onDuplicate: (spec: Record<string, unknown>) => {
+            const cleanedSpec = Object.fromEntries(
+              Object.entries(spec).filter(
+                ([_, value]) => value !== null && value !== undefined,
+              ),
+            ) as Record<string, unknown>;
+            const maybeId = cleanedSpec.id;
+            const newModelId =
+              typeof maybeId === "string" && maybeId.trim()
+                ? maybeId.trim()
+                : null;
+            lastAddedCustomModelIdRef.current = null;
+            addCustomModelMutation.mutate(cleanedSpec, {
+              onSuccess: () => {
+                if (newModelId) {
+                  installNewlyDuplicatedModel(
+                    newModelId,
+                    typeof cleanedSpec.size === "string"
+                      ? cleanedSpec.size
+                      : undefined,
+                    buildDuplicateInstallSpec(cleanedSpec),
+                  );
+                }
+              },
+            });
+          },
+          existingModels: existingModelRefs,
+          isSubmitting: addCustomModelMutation.isPending,
+        });
+        return;
+      }
+      if (kind === "proxy") {
+        setEditMcpServer({
+          customModelId,
+          spec: {
+            kind: "proxy",
+            id: model.id,
+            name: String(rawSpec?.name ?? model.id),
+            server_url: String(rawSpec?.server_url ?? ""),
+            transport:
+              (rawSpec?.transport as ProxyMcpServerSpec["transport"]) ??
+              "streamable_http",
+            default_prefix:
+              rawSpec?.default_prefix != null
+                ? String(rawSpec.default_prefix)
+                : undefined,
+            headers: rawSpec?.headers as Record<string, string> | undefined,
+            oauth: rawSpec?.oauth as ProxyMcpServerSpec["oauth"] | undefined,
+          },
+        });
+      } else {
+        setEditMcpServer({
+          customModelId,
+          spec: {
+            kind: "user",
+            id: model.id,
+            name: model.id,
+            variant: (model.variant ??
+              "node-headless") as AddMcpServerSpec["variant"],
+            command: String(rawSpec?.command ?? model.command ?? ""),
+            base_image:
+              rawSpec?.base_image != null
+                ? String(rawSpec.base_image)
+                : (model.base_image ?? undefined),
+            envs: rawSpec?.envs as Record<string, string> | undefined,
+            default_prefix:
+              rawSpec?.default_prefix != null
+                ? String(rawSpec.default_prefix)
+                : undefined,
+          },
+        });
+      }
+    },
+    [
+      modal,
+      serviceInfo,
+      existingModelRefs,
+      editCustomModelMutation.mutate,
+      addCustomModelMutation.mutate,
+      addCustomModelMutation.isPending,
+      installNewlyDuplicatedModel,
+    ],
+  );
 
+  // A duplicated model installs itself immediately, using the definition's own default prefix/envs -
+  // no separate "click Install" step, unlike a freshly hand-added custom model.
   const handleEditCustomModelClick = useCallback(
     (model: ServiceModel) => {
       const customModelId = model.custom;
@@ -1315,41 +1591,70 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
         toast.error("Model is not a custom model.");
         return;
       }
-      if (model.installed) {
-        toast.error(
-          "Cannot edit custom model: it is currently installed. Please uninstall it first.",
-        );
-        return;
-      }
       if (!serviceInfo?.custom_model_spec) return;
       const fields = serviceInfo.custom_model_spec.fields;
 
+      // Mirrors the Install flow: the dialog closes the moment the request is submitted, and the
+      // row's Status column shows "Editing..." for the duration instead of a spinner inside the
+      // dialog. That also sidesteps needing to keep isSubmitting reactive across the closed dialog.
       modal.open(DynamicFormModal, {
         title: `Edit custom model ${model.id}`,
+        duplicateTitle: `Duplicate ${model.id}`,
         fields,
         initialData: (model.custom_spec ?? {}) as Record<string, unknown>,
+        selfModelId: model.id,
         deferRender: true,
         submitLabel: "Save",
-        submittingLabel: "Saving...",
         onSubmit: (spec: Record<string, unknown>) => {
           const cleanedSpec = Object.fromEntries(
             Object.entries(spec).filter(
               ([_, value]) => value !== null && value !== undefined,
             ),
           ) as Record<string, unknown>;
-          updateCustomModelMutation.mutate({
-            customModelId,
-            spec: cleanedSpec,
+          modal.close();
+          setEditingModelId(model.id);
+          editCustomModelMutation.mutate({ customModelId, spec: cleanedSpec });
+        },
+        onDuplicate: (spec: Record<string, unknown>) => {
+          const cleanedSpec = Object.fromEntries(
+            Object.entries(spec).filter(
+              ([_, value]) => value !== null && value !== undefined,
+            ),
+          ) as Record<string, unknown>;
+          const maybeId = cleanedSpec.id;
+          const newModelId =
+            typeof maybeId === "string" && maybeId.trim()
+              ? maybeId.trim()
+              : null;
+          // No search-and-focus after duplicating: the new model installs itself immediately
+          // below, so there's no need to jump to it in the list.
+          lastAddedCustomModelIdRef.current = null;
+          addCustomModelMutation.mutate(cleanedSpec, {
+            onSuccess: () => {
+              if (newModelId) {
+                installNewlyDuplicatedModel(
+                  newModelId,
+                  typeof cleanedSpec.size === "string"
+                    ? cleanedSpec.size
+                    : undefined,
+                  buildDuplicateInstallSpec(cleanedSpec),
+                );
+              }
+            },
           });
         },
-        isSubmitting: updateCustomModelMutation.isPending,
+        existingModels: existingModelRefs,
+        isSubmitting: addCustomModelMutation.isPending,
       });
     },
     [
       modal,
       serviceInfo,
-      updateCustomModelMutation.isPending,
-      updateCustomModelMutation.mutate,
+      existingModelRefs,
+      editCustomModelMutation.mutate,
+      addCustomModelMutation.mutate,
+      addCustomModelMutation.isPending,
+      installNewlyDuplicatedModel,
     ],
   );
 
@@ -1555,6 +1860,7 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
         serviceId={serviceId}
         isCpuOnly={isCpuOnly}
         installingModelId={installingModelId}
+        editingModelId={editingModelId}
         isInstallingAny={installMutation.isPending}
         isPurgePending={purgeMutation.isPending}
         isRemoveCustomPending={removeCustomModelMutation.isPending}
@@ -1565,6 +1871,7 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
         onRemoveCustomModelClick={handleRemoveCustomModelClick}
         onEditMcpServerClick={handleEditMcpServerClick}
         onEditCustomModelClick={handleEditCustomModelClick}
+        onEditModelOptionsClick={handleEditModelOptionsClick}
         onPurgeClick={handlePurgeClick}
         onTestClick={handleTestClick}
         onShowDockerLogs={handleShowDockerLogs}
@@ -1593,17 +1900,37 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
           }}
           onSubmit={(payload) => {
             if (payload.kind === "user" || payload.kind === "proxy") {
-              updateMcpServerMutation.mutate({
+              setEditMcpServer(null);
+              setMcpApiError(null);
+              setEditingModelId(editMcpServer.spec.id);
+              editMcpServerMutation.mutate({
                 customModelId: editMcpServer.customModelId,
                 spec: payload,
               });
             }
           }}
-          isSubmitting={updateMcpServerMutation.isPending}
+          onDuplicate={(payload) => {
+            if (payload.kind === "user" || payload.kind === "proxy") {
+              setEditMcpServer(null);
+              setMcpApiError(null);
+              addMcpServerMutation.mutate(payload, {
+                onSuccess: () =>
+                  installNewlyDuplicatedModel(
+                    payload.id,
+                    undefined,
+                    buildDuplicateInstallSpec(
+                      payload as unknown as Record<string, unknown>,
+                    ),
+                  ),
+              });
+            }
+          }}
+          isSubmitting={false}
           dockerFields={[]}
+          existingModels={existingModelRefs}
           initialValues={editMcpServer.spec}
           title="Edit MCP Server"
-          notice="After saving, reinstall the server to apply changes."
+          notice="If the server is currently installed, saving will briefly stop and restart it to apply the new settings."
           apiError={mcpApiError}
         />
       )}
@@ -1654,6 +1981,7 @@ type ModelsTableProps = {
   serviceId: string;
   isCpuOnly: boolean;
   installingModelId: string | null;
+  editingModelId: string | null;
   isInstallingAny: boolean;
   isRemoveCustomPending: boolean;
   isPurgePending: boolean;
@@ -1664,6 +1992,7 @@ type ModelsTableProps = {
   onRemoveCustomModelClick: (model: ServiceModel) => void;
   onEditMcpServerClick: (model: ServiceModel) => void;
   onEditCustomModelClick: (model: ServiceModel) => void;
+  onEditModelOptionsClick: (model: ServiceModel) => void | Promise<void>;
   onPurgeClick: (modelId: string) => void;
   onTestClick: (model: ServiceModel) => void;
   onShowDockerLogs: (modelId: string) => void | Promise<void>;
@@ -1679,6 +2008,7 @@ const ModelsTable = memo(function ModelsTable({
   serviceId,
   isCpuOnly,
   installingModelId,
+  editingModelId,
   isInstallingAny,
   isRemoveCustomPending,
   isPurgePending,
@@ -1689,6 +2019,7 @@ const ModelsTable = memo(function ModelsTable({
   onRemoveCustomModelClick,
   onEditMcpServerClick,
   onEditCustomModelClick,
+  onEditModelOptionsClick,
   onPurgeClick,
   onTestClick,
   onShowDockerLogs,
@@ -1759,6 +2090,7 @@ const ModelsTable = memo(function ModelsTable({
                 serviceId={serviceId}
                 isCpuOnly={isCpuOnly}
                 installingModelId={installingModelId}
+                editingModelId={editingModelId}
                 isInstallingAny={isInstallingAny}
                 isRemoveCustomPending={isRemoveCustomPending}
                 isPurgePending={isPurgePending}
@@ -1769,6 +2101,7 @@ const ModelsTable = memo(function ModelsTable({
                 onRemoveCustomModelClick={onRemoveCustomModelClick}
                 onEditMcpServerClick={onEditMcpServerClick}
                 onEditCustomModelClick={onEditCustomModelClick}
+                onEditModelOptionsClick={onEditModelOptionsClick}
                 onPurgeClick={onPurgeClick}
                 onTestClick={onTestClick}
                 onShowDockerLogs={onShowDockerLogs}
@@ -1789,6 +2122,7 @@ type ModelRowProps = {
   serviceId: string;
   isCpuOnly: boolean;
   installingModelId: string | null;
+  editingModelId: string | null;
   isInstallingAny: boolean;
   isRemoveCustomPending: boolean;
   isPurgePending: boolean;
@@ -1799,6 +2133,7 @@ type ModelRowProps = {
   onRemoveCustomModelClick: (model: ServiceModel) => void;
   onEditMcpServerClick: (model: ServiceModel) => void;
   onEditCustomModelClick: (model: ServiceModel) => void;
+  onEditModelOptionsClick: (model: ServiceModel) => void | Promise<void>;
   onPurgeClick: (modelId: string) => void;
   onTestClick: (model: ServiceModel) => void;
   onShowDockerLogs: (modelId: string) => void | Promise<void>;
@@ -1828,6 +2163,7 @@ const ModelRow = memo(function ModelRow({
   serviceId,
   isCpuOnly,
   installingModelId,
+  editingModelId,
   isInstallingAny,
   isRemoveCustomPending,
   isPurgePending,
@@ -1838,6 +2174,7 @@ const ModelRow = memo(function ModelRow({
   onRemoveCustomModelClick,
   onEditMcpServerClick,
   onEditCustomModelClick,
+  onEditModelOptionsClick,
   onPurgeClick,
   onTestClick,
   onShowDockerLogs,
@@ -1858,6 +2195,7 @@ const ModelRow = memo(function ModelRow({
   const hasProgressStage =
     !!installedInfo?.stage && installedInfo?.value !== undefined;
   const isInstallingCurrent = isInstallingAny && installingModelId === model.id;
+  const isEditingCurrent = editingModelId === model.id;
 
   const oauthConfig = (
     model.custom_spec as { oauth?: { enabled?: boolean } } | null
@@ -1951,7 +2289,14 @@ const ModelRow = memo(function ModelRow({
         </TableCell>
       )}
       <TableCell>
-        {isInProgress || hasProgressStage ? (
+        {isEditingCurrent ? (
+          // Takes priority over the raw install-progress view below: an edit's internal
+          // uninstall->update->reinstall cycle genuinely populates server-side install progress
+          // partway through, and a periodic models-list refetch landing in that window would
+          // otherwise flip this row from "Editing..." to a raw progress bar mid-edit. From the
+          // admin's perspective this is one atomic operation, so it stays "Editing..." throughout.
+          <Badge variant="outline">Editing…</Badge>
+        ) : isInProgress || hasProgressStage ? (
           <ProgressBadge
             stage={
               currentProgress?.stage ||
@@ -2002,7 +2347,16 @@ const ModelRow = memo(function ModelRow({
         )}
       </TableCell>
       <TableCell className="text-right" style={{ height: "49px" }}>
-        {isInProgress || hasProgressStage ? (
+        {isEditingCurrent ? (
+          // No actions at all while an edit's uninstall->update->reinstall cycle is in flight -
+          // there's nothing to cancel (unlike a real install), and every other action here
+          // (Test, Uninstall, Docker controls, a second Edit...) would race the in-flight request.
+          <div className="flex justify-end">
+            <Button variant="outline" size="sm" disabled>
+              <MoreVertical className="h-4 w-4" />
+            </Button>
+          </div>
+        ) : isInProgress || hasProgressStage ? (
           <div className="flex justify-end gap-2">
             <Button
               onClick={() => onCancelInstall(model.id)}
@@ -2091,6 +2445,28 @@ const ModelRow = memo(function ModelRow({
               >
                 {isTestPending ? "Testing..." : "Test"}
               </DropdownMenuItem>
+              {model.custom ? (
+                <DropdownMenuItem
+                  onClick={() =>
+                    serviceId === "mcp"
+                      ? onEditMcpServerClick(model)
+                      : onEditCustomModelClick(model)
+                  }
+                >
+                  Edit Settings
+                </DropdownMenuItem>
+              ) : (
+                // Ticket scope is "MCP and custom services" only - catalog models on other
+                // services (Ollama, vLLM, sglang, etc.) don't get this action, even though the
+                // backend route is generic enough to support them too.
+                (serviceId === "mcp" || serviceId === "custom") && (
+                  <DropdownMenuItem
+                    onClick={() => onEditModelOptionsClick(model)}
+                  >
+                    Edit Settings
+                  </DropdownMenuItem>
+                )
+              )}
               {oauthEnabled && (
                 <DropdownMenuItem
                   onClick={() => startOauthMutation.mutate()}

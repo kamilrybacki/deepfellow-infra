@@ -9,6 +9,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+import {
+  type ExistingModelRef,
+  filterExistingModelsForCollisionCheck,
+} from "@/components/DynamicFormFields";
 import { ListInput } from "@/components/ListInput";
 import { MapInput } from "@/components/MapInput";
 import {
@@ -28,6 +32,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -58,7 +63,7 @@ import {
   useStdioForm,
   useUrlForm,
 } from "@/hooks/use-mcp-server-form";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { DynamicFormFields } from "./DynamicFormFields";
 
 export type {
@@ -137,9 +142,17 @@ interface AddMcpServerModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSubmit: (payload: AddMcpServerPayload) => void;
+  /** When provided, an edit form also offers a "save as new (duplicate)" checkbox that routes
+   * submission here instead, with the id/prefix fields cleared so the user must supply new ones. */
+  onDuplicate?: (payload: AddMcpServerPayload) => void;
   isSubmitting: boolean;
   dockerFields: SpecField[];
   initialValues?: Partial<AddMcpServerSpec> | Partial<ProxyMcpServerSpec>;
+  /** Other existing models (id/effective_prefix) to check the submitted id/prefix against, surfacing
+   * a "this id/prefix is already used" error inline instead of failing on the server. Include the
+   * model being edited itself here too - it's excluded automatically while not duplicating, but a
+   * duplicate must not collide with its own source either. */
+  existingModels?: ExistingModelRef[];
   title?: string;
   notice?: string;
   apiError?: string | null;
@@ -168,9 +181,11 @@ export function AddMcpServerModal({
   open,
   onOpenChange,
   onSubmit,
+  onDuplicate,
   isSubmitting,
   dockerFields,
   initialValues,
+  existingModels = [],
   title = "Add MCP Server",
   notice,
   apiError,
@@ -179,6 +194,7 @@ export function AddMcpServerModal({
   const editKind = initialValues?.kind ?? "user";
   const [serverMode, setServerMode] = useState<McpServerMode>("auto-import");
   const [autoImportWarningOpen, setAutoImportWarningOpen] = useState(false);
+  const [duplicateMode, setDuplicateMode] = useState(false);
 
   const proxyInitial =
     editKind === "proxy"
@@ -211,6 +227,25 @@ export function AddMcpServerModal({
   const isUrlMode = isEditMode ? editKind === "proxy" : serverMode === "url";
   const isAutoImportMode = !isEditMode && serverMode === "auto-import";
 
+  useEffect(() => {
+    if (open) setDuplicateMode(false);
+  }, [open]);
+
+  const handleDuplicateModeChange = (checked: boolean) => {
+    setDuplicateMode(checked);
+    if (isStdioMode) {
+      stdio.handleModelIdChange(checked ? "" : (stdioInitial?.name ?? ""));
+      stdio.handlePrefixChange(
+        checked ? "" : (stdioInitial?.default_prefix ?? ""),
+      );
+    } else if (isUrlMode) {
+      url.handleNameChange(checked ? "" : (proxyInitial?.name ?? ""));
+      url.handlePrefixChange(
+        checked ? "" : (proxyInitial?.default_prefix ?? ""),
+      );
+    }
+  };
+
   const currentTabHasData = () => {
     if (serverMode === "command") return !!stdio.command.trim();
     if (serverMode === "url") return !!url.serverUrl.trim();
@@ -229,8 +264,22 @@ export function AddMcpServerModal({
     }
   };
 
+  const submitPayload = (payload: AddMcpServerPayload) => {
+    if (duplicateMode && onDuplicate) {
+      onDuplicate(payload);
+      return;
+    }
+    onSubmit(payload);
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+
+    const collisionCheckModels = filterExistingModelsForCollisionCheck(
+      existingModels,
+      initialValues?.id,
+      duplicateMode,
+    );
 
     if (isAutoImportMode) {
       void stdio.convertJson();
@@ -238,7 +287,7 @@ export function AddMcpServerModal({
     }
 
     if (serverMode === "docker") {
-      const errs = docker.validate();
+      const errs = docker.validate(collisionCheckModels);
       if (Object.keys(errs).length > 0) {
         focusField(Object.keys(errs)[0]);
         return;
@@ -249,7 +298,7 @@ export function AddMcpServerModal({
         ),
       );
       const volumes = docker.volumes.filter((v) => v.trim());
-      onSubmit({
+      submitPayload({
         kind: "docker",
         data: { ...cleaned, ...(volumes.length > 0 ? { volumes } : {}) },
         repository_url: docker.repositoryUrl.trim() || undefined,
@@ -259,9 +308,9 @@ export function AddMcpServerModal({
     }
 
     if (isUrlMode) {
-      const errs = url.validate();
+      const errs = url.validate(collisionCheckModels);
       if (Object.values(errs).some(Boolean)) return;
-      onSubmit({
+      submitPayload({
         kind: "proxy",
         id: url.name.trim(),
         name: url.name.trim(),
@@ -283,9 +332,9 @@ export function AddMcpServerModal({
       return;
     }
 
-    const payload = stdio.buildPayload();
+    const payload = stdio.buildPayload(collisionCheckModels);
     if (!payload) return;
-    onSubmit(payload);
+    submitPayload(payload);
   };
 
   const detectedRuntime = detectRuntime(stdio.command);
@@ -315,10 +364,14 @@ export function AddMcpServerModal({
           }}
         >
           <DialogHeader>
-            <DialogTitle>{title}</DialogTitle>
+            <DialogTitle>
+              {isEditMode && duplicateMode
+                ? `Duplicate ${initialValues?.id ?? ""}`
+                : title}
+            </DialogTitle>
             <DialogDescription>
               {isEditMode
-                ? "Edit stdio MCP server settings. Reinstall required after saving."
+                ? "Edit stdio MCP server settings."
                 : "Add a new MCP server — choose the connection type below."}
             </DialogDescription>
           </DialogHeader>
@@ -328,6 +381,35 @@ export function AddMcpServerModal({
             onSubmit={handleSubmit}
             className="space-y-4 max-h-[70vh] overflow-y-auto pr-1"
           >
+            {isEditMode && onDuplicate && (
+              <label
+                htmlFor="mcp-duplicate-as-new"
+                className="flex items-start gap-3 cursor-pointer rounded-md border bg-muted/30 p-3"
+              >
+                <Checkbox
+                  id="mcp-duplicate-as-new"
+                  checked={duplicateMode}
+                  disabled={isSubmitting}
+                  onCheckedChange={(checked) =>
+                    handleDuplicateModeChange(checked === true)
+                  }
+                />
+                <div className="grid gap-1">
+                  <Label
+                    htmlFor="mcp-duplicate-as-new"
+                    className="leading-none cursor-pointer select-none"
+                  >
+                    Save as a new server (duplicate)
+                  </Label>
+                  <p className="text-sm text-muted-foreground">
+                    Creates a copy with these settings under a new id, instead
+                    of changing the original. The original is left untouched;
+                    the copy is installed immediately using these settings.
+                  </p>
+                </div>
+              </label>
+            )}
+
             {/* Mode toggle — hidden in edit mode */}
             {!isEditMode && (
               <div className="flex rounded-md border overflow-hidden text-sm">
@@ -457,7 +539,7 @@ export function AddMcpServerModal({
                     placeholder="my-remote-mcp"
                     value={url.name}
                     onChange={(e) => url.handleNameChange(e.target.value)}
-                    disabled={isSubmitting}
+                    disabled={isSubmitting || (isEditMode && !duplicateMode)}
                   />
                   {url.errors.name && (
                     <p className="text-sm text-destructive">
@@ -782,7 +864,7 @@ export function AddMcpServerModal({
                     placeholder="my-mcp-server"
                     value={stdio.modelId}
                     onChange={(e) => stdio.handleModelIdChange(e.target.value)}
-                    disabled={isSubmitting}
+                    disabled={isSubmitting || (isEditMode && !duplicateMode)}
                   />
                   {stdio.errors.name && (
                     <p className="text-sm text-destructive">
@@ -908,14 +990,18 @@ export function AddMcpServerModal({
               }
             >
               {isSubmitting
-                ? "Saving…"
-                : isEditMode
-                  ? "Save"
-                  : isAutoImportMode
-                    ? stdio.isConverting
-                      ? "Converting…"
-                      : "Convert"
-                    : "Add"}
+                ? duplicateMode
+                  ? "Duplicating…"
+                  : "Saving…"
+                : duplicateMode
+                  ? "Duplicate"
+                  : isEditMode
+                    ? "Save"
+                    : isAutoImportMode
+                      ? stdio.isConverting
+                        ? "Converting…"
+                        : "Convert"
+                      : "Add"}
             </Button>
           </DialogFooter>
         </DialogContent>

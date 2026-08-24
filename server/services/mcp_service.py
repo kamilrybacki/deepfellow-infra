@@ -863,19 +863,12 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
         else:
             self._add_image_model(instance, model)
 
-    def _add_image_model(self, instance: str, model: CustomModel) -> None:
-        parsed = try_parse_pydantic(SrvMcpCustomModel, model.data)
-
-        if not self.models.get(instance):
-            self.models[instance] = {}
-
-        if parsed.id in self.models[instance]:
-            raise HTTPException(400, f"Model with {parsed.id} id already exists.")
+    def _build_image_model(self, instance: str, parsed: SrvMcpCustomModel, custom_id: CustomModelId | None = None) -> SrvMcpModel:
         name = normalize_name(f"{parsed.id}-{instance}")
         subnet = self.docker_service.get_docker_subnet()
         required_envs = list(parsed.required_envs.keys() if parsed.required_envs else [])
         required_headers = list(parsed.required_headers.keys() if parsed.required_headers else [])
-        self.models[instance][parsed.id] = SrvMcpModel(
+        return SrvMcpModel(
             model_props=ModelProps(
                 private=parsed.private, type="mcp", endpoints=[f"/mcp/{parsed.default_prefix}/mcp"], transport=parsed.proxy_transport
             ),
@@ -904,7 +897,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                 if parsed.healthcheck_cmd
                 else None,
             ),
-            custom=model.id,
+            custom=custom_id,
             headers=parsed.headers,
             required_envs=required_envs,
             required_headers=required_headers,
@@ -912,6 +905,17 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
             description=parsed.description,
             repository_url=parsed.repository_url,
         )
+
+    def _add_image_model(self, instance: str, model: CustomModel) -> None:
+        parsed = try_parse_pydantic(SrvMcpCustomModel, model.data)
+
+        if not self.models.get(instance):
+            self.models[instance] = {}
+
+        if parsed.id in self.models[instance]:
+            raise HTTPException(400, f"Model with {parsed.id} id already exists.")
+        self._check_prefix_collision(instance, parsed.default_prefix, exclude_model_id=None)
+        self.models[instance][parsed.id] = self._build_image_model(instance, parsed, custom_id=model.id)
 
     def _add_user_model(self, instance: str, model: CustomModel) -> None:
         parsed = try_parse_pydantic(SrvMcpUserModel, model.data)
@@ -928,6 +932,32 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
         srv_model = self._build_user_model(instance, parsed, custom_id=model.id)
         self.models[instance][parsed.id] = srv_model
 
+    def _build_proxy_model(self, parsed: SrvMcpProxyModel, prefix: str, custom_id: CustomModelId | None = None) -> SrvMcpModel:
+        """Construct a proxy `SrvMcpModel` with no side effects - no registry guard, no registration.
+
+        Kept separate from `_add_proxy_model` so an edit can validate and build the replacement before
+        touching `self.models`, the same way the "user"/image branches already do via their own
+        `_build_user_model`/`_build_image_model` helpers.
+        """
+        required_headers = list(parsed.required_headers.keys() if parsed.required_headers else [])
+        return SrvMcpModel(
+            model_props=ModelProps(private=parsed.private, type="mcp", endpoints=[f"/mcp/{prefix}/mcp"], transport=parsed.transport),
+            model_spec=self.get_default_model_spec(prefix, None, parsed.required_headers),
+            model_type="mcp",
+            default_prefix=prefix,
+            size="",
+            options=None,
+            custom=custom_id,
+            kind="proxy",
+            headers=parsed.headers,
+            required_headers=required_headers,
+            proxy_url=parsed.server_url,
+            proxy_transport=parsed.transport,
+            description=parsed.description,
+            repository_url=parsed.repository_url,
+            oauth=parsed.oauth,
+        )
+
     def _add_proxy_model(self, instance: str, model: CustomModel) -> None:
         parsed = try_parse_pydantic(SrvMcpProxyModel, model.data)
 
@@ -940,29 +970,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
         prefix = parsed.default_prefix or normalize_name(parsed.id)
         self._check_prefix_collision(instance, prefix, exclude_model_id=None)
 
-        required_headers = list(parsed.required_headers.keys() if parsed.required_headers else [])
-        self.models[instance][parsed.id] = SrvMcpModel(
-            model_props=ModelProps(private=parsed.private, type="mcp", endpoints=[f"/mcp/{prefix}/mcp"], transport=parsed.transport),
-            model_spec=self.get_default_model_spec(prefix, None, parsed.required_headers),
-            model_type="mcp",
-            default_prefix=prefix,
-            size="",
-            options=None,
-            custom=model.id,
-            kind="proxy",
-            headers=parsed.headers,
-            required_headers=required_headers,
-            proxy_url=parsed.server_url,
-            proxy_transport=parsed.transport,
-            description=parsed.description,
-            repository_url=parsed.repository_url,
-            oauth=parsed.oauth,
-        )
-
-    def _check_prefix_collision(self, instance: str, prefix: str, exclude_model_id: str | None) -> None:
-        for mid, m in self.models.get(instance, {}).items():
-            if mid != exclude_model_id and m.default_prefix == prefix:
-                raise HTTPException(400, f"Prefix '{prefix}' is already in use by model '{mid}'.")
+        self.models[instance][parsed.id] = self._build_proxy_model(parsed, prefix, custom_id=model.id)
 
     async def _update_custom_model(self, instance: str, model: CustomModel, new_data: dict[str, Any]) -> None:  # noqa: C901
         kind = model.data.get("kind")
@@ -1003,38 +1011,90 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                     parsed_old.id,
                 )
                 new_data = {**new_data, "oauth": parsed_old.oauth.model_dump(mode="json", exclude_none=True)}
+            # Build (and validate) the new model first, from the possibly oauth-merged new_data - not
+            # the earlier parsed_new - before touching the registry. _add_proxy_model's own guard
+            # ("already exists") would always reject the id here since it's unchanged, and previously
+            # the old entry was deleted first just to dodge that guard - so a failure re-parsing/
+            # validating new_data left the server deleted from the registry (and so from the endpoint
+            # list) until a process restart. Same build-then-swap ordering the "user"/image branches
+            # below already use.
+            new_srv_model = self._build_proxy_model(try_parse_pydantic(SrvMcpProxyModel, new_data), new_prefix, custom_id=model.id)
             if instance in self.models and parsed_old.id in self.models[instance]:
                 del self.models[instance][parsed_old.id]
-            self._add_proxy_model(instance, CustomModel(id=model.id, data=new_data))
+            if instance not in self.models:
+                self.models[instance] = {}
+            self.models[instance][parsed_new.id] = new_srv_model
             return
-        if kind != "user":
-            raise HTTPException(400, "Only user-defined MCP servers support editing.")
+        if kind == "user":
+            parsed_old = try_parse_pydantic(SrvMcpUserModel, model.data)
+            parsed_new = try_parse_pydantic(SrvMcpUserModel, new_data)
 
-        parsed_old = try_parse_pydantic(SrvMcpUserModel, model.data)
-        parsed_new = try_parse_pydantic(SrvMcpUserModel, new_data)
+            if parsed_new.id != parsed_old.id:
+                raise HTTPException(400, "Cannot change the server ID.")
 
-        if parsed_new.id != parsed_old.id:
+            installed = self.get_instance_info(instance).installed
+            if installed and parsed_old.id in installed.models:
+                raise HTTPException(400, "Cannot update an installed server. Uninstall it first.")
+
+            new_prefix = parsed_new.default_prefix or normalize_name(parsed_new.id)
+            self._check_prefix_collision(instance, new_prefix, exclude_model_id=parsed_old.id)
+
+            old_name = normalize_name(f"{parsed_old.id}_{instance}")
+            old_tag = f"deepfellow-mcp-{old_name}:latest"
+            # Id is immutable here, so the new Dockerfile lands at the same path as the old one -
+            # back up its content so a failed remove_image below can be undone at the file level too,
+            # not just in the in-memory registry. Without this, a later rollback-rebuild (edit_model's
+            # except branch, which reinstalls the OLD model_id from whatever's on disk) would silently
+            # build the NEW, partially-applied command/variant/base_image under the OLD model's identity.
+            dockerfile_path = self._get_dockerfile_dir(instance, parsed_old.id) / "Dockerfile"
+            old_dockerfile_content = dockerfile_path.read_text(encoding="utf-8") if dockerfile_path.exists() else None
+
+            # Build the new model first (writes Dockerfile). If this fails the old model is preserved.
+            new_srv_model = self._build_user_model(instance, parsed_new, custom_id=model.id)
+
+            try:
+                await self.docker_service.remove_image(old_tag)
+            except Exception:
+                if old_dockerfile_content is not None:
+                    dockerfile_path.write_text(old_dockerfile_content, encoding="utf-8")
+                raise
+            if instance in self.models and parsed_old.id in self.models[instance]:
+                del self.models[instance][parsed_old.id]
+            if instance not in self.models:
+                self.models[instance] = {}
+            self.models[instance][parsed_new.id] = new_srv_model
+            return
+
+        # Plain docker-image MCP server (the default/`None` kind). Unlike `user`, there's no locally
+        # built image to rebuild - `image` is an external reference - so this is a re-register, same
+        # shape as `_add_image_model`, not a Dockerfile rebuild.
+        parsed_old_image = try_parse_pydantic(SrvMcpCustomModel, model.data)
+        parsed_new_image = try_parse_pydantic(SrvMcpCustomModel, new_data)
+
+        if parsed_new_image.id != parsed_old_image.id:
             raise HTTPException(400, "Cannot change the server ID.")
 
         installed = self.get_instance_info(instance).installed
-        if installed and parsed_old.id in installed.models:
+        if installed and parsed_old_image.id in installed.models:
             raise HTTPException(400, "Cannot update an installed server. Uninstall it first.")
 
-        new_prefix = parsed_new.default_prefix or normalize_name(parsed_new.id)
-        self._check_prefix_collision(instance, new_prefix, exclude_model_id=parsed_old.id)
+        new_prefix = parsed_new_image.default_prefix or normalize_name(parsed_new_image.id)
+        self._check_prefix_collision(instance, new_prefix, exclude_model_id=parsed_old_image.id)
 
-        old_name = normalize_name(f"{parsed_old.id}_{instance}")
-        old_tag = f"deepfellow-mcp-{old_name}:latest"
-
-        # Build the new model first (writes Dockerfile). If this fails the old model is preserved.
-        new_srv_model = self._build_user_model(instance, parsed_new, custom_id=model.id)
-
-        await self.docker_service.remove_image(old_tag)
-        if instance in self.models and parsed_old.id in self.models[instance]:
-            del self.models[instance][parsed_old.id]
+        # Build the new registration first (validates the image/etc.) - if this fails, the old model
+        # is preserved, same ordering as the "user" kind branch above. No rollback needed since the
+        # old registration is only ever replaced once the new one is already known-good.
+        new_srv_model = self._build_image_model(instance, parsed_new_image, custom_id=model.id)
+        if instance in self.models and parsed_old_image.id in self.models[instance]:
+            del self.models[instance][parsed_old_image.id]
         if instance not in self.models:
             self.models[instance] = {}
-        self.models[instance][parsed_new.id] = new_srv_model
+        self.models[instance][parsed_new_image.id] = new_srv_model
+
+    def _validate_edit(self, instance: str, model_id: str) -> None:
+        model = self.models.get(instance, {}).get(model_id)
+        if model and model.kind == "proxy" and self._oauth_state_store.find_for_model(instance, model_id):
+            raise HTTPException(400, "Cannot edit this MCP server while an OAuth authorization is pending.")
 
     def _remove_custom_model(self, instance: str, model: CustomModel) -> None:
         installed = self.get_instance_info(instance).installed
@@ -1113,6 +1173,60 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
             return spec
         return None
 
+    async def get_duplicate_spec(self, instance: str, model_id: str) -> dict[str, Any]:
+        """Return a full add-model spec for duplicating `model_id`, custom-backed or catalog."""
+        model = self.models.get(instance, {}).get(model_id)
+        if model is None:
+            raise HTTPException(400, "Model not found")
+        if model.custom:
+            definition = self.get_custom_model_definition(model.custom)
+            if definition is None:
+                raise HTTPException(404, f"Custom model definition for {model_id} not found.")
+            definition = dict(definition)
+            oauth = definition.get("oauth")
+            if isinstance(oauth, dict):
+                # The WebUI never round-trips secrets/tokens (see `_get_custom_spec`) - a duplicate
+                # is an independent model with its own OAuth flow, so it must not inherit the
+                # original's live client_secret/access_token/refresh_token either.
+                definition["oauth"] = {k: oauth[k] for k in ("enabled", "client_id", "scope") if k in oauth}
+            return definition
+        # Catalog model: no stored definition exists (it's hardcoded in `_const.models`), so
+        # synthesize one from the live registered model - the same shape `_add_image_model` expects.
+        if model.options is None:
+            raise HTTPException(400, "This model cannot be duplicated.")
+        command = model.options.command if isinstance(model.options.command, str) else None
+        healthcheck = model.options.healthcheck or {}
+        # `ModelInstalledInfo.envs`/`.headers` hold only what the admin explicitly supplied at
+        # install time (e.g. an API key) - they don't include the catalog's own static defaults
+        # (those are merged into the actual container's env vars, but never written back here). So
+        # merge both when installed, catalog defaults as the base, install-time values overriding -
+        # using just the installed values alone would silently drop the catalog's own defaults.
+        installed = self.get_instance_info(instance).installed
+        installed_model = installed.models.get(model_id) if installed else None
+        envs = {**(model.options.env_vars or {}), **(installed_model.envs or {})} if installed_model else model.options.env_vars
+        headers = {**(model.headers or {}), **(installed_model.headers or {})} if installed_model else model.headers
+        return {
+            "id": model_id,
+            "private": True,
+            "default_prefix": model.default_prefix,
+            "size": model.size,
+            "image": model.options.image,
+            "image_port": model.options.image_port,
+            "command": command,
+            # See the equivalent CustomService.get_duplicate_spec for why the host side is stripped:
+            # model.options.volumes is already a fully-expanded host:container bind mount, but
+            # _add_image_model re-prefixes whatever it receives assuming a bare container path.
+            "volumes": [v.split(":", 1)[1] if ":" in v else v for v in (model.options.volumes or [])],
+            "envs": dict(envs) if envs else None,
+            "headers": dict(headers) if headers else None,
+            "healthcheck_cmd": healthcheck.get("test"),
+            "healthcheck_start_period": healthcheck.get("start_period"),
+            "required_envs": dict.fromkeys(model.required_envs, "") if model.required_envs else None,
+            "required_headers": dict.fromkeys(model.required_headers, "") if model.required_headers else None,
+            "description": model.description,
+            "repository_url": model.repository_url,
+        }
+
     async def list_models(self, input_instance: str | list[str] | None, filters: ListModelsFilters) -> ListModelsOut:
         """List models."""
         instances = [input_instance] if isinstance(input_instance, str) else input_instance if input_instance else self.instances_info
@@ -1143,6 +1257,8 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                             downloaded=model_id in self.models_downloaded,
                             size=model.size,
                             custom=model.custom,
+                            default_prefix=model.default_prefix,
+                            effective_prefix=(info.models[model_id].prefix if model_id in info.models else model.default_prefix),
                             spec=model.model_spec,
                             has_docker=model.kind != "proxy",
                             variant=model.variant,
@@ -1174,6 +1290,8 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
             downloaded=model_id in self.models_downloaded,
             size=model.size,
             custom=model.custom,
+            default_prefix=model.default_prefix,
+            effective_prefix=(info.models[model_id].prefix if model_id in info.models else model.default_prefix),
             spec=model.model_spec,
             has_docker=model.kind != "proxy",
             variant=model.variant,

@@ -154,6 +154,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
     """Override to False for services whose ``_generate_instance_config`` never populates ``ModelConfig.definition``
     (e.g. it has no registry snapshot to persist). Otherwise ``load_service`` treats every model as needing a
     backfill save on every startup, forever."""
+    _edit_locks: dict[tuple[str, str], asyncio.Lock]
 
     def __init__(
         self,
@@ -180,6 +181,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         self._log_cache = {}
         self._failed_models = {}
         self._warning_tasks = set()
+        self._edit_locks = {}
         self._after_init()
 
     def _after_init(self) -> None:
@@ -502,7 +504,24 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
 
         if instance_data.custom:
             for custom in instance_data.custom:
-                self._add_custom_model(instance, custom)
+                model_id = custom.data.get("id", custom.id)
+                try:
+                    self._add_custom_model(instance, custom)
+                except Exception as exc:
+                    # Registering one custom model must not take the whole instance - and, since
+                    # load_service gathers all of a service's instances without return_exceptions=True,
+                    # every other instance of this service too - down with it. Matches load_model's
+                    # per-model warning-and-continue pattern just above.
+                    logger.exception(f"{self.get_id(instance)} failed to register custom model {model_id} while loading")  # noqa: G004
+                    try:
+                        await self.service_provider.add_warning(
+                            self.get_type(),
+                            f"Custom model '{model_id}' failed to load on instance '{instance}': {exc}",
+                            instance=instance,
+                            model_id=model_id,
+                        )
+                    except Exception:
+                        logger.exception(f"{self.get_id(instance)} failed to record warning for custom model {model_id}")  # noqa: G004
 
         promise = await self.install_instance(instance, instance_data.options, instance_data, save=False)
         await promise.wait()
@@ -698,6 +717,9 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         model = next(x for x in config.custom or {} if x.id == custom_model_id)
         self._remove_custom_model(instance, model)
         config.custom = [x for x in config.custom or {} if x.id != custom_model_id]
+        model_id = model.data.get("id")
+        if model_id:
+            self._edit_locks.pop((instance, model_id), None)
         await self._save()
 
     def _remove_custom_model(self, instance: str, model: CustomModel) -> None:  # noqa: ARG002
@@ -726,6 +748,190 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         except Exception:
             self._add_custom_model(instance, model)
             raise
+
+    async def _install_model_and_wait(
+        self, instance: str, model_id: str, options: InstallModelIn
+    ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
+        """Install the model and wait for the underlying work to actually finish before returning.
+
+        `install_model` returns a `PromiseWithProgress` whose real work runs in a background task -
+        awaiting the call itself only awaits kicking it off, not its completion. Edit orchestration needs
+        to know whether the (re)install genuinely succeeded before deciding to roll back, so this awaits
+        the promise fully and lets any failure propagate.
+        """
+        promise = await self.install_model(instance, model_id, options)
+        await promise.wait()
+        return promise
+
+    def _get_edit_lock(self, instance: str, model_id: str) -> asyncio.Lock:
+        """Return the lock serializing `edit_model`/`edit_model_install_options` calls for one model.
+
+        Scoped to edit orchestration only - `install_model`/`uninstall_model`/`update_custom_model`
+        already guard themselves against concurrent calls to themselves (see design.md), so they don't
+        need to acquire this lock.
+        """
+        key = (instance, model_id)
+        if key not in self._edit_locks:
+            self._edit_locks[key] = asyncio.Lock()
+        return self._edit_locks[key]
+
+    def _validate_edit(self, instance: str, model_id: str) -> None:
+        """Reject an edit upfront, before any uninstall happens. Default no-op.
+
+        Override for service-specific preconditions that would otherwise only be caught deep inside
+        `update_custom_model`, after `edit_model` has already uninstalled the model for nothing (see
+        MCP's OAuth-pending check).
+        """
+
+    def _check_prefix_collision(self, instance: str, prefix: str, exclude_model_id: str | None) -> None:
+        """Reject `prefix` if another model in `instance` is already registered under it.
+
+        Compares against each model's *effective* prefix - the live install-time prefix when the
+        model is installed, falling back to `default_prefix` otherwise - not `default_prefix` alone.
+        `edit_model_install_options` can move a model's install-time prefix independently of its
+        `default_prefix`, so the two can disagree; the effective prefix is whichever one actually
+        reflects what a model is doing right now (serving traffic on it, or reserving it unstalled).
+        """
+        # Looked up directly rather than via `get_instance_info` (which 404s): this can run for an
+        # instance that isn't registered in `instances_info` yet, e.g. while adding its first model.
+        info = self.instances_info.get(instance)
+        installed_models = cast("_HasModels", info.installed).models if info and info.installed else {}
+        for mid, m in self.models.get(instance, {}).items():
+            if mid == exclude_model_id:
+                continue
+            effective_prefix = installed_models[mid].prefix if mid in installed_models else m.default_prefix
+            if effective_prefix == prefix:
+                raise HTTPException(400, f"Prefix '{prefix}' is already in use by model '{mid}'.")
+
+    async def edit_model(  # noqa: C901
+        self, instance: str, custom_model_id: CustomModelId, new_definition: AddCustomModelIn
+    ) -> PromiseWithProgress[InstallModelOut, StreamChunk] | None:
+        """Edit a custom-backed model's definition without requiring a manual uninstall first.
+
+        If the model is currently installed, uninstalls it, applies the new definition, then reinstalls
+        it with its previous install-time options (prefix/envs/headers), returning the reinstall promise.
+        If it isn't installed, this is a plain definition update (same as calling `update_custom_model`
+        directly) and returns None. On failure applying the new definition or reinstalling, restores the
+        model to its previous definition and installed state on a best-effort basis.
+        """
+        config = self.get_instance_info(instance).config
+        model = next((x for x in config.custom or [] if x.id == custom_model_id), None)
+        if model is None:
+            raise HTTPException(404, f"Custom model {custom_model_id} not found.")
+        model_id = model.data.get("id")
+        if not model_id:
+            raise HTTPException(400, "Custom model definition has no id.")
+        new_id = new_definition.spec.get("id")
+        if new_id is not None and new_id != model_id:
+            # `edit_model` uninstalls/reinstalls under this one captured `model_id` throughout - an id
+            # change would rename the entry out from under that, so the reinstall step would fail
+            # looking for the old id. MCP's own per-kind `_update_custom_model` branches already reject
+            # this, but only *after* uninstalling; checking here first avoids that pointless disruption,
+            # and closes the same gap for services (e.g. CustomService) whose generic update path never
+            # enforced id immutability at all.
+            raise HTTPException(400, "Cannot change the model's id while editing. Duplicate it instead to use a new id.")
+        self._validate_edit(instance, model_id)
+
+        async with self._get_edit_lock(instance, model_id):
+            info = self.get_instance_info(instance)
+            installed_models = cast("_HasModels", info.installed).models if info.installed else {}
+            was_installed = model_id in installed_models
+            install_options: InstallModelIn | None = installed_models[model_id].options if was_installed else None
+            old_data = dict(model.data)
+
+            if was_installed:
+                await self.uninstall_model(instance, model_id, UninstallModelIn(purge=False))
+
+            try:
+                await self.update_custom_model(instance, custom_model_id, new_definition)
+            except Exception:
+                logger.exception(f"{self.get_id(instance)} failed to apply new definition for model {model_id} while editing")  # noqa: G004
+                if was_installed:
+                    assert install_options is not None
+                    try:
+                        await self._install_model_and_wait(instance, model_id, install_options)
+                    except Exception:
+                        logger.exception(f"{self.get_id(instance)} failed to roll back model {model_id} after a failed edit")  # noqa: G004
+                raise
+
+            if not was_installed:
+                return None
+
+            assert install_options is not None
+            # Read the prefix `update_custom_model` actually computed for the model now sitting in the
+            # registry - not `new_definition.spec.get("default_prefix")`. `default_prefix` is optional
+            # for MCP `user`/`proxy` models and the WebUI sends it as absent whenever the field is
+            # cleared; `_update_custom_model` still falls back to `normalize_name(id)` in that case and
+            # writes that as the model's new `default_prefix`, which the raw request body never reflects.
+            updated_model = self.models.get(instance, {}).get(model_id)
+            new_default_prefix = updated_model.default_prefix if updated_model else None
+            reinstall_options = install_options
+            if (
+                install_options.spec is not None
+                and new_default_prefix is not None
+                and install_options.spec.get("prefix") != new_default_prefix
+            ):
+                # The install-time `prefix` starts out equal to the definition's `default_prefix` (set by
+                # `_install_model` when "prefix" is absent from the install spec) and there's no user-facing
+                # way to diverge a custom-backed model's `prefix` from that - `edit_model_install_options`
+                # (the only path that edits `prefix` directly) is only reachable for catalog models with no
+                # `CustomModel` definition, mutually exclusive with this one. So `prefix` must always follow
+                # `default_prefix` here, or editing it would silently do nothing to the registered endpoint.
+                # `install_options` itself is left untouched so a rollback below reinstalls with the prefix
+                # that actually matches the restored (old) definition.
+                reinstall_options = install_options.model_copy(update={"spec": {**install_options.spec, "prefix": new_default_prefix}})
+            try:
+                return await self._install_model_and_wait(instance, model_id, reinstall_options)
+            except Exception:
+                logger.exception(f"{self.get_id(instance)} failed to reinstall model {model_id} while editing")  # noqa: G004
+                try:
+                    await self.update_custom_model(instance, custom_model_id, AddCustomModelIn(spec=old_data))
+                    await self._install_model_and_wait(instance, model_id, install_options)
+                except Exception:
+                    logger.exception(f"{self.get_id(instance)} failed to roll back model {model_id} after a failed reinstall")  # noqa: G004
+                raise
+
+    async def edit_model_install_options(
+        self, instance: str, model_id: str, new_options: InstallModelIn
+    ) -> tuple[bool, PromiseWithProgress[InstallModelOut, StreamChunk]]:
+        """Edit a model's install-time options only (no persisted `CustomModel` definition involved).
+
+        For catalog models (no `CustomModel` backing) whose only editable state is install-time options
+        like prefix/envs/headers. Uninstalls the model if installed, then reinstalls it with the new
+        options, restoring the previous options on a best-effort basis if the reinstall fails. Always
+        installs, even if the model wasn't installed to begin with - the returned bool tells the caller
+        which case it was, so it can report whether this was actually a reinstall.
+        """
+        model = self.models.get(instance, {}).get(model_id)
+        new_prefix = (new_options.spec or {}).get("prefix") or (model.default_prefix if model else None)
+        if new_prefix is not None:
+            # Checked upfront, before any uninstall, so a doomed edit doesn't disrupt the running
+            # model for nothing - mirrors `edit_model`'s id-immutability check above.
+            self._check_prefix_collision(instance, new_prefix, exclude_model_id=model_id)
+
+        async with self._get_edit_lock(instance, model_id):
+            info = self.get_instance_info(instance)
+            installed_models = cast("_HasModels", info.installed).models if info.installed else {}
+            was_installed = model_id in installed_models
+            old_options: InstallModelIn | None = installed_models[model_id].options if was_installed else None
+
+            if was_installed:
+                await self.uninstall_model(instance, model_id, UninstallModelIn(purge=False))
+
+            try:
+                promise = await self._install_model_and_wait(instance, model_id, new_options)
+            except Exception:
+                logger.exception(f"{self.get_id(instance)} failed to reinstall model {model_id} with new install options")  # noqa: G004
+                if was_installed:
+                    assert old_options is not None
+                    try:
+                        await self._install_model_and_wait(instance, model_id, old_options)
+                    except Exception:
+                        logger.exception(
+                            f"{self.get_id(instance)} failed to roll back model {model_id} after a failed install-options edit"  # noqa: G004
+                        )
+                raise
+            return was_installed, promise
 
     async def install_model(
         self, instance: str, model_id: str, options: InstallModelIn

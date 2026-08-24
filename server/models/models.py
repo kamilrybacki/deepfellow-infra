@@ -90,6 +90,12 @@ class RetrieveModelOut(BaseModel):
     installed: bool | InstallModelProgress | ModelInfo
     downloaded: bool
     custom: CustomModelId | None = None
+    default_prefix: str | None = None
+    # The prefix this model is actually reachable on - the live install-time prefix when installed,
+    # else `default_prefix`. `edit_model_install_options` can move a model's install-time prefix
+    # independently of `default_prefix`, so the two can disagree; collision checks must compare
+    # against this field, not `default_prefix`, which only describes the declared definition.
+    effective_prefix: str | None = None
     size: str
     spec: ModelSpecification
     has_docker: bool
@@ -125,6 +131,15 @@ class RemoveCustomModelOut(BaseModel):
 
 class UpdateCustomModelOut(BaseModel):
     status: Literal["OK"]
+
+
+class EditModelOut(BaseModel):
+    status: Literal["OK"]
+    reinstalled: bool
+
+
+class DuplicateSpecOut(BaseModel):
+    spec: dict[str, Any]
 
 
 class SyncModelsOut(BaseModel):

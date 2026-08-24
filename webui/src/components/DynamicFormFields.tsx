@@ -50,6 +50,9 @@ export interface DynamicFormFieldsProps {
   errors: Record<string, string>;
   onChange: (name: string, value: unknown) => void;
   serviceId?: string;
+  /** Field names to render read-only (grayed out) - e.g. `id` while editing, since the backend
+   * rejects changing it there and only allows a new one via duplicate. */
+  disabledFields?: string[];
 }
 
 interface DockerTagsFieldProps {
@@ -214,6 +217,7 @@ export function DynamicFormFields({
   errors,
   onChange,
   serviceId,
+  disabledFields,
 }: DynamicFormFieldsProps) {
   const visibleFields = useMemo(
     () =>
@@ -227,127 +231,135 @@ export function DynamicFormFields({
 
   return (
     <>
-      {visibleFields.map((field) => (
-        <div
-          key={field.name}
-          className="grid gap-2"
-          data-field-name={field.name}
-        >
-          <Label htmlFor={field.name}>
-            {field.description}
-            {field.required && (
-              <span className="text-destructive text-sm ml-1">*</span>
-            )}
-            {!field.required && (
-              <span className="text-muted-foreground text-sm ml-1">
-                (optional)
-              </span>
-            )}
-          </Label>
-          {field.type === "docker-tags" && serviceId ? (
-            <DockerTagsField
-              field={field}
-              value={(formData[field.name] as string | undefined) ?? ""}
-              onChange={(v) => onChange(field.name, v)}
-              serviceId={serviceId}
-              hardware={
-                field.depends_on
-                  ? (formData[field.depends_on] as string | undefined)
-                  : undefined
-              }
-            />
-          ) : field.type === "bool" ? (
-            <div className="flex items-center space-x-2">
-              <Checkbox
-                id={field.name}
-                checked={formData[field.name] === true}
-                onCheckedChange={(checked) =>
-                  onChange(field.name, checked === true)
+      {visibleFields.map((field) => {
+        const isDisabled = disabledFields?.includes(field.name) ?? false;
+        return (
+          <div
+            key={field.name}
+            className="grid gap-2"
+            data-field-name={field.name}
+          >
+            <Label htmlFor={field.name}>
+              {field.description}
+              {field.required && (
+                <span className="text-destructive text-sm ml-1">*</span>
+              )}
+              {!field.required && (
+                <span className="text-muted-foreground text-sm ml-1">
+                  (optional)
+                </span>
+              )}
+            </Label>
+            {field.type === "docker-tags" && serviceId ? (
+              <DockerTagsField
+                field={field}
+                value={(formData[field.name] as string | undefined) ?? ""}
+                onChange={(v) => onChange(field.name, v)}
+                serviceId={serviceId}
+                hardware={
+                  field.depends_on
+                    ? (formData[field.depends_on] as string | undefined)
+                    : undefined
                 }
               />
-            </div>
-          ) : field.type === "oneof" ? (
-            <Select
-              value={
-                (formData[field.name] as string | undefined) ||
-                (field.default as string | undefined) ||
-                "__none__"
-              }
-              onValueChange={(value) =>
-                onChange(field.name, value === "__none__" ? "" : value)
-              }
-            >
-              <SelectTrigger id={field.name} className="w-full">
-                <SelectValue placeholder="Select an option" />
-              </SelectTrigger>
-              <SelectContent>
-                {!field.values?.length && (
-                  <SelectItem value="__none__">
-                    <span className="text-muted-foreground">None</span>
-                  </SelectItem>
-                )}
-                {field.values
-                  ?.filter(
-                    (val) => (typeof val === "string" ? val : val.value) !== "",
-                  )
-                  .map((val) => (
-                    <SelectItem
-                      key={typeof val === "string" ? val : val.value}
-                      value={typeof val === "string" ? val : val.value}
-                    >
-                      {typeof val === "string" ? val : val.label}
+            ) : field.type === "bool" ? (
+              <div className="flex items-center space-x-2">
+                <Checkbox
+                  id={field.name}
+                  checked={formData[field.name] === true}
+                  onCheckedChange={(checked) =>
+                    onChange(field.name, checked === true)
+                  }
+                />
+              </div>
+            ) : field.type === "oneof" ? (
+              <Select
+                value={
+                  (formData[field.name] as string | undefined) ||
+                  (field.default as string | undefined) ||
+                  "__none__"
+                }
+                onValueChange={(value) =>
+                  onChange(field.name, value === "__none__" ? "" : value)
+                }
+              >
+                <SelectTrigger id={field.name} className="w-full">
+                  <SelectValue placeholder="Select an option" />
+                </SelectTrigger>
+                <SelectContent>
+                  {!field.values?.length && (
+                    <SelectItem value="__none__">
+                      <span className="text-muted-foreground">None</span>
                     </SelectItem>
-                  ))}
-              </SelectContent>
-            </Select>
-          ) : field.type === "list" ? (
-            <ListInput
-              value={(formData[field.name] as string[] | undefined) ?? []}
-              onChange={(value) => onChange(field.name, value)}
-              placeholder={field.placeholder}
-            />
-          ) : field.type === "map" ? (
-            <MapInput
-              value={
-                (formData[field.name] as Record<string, string> | undefined) ??
-                {}
-              }
-              onChange={(value) => onChange(field.name, value)}
-              placeholder={field.placeholder}
-            />
-          ) : field.type === "textarea" ? (
-            <Textarea
-              id={field.name}
-              placeholder={field.placeholder || ""}
-              required={field.required}
-              value={(formData[field.name] as string | undefined) ?? ""}
-              onChange={(e) => onChange(field.name, e.target.value)}
-              aria-invalid={!!errors[field.name]}
-            />
-          ) : (
-            <Input
-              id={field.name}
-              type={field.type}
-              placeholder={field.placeholder || ""}
-              required={field.required}
-              value={
-                (formData[field.name] as string | number | undefined) ?? ""
-              }
-              onChange={(e) => {
-                const value =
-                  field.type === "number"
-                    ? e.target.valueAsNumber
-                    : e.target.value;
-                onChange(field.name, value);
-              }}
-              aria-invalid={!!errors[field.name]}
-            />
-          )}
-          {errors[field.name] && (
-            <div className="text-sm text-destructive">{errors[field.name]}</div>
-          )}
-        </div>
-      ))}
+                  )}
+                  {field.values
+                    ?.filter(
+                      (val) =>
+                        (typeof val === "string" ? val : val.value) !== "",
+                    )
+                    .map((val) => (
+                      <SelectItem
+                        key={typeof val === "string" ? val : val.value}
+                        value={typeof val === "string" ? val : val.value}
+                      >
+                        {typeof val === "string" ? val : val.label}
+                      </SelectItem>
+                    ))}
+                </SelectContent>
+              </Select>
+            ) : field.type === "list" ? (
+              <ListInput
+                value={(formData[field.name] as string[] | undefined) ?? []}
+                onChange={(value) => onChange(field.name, value)}
+                placeholder={field.placeholder}
+              />
+            ) : field.type === "map" ? (
+              <MapInput
+                value={
+                  (formData[field.name] as
+                    | Record<string, string>
+                    | undefined) ?? {}
+                }
+                onChange={(value) => onChange(field.name, value)}
+                placeholder={field.placeholder}
+              />
+            ) : field.type === "textarea" ? (
+              <Textarea
+                id={field.name}
+                placeholder={field.placeholder || ""}
+                required={field.required}
+                value={(formData[field.name] as string | undefined) ?? ""}
+                onChange={(e) => onChange(field.name, e.target.value)}
+                aria-invalid={!!errors[field.name]}
+              />
+            ) : (
+              <Input
+                id={field.name}
+                type={field.type}
+                placeholder={field.placeholder || ""}
+                required={field.required}
+                disabled={isDisabled}
+                value={
+                  (formData[field.name] as string | number | undefined) ?? ""
+                }
+                onChange={(e) => {
+                  const value =
+                    field.type === "number"
+                      ? e.target.valueAsNumber
+                      : e.target.value;
+                  onChange(field.name, value);
+                }}
+                aria-invalid={!!errors[field.name]}
+              />
+            )}
+            {errors[field.name] && (
+              <div className="text-sm text-destructive">
+                {errors[field.name]}
+              </div>
+            )}
+          </div>
+        );
+      })}
     </>
   );
 }
@@ -410,9 +422,77 @@ export function mergeInitialData(
   return merged;
 }
 
+/** Minimal reference to another existing model, used to flag id/prefix collisions client-side. */
+export interface ExistingModelRef {
+  id: string;
+  // What the model is actually reachable on (live prefix when installed, else its declared
+  // default) - not its declared `default_prefix`, which can diverge once installed.
+  effective_prefix?: string | null;
+}
+
+/**
+ * Narrow `existingModels` to the set a submission should actually be checked against: while
+ * plain-editing (not duplicating), the model's own id must not flag itself as a collision with
+ * itself; while duplicating, it must - a duplicate is a new, independent model that has to differ
+ * from its own source too.
+ */
+export function filterExistingModelsForCollisionCheck(
+  existingModels: ExistingModelRef[],
+  originalId: unknown,
+  duplicateMode: boolean,
+): ExistingModelRef[] {
+  return duplicateMode
+    ? existingModels
+    : existingModels.filter((m) => m.id !== originalId);
+}
+
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return (
+      Array.isArray(a) &&
+      Array.isArray(b) &&
+      a.length === b.length &&
+      a.every((v, i) => deepEqual(v, b[i]))
+    );
+  }
+  if (a && b && typeof a === "object" && typeof b === "object") {
+    const aRecord = a as Record<string, unknown>;
+    const bRecord = b as Record<string, unknown>;
+    const aKeys = Object.keys(aRecord);
+    const bKeys = Object.keys(bRecord);
+    return (
+      aKeys.length === bKeys.length &&
+      aKeys.every((k) => deepEqual(aRecord[k], bRecord[k]))
+    );
+  }
+  return false;
+}
+
+/** Whether `formData` actually differs from `initialData` - used to skip a no-op edit submission
+ * (and its otherwise-pointless uninstall/reinstall cycle) when nothing was actually changed. */
+export function hasFormDataChanged(
+  formData: Record<string, unknown>,
+  initialData: Record<string, unknown>,
+): boolean {
+  return !deepEqual(formData, initialData);
+}
+
+/** "default_prefix" (the full add/duplicate model definition) and "prefix" (install-time options,
+ * e.g. the Install dialog or a catalog model's Edit Settings) are two different field names for the
+ * same underlying endpoint prefix - either can appear in a given field set, never both at once. */
+export function getPrefixFieldName(
+  fields: SpecField[],
+): "default_prefix" | "prefix" | null {
+  if (fields.some((f) => f.name === "default_prefix")) return "default_prefix";
+  if (fields.some((f) => f.name === "prefix")) return "prefix";
+  return null;
+}
+
 export function validateFields(
   fields: SpecField[],
   formData: Record<string, unknown>,
+  existingModels: ExistingModelRef[] = [],
 ): Record<string, string> {
   const errors: Record<string, string> = {};
   for (const field of fields) {
@@ -467,5 +547,27 @@ export function validateFields(
           errors[field.name] = "This field is required.";
     }
   }
+
+  if (fields.some((f) => f.name === "id")) {
+    const idValue = typeof formData.id === "string" ? formData.id.trim() : "";
+    const collision = idValue
+      ? existingModels.find((m) => m.id === idValue)
+      : undefined;
+    if (collision) errors.id = "This id is already in use.";
+  }
+  const prefixFieldName = getPrefixFieldName(fields);
+  if (prefixFieldName) {
+    const prefixValue =
+      typeof formData[prefixFieldName] === "string"
+        ? (formData[prefixFieldName] as string).trim()
+        : "";
+    const collision = prefixValue
+      ? existingModels.find((m) => m.effective_prefix === prefixValue)
+      : undefined;
+    if (collision)
+      errors[prefixFieldName] =
+        `This prefix is already used by "${collision.id}".`;
+  }
+
   return errors;
 }

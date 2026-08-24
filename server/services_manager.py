@@ -6,6 +6,7 @@
 import asyncio
 import logging
 import re
+from typing import Any
 
 from fastapi import HTTPException
 
@@ -202,6 +203,25 @@ class ServicesManager:
         """Update custom model."""
         service_type, instance = self.split_service_type_and_instance(service_id)
         return await self._get_service(service_type).update_custom_model(instance, custom_model_id, options)
+
+    async def edit_model(
+        self, service_id: str, custom_model_id: CustomModelId, new_definition: AddCustomModelIn
+    ) -> PromiseWithProgress[InstallModelOut, StreamChunk] | None:
+        """Edit a custom-backed model's definition, uninstalling and reinstalling it if installed."""
+        service_type, instance = self.split_service_type_and_instance(service_id)
+        return await self._get_service(service_type).edit_model(instance, custom_model_id, new_definition)
+
+    async def edit_model_install_options(
+        self, service_id: str, model_id: str, new_options: InstallModelIn
+    ) -> tuple[bool, PromiseWithProgress[InstallModelOut, StreamChunk]]:
+        """Edit a model's install-time options only, reinstalling it if installed."""
+        service_type, instance = self.split_service_type_and_instance(service_id)
+        return await self._get_service(service_type).edit_model_install_options(instance, model_id, new_options)
+
+    async def get_duplicate_spec(self, service_id: str, model_id: str) -> dict[str, Any]:
+        """Return a full add-model spec synthesized from an existing model, for duplication."""
+        service_type, instance = self.split_service_type_and_instance(service_id)
+        return await self._get_service(service_type).get_duplicate_spec(instance, model_id)
 
     async def sync_models_in_service(self, service_id: str) -> None:
         """Trigger immediate model sync for the service instance."""

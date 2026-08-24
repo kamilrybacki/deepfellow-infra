@@ -523,6 +523,48 @@ async def test_update_custom_model(services_manager: ServicesManager):
 
 
 @pytest.mark.asyncio
+async def test_edit_model(services_manager: ServicesManager):
+    svc = FakeService("ollama")
+    svc.edit_model = AsyncMock(return_value=None)
+    services_manager.register_service(svc)
+    new_definition = AddCustomModelIn(spec={"name": "my-model"})
+
+    result = await services_manager.edit_model("ollama", "my-custom-id", new_definition)
+
+    assert result is None
+    assert svc.edit_model.await_count == 1
+    assert svc.edit_model.await_args == call("default", "my-custom-id", new_definition)
+
+
+@pytest.mark.asyncio
+async def test_edit_model_install_options(services_manager: ServicesManager):
+    svc = FakeService("ollama")
+    promise = MagicMock()
+    svc.edit_model_install_options = AsyncMock(return_value=(True, promise))
+    services_manager.register_service(svc)
+    new_options = InstallModelIn(spec={"prefix": "my-model"})
+
+    result = await services_manager.edit_model_install_options("ollama", "my-model", new_options)
+
+    assert result == (True, promise)
+    assert svc.edit_model_install_options.await_count == 1
+    assert svc.edit_model_install_options.await_args == call("default", "my-model", new_options)
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec(services_manager: ServicesManager):
+    svc = FakeService("ollama")
+    svc.get_duplicate_spec = AsyncMock(return_value={"id": "my-model"})
+    services_manager.register_service(svc)
+
+    result = await services_manager.get_duplicate_spec("ollama", "my-model")
+
+    assert result == {"id": "my-model"}
+    assert svc.get_duplicate_spec.await_count == 1
+    assert svc.get_duplicate_spec.await_args == call("default", "my-model")
+
+
+@pytest.mark.asyncio
 async def test_sync_models_in_service(services_manager: ServicesManager):
     svc = FakeService("ollama")
     svc.sync_models = AsyncMock()

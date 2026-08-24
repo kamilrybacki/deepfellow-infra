@@ -7,7 +7,7 @@ from collections.abc import Generator
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from starlette.testclient import TestClient
 
@@ -54,6 +54,9 @@ def services_manager(retrieve_model_out: RetrieveModelOut) -> MagicMock:
     manager.update_custom_model = AsyncMock(return_value=None)
     manager.sync_models_in_service = AsyncMock(return_value=None)
     manager.cancel_model_install = AsyncMock(return_value=None)
+    manager.edit_model = AsyncMock(return_value=promise)
+    manager.edit_model_install_options = AsyncMock(return_value=(True, promise))
+    manager.get_duplicate_spec = AsyncMock(return_value={"id": MODEL_ID, "image": "img:latest"})
     return manager
 
 
@@ -374,6 +377,100 @@ def test_update_custom_model_returns_ok_status(client: TestClient, auth_header: 
     resp = client.put(f"/admin/services/{SERVICE_ID}/models/custom/cust-1", json={"spec": {"name": "x"}}, headers=auth_header)
 
     assert resp.json()["status"] == "OK"
+
+
+def test_edit_custom_model_returns_200(client: TestClient, auth_header: dict[str, str]) -> None:
+    resp = client.post(f"/admin/services/{SERVICE_ID}/models/custom/cust-1/edit", json={"spec": {"name": "x"}}, headers=auth_header)
+
+    assert resp.status_code == 200
+
+
+def test_edit_custom_model_calls_manager_with_ids(services_manager: MagicMock, client: TestClient, auth_header: dict[str, str]) -> None:
+    client.post("/admin/services/my-svc/models/custom/my-id/edit", json={"spec": {"name": "x"}}, headers=auth_header)
+
+    assert services_manager.edit_model.call_args.args[0] == "my-svc"
+    assert services_manager.edit_model.call_args.args[1] == "my-id"
+
+
+def test_edit_custom_model_reports_reinstalled_when_promise_returned(
+    services_manager: MagicMock, client: TestClient, auth_header: dict[str, str]
+) -> None:
+    resp = client.post(f"/admin/services/{SERVICE_ID}/models/custom/cust-1/edit", json={"spec": {"name": "x"}}, headers=auth_header)
+
+    assert resp.json() == {"status": "OK", "reinstalled": True}
+
+
+def test_edit_custom_model_reports_not_reinstalled_when_not_previously_installed(
+    services_manager: MagicMock, client: TestClient, auth_header: dict[str, str]
+) -> None:
+    services_manager.edit_model = AsyncMock(return_value=None)
+
+    resp = client.post(f"/admin/services/{SERVICE_ID}/models/custom/cust-1/edit", json={"spec": {"name": "x"}}, headers=auth_header)
+
+    assert resp.json() == {"status": "OK", "reinstalled": False}
+
+
+def test_edit_model_options_returns_200(client: TestClient, auth_header: dict[str, str]) -> None:
+    resp = client.post(f"/admin/services/{SERVICE_ID}/models/_/edit", json=INSTALL_BODY, params={"model_id": MODEL_ID}, headers=auth_header)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "OK", "reinstalled": True}
+
+
+def test_edit_model_options_reports_not_reinstalled_when_not_previously_installed(
+    services_manager: MagicMock, client: TestClient, auth_header: dict[str, str]
+) -> None:
+    """edit_model_install_options always installs, even for a model that wasn't installed before - the
+    response must reflect that as reinstalled=False rather than hardcoding True regardless."""
+    promise = MagicMock()
+    promise.wait = AsyncMock(return_value=InstallModelOut(status="OK", details="done"))
+    services_manager.edit_model_install_options = AsyncMock(return_value=(False, promise))
+
+    resp = client.post(f"/admin/services/{SERVICE_ID}/models/_/edit", json=INSTALL_BODY, params={"model_id": MODEL_ID}, headers=auth_header)
+
+    assert resp.json() == {"status": "OK", "reinstalled": False}
+
+
+def test_edit_model_options_calls_manager_with_ids(services_manager: MagicMock, client: TestClient, auth_header: dict[str, str]) -> None:
+    client.post("/admin/services/my-svc/models/_/edit", json=INSTALL_BODY, params={"model_id": "my-model"}, headers=auth_header)
+
+    assert services_manager.edit_model_install_options.call_args.args[0] == "my-svc"
+    assert services_manager.edit_model_install_options.call_args.args[1] == "my-model"
+
+
+def test_get_duplicate_spec_returns_200(client: TestClient, auth_header: dict[str, str]) -> None:
+    resp = client.get(f"/admin/services/{SERVICE_ID}/models/_/duplicate-spec", params={"model_id": MODEL_ID}, headers=auth_header)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"spec": {"id": MODEL_ID, "image": "img:latest"}}
+
+
+def test_get_duplicate_spec_calls_manager_with_ids(services_manager: MagicMock, client: TestClient, auth_header: dict[str, str]) -> None:
+    client.get("/admin/services/my-svc/models/_/duplicate-spec", params={"model_id": "my-model"}, headers=auth_header)
+
+    assert services_manager.get_duplicate_spec.call_args.args[0] == "my-svc"
+    assert services_manager.get_duplicate_spec.call_args.args[1] == "my-model"
+
+
+def test_get_duplicate_spec_not_found_propagates_404(services_manager: MagicMock, client: TestClient, auth_header: dict[str, str]) -> None:
+    services_manager.get_duplicate_spec = AsyncMock(side_effect=HTTPException(400, "Model not found"))
+
+    resp = client.get(f"/admin/services/{SERVICE_ID}/models/_/duplicate-spec", params={"model_id": "ghost"}, headers=auth_header)
+
+    assert resp.status_code == 400
+
+
+def test_update_custom_model_route_still_rejects_when_installed(
+    services_manager: MagicMock, client: TestClient, auth_header: dict[str, str]
+) -> None:
+    """The existing PUT route's contract is unchanged by the new edit route - it still delegates
+    straight to `update_custom_model`, which is where the installed-guard lives."""
+    services_manager.update_custom_model = AsyncMock(side_effect=HTTPException(400, "Cannot update installed server. Uninstall first."))
+
+    resp = client.put(f"/admin/services/{SERVICE_ID}/models/custom/cust-1", json={"spec": {"name": "x"}}, headers=auth_header)
+
+    assert resp.status_code == 400
+    assert "Uninstall first" in resp.json()["detail"]
 
 
 def test_sync_models_returns_200(client: TestClient, auth_header: dict[str, str]) -> None:
