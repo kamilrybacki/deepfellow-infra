@@ -40,6 +40,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fixed the Ollama install progress bar getting stuck at 100% forever when a service install's post-processing step (e.g. saving config) failed after an install/uninstall/reinstall cycle.
 - Rotating `infra_api_key` no longer leaves already-connected subinfras calling ancestor-proxied models with the old key: a proxy registration is now refreshed whenever the reporting peer's API key changes, not only when the model id itself is new.
 - Fixed a `pyright` type-check failure on `main` caused by Docker Model Runner's `_generate_instance_config` override not matching its base class signature.
+- A HuggingFace model download with an invalid or unreachable repository id no longer silently reports install success with an empty model directory; it now fails fast with a "model repository not found" error instead of a confusing container-startup failure minutes later.
 
 ## [0.31.0] - 2026-08-06
 

@@ -8,7 +8,6 @@ import logging
 import re
 from abc import abstractmethod
 from collections.abc import AsyncGenerator
-from contextlib import suppress
 from pathlib import Path
 from typing import Any, Never, NotRequired, TypedDict
 from urllib.parse import urlparse, urlunparse
@@ -256,19 +255,17 @@ class HuggingFaceRepoDownloader(BaseDownloader):
         data: list[dict[str, Any]] = []
         size = 0
         filenames = []
-        with suppress(Exception):
-            # Adding authentication header in here make error in public repos
-            async with ClientSession() as session, session.get(url) as response:
-                data = await response.json()
-        try:
-            for item in data:
-                # If we find repo with folder we should add support for it.
-                if item.get("type") == "file" and (filename := item.get("path")):
-                    filenames.append(filename)
-                    size += int(item.get("size", 0))
-
-        except Exception:
-            filenames = []
+        async with ClientSession() as session, session.get(url) as response:
+            if response.status != 200:
+                body = await response.text()
+                msg = f"Cannot download file from {url}, get status code {response.status}, {body}"
+                raise HttpClientError(message=msg, status_code=response.status, headers=response.headers, body=body)
+            data = await response.json()
+        for item in data:
+            # If we find repo with folder we should add support for it.
+            if item.get("type") == "file" and (filename := item.get("path")):
+                filenames.append(filename)
+                size += int(item.get("size", 0))
 
         return filenames, size
 
@@ -281,7 +278,14 @@ class HuggingFaceRepoDownloader(BaseDownloader):
             if match:
                 model_id = match.group(1)
 
-        filenames, size = await self.get_filenames(model_id)
+        try:
+            filenames, size = await self.get_filenames(model_id)
+        except HttpClientError as e:
+            if e.status_code == 401:
+                # get_filenames never sends an auth header, so a 401 here can only mean HF didn't
+                # recognize the repository — not a credentials problem.
+                raise HTTPException(404, f"Model repository not found on HuggingFace: https://huggingface.co/{model_id}") from e
+            self._raise_http_error(e, f"https://huggingface.co/{model_id}")
         yield PreDownloadPacket(size)
         for filename in filenames:
             whole_url = f"https://huggingface.co/{model_id}/resolve/main/{filename}"
