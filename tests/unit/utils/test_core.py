@@ -724,6 +724,43 @@ async def test_make_http_request_success():
 
 
 @pytest.mark.asyncio
+async def test_make_http_request_uses_default_timeout_when_not_given():
+    mock_resp = MagicMock()
+    mock_resp.content_type = "text/plain"
+    mock_resp.status = 200
+    mock_resp.headers = {}
+    mock_resp.release = AsyncMock()
+
+    mock_session = MagicMock()
+    mock_session.request = AsyncMock(return_value=mock_resp)
+    mock_session.close = AsyncMock()
+
+    with patch("server.utils.core.ClientSession", return_value=mock_session):
+        await make_http_request("http://example.com/")
+
+    assert mock_session.request.call_args.kwargs["timeout"] == ClientTimeout(total=300, sock_connect=30)
+
+
+@pytest.mark.asyncio
+async def test_make_http_request_passes_timeout_when_given():
+    mock_resp = MagicMock()
+    mock_resp.content_type = "text/plain"
+    mock_resp.status = 200
+    mock_resp.headers = {}
+    mock_resp.release = AsyncMock()
+
+    mock_session = MagicMock()
+    mock_session.request = AsyncMock(return_value=mock_resp)
+    mock_session.close = AsyncMock()
+
+    timeout = ClientTimeout(total=None, sock_read=1800)
+    with patch("server.utils.core.ClientSession", return_value=mock_session):
+        await make_http_request("http://example.com/", timeout=timeout)
+
+    assert mock_session.request.call_args.kwargs["timeout"] is timeout
+
+
+@pytest.mark.asyncio
 async def test_make_http_request_skips_falsy_chunks():
     """iter_chunks yields a falsy (empty) chunk — covers the False branch of 'if chunk' (559->558)."""
 

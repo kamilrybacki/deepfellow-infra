@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, cast
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import aiohttp
-from aiohttp import JsonPayload
+from aiohttp import ClientTimeout, JsonPayload
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, TypeAdapter, ValidationError, field_validator
@@ -583,6 +583,10 @@ class ProxyOptions:
     allowed_request_headers: list[str] | None = None
     dynamic_headers: Callable[[], Awaitable[dict[str, str]]] | None = None
     on_reauth: Callable[[], Awaitable[dict[str, str] | None]] | None = None
+    # Max idle time between reads from the backend, not a total-request cap. Only applied by
+    # register_custom_endpoint_as_proxy; ignored by every other proxy path. This is deliberate —
+    # the longer timeout is meant for doc-chunker and other custom services only.
+    read_timeout_seconds: int = 300
 
     async def get_request_headers(self, request: Request | None) -> dict[str, str]:
         """Get request headers, merging in freshly-computed dynamic headers (e.g. a live OAuth token) last."""
@@ -987,6 +991,7 @@ class EndpointRegistry:
                     method=request.method,
                     data=request.stream(),
                     headers=headers,
+                    timeout=ClientTimeout(total=None, sock_connect=30, sock_read=options.read_timeout_seconds),
                 )
             ).as_streaming_response(options.allowed_response_headers)
 
