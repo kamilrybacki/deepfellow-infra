@@ -96,6 +96,8 @@ export interface ServiceModel {
   spec: ServiceSpec;
   size: string;
   custom?: string; // Custom model ID if custom
+  default_prefix?: string | null; // The definition's declared default - may not match what's actually installed
+  effective_prefix?: string | null; // What this model is actually reachable on; use this for collision checks
   has_docker?: boolean;
   vram_estimate_gb?: number | null;
   is_loaded?: boolean | null;

@@ -9,7 +9,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import { initFormData, validateFields } from "@/components/DynamicFormFields";
+import {
+  type ExistingModelRef,
+  initFormData,
+  validateFields,
+} from "@/components/DynamicFormFields";
 import { apiClient } from "@/deepfellow/client";
 import type { ConvertedMcpConfig, SpecField } from "@/deepfellow/types";
 import { proposePrefix } from "@/utils/prefix";
@@ -177,7 +181,7 @@ export interface DockerFormState {
   description: string;
   setDescription: (v: string) => void;
   handleChange: (name: string, value: unknown) => void;
-  validate: () => Record<string, string>;
+  validate: (existingModels?: ExistingModelRef[]) => Record<string, string>;
   populate: (parsed: {
     name: string;
     image: string;
@@ -234,8 +238,10 @@ export function useDockerForm(
     });
   };
 
-  const validate = (): Record<string, string> => {
-    const errs = validateFields(dockerFields, data);
+  const validate = (
+    existingModels?: ExistingModelRef[],
+  ): Record<string, string> => {
+    const errs = validateFields(dockerFields, data, existingModels);
     setErrors(errs);
     return errs;
   };
@@ -307,7 +313,9 @@ export interface UrlFormState {
     headers: Record<string, string>;
     oauth?: ParsedMcpOAuth;
   }) => void;
-  validate: () => Record<string, string | undefined>;
+  validate: (
+    existingModels?: ExistingModelRef[],
+  ) => Record<string, string | undefined>;
 }
 
 export interface ProxyMcpServerOAuthSpec {
@@ -418,15 +426,26 @@ export function useUrlForm(
     setErrors({});
   };
 
-  const validate = (): Record<string, string | undefined> => {
+  const validate = (
+    existingModels: ExistingModelRef[] = [],
+  ): Record<string, string | undefined> => {
     const errs: Record<string, string | undefined> = {};
     if (!serverUrl.trim()) errs.server_url = "Server URL is required.";
     else if (!/^https?:\/\/.+/.test(serverUrl.trim()))
       errs.server_url = "Must be a valid http:// or https:// URL.";
     if (!name.trim()) errs.name = "Name is required.";
+    else if (existingModels.some((m) => m.id === name.trim()))
+      errs.name = "This id is already in use.";
     if (prefix.trim() && !PREFIX_PATTERN.test(prefix.trim()))
       errs.prefix =
         "Only letters, digits, hyphens and underscores are allowed.";
+    else if (prefix.trim()) {
+      const collision = existingModels.find(
+        (m) => m.effective_prefix === prefix.trim(),
+      );
+      if (collision)
+        errs.prefix = `This prefix is already used by "${collision.id}".`;
+    }
     setErrors(errs);
     return errs;
   };
@@ -501,7 +520,7 @@ export interface StdioFormState {
   handleCommandChange: (text: string) => void;
   handleVariantChange: (v: string) => void;
   clearErrors: () => void;
-  buildPayload: () => {
+  buildPayload: (existingModels?: ExistingModelRef[]) => {
     kind: "user";
     id: string;
     name: string;
@@ -742,14 +761,23 @@ export function useStdioForm(
 
   const clearErrors = () => setErrors({});
 
-  const buildPayload = () => {
+  const buildPayload = (existingModels: ExistingModelRef[] = []) => {
     if (subMode === "import") setSubMode("manual");
     const errs: Record<string, string | undefined> = {};
     if (!modelId.trim()) errs.name = "Model ID is required.";
+    else if (existingModels.some((m) => m.id === modelId.trim()))
+      errs.name = "This id is already in use.";
     if (!command.trim()) errs.command = "Command is required.";
     if (prefix.trim() && !PREFIX_PATTERN.test(prefix.trim()))
       errs.prefix =
         "Only letters, digits, hyphens and underscores are allowed.";
+    else if (prefix.trim()) {
+      const collision = existingModels.find(
+        (m) => m.effective_prefix === prefix.trim(),
+      );
+      if (collision)
+        errs.prefix = `This prefix is already used by "${collision.id}".`;
+    }
     if (Object.values(errs).some(Boolean)) {
       setErrors(errs);
       return null;

@@ -14,8 +14,9 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
+from server.docker import DockerOptions
 from server.models.api import McpToolInfo
-from server.models.models import InstallModelIn, ListModelsFilters, McpHealthCheckResult, UninstallModelIn
+from server.models.models import AddCustomModelIn, InstallModelIn, ListModelsFilters, McpHealthCheckResult, UninstallModelIn
 from server.models.services import InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import CustomModel, Instance, InstanceConfig
 from server.services.mcp_service import (
@@ -596,6 +597,7 @@ async def test_list_models_filter_installed_true_returns_only_installed(svc: Mcp
     installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     mock_info = MagicMock()
     mock_info.get_info.return_value = MagicMock()
+    mock_info.prefix = "open-websearch"
     installed.models["open-websearch"] = mock_info
     svc.instances_info["default"].installed = installed
 
@@ -618,6 +620,7 @@ async def test_list_models_installed_model_has_model_info(svc: McpService) -> No
     installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     mock_info = MagicMock()
     mock_info.get_info.return_value = MagicMock()
+    mock_info.prefix = "open-websearch"
     installed.models["open-websearch"] = mock_info
     svc.instances_info["default"].installed = installed
 
@@ -664,6 +667,7 @@ async def test_get_model_installed_returns_model_info(svc: McpService) -> None:
     installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     mock_info = MagicMock()
     mock_info.get_info.return_value = MagicMock()
+    mock_info.prefix = "open-websearch"
     installed.models["open-websearch"] = mock_info
     svc.instances_info["default"].installed = installed
 
@@ -2278,6 +2282,269 @@ async def test_update_custom_model_proxy_preserves_oauth_when_new_data_omits_it(
     assert updated.oauth.client_secret == "super-secret"
     assert updated.oauth.access_token == "access-tok"
     assert updated.oauth.refresh_token == "refresh-tok"
+
+
+@mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
+@pytest.mark.asyncio
+async def test_edit_model_preserves_oauth_secrets_through_uninstall_reinstall(mock_fetch: AsyncMock, svc: McpService) -> None:
+    """DFINFRA-271 regression: OAuth secret preservation still holds when editing an *installed* proxy
+    MCP server through `edit_model`'s uninstall->update->reinstall orchestration, not just a direct,
+    not-installed `_update_custom_model` call (the scenario the pre-existing tests above cover)."""
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    old = _make_proxy_custom(
+        oauth={
+            "enabled": True,
+            "client_id": "client-1",
+            "client_secret": "super-secret",
+            "access_token": "access-tok",
+            "refresh_token": "refresh-tok",
+            "token_expires_at": 12345.0,
+        }
+    )
+    svc._add_custom_model("default", old)  # pyright: ignore[reportPrivateUsage]
+    svc.instances_info["default"].config.custom = [old]
+    mock_fetch.return_value = McpHealthCheckResult(healthy=True, transport="streamable_http", tools=[])
+
+    with patch.object(svc, "_save", new=AsyncMock()):
+        install_promise = await svc.install_model("default", "my-remote-mcp", InstallModelIn())
+        await install_promise.wait()
+        await asyncio.sleep(0)
+        installed = svc.instances_info["default"].installed
+        assert installed is not None
+        assert "my-remote-mcp" in installed.models
+
+        new_data = dict(old.data)
+        new_data["oauth"] = {"enabled": True, "client_id": "client-1", "scope": "tools:read"}
+
+        promise = await svc.edit_model("default", old.id, AddCustomModelIn(spec=new_data))
+        assert promise is not None
+        await promise.wait()
+        await asyncio.sleep(0)
+
+    updated = svc.models["default"]["my-remote-mcp"]
+    assert updated.oauth is not None
+    assert updated.oauth.client_secret == "super-secret"
+    assert updated.oauth.access_token == "access-tok"
+    assert updated.oauth.refresh_token == "refresh-tok"
+    assert updated.oauth.token_expires_at == 12345.0
+    assert updated.oauth.scope == "tools:read"
+    installed = svc.instances_info["default"].installed
+    assert installed is not None
+    assert "my-remote-mcp" in installed.models
+
+
+@pytest.mark.asyncio
+async def test_edit_model_rejects_when_oauth_flow_pending(svc: McpService) -> None:
+    """`_validate_edit`'s MCP override rejects the edit upfront, via `Base2Service.edit_model`, before
+    its uninstall->update->reinstall orchestration runs - not just deep inside `_update_custom_model`
+    (see `test_update_custom_model_proxy_raises_when_oauth_flow_pending`), so an edit that was always
+    going to be rejected doesn't uninstall the model for nothing first."""
+    old = _make_proxy_custom()
+    svc._add_custom_model("default", old)  # pyright: ignore[reportPrivateUsage]
+    svc.instances_info["default"].config.custom = [old]
+    svc._oauth_state_store.add(  # pyright: ignore[reportPrivateUsage]
+        "state-1",
+        PendingOAuthFlow(instance="default", model_id="my-remote-mcp", code_verifier="v", redirect_uri="http://x", resource="http://y"),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await svc.edit_model("default", old.id, AddCustomModelIn(spec=dict(old.data)))
+
+    assert exc_info.value.status_code == 400
+    assert svc.models["default"]["my-remote-mcp"].proxy_url == old.data["server_url"]
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_catalog_model_synthesizes_from_live_model(svc: McpService) -> None:
+    """DFINFRA-271: open-websearch has no stored definition (it's hardcoded in _const.models) - the
+    spec must be synthesized from the live registered SrvMcpModel object."""
+    spec = await svc.get_duplicate_spec("default", "open-websearch")
+
+    assert spec["id"] == "open-websearch"
+    assert spec["default_prefix"] == "open-websearch"
+    assert spec["size"] == "427MB"
+    assert spec["image"] == "hub.simplito.com/deepfellow/open-websearch:v2.1.9"
+    assert spec["image_port"] == 3000
+    assert spec["description"] == "Multi-engine customizable web search with no API key required."
+    assert spec["repository_url"] == "https://github.com/aas-ee/open-websearch"
+    assert "kind" not in spec
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_catalog_model_uses_installed_envs_and_headers(svc: McpService) -> None:
+    """`model.options.env_vars`/`model.headers` are the catalog's static (usually empty) definition -
+    the actual values the user supplied at install time (e.g. an API key) live on the installed model
+    instead, so duplicating an installed catalog model must carry those over, not the empty defaults."""
+    svc.instances_info["default"].installed = InstalledInfo(
+        models={
+            "brave-search": ModelInstalledInfo(
+                id="brave-search",
+                options=InstallModelIn(spec={"prefix": "brave-search"}),
+                docker_options=None,
+                container_host="brave-search",
+                container_port=8080,
+                docker_exposed_port=8080,
+                registration_id="reg-1",
+                prefix="brave-search",
+                base_url="http://brave-search:8080",
+                headers={"X-Custom": "value"},
+                envs={"BRAVE_API_KEY": "secret-key"},
+            )
+        },
+        options=InstallServiceIn(spec={}),
+    )
+
+    spec = await svc.get_duplicate_spec("default", "brave-search")
+
+    assert spec["envs"] == {"BRAVE_API_KEY": "secret-key"}
+    assert spec["headers"] == {"X-Custom": "value"}
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_catalog_model_merges_default_envs_with_installed(svc: McpService) -> None:
+    """DFINFRA-271 regression: `ModelInstalledInfo.envs` holds only what the admin explicitly supplied
+    at install time (e.g. an API key), not the catalog's own default env vars (those are merged only
+    into the actual container's env_vars, never written back to ModelInstalledInfo). Using the
+    installed envs alone would silently drop firecrawl's own HTTP_STREAMABLE_SERVER/HOST/PORT
+    defaults from the duplicate spec."""
+    svc.instances_info["default"].installed = InstalledInfo(
+        models={
+            "firecrawl": ModelInstalledInfo(
+                id="firecrawl",
+                options=InstallModelIn(spec={"prefix": "firecrawl"}),
+                docker_options=None,
+                container_host="firecrawl",
+                container_port=3000,
+                docker_exposed_port=3000,
+                registration_id="reg-1",
+                prefix="firecrawl",
+                base_url="http://firecrawl:3000",
+                headers={},
+                envs={"FIRECRAWL_API_KEY": "secret-key"},
+            )
+        },
+        options=InstallServiceIn(spec={}),
+    )
+
+    spec = await svc.get_duplicate_spec("default", "firecrawl")
+
+    assert spec["envs"] == {
+        "HTTP_STREAMABLE_SERVER": "true",
+        "HOST": "0.0.0.0",
+        "PORT": "3000",
+        "FIRECRAWL_API_KEY": "secret-key",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_catalog_model_with_required_envs(svc: McpService) -> None:
+    """brave-search declares required_envs (a list of keys on the live model) - the synthesized spec
+    turns them into the dict shape `_add_image_model`/the form expects, as empty placeholders."""
+    spec = await svc.get_duplicate_spec("default", "brave-search")
+
+    assert spec["required_envs"] == {"BRAVE_API_KEY": ""}
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_catalog_model_spec_is_addable(svc: McpService) -> None:
+    """End-to-end regression: the synthesized spec must actually pass `_add_image_model`'s validation
+    (SrvMcpCustomModel), not just look plausible."""
+    spec = await svc.get_duplicate_spec("default", "open-websearch")
+    spec["id"] = "open-websearch-copy"
+    spec["default_prefix"] = "open-websearch-copy"
+
+    svc._add_custom_model("default", CustomModel(id="new-uuid", data=spec))  # pyright: ignore[reportPrivateUsage]
+
+    assert "open-websearch-copy" in svc.models["default"]
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_custom_backed_model_returns_stored_definition(svc: McpService) -> None:
+    model = _make_proxy_custom()
+    svc._add_custom_model("default", model)  # pyright: ignore[reportPrivateUsage]
+    svc.instances_info["default"].config.custom = [model]
+
+    spec = await svc.get_duplicate_spec("default", "my-remote-mcp")
+
+    assert spec == model.data
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_redacts_oauth_secrets(svc: McpService) -> None:
+    """DFINFRA-271 regression: the WebUI never round-trips OAuth secrets/tokens (see `_get_custom_spec`)
+    - `get_duplicate_spec` must not leak them either by returning the raw stored definition verbatim."""
+    model = _make_proxy_custom(
+        oauth={
+            "enabled": True,
+            "client_id": "client-1",
+            "client_secret": "super-secret",
+            "access_token": "access-tok",
+            "refresh_token": "refresh-tok",
+            "token_expires_at": 12345.0,
+            "scope": "tools:read",
+        }
+    )
+    svc._add_custom_model("default", model)  # pyright: ignore[reportPrivateUsage]
+    svc.instances_info["default"].config.custom = [model]
+
+    spec = await svc.get_duplicate_spec("default", "my-remote-mcp")
+
+    assert spec["oauth"] == {"enabled": True, "client_id": "client-1", "scope": "tools:read"}
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_strips_host_side_off_an_expanded_volume(svc: McpService) -> None:
+    """No catalog MCP model declares volumes today, but the code path is the same as CustomService's -
+    model.options.volumes would be an already-expanded host:container bind mount, and _add_image_model
+    re-prefixes whatever it receives assuming a bare container path. Verified synthetically since it's
+    otherwise currently unreachable through any real catalog model."""
+    model = svc.models["default"]["open-websearch"]
+    assert isinstance(model.options, DockerOptions)
+    model.options.volumes = [f"{svc.get_working_dir()}/open-websearch/data:/data"]
+
+    spec = await svc.get_duplicate_spec("default", "open-websearch")
+
+    assert spec["volumes"] == ["/data"]
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_unknown_model_raises_400(svc: McpService) -> None:
+    with pytest.raises(HTTPException) as exc:
+        await svc.get_duplicate_spec("default", "ghost")
+
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_custom_backed_missing_definition_raises_404(svc: McpService) -> None:
+    """Registry has `custom=<id>` but no matching CustomModel definition (data inconsistency)."""
+    model = _make_proxy_custom()
+    svc._add_custom_model("default", model)  # pyright: ignore[reportPrivateUsage]
+    # Deliberately not setting `svc.instances_info["default"].config.custom` here.
+
+    with pytest.raises(HTTPException) as exc:
+        await svc.get_duplicate_spec("default", "my-remote-mcp")
+
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_catalog_model_without_options_raises_400(svc: McpService) -> None:
+    """Defensive guard: a catalog (non-custom) model with no docker options at all can't be duplicated.
+
+    Not reachable through any real catalog entry today (they're all image-based), but `model.options`
+    is legitimately `None` for other, custom-backed kinds (e.g. proxy) - this guards the catalog branch
+    specifically, independent of that.
+    """
+    model = MagicMock(spec=SrvMcpModel)
+    model.custom = None
+    model.options = None
+    svc.models.setdefault("default", {})["no-options"] = model
+
+    with pytest.raises(HTTPException) as exc:
+        await svc.get_duplicate_spec("default", "no-options")
+
+    assert exc.value.status_code == 400
 
 
 @pytest.mark.asyncio

@@ -462,6 +462,43 @@ export class DeepFellowClient {
     );
   }
 
+  async editCustomModel(
+    serviceId: string,
+    customModelId: string,
+    spec: Record<string, unknown>,
+  ): Promise<{ status: string; reinstalled: boolean }> {
+    return this.makeRequest<{ status: string; reinstalled: boolean }>(
+      `/admin/services/${serviceId}/models/custom/${customModelId}/edit`,
+      {
+        method: "POST",
+        body: JSON.stringify({ spec }),
+      },
+    );
+  }
+
+  async editModelInstallOptions(
+    serviceId: string,
+    modelId: string,
+    spec: Record<string, unknown>,
+  ): Promise<{ status: string; reinstalled: boolean }> {
+    return this.makeRequest<{ status: string; reinstalled: boolean }>(
+      `/admin/services/${serviceId}/models/_/edit?model_id=${encodeURIComponent(modelId)}`,
+      {
+        method: "POST",
+        body: JSON.stringify({ spec }),
+      },
+    );
+  }
+
+  async getDuplicateSpec(
+    serviceId: string,
+    modelId: string,
+  ): Promise<{ spec: Record<string, unknown> }> {
+    return this.makeRequest<{ spec: Record<string, unknown> }>(
+      `/admin/services/${serviceId}/models/_/duplicate-spec?model_id=${encodeURIComponent(modelId)}`,
+    );
+  }
+
   async startMcpOAuth(
     serviceId: string,
     modelId: string,

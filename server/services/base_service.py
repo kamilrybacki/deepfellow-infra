@@ -179,6 +179,38 @@ class BaseService(ABC):
     async def update_custom_model(self, instance: str, custom_model_id: CustomModelId, options: AddCustomModelIn) -> None:  # noqa: B027
         """Update custom model. No-op by default; override to support."""
 
+    async def edit_model(
+        self,
+        instance: str,  # noqa: ARG002
+        custom_model_id: CustomModelId,  # noqa: ARG002
+        new_definition: AddCustomModelIn,  # noqa: ARG002
+    ) -> PromiseWithProgress[InstallModelOut, StreamChunk] | None:
+        """Edit a custom-backed model's definition, uninstalling and reinstalling it if installed.
+
+        Services without custom model support raise 405 by default.
+        """
+        raise HTTPException(405, "This service does not support editing custom models.")
+
+    async def edit_model_install_options(
+        self,
+        instance: str,  # noqa: ARG002
+        model_id: str,  # noqa: ARG002
+        new_options: InstallModelIn,  # noqa: ARG002
+    ) -> tuple[bool, PromiseWithProgress[InstallModelOut, StreamChunk]]:
+        """Edit a model's install-time options only (no persisted definition change), reinstalling it.
+
+        Services without this concept raise 405 by default.
+        """
+        raise HTTPException(405, "This service does not support editing model install options.")
+
+    async def get_duplicate_spec(self, instance: str, model_id: str) -> dict[str, Any]:  # noqa: ARG002
+        """Return a full add-model spec synthesized from an existing model, for duplication.
+
+        Works for both custom-backed models (their stored definition) and catalog models (synthesized
+        from the live registered model object). Services without this concept raise 405 by default.
+        """
+        raise HTTPException(405, "This service does not support duplicating models.")
+
     async def sync_models(self, instance: str) -> None:  # noqa: B027
         """Trigger an immediate model sync. No-op for services without sync support."""
 

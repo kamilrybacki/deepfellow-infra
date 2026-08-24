@@ -14,6 +14,8 @@ from server.models.models import (
     AddCustomModelIn,
     AddCustomModelOut,
     CancelModelInstallOut,
+    DuplicateSpecOut,
+    EditModelOut,
     InstallModelIn,
     ListModelsFilters,
     ListModelsOut,
@@ -193,6 +195,74 @@ async def update_custom_model(
     """Update a custom model definition."""
     await services_manager.update_custom_model(service_id, custom_model_id, model)
     return UpdateCustomModelOut(status="OK")
+
+
+@router.post(
+    "/custom/{custom_model_id}/edit",
+    summary="Edit a custom model, uninstalling and reinstalling it automatically if it's installed.",
+)
+@tracer.trace_request()
+async def edit_custom_model(
+    request: Request,  # noqa: ARG001 needed for tracer
+    model: Annotated[AddCustomModelIn, Body()],
+    service_id: Annotated[str, Path(description="The ID of the service to use.")],
+    custom_model_id: Annotated[str, Path(description="The ID of the custom model to edit.")],
+    services_manager: Annotated[ServicesManager, Depends(get_services_manager)],
+    _: Annotated[str, Depends(auth_admin)],
+) -> EditModelOut:
+    """Edit a custom model's definition without requiring a manual uninstall first.
+
+    Unlike PUT .../custom/{custom_model_id}, which rejects the request while the model is installed,
+    this uninstalls it, applies the new definition, and reinstalls it with its previous install options.
+    """
+    promise = await services_manager.edit_model(service_id, custom_model_id, model)
+    if promise is None:
+        return EditModelOut(status="OK", reinstalled=False)
+    await promise.wait()
+    return EditModelOut(status="OK", reinstalled=True)
+
+
+@router.post(
+    "/_/edit",
+    summary="Edit a model's install-time options only (prefix/envs/headers), reinstalling it if needed.",
+)
+@tracer.trace_request()
+async def edit_model_options(
+    request: Request,  # noqa: ARG001 needed for tracer
+    model: Annotated[InstallModelIn, Body()],
+    service_id: Annotated[str, Path(description="The ID of the service to use.")],
+    query: Annotated[ModelIdQuery, Query()],
+    services_manager: Annotated[ServicesManager, Depends(get_services_manager)],
+    _: Annotated[str, Depends(auth_admin)],
+) -> EditModelOut:
+    """Edit a model's install-time options only.
+
+    Options are e.g. prefix, envs, headers, with no persisted custom model definition involved - for
+    catalog models. Uninstalls the model if installed, then reinstalls it with the new options.
+    """
+    was_installed, promise = await services_manager.edit_model_install_options(service_id, query.model_id, model)
+    await promise.wait()
+    return EditModelOut(status="OK", reinstalled=was_installed)
+
+
+@router.get(
+    "/_/duplicate-spec",
+    summary="Get a full add-model spec synthesized from an existing model, for duplication.",
+)
+async def get_duplicate_spec(
+    service_id: Annotated[str, Path(description="The ID of the service to use.")],
+    query: Annotated[ModelIdQuery, Query()],
+    services_manager: Annotated[ServicesManager, Depends(get_services_manager)],
+    _: Annotated[str, Depends(auth_admin)],
+) -> DuplicateSpecOut:
+    """Return a spec for duplicating the given model.
+
+    Its stored definition if custom-backed, or one synthesized from the live registered model if it's
+    a catalog model. Submit the result (with a new id) to the existing add-custom-model endpoint to
+    create the duplicate.
+    """
+    spec = await services_manager.get_duplicate_spec(service_id, query.model_id)
+    return DuplicateSpecOut(spec=spec)
 
 
 @router.post(

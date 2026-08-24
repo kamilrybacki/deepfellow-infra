@@ -290,6 +290,18 @@ def test_add_custom_model_duplicate_raises(svc: CustomService) -> None:
     assert exc.value.status_code == 400
 
 
+def test_add_custom_model_prefix_collision_raises_400(svc: CustomService) -> None:
+    """Duplicating a custom model without changing `default_prefix` must be rejected on add - a
+    different `id` alone previously wasn't enough to avoid two models sharing the same endpoint."""
+    svc._add_custom_model("default", CustomModel(id="cm-1", data=_CUSTOM_MODEL_DATA))  # pyright: ignore[reportPrivateUsage]
+    colliding_data = {**_CUSTOM_MODEL_DATA, "id": "other-custom"}
+
+    with pytest.raises(HTTPException) as exc:
+        svc._add_custom_model("default", CustomModel(id="cm-2", data=colliding_data))  # pyright: ignore[reportPrivateUsage]
+
+    assert exc.value.status_code == 400
+
+
 def test_remove_custom_model_when_in_use_raises(svc: CustomService) -> None:
     model = CustomModel(id="cm-1", data=_CUSTOM_MODEL_DATA)
     svc._add_custom_model("default", model)  # pyright: ignore[reportPrivateUsage]
@@ -388,6 +400,129 @@ def test_remove_custom_model_success(svc: CustomService) -> None:
 
 
 @pytest.mark.asyncio
+async def test_remove_custom_model_that_never_registered_still_prunes_config(svc: CustomService) -> None:
+    """A model that failed to register at load time (e.g. a prefix collision caught by load_instance)
+    is persisted in config.custom but never entered self.models - removing it must still succeed and
+    prune the persisted entry, not KeyError on an unconditional del."""
+    model = CustomModel(id="cm-1", data=_CUSTOM_MODEL_DATA)
+    svc.instances_info["default"].config.custom = [model]
+    svc.service_provider.save_service_config = AsyncMock()
+    assert "my-custom" not in svc.models.get("default", {})
+
+    await svc.remove_custom_model("default", "cm-1")
+
+    assert svc.instances_info["default"].config.custom == []
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_catalog_model_synthesizes_from_defaults(svc: CustomService) -> None:
+    """DFINFRA-271: lemmatizer's `options` is a callable resolving docker options from install fields -
+    with nothing installed, get_duplicate_spec must resolve it using the fields' own defaults."""
+    spec = await svc.get_duplicate_spec("default", "lemmatizer")
+
+    assert spec["id"] == "lemmatizer"
+    assert spec["default_prefix"] == "lemmatizer"
+    assert spec["size"] == "1.89GB"
+    assert spec["image"] == "hub.simplito.com/deepfellow/deepfellow-lemmatizer:1.0.0-cpu"
+    assert spec["image_port"] == 8090
+    # generate_docker_options defaults these to int/bool literals, not strings - the duplicate spec
+    # must stringify them, since SrvCustomCustomModel.envs is dict[str, str] (add_custom_model would
+    # otherwise reject them with a validation error).
+    assert spec["envs"] == {
+        "DF_LEMMATIZER_NUM_WORKERS": "4",
+        "DF_LEMMATIZER_QUEUE_MAX": "100000",
+        "DF_LEMMATIZER_SHUTDOWN_TIMEOUT": "30",
+    }
+    assert all(isinstance(v, str) for v in spec["envs"].values())
+    assert spec["healthcheck_cmd"] == "wget -q --spider http://localhost:8090/health"
+    assert spec["healthcheck_start_period"] == "30s"
+    assert spec["description"] == "Multilingual text lemmatization API."
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_catalog_model_uses_installed_options(svc: CustomService) -> None:
+    """When the source model is installed, duplicate resolves docker options from its actual install
+    spec (e.g. a non-default num_workers), not the field defaults."""
+    installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    installed.models["lemmatizer"] = ModelInstalledInfo(
+        id="lemmatizer",
+        options=InstallModelIn(spec={"num_workers": 8}),
+        docker_options=MagicMock(),
+        container_host="",
+        container_port=0,
+        docker_exposed_port=0,
+        registration_id="reg-1",
+        prefix="lemmatizer",
+        base_url="",
+    )
+    svc.instances_info["default"].installed = installed
+
+    spec = await svc.get_duplicate_spec("default", "lemmatizer")
+
+    assert spec["envs"]["DF_LEMMATIZER_NUM_WORKERS"] == "8"
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_catalog_model_spec_is_addable(svc: CustomService) -> None:
+    """End-to-end regression: the synthesized spec must actually pass `_add_custom_model`'s validation
+    (SrvCustomCustomModel), not just look plausible - catches type mismatches like int-valued envs."""
+    spec = await svc.get_duplicate_spec("default", "lemmatizer")
+    spec["id"] = "lemmatizer-copy"
+    spec["default_prefix"] = "lemmatizer-copy"
+
+    svc._add_custom_model("default", CustomModel(id="new-uuid", data=spec))  # pyright: ignore[reportPrivateUsage]
+
+    assert "lemmatizer-copy" in svc.models["default"]
+    options = svc.models["default"]["lemmatizer-copy"].options
+    assert isinstance(options, DockerOptions)
+    # A single-colon, two-segment bind mount under the duplicate's own working directory - not the
+    # three-segment, two-colon string produced by re-prefixing an already-expanded host:container path.
+    assert options.volumes == [f"{svc.get_working_dir()}/lemmatizer_copy_default/volume_0:/root/.cache/stanza"]
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_strips_host_side_off_an_expanded_volume(svc: CustomService) -> None:
+    """`generate_docker_options` callables (e.g. lemmatizer) return an already-expanded host:container
+    volume string - get_duplicate_spec must return just the container side, the raw form
+    `_add_custom_model` expects, not hand it straight back to be re-prefixed a second time."""
+    spec = await svc.get_duplicate_spec("default", "lemmatizer")
+
+    assert spec["volumes"] == ["/root/.cache/stanza"]
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_custom_backed_model_returns_stored_definition(svc: CustomService) -> None:
+    model = CustomModel(id="cm-1", data=dict(_CUSTOM_MODEL_DATA))
+    svc._add_custom_model("default", model)  # pyright: ignore[reportPrivateUsage]
+    svc.instances_info["default"].config.custom = [model]
+
+    spec = await svc.get_duplicate_spec("default", "my-custom")
+
+    assert spec == _CUSTOM_MODEL_DATA
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_custom_backed_missing_definition_raises_404(svc: CustomService) -> None:
+    """Registry has `custom=<id>` but no matching CustomModel definition (data inconsistency)."""
+    model = CustomModel(id="cm-1", data=dict(_CUSTOM_MODEL_DATA))
+    svc._add_custom_model("default", model)  # pyright: ignore[reportPrivateUsage]
+    # Deliberately not setting `svc.instances_info["default"].config.custom` here.
+
+    with pytest.raises(HTTPException) as exc:
+        await svc.get_duplicate_spec("default", "my-custom")
+
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_unknown_model_raises_400(svc: CustomService) -> None:
+    with pytest.raises(HTTPException) as exc:
+        await svc.get_duplicate_spec("default", "ghost")
+
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_list_models_unknown_instance_raises(svc: CustomService) -> None:
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
 
@@ -420,6 +555,7 @@ async def test_list_models_filter_not_installed(svc: CustomService) -> None:
 async def test_list_models_filter_installed_returns_only_installed(svc: CustomService) -> None:
     mock_installed = MagicMock()
     mock_installed.get_info.return_value = ModelInfo(spec={"prefix": "lemmatizer"}, registration_id="r1")
+    mock_installed.prefix = "lemmatizer"
     svc.instances_info["default"].installed = InstalledInfo(
         models={"lemmatizer": mock_installed},
         options=InstallServiceIn(spec={}),
@@ -468,6 +604,7 @@ async def test_get_model_installed_returns_model_info(svc: CustomService) -> Non
     model_info = ModelInfo(spec={"prefix": "lemmatizer"}, registration_id="r1")
     mock_installed = MagicMock()
     mock_installed.get_info.return_value = model_info
+    mock_installed.prefix = "lemmatizer"
     svc.instances_info["default"].installed = InstalledInfo(
         models={"lemmatizer": mock_installed},
         options=InstallServiceIn(spec={}),

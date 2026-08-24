@@ -452,6 +452,30 @@ async def test_cancel_model_install_default_raises_405(base_svc: _BaseImpl) -> N
     assert exc_info.value.status_code == 405
 
 
+@pytest.mark.asyncio
+async def test_edit_model_default_raises_405(base_svc: _BaseImpl) -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        await base_svc.edit_model("default", "custom-1", AddCustomModelIn(spec={}))
+
+    assert exc_info.value.status_code == 405
+
+
+@pytest.mark.asyncio
+async def test_edit_model_install_options_default_raises_405(base_svc: _BaseImpl) -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        await base_svc.edit_model_install_options("default", "m1", InstallModelIn())
+
+    assert exc_info.value.status_code == 405
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_default_raises_405(base_svc: _BaseImpl) -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        await base_svc.get_duplicate_spec("default", "m1")
+
+    assert exc_info.value.status_code == 405
+
+
 def test_is_cloud_service_true_when_class_attr_set() -> None:
     class CloudSvc(_BaseImpl):
         is_cloud = True
@@ -834,6 +858,67 @@ async def test_load_instance_with_custom_models(custom_svc: _Base2ImplWithCustom
         await custom_svc.load_instance("default", instance_data)
 
     assert "cm-test" in custom_svc._custom_store  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_load_instance_custom_model_failure_does_not_block_instance(
+    custom_svc: _Base2ImplWithCustom, base2_deps: dict[str, Any]
+) -> None:
+    """A single custom model raising while loading (e.g. a stale prefix collision from before that
+    check existed) must not stop the rest of the instance from loading - previously any exception
+    from _add_custom_model propagated out of load_instance uncaught, and since load_service gathers
+    every instance of a service without return_exceptions=True, one bad model took the whole service
+    down on startup, not just itself."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    installed_value: dict[str, Any] = {}
+    promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value=installed_value)
+    bad = CustomModel(id="cm-bad", data={"id": "bad-model"})
+    good = CustomModel(id="cm-good", data={"name": "my-model"})
+    instance_data = InstanceConfig(options=InstallServiceIn(spec={}), models=[], custom=[bad, good])
+
+    def add_custom_model(instance: str, model: CustomModel) -> None:
+        if model.id == "cm-bad":
+            raise HTTPException(400, "Prefix 'x' is already in use by model 'other'.")
+        custom_svc._custom_store[model.id] = model  # pyright: ignore[reportPrivateUsage]
+
+    with (
+        patch.object(custom_svc, "_add_custom_model", side_effect=add_custom_model),
+        patch.object(custom_svc, "_install_instance", new=AsyncMock(return_value=promise)),
+    ):
+        await custom_svc.load_instance("default", instance_data)
+
+    assert "cm-good" in custom_svc._custom_store  # pyright: ignore[reportPrivateUsage]
+    assert "cm-bad" not in custom_svc._custom_store  # pyright: ignore[reportPrivateUsage]
+    assert custom_svc.instances_info["default"].installed is installed_value
+    base2_deps["service_provider"].add_warning.assert_awaited_once()
+    call_kwargs = base2_deps["service_provider"].add_warning.await_args.kwargs
+    assert call_kwargs["model_id"] == "bad-model"
+    assert call_kwargs["instance"] == "default"
+
+
+@pytest.mark.asyncio
+async def test_load_instance_custom_model_failure_with_failing_add_warning_does_not_propagate(
+    custom_svc: _Base2ImplWithCustom, base2_deps: dict[str, Any]
+) -> None:
+    """A failure while recording the warning itself must not escape load_instance either - same
+    guarantee test_load_model_failing_add_warning_does_not_propagate already gives load_model."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_deps["service_provider"].add_warning = AsyncMock(side_effect=RuntimeError("disk full"))
+    installed_value: dict[str, Any] = {}
+    promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value=installed_value)
+    bad = CustomModel(id="cm-bad", data={"id": "bad-model"})
+    instance_data = InstanceConfig(options=InstallServiceIn(spec={}), models=[], custom=[bad])
+
+    def add_custom_model(instance: str, model: CustomModel) -> None:
+        raise HTTPException(400, "Prefix 'x' is already in use by model 'other'.")
+
+    with (
+        patch.object(custom_svc, "_add_custom_model", side_effect=add_custom_model),
+        patch.object(custom_svc, "_install_instance", new=AsyncMock(return_value=promise)),
+    ):
+        await custom_svc.load_instance("default", instance_data)
+
+    assert custom_svc.instances_info["default"].installed is installed_value
 
 
 @pytest.mark.asyncio
