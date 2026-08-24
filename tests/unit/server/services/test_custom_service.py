@@ -656,6 +656,8 @@ async def test_install_model_success(svc: CustomService, deps: dict[str, Any]) -
 
     assert result.status == "OK"
     assert "lemmatizer" in svc.instances_info["default"].installed.models  # pyright: ignore[reportOptionalMemberAccess]
+    registered_options = deps["endpoint_registry"].register_custom_endpoint_as_proxy.call_args.kwargs["options"]
+    assert registered_options.read_timeout_seconds == 900
 
 
 @pytest.mark.asyncio

@@ -30,6 +30,10 @@ from server.utils.logger import uvicorn_logger
 
 logger = logging.getLogger("uvicorn.error")
 
+# Mirrors aiohttp's own ClientSession default (aiohttp.client.DEFAULT_TIMEOUT), spelled out explicitly
+# so make_http_request's default behavior doesn't depend on omitting the timeout kwarg entirely.
+_DEFAULT_HTTP_TIMEOUT = ClientTimeout(total=300, sock_connect=30)
+
 
 class HttpClientError(Exception):
     def __init__(self, message: str, status_code: int, headers: CIMultiDictProxy[str], body: str):
@@ -579,6 +583,7 @@ async def make_http_request(
     method: str = "GET",
     data: AsyncGenerator[bytes] | bytes | FormData | Payload | None = None,
     headers: dict[str, str] | None = None,
+    timeout: ClientTimeout = _DEFAULT_HTTP_TIMEOUT,
 ) -> HttpResponse:
     """Make HTTP request to given url."""
     logger.debug("HTTP request: %s %s", method, url)
@@ -586,7 +591,7 @@ async def make_http_request(
     session = ClientSession()
     response = None
     try:
-        response = await session.request(method=method, url=url, data=data, headers=headers)
+        response = await session.request(method=method, url=url, data=data, headers=headers, timeout=timeout)
 
         async def generator() -> AsyncGenerator[bytes]:
             try:

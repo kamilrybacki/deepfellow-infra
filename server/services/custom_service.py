@@ -495,7 +495,7 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
                     model_info.registration_id = self.endpoint_registry.register_custom_endpoint_as_proxy(
                         url=model_info.prefix,
                         props=model.model_props,
-                        options=ProxyOptions(url=model_info.base_url),
+                        options=ProxyOptions(url=model_info.base_url, read_timeout_seconds=900),
                         registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                     )
                     self.models_downloaded[model_id] = DownloadedInfo(image.name)

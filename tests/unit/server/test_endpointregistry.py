@@ -2934,9 +2934,22 @@ async def test_register_rerank_as_proxy_normalize_sglang_invokes_post_json_reran
 
 
 @pytest.mark.asyncio
-async def test_register_custom_endpoint_as_proxy_callback_invokes_make_http_request():
+@pytest.mark.parametrize(
+    ("read_timeout_seconds", "expected_sock_read"),
+    [
+        pytest.param(None, 300, id="default"),
+        pytest.param(1800, 1800, id="configured"),
+    ],
+)
+async def test_register_custom_endpoint_as_proxy_callback_invokes_make_http_request(
+    read_timeout_seconds: int | None, expected_sock_read: int
+) -> None:
     reg = make_registry()
-    opts = ProxyOptions(url="http://example.com/custom/")
+    opts = (
+        ProxyOptions(url="http://example.com/custom/")
+        if read_timeout_seconds is None
+        else ProxyOptions(url="http://example.com/custom/", read_timeout_seconds=read_timeout_seconds)
+    )
     reg.register_custom_endpoint_as_proxy("my-svc", make_props(), opts, None)
     ep = reg.custom_endpoints.get_model("my-svc")
     mock_http_response = MagicMock()
@@ -2948,10 +2961,11 @@ async def test_register_custom_endpoint_as_proxy_callback_invokes_make_http_requ
     request.path_params = {"full_path": "my-svc/sub/path"}
     request.stream.return_value = AsyncMock()
 
-    with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response):
+    with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response) as mock_call:
         result = await ep.endpoint.on_request(request)  # pyright: ignore[reportOptionalMemberAccess]
 
     assert result is mock_streaming
+    assert mock_call.call_args.kwargs["timeout"] == aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=expected_sock_read)
 
 
 @pytest.mark.asyncio
