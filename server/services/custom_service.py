@@ -51,6 +51,9 @@ from server.utils.core import (
 from server.utils.hardware import NvidiaGpuInfo
 from server.utils.size_fetcher import fmt_size
 
+# Token window accepted by BAAI/bge-m3, which the deepfellow-bge-m3 image serves unmodified.
+BGE_M3_CONTEXT_WINDOW = 8192
+
 type SrvCustomModelX = Callable[["CustomService", str | None], SrvCustomModel]
 type DockerOptionsOrCallable = DockerOptions | Callable[[InstallModelOptions], DockerOptions]
 
@@ -597,7 +600,13 @@ def create_bge_m3_model(custom_service: CustomService, subnet: str | None) -> Sr
         )
 
     return SrvCustomModel(
-        model_props=ModelProps(private=True, type="custom", endpoints=["/custom/deepfellow-bge-m3/v1/embeddings"]),
+        model_props=ModelProps(
+            private=True,
+            type="custom",
+            endpoints=["/custom/deepfellow-bge-m3/v1/embeddings"],
+            context_window=BGE_M3_CONTEXT_WINDOW,
+            max_context_window=BGE_M3_CONTEXT_WINDOW,
+        ),
         model_spec=ModelSpecification(fields=fields),
         model_type="custom",
         default_prefix="deepfellow-bge-m3",

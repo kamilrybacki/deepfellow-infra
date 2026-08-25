@@ -239,6 +239,16 @@ async def test_get_gguf_context_window_returns_context(tmp_path: Path, kv_bytes:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kv_bytes", [_kv_uint32("llama.context_length", 0), _kv_int32("llama.context_length", -1)])
+async def test_get_gguf_context_window_rejects_non_positive(tmp_path: Path, kv_bytes: bytes) -> None:
+    """A malformed gguf must read as an unknown window, so consumers fall back instead of sizing to 0."""
+    file = tmp_path / "model.gguf"
+    file.write_bytes(_build_gguf([kv_bytes]))
+
+    assert await get_gguf_context_window(file) is None
+
+
+@pytest.mark.asyncio
 async def test_get_gguf_context_window_returns_none_when_pattern_not_found(tmp_path: Path) -> None:
     file = tmp_path / "model.gguf"
     file.write_bytes(b"\x00" * 64)
@@ -285,6 +295,15 @@ async def test_get_model_dir_context_window_reads_max_position_embeddings(tmp_pa
     result = await get_model_dir_context_window(tmp_path)
 
     assert result == 2048
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [0, -1])
+async def test_get_model_dir_context_window_rejects_non_positive(tmp_path: Path, value: int) -> None:
+    """A malformed config must read as an unknown window, not as a zero-size one."""
+    (tmp_path / "config.json").write_text(json.dumps({"max_position_embeddings": value}))
+
+    assert await get_model_dir_context_window(tmp_path) is None
 
 
 @pytest.mark.asyncio

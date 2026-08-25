@@ -483,3 +483,20 @@ def test_mcp_tool_call_generates_unique_ids_per_instance() -> None:
     second = McpToolCall(server_label="s", name="f")
 
     assert first.id != second.id
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_model_props_rejects_non_positive_context_window(value: int) -> None:
+    """0 is not a window a model can have, and consumers use these as a ceiling for their own sizing."""
+    with pytest.raises(ValidationError):
+        ModelProps(private=True, type="custom", endpoints=[], context_window=value)
+
+    with pytest.raises(ValidationError):
+        ModelProps(private=True, type="custom", endpoints=[], max_context_window=value)
+
+
+def test_model_props_context_window_defaults_to_none() -> None:
+    props = ModelProps(private=True, type="custom", endpoints=[])
+
+    assert props.context_window is None
+    assert props.max_context_window is None

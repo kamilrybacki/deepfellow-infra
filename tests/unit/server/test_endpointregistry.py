@@ -1048,6 +1048,53 @@ def test_get_max_context_window_returns_max():
     assert result == 16000
 
 
+def test_get_model_context_window_returns_none_when_undeclared():
+    ep = make_endpoint()
+    ep.add_model(
+        "custom-model",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "custom",
+        RegistrationOptions(origin="local", id="id-1"),
+    )
+
+    assert ep.get_model_context_window(ep.models["custom-model"]) is None
+
+
+def test_get_max_context_window_returns_none_when_undeclared():
+    """Reporting 0 here made df-server store 0 as its chunk-size ceiling and fail every ingest."""
+    ep = make_endpoint()
+    ep.add_model(
+        "custom-model",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "custom",
+        RegistrationOptions(origin="local", id="id-1"),
+    )
+
+    assert ep.get_max_context_window(ep.models["custom-model"]) is None
+
+
+def test_get_max_context_window_ignores_registrations_without_a_window():
+    ep = make_endpoint()
+    ep.add_model(
+        "gpt-4",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-1"),
+    )
+    ep.add_model(
+        "gpt-4",
+        make_props(max_context_window=16000),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-2"),
+    )
+
+    assert ep.get_max_context_window(ep.models["gpt-4"]) == 16000
+
+
 def test_get_models_returns_api_model_list():
     ep = make_endpoint()
     ep.add_model("gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local"))

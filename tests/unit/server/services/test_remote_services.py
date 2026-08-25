@@ -236,6 +236,26 @@ def test_get_model_props_llm_includes_chat_completions() -> None:
     assert "/v1/chat/completions" in props.endpoints
 
 
+@pytest.mark.parametrize("value", [0, -100])
+def test_get_model_props_drops_unusable_context_window(value: int) -> None:
+    """An admin leaving the numeric field at 0 must not fail the install or publish a bogus ceiling."""
+    model = RemoteModel(type="llm", context_length=value, max_context_length=value)
+
+    props = get_model_props(model)
+
+    assert props.context_window is None
+    assert props.max_context_window is None
+
+
+def test_get_model_props_keeps_declared_context_window() -> None:
+    model = RemoteModel(type="llm", context_length=4096, max_context_length=8192)
+
+    props = get_model_props(model)
+
+    assert props.context_window == 4096
+    assert props.max_context_window == 8192
+
+
 def test_get_model_props_respects_disabled_endpoints() -> None:
     model = RemoteModel(type="llm", completions=False, legacy_completions=False, responses=False, messages=False)
 

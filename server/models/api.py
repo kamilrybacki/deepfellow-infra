@@ -418,8 +418,8 @@ class ModelProps(BaseModel):
     private: bool
     type: str
     endpoints: list[str]
-    context_window: int | None = None
-    max_context_window: int | None = None
+    context_window: Annotated[int, Field(gt=0)] | None = None
+    max_context_window: Annotated[int, Field(gt=0)] | None = None
     prefix: str | None = None
     transport: str | None = None
     tools: list[McpToolInfo] = []

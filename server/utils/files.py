@@ -11,6 +11,7 @@ from typing import Any
 
 import aiofiles
 
+from server.utils.core import positive_context_window_or_none
 from server.utils.vram_calculator import ArchParams
 
 _GGUF_SCALAR_FMTS: dict[int, str] = {
@@ -135,7 +136,8 @@ async def get_gguf_context_window(file_path: Path | str) -> int | None:
             chunk = await f.read(1_000_000)
 
         metadata = _parse_gguf_metadata(chunk)
-        return next((v for k, v in metadata.items() if k.endswith(".context_length") and isinstance(v, int)), None)
+        window = next((v for k, v in metadata.items() if k.endswith(".context_length") and isinstance(v, int)), None)
+        return positive_context_window_or_none(window)
 
     except Exception:
         return None
@@ -154,7 +156,7 @@ async def get_model_dir_context_window(model_dir: Path | str) -> int | None:
             # Extract the specific parameter
             value = config_data.get("max_position_embeddings")
 
-            return int(value) if value is not None else None
+            return positive_context_window_or_none(int(value) if value is not None else None)
 
     except (FileNotFoundError, json.JSONDecodeError, ValueError, KeyError):
         # Gracefully handle missing files, malformed JSON, or non-int values

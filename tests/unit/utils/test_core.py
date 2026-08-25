@@ -31,6 +31,7 @@ from server.utils.core import (
     get_os,
     load_json_registry,
     make_http_request,
+    positive_context_window_or_none,
     stream_fetch_from,
 )
 
@@ -964,3 +965,18 @@ async def test_sse_generator_reraises_cancellation_when_task_cancelling():
 
     promise.cancel()
     await asyncio.gather(*promise.tasks(), return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (8192, 8192),
+        (1, 1),
+        (0, None),
+        (-1, None),
+        (None, None),
+    ],
+)
+def test_positive_context_window_or_none(value: int | None, expected: int | None) -> None:
+    """A zero or negative window is an unknown window, not a small one."""
+    assert positive_context_window_or_none(value) == expected

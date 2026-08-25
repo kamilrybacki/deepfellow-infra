@@ -56,6 +56,7 @@ from server.utils.core import (
     StreamChunkProgress,
     convert_size_to_bytes,
     fetch_from,
+    positive_context_window_or_none,
     stream_fetch_from,
     try_parse_pydantic,
 )
@@ -1325,8 +1326,8 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                 internal_name = model_id
                 new_modelfile: str | None = None
 
-                service_form_context_window = info.parsed_options.context_length
-                model_form_context_window = parsed_model_options.context_length
+                service_form_context_window = positive_context_window_or_none(info.parsed_options.context_length)
+                model_form_context_window = positive_context_window_or_none(parsed_model_options.context_length)
 
                 # Default model with custom context
                 if model.type == "llm" and parsed_model_options.context_length is not None:
@@ -1369,7 +1370,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                     internal_name=internal_name,
                 )
                 try:
-                    model_max_context_window = model_context
+                    model_max_context_window = positive_context_window_or_none(model_context)
                     service_max_context_window = self.default_context_length
                     default_context_window = self.get_default_context_window(model_max_context_window, service_max_context_window)
                     max_context_window = model_form_context_window or model_max_context_window or service_max_context_window
