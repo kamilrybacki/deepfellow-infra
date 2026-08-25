@@ -347,13 +347,19 @@ class Endpoint[T]:
         """Get model available endpoints."""
         return list({endpoint for item in model.values() for endpoint in item.props.endpoints})
 
-    def get_model_context_window(self, model: dict[RegistrationId, RegisteredModel[T]]) -> int:
-        """Get model context window."""
-        return max([0, *list({item.props.context_window for item in model.values() if item.props.context_window})])
+    def get_model_context_window(self, model: dict[RegistrationId, RegisteredModel[T]]) -> int | None:
+        """Get model context window, or None when no registration declares one."""
+        return max((window for item in model.values() if (window := item.props.context_window) is not None), default=None)
 
-    def get_max_context_window(self, model: dict[RegistrationId, RegisteredModel[T]]) -> int:
-        """Get model max context window."""
-        return max([0, *list({item.props.max_context_window for item in model.values() if item.props.max_context_window})])
+    def get_max_context_window(self, model: dict[RegistrationId, RegisteredModel[T]]) -> int | None:
+        """Get model max context window, or None when no registration declares one.
+
+        Reported as None rather than 0: consumers use this as a ceiling for their own request sizing,
+        and 0 is not a window a model could have. Any registration may leave the window undeclared -
+        custom-service models never declare one - and seeding a max() with 0 used to publish 0 for all
+        of them.
+        """
+        return max((window for item in model.values() if (window := item.props.max_context_window) is not None), default=None)
 
     def get_model_prefix(self, model: dict[RegistrationId, RegisteredModel[T]]) -> str | None:
         """Get model prefix."""

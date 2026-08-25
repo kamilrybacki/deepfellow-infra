@@ -258,6 +258,17 @@ async def stream_fetch_from(
             yield FetchResult(status_code=response.status, data=chunk[0].decode())
 
 
+def positive_context_window_or_none(value: int | None) -> int | None:
+    """Return a context window only when it could actually be one.
+
+    Windows reach us from model files, remote peers and admin forms, none of which guarantee a sane
+    number. A zero or negative window is not a smaller window, it is an unknown one, and reporting it
+    as a number makes consumers size their requests against it. `ModelProps` rejects such values, so
+    normalise here rather than failing an install over a blank form field.
+    """
+    return value if value is not None and value > 0 else None
+
+
 def normalize_name(s: str) -> str:
     """Normalize name."""
     result: list[str] = []

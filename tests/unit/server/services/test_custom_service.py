@@ -724,6 +724,14 @@ def test_create_bge_m3_model_cpu_image(svc: CustomService) -> None:
     assert "cpu" in docker_opts.image
 
 
+def test_create_bge_m3_model_declares_context_window(svc: CustomService) -> None:
+    """Consumers chunk against this ceiling; leaving it unset made them fall back to a smaller guess."""
+    model = create_bge_m3_model(svc, "172.20.0.0/16")
+
+    assert model.model_props.max_context_window == 8192
+    assert model.model_props.context_window == 8192
+
+
 def test_create_bge_m3_model_gpu_image(deps: dict[str, Any]) -> None:
     gpu = NvidiaGpuInfo(name="RTX 4090", vram="24GB", id=0)
     deps["hardware"] = MagicMock(gpus=[gpu], cpu=MagicMock())

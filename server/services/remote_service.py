@@ -43,6 +43,7 @@ from server.utils.core import (
     Stream,
     StreamChunk,
     StreamChunkProgress,
+    positive_context_window_or_none,
     try_parse_pydantic,
 )
 
@@ -86,8 +87,8 @@ def get_model_props(model: RemoteModel | RemoteCustomModel) -> ModelProps:
         private=False,
         type=model.type,
         endpoints=endpoints,
-        context_window=model.context_length,
-        max_context_window=model.max_context_length,
+        context_window=positive_context_window_or_none(model.context_length),
+        max_context_window=positive_context_window_or_none(model.max_context_length),
     )
 
 
