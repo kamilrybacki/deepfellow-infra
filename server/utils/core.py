@@ -30,9 +30,11 @@ from server.utils.logger import uvicorn_logger
 
 logger = logging.getLogger("uvicorn.error")
 
-# Mirrors aiohttp's own ClientSession default (aiohttp.client.DEFAULT_TIMEOUT), spelled out explicitly
-# so make_http_request's default behavior doesn't depend on omitting the timeout kwarg entirely.
-_DEFAULT_HTTP_TIMEOUT = ClientTimeout(total=300, sock_connect=30)
+# Used by make_http_request only when a caller passes no timeout at all (e.g. the mesh websocket's
+# HTTP call) - proxy paths always pass an explicit timeout, so they never fall back to this. Mirrors
+# aiohttp's own ClientSession default (aiohttp.client.DEFAULT_TIMEOUT), spelled out explicitly so
+# that behavior doesn't depend on omitting the timeout kwarg entirely.
+_FALLBACK_HTTP_TIMEOUT = ClientTimeout(total=300, sock_connect=30)
 
 
 class HttpClientError(Exception):
@@ -594,7 +596,7 @@ async def make_http_request(
     method: str = "GET",
     data: AsyncGenerator[bytes] | bytes | FormData | Payload | None = None,
     headers: dict[str, str] | None = None,
-    timeout: ClientTimeout = _DEFAULT_HTTP_TIMEOUT,
+    timeout: ClientTimeout | None = None,
 ) -> HttpResponse:
     """Make HTTP request to given url."""
     logger.debug("HTTP request: %s %s", method, url)
@@ -602,7 +604,7 @@ async def make_http_request(
     session = ClientSession()
     response = None
     try:
-        response = await session.request(method=method, url=url, data=data, headers=headers, timeout=timeout)
+        response = await session.request(method=method, url=url, data=data, headers=headers, timeout=timeout or _FALLBACK_HTTP_TIMEOUT)
 
         async def generator() -> AsyncGenerator[bytes]:
             try:
