@@ -316,6 +316,16 @@ def test_chat_completion_reasoning_both_fields_forwarded_without_disambiguation(
     assert raw["reasoning"] == {"effort": "high"}
 
 
+def test_chat_completion_response_format_json_object_without_schema() -> None:
+    """`json_schema` is optional per the OpenAI spec — omitting it (the normal `json_object` case)
+    must not raise, or forcing JSON mode on any downstream LLM call becomes impossible."""
+    req = ChatCompletionRequest(**_base_chat_req(response_format={"type": "json_object"}))  # pyright: ignore[reportArgumentType]
+
+    assert req.response_format is not None
+    assert req.response_format.type == "json_object"
+    assert req.response_format.json_schema is None
+
+
 def test_images_request_n_at_limit() -> None:
     req = ImagesRequest(model="dall-e-3", prompt="cat", n=10)
 

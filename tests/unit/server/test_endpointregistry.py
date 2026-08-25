@@ -2977,7 +2977,7 @@ async def test_register_rerank_as_proxy_normalize_sglang_invokes_post_json_reran
         result = await ep.endpoint.on_request(body, None)  # pyright: ignore[reportOptionalMemberAccess]
 
     assert result is mock_resp
-    mock_call.assert_awaited_once_with(body, opts, None)
+    mock_call.assert_awaited_once_with(body, opts, None, timeout=reg._proxy_timeout)  # type: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio

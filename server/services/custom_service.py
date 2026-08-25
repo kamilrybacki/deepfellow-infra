@@ -498,7 +498,9 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
                     model_info.registration_id = self.endpoint_registry.register_custom_endpoint_as_proxy(
                         url=model_info.prefix,
                         props=model.model_props,
-                        options=ProxyOptions(url=model_info.base_url, read_timeout_seconds=900),
+                        options=ProxyOptions(
+                            url=model_info.base_url, read_timeout_seconds=self.config.custom_endpoint_read_timeout_seconds
+                        ),
                         registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                     )
                     self.models_downloaded[model_id] = DownloadedInfo(image.name)
@@ -696,6 +698,56 @@ def create_lemmatizer_model(custom_service: CustomService, subnet: str | None) -
         options=generate_docker_options,
         description="Multilingual text lemmatization API.",
         repository_url="https://gitlab2.simplito.com/df/deepfellow-lemmatizer",
+    )
+
+
+def create_gliner_model(custom_service: CustomService, subnet: str | None) -> SrvCustomModel:
+    """Create GLiNER named-entity-recognition model."""
+    fields: list[ModelField] = custom_service.add_hardware_field_to_model_spec()
+    fields.append(
+        ModelField(
+            type="text",
+            name="prefix",
+            description="Endpoint prefix",
+            required=True,
+            placeholder="gliner",
+            default="gliner",
+        )
+    )
+
+    def generate_docker_options(model_fields: InstallModelOptions) -> DockerOptions:
+        hardware_parts = custom_service.get_specified_hardware_parts(model_fields.get("hardware"))
+        image = (
+            "hub.simplito.com/deepfellow/gliner-gpu:main"
+            if any(isinstance(h, NvidiaGpuInfo) for h in hardware_parts)
+            else "hub.simplito.com/deepfellow/gliner-cpu:main"
+        )
+        return DockerOptions(
+            image_port=8000,
+            name="df-gliner",
+            container_name="df-gliner",
+            image=image,
+            restart="unless-stopped",
+            hardware=hardware_parts,
+            subnet=subnet,
+            healthcheck={
+                "test": "wget -q --spider http://localhost:8000/health",
+                "interval": "30s",
+                "timeout": "10s",
+                "retries": "3",
+                "start_period": "30s",
+            },
+        )
+
+    return SrvCustomModel(
+        model_props=ModelProps(private=True, type="custom", endpoints=["/custom/gliner/extract_entities"]),
+        model_spec=ModelSpecification(fields=fields),
+        model_type="custom",
+        default_prefix="gliner",
+        size="9.68GB",
+        options=generate_docker_options,
+        description="GLiNER named-entity-recognition API for knowledge-graph extraction.",
+        repository_url="https://gitlab2.simplito.com/df/df-docker-images",
     )
 
 
@@ -992,6 +1044,7 @@ _const = CustomConst(
             description="Optical character recognition service, to change binary data to text.",
         ),
         "lemmatizer": create_lemmatizer_model,
+        "gliner": create_gliner_model,
         "doc_chunker": create_doc_chunker_model,
         "deepfellow-finetune": create_finetune_model,
         "deepfellow-bge-m3": create_bge_m3_model,

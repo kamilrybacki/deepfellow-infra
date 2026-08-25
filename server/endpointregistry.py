@@ -614,20 +614,21 @@ async def _make_request_with_reauth(
     data: bytes | None,
     headers: dict[str, str],
     options: ProxyOptions,
+    timeout: ClientTimeout | None = None,
 ) -> HttpResponse:
     """Issue a request; on a 401 with `on_reauth` configured, refresh headers and retry once.
 
     If `on_reauth` isn't set, or returns None (nothing to refresh, e.g. no refresh token),
     the original 401 response is returned untouched so it streams through to the client.
     """
-    response = await make_http_request(url=url, method=method, data=data, headers=headers)
+    response = await make_http_request(url=url, method=method, data=data, headers=headers, timeout=timeout)
     if response.response.status != 401 or not options.on_reauth:
         return response
     new_headers = await options.on_reauth()
     if new_headers is None:
         return response
     await response.discard()
-    return await make_http_request(url=url, method=method, data=data, headers=headers | new_headers)
+    return await make_http_request(url=url, method=method, data=data, headers=headers | new_headers, timeout=timeout)
 
 
 async def _read_body_with_limit(request: Request, max_bytes: int) -> bytes:
@@ -671,6 +672,11 @@ class EndpointRegistry:
         self.mcp_endpoints = Endpoint[McpEndpoint](self.registry, self.parent_infra)
         self.response_item_store = ResponseItemStore()
         self._proxy_api_keys = dict[str, str]()
+
+    @property
+    def _proxy_timeout(self) -> ClientTimeout:
+        """Default timeout for outbound proxy requests, driven by `DF_STANDARD_PROXY_TIMEOUT_SECONDS`."""
+        return ClientTimeout(total=self.config.standard_proxy_timeout_seconds, sock_connect=30)
 
     def get_models(self) -> ApiModels:
         """Get models for api."""
@@ -780,33 +786,33 @@ class EndpointRegistry:
         if chat_completions:
 
             async def on_chat_completions_request(body: ChatCompletionRequest, request: Request | None) -> StreamingResponse:
-                return await post_json(body, chat_completions, request)
+                return await post_json(body, chat_completions, request, timeout=self._proxy_timeout)
 
             endpoint.on_chat_completion = on_chat_completions_request
         if completions:
 
             async def on_completion_request(body: CompletionLegacyRequest, request: Request | None) -> StreamingResponse:
-                return await post_json(body, completions, request)
+                return await post_json(body, completions, request, timeout=self._proxy_timeout)
 
             endpoint.on_completion = on_completion_request
         if responses:
 
             async def on_responses_request(body: ResponsesRequest, request: Request | None) -> StreamingResponse:
-                return await post_json_responses(body, responses, self.response_item_store, request)
+                return await post_json_responses(body, responses, self.response_item_store, request, timeout=self._proxy_timeout)
 
             endpoint.on_responses = on_responses_request
 
         if messages:
 
             async def on_messages_request(body: MessagesRequest, request: Request | None) -> StreamingResponse:
-                return await post_json(body, messages, request)
+                return await post_json(body, messages, request, timeout=self._proxy_timeout)
 
             endpoint.on_messages = on_messages_request
 
         if ollama_chat:
 
             async def on_ollama_chat_request(body: OllamaChatRequest, request: Request | None) -> StreamingResponse:
-                return await post_json(body, ollama_chat, request)
+                return await post_json(body, ollama_chat, request, timeout=self._proxy_timeout)
 
             endpoint.on_ollama_chat = on_ollama_chat_request
 
@@ -836,7 +842,7 @@ class EndpointRegistry:
         """Register embeddings for given model as a proxy."""
 
         async def on_request(body: EmbeddingRequest, request: Request | None) -> StreamingResponse:
-            return await post_json(body, options, request)
+            return await post_json(body, options, request, timeout=self._proxy_timeout)
 
         return self.register_embeddings(model, props, SimpleEndpoint(on_request=on_request), registration_options)
 
@@ -864,7 +870,7 @@ class EndpointRegistry:
         """Register audio speech for given model as a proxy."""
 
         async def on_request(body: CreateSpeechRequest, request: Request | None) -> StreamingResponse:
-            return await post_json(body, options, request)
+            return await post_json(body, options, request, timeout=self._proxy_timeout)
 
         return self.register_audio_speech(model, props, SimpleEndpoint(on_request=on_request), registration_options)
 
@@ -892,7 +898,7 @@ class EndpointRegistry:
         """Register audio transcriptions for given model as a proxy."""
 
         async def on_request(body: CreateTranscriptionRequest, request: Request | None) -> StreamingResponse:
-            return await post_form(body, options, request)
+            return await post_form(body, options, request, timeout=self._proxy_timeout)
 
         return self.register_audio_transcriptions(model, props, SimpleEndpoint(on_request=on_request), registration_options)
 
@@ -920,7 +926,7 @@ class EndpointRegistry:
         """Register image generations for given model as a proxy."""
 
         async def on_request(body: ImagesRequest, request: Request | None) -> StreamingResponse:
-            return await post_json(body, options, request)
+            return await post_json(body, options, request, timeout=self._proxy_timeout)
 
         return self.register_image_generations(model, props, SimpleEndpoint(on_request=on_request), registration_options)
 
@@ -956,8 +962,8 @@ class EndpointRegistry:
 
         async def on_request(body: RerankRequest, request: Request | None) -> StreamingResponse:
             if normalize_sglang_response:
-                return await post_json_rerank_sglang(body, options, request)
-            return await post_json(body, options, request)
+                return await post_json_rerank_sglang(body, options, request, timeout=self._proxy_timeout)
+            return await post_json(body, options, request, timeout=self._proxy_timeout)
 
         return self.register_rerank(model, props, SimpleEndpoint(on_request=on_request), registration_options)
 
@@ -1037,9 +1043,11 @@ class EndpointRegistry:
                 # Buffered (not streamed) so a 401-triggered retry can replay the body; size-capped to bound memory use.
                 # Only needed for OAuth-enabled proxies — everything else keeps streaming the body straight through.
                 body = await _read_body_with_limit(request, _MCP_PROXY_MAX_BODY_BYTES)
-                response = await _make_request_with_reauth(full_url, request.method, body, headers, options)
+                response = await _make_request_with_reauth(full_url, request.method, body, headers, options, timeout=self._proxy_timeout)
             else:
-                response = await make_http_request(url=full_url, method=request.method, data=request.stream(), headers=headers)
+                response = await make_http_request(
+                    url=full_url, method=request.method, data=request.stream(), headers=headers, timeout=self._proxy_timeout
+                )
             logger.debug("MCP proxy response: %s", response.response.status)
             return response.as_streaming_response(options.allowed_response_headers)
 
@@ -1075,7 +1083,7 @@ class EndpointRegistry:
                 # replay mid-stream); only this initial GET goes through the reauth helper. Proactive
                 # background refresh (see McpService) mitigates the gap; the client must reconnect
                 # if the token expires after the stream is already established.
-                upstream_response = await _make_request_with_reauth(options.url, "GET", None, headers, options)
+                upstream_response = await _make_request_with_reauth(options.url, "GET", None, headers, options, timeout=self._proxy_timeout)
 
                 async def rewritten() -> AsyncGenerator[bytes]:
                     session_id: str | None = None
@@ -1108,7 +1116,9 @@ class EndpointRegistry:
             if upstream_url is None:
                 raise HTTPException(404, f"Unknown session: {session_id}")
             headers["content-type"] = request.headers.get("content-type") or "application/json"
-            response = await make_http_request(url=upstream_url, method="POST", data=request.stream(), headers=headers)
+            response = await make_http_request(
+                url=upstream_url, method="POST", data=request.stream(), headers=headers, timeout=self._proxy_timeout
+            )
             return response.as_streaming_response(options.allowed_response_headers)
 
         return self.register_mcp_endpoint(url, props, McpEndpoint(on_request=on_request), registration_options)
@@ -1701,7 +1711,9 @@ def _classify_error(e: Exception) -> str:
     return "model_error"
 
 
-async def post_json(data: BaseModel, options: ProxyOptions, request: Request | None = None) -> StreamingResponse:
+async def post_json(
+    data: BaseModel, options: ProxyOptions, request: Request | None = None, timeout: ClientTimeout | None = None
+) -> StreamingResponse:
     """Make HTTP POST request sending data as JSON."""
     raw = data.model_dump(exclude_none=True)
     if options.remove_model:
@@ -1714,12 +1726,17 @@ async def post_json(data: BaseModel, options: ProxyOptions, request: Request | N
             method="POST",
             data=JsonPayload(raw),
             headers=await options.get_request_headers(request),
+            timeout=timeout,
         )
     ).as_streaming_response(options.allowed_response_headers)
 
 
 async def post_json_responses(
-    data: ResponsesRequest, options: ProxyOptions, store: ResponseItemStore, request: Request | None = None
+    data: ResponsesRequest,
+    options: ProxyOptions,
+    store: ResponseItemStore,
+    request: Request | None = None,
+    timeout: ClientTimeout | None = None,
 ) -> StreamingResponse:
     """Make HTTP POST request for /v1/responses, caching stateful output items for later item_reference resolution."""
     raw = data.model_dump(exclude_none=True)
@@ -1732,6 +1749,7 @@ async def post_json_responses(
         method="POST",
         data=JsonPayload(raw),
         headers=await options.get_request_headers(request),
+        timeout=timeout,
     )
     if data.stream or not (http_response.response.content_type or "").startswith("application/json"):
         return http_response.as_streaming_response(options.allowed_response_headers)
@@ -1773,7 +1791,9 @@ def _sglang_rerank_response_to_cohere(raw_body: bytes) -> bytes:
     return json.dumps({"results": results}).encode()
 
 
-async def post_json_rerank_sglang(data: RerankRequest, options: ProxyOptions, request: Request | None = None) -> StreamingResponse:
+async def post_json_rerank_sglang(
+    data: RerankRequest, options: ProxyOptions, request: Request | None = None, timeout: ClientTimeout | None = None
+) -> StreamingResponse:
     """Make HTTP POST request to SGLang's `/v1/rerank`, rewriting its native array response into Cohere-style shape."""
     raw = data.model_dump(exclude_none=True)
     if options.remove_model:
@@ -1785,6 +1805,7 @@ async def post_json_rerank_sglang(data: RerankRequest, options: ProxyOptions, re
         method="POST",
         data=JsonPayload(raw),
         headers=await options.get_request_headers(request),
+        timeout=timeout,
     )
     if not (http_response.response.content_type or "").startswith("application/json"):
         return http_response.as_streaming_response(options.allowed_response_headers)
@@ -1809,7 +1830,9 @@ async def post_json_rerank_sglang(data: RerankRequest, options: ProxyOptions, re
     )
 
 
-async def post_form(data: FormSerializable, options: ProxyOptions, request: Request | None = None) -> StreamingResponse:
+async def post_form(
+    data: FormSerializable, options: ProxyOptions, request: Request | None = None, timeout: ClientTimeout | None = None
+) -> StreamingResponse:
     """Make HTTP POST request sending data as form."""
     return (
         await make_http_request(
@@ -1817,5 +1840,6 @@ async def post_form(data: FormSerializable, options: ProxyOptions, request: Requ
             method="POST",
             data=await data.to_form(options.remove_model, options.rewrite_model_to),
             headers=await options.get_request_headers(request),
+            timeout=timeout,
         )
     ).as_streaming_response(options.allowed_response_headers)

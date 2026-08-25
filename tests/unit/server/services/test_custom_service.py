@@ -20,6 +20,7 @@ from server.services.custom_service import (
     create_bge_m3_model,
     create_doc_chunker_model,
     create_finetune_model,
+    create_gliner_model,
     create_lemmatizer_model,
 )
 from server.utils.hardware import NvidiaGpuInfo
@@ -38,8 +39,10 @@ def deps() -> dict[str, Any]:
     docker_svc = MagicMock()
     docker_svc.get_docker_subnet.return_value = "172.20.0.0/16"
     docker_svc.get_docker_container_name.side_effect = lambda name: f"df-{name}"  # pyright: ignore[reportUnknownLambdaType]
+    config = MagicMock()
+    config.custom_endpoint_read_timeout_seconds = 900
     return {
-        "config": MagicMock(),
+        "config": config,
         "endpoint_registry": MagicMock(),
         "service_provider": MagicMock(),
         "model_downloader": MagicMock(),
@@ -661,6 +664,26 @@ async def test_install_model_success(svc: CustomService, deps: dict[str, Any]) -
 
 
 @pytest.mark.asyncio
+async def test_install_model_uses_configured_custom_endpoint_read_timeout(svc: CustomService, deps: dict[str, Any]) -> None:
+    deps["config"].custom_endpoint_read_timeout_seconds = 1800
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
+    deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.1"
+    deps["docker_service"].get_container_port.return_value = 8090
+    deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
+
+    promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+        "default", "lemmatizer", InstallModelIn(spec={"prefix": "lemmatizer"})
+    )
+    await promise.wait()
+
+    registered_options = deps["endpoint_registry"].register_custom_endpoint_as_proxy.call_args.kwargs["options"]
+    assert registered_options.read_timeout_seconds == 1800
+
+
+@pytest.mark.asyncio
 async def test_uninstall_model_removes_from_installed(svc: CustomService, deps: dict[str, Any]) -> None:
     mock_model = MagicMock()
     mock_model.prefix = "lemmatizer"
@@ -714,6 +737,25 @@ def test_create_lemmatizer_model_gpu_image(deps: dict[str, Any]) -> None:
 
     docker_opts = model.options({"hardware": "GPU"})  # pyright: ignore[reportCallIssue]
     assert "cuda" in docker_opts.image
+
+
+def test_create_gliner_model_cpu_image(svc: CustomService) -> None:
+    model = create_gliner_model(svc, "172.20.0.0/16")
+
+    assert callable(model.options)
+    docker_opts = model.options({"hardware": "CPU"})  # pyright: ignore[reportCallIssue]
+    assert "cpu" in docker_opts.image
+
+
+def test_create_gliner_model_gpu_image(deps: dict[str, Any]) -> None:
+    gpu = NvidiaGpuInfo(name="RTX 4090", vram="24GB", id=0)
+    deps["hardware"] = MagicMock(gpus=[gpu], cpu=MagicMock())
+    svc_gpu = CustomService(**deps)
+
+    model = create_gliner_model(svc_gpu, "172.20.0.0/16")
+
+    docker_opts = model.options({"hardware": "GPU"})  # pyright: ignore[reportCallIssue]
+    assert "gpu" in docker_opts.image
 
 
 def test_create_bge_m3_model_cpu_image(svc: CustomService) -> None:

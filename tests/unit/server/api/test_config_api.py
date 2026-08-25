@@ -53,6 +53,8 @@ def config() -> MagicMock:
     mock.docker_hub_token = ""
     mock.mcp_sse_session_ttl_seconds = 300
     mock.mcp_sse_max_sessions = 128
+    mock.standard_proxy_timeout_seconds = 300
+    mock.custom_endpoint_read_timeout_seconds = 900
     mock.otel_exporter_otlp_endpoint = "http://localhost:4317"
     mock.otel_tracing_enabled = False
     mock.otel_logging_enabled = False
