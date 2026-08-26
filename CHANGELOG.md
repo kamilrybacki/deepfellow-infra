@@ -47,6 +47,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Rotating `infra_api_key` no longer leaves already-connected subinfras calling ancestor-proxied models with the old key: a proxy registration is now refreshed whenever the reporting peer's API key changes, not only when the model id itself is new.
 - Fixed a `pyright` type-check failure on `main` caused by Docker Model Runner's `_generate_instance_config` override not matching its base class signature.
 - A HuggingFace model download with an invalid or unreachable repository id no longer silently reports install success with an empty model directory; it now fails fast with a "model repository not found" error instead of a confusing container-startup failure minutes later.
+- Installing a rerank model on a rootful Docker setup no longer fails with `PermissionError`: the HuggingFace cache directory bind-mounted into the rerank container is now created by the server before the container starts (previously the Docker daemon created it as `root:root`, so the host-side model download couldn't write into it), and the container itself now runs as the server's user instead of root, so it no longer leaves root-owned files in that shared cache.
 
 ## [0.31.0] - 2026-08-06
 

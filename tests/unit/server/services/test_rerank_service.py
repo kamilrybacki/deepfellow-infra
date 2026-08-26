@@ -47,7 +47,7 @@ def deps() -> dict[str, Any]:
         "endpoint_registry": MagicMock(),
         "service_provider": MagicMock(),
         "model_downloader": MagicMock(),
-        "docker_service": MagicMock(),
+        "docker_service": MagicMock(get_user_for_docker=AsyncMock(return_value="1000:1000")),
         "hardware": MagicMock(gpus=[], nvidia_gpus=[]),
     }
 
@@ -1231,3 +1231,36 @@ async def test_install_model_registration_failure_skips_rollback_when_already_re
             await promise.wait()
 
     assert model_id not in installed.models
+
+
+@pytest.mark.asyncio
+async def test_install_instance_creates_hf_cache_dir_before_container_and_sets_user(
+    svc: RerankService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    deps["config"].get_storage_services_dir.return_value = tmp_path
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "df-rerank"
+    deps["docker_service"].get_container_host.return_value = "localhost"
+    deps["docker_service"].get_container_port.return_value = 8089
+    captured: list[Any] = []
+    hub_existed: list[bool] = []
+
+    async def capture(docker_opts: Any) -> tuple[int, bool]:
+        captured.append(docker_opts)
+        hub_existed.append((tmp_path / "rerank/main/hub").is_dir())
+        return (8089, True)
+
+    deps["docker_service"].install_and_run_docker = capture
+
+    with (
+        patch.object(svc, "_download_image_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_verify_docker_image", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+        patch("server.services.rerank_service.get_base_url", return_value="http://localhost:8089"),
+    ):
+        promise = await svc._install_instance("default", InstallServiceIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    assert hub_existed == [True]
+    assert captured[0].user == "1000:1000"
+    assert captured[0].volumes == [f"{tmp_path}/rerank/main:/root/.cache/huggingface"]
