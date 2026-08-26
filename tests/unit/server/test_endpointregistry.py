@@ -2061,6 +2061,19 @@ def test_register_proxy_custom_registers_custom_endpoint():
     assert reg.custom_endpoints.has_model("custom/url")
 
 
+def test_register_proxy_custom_uses_configured_standard_proxy_timeout():
+    reg = make_registry()
+    reg.config.standard_proxy_timeout_seconds = 1800
+
+    with patch.object(reg, "register_custom_endpoint_as_proxy") as mock_register:
+        reg._register_proxy(  # pyright: ignore[reportPrivateUsage]
+            "custom/url", "custom", make_props(), "http://example.com/", "key", RegistrationOptions(origin="http://example.com/")
+        )
+
+    registered_options = mock_register.call_args.kwargs["options"]
+    assert registered_options.read_timeout_seconds == 1800
+
+
 def test_register_proxy_mcp_registers_mcp_endpoint():
     reg = make_registry()
 

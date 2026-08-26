@@ -1298,6 +1298,7 @@ class EndpointRegistry:
                 options=ProxyOptions(
                     url=urljoin(url, "custom"),
                     headers={"Authorization": f"Bearer {api_key}"},
+                    read_timeout_seconds=self.config.standard_proxy_timeout_seconds,
                 ),
                 registration_options=registration_options,
             )

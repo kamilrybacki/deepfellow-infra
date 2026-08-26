@@ -404,7 +404,7 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
                 self.endpoint_registry.register_custom_endpoint_as_proxy(
                     parsed_options.expose_api_at_prefix,
                     ModelProps(private=False, type="txt2img", endpoints=[f"/custom/{parsed_options.expose_api_at_prefix}/"]),
-                    ProxyOptions(get_base_url(host, port)),
+                    ProxyOptions(get_base_url(host, port), read_timeout_seconds=self.config.standard_proxy_timeout_seconds),
                     registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                 )
                 if parsed_options.expose_api_at_prefix
