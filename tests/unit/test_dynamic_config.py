@@ -49,7 +49,6 @@ def _make_config(storage_dir: Path | None = None, **overrides: object) -> MagicM
     mock.mcp_sse_session_ttl_seconds = 300
     mock.mcp_sse_max_sessions = 128
     mock.standard_proxy_timeout_seconds = 300
-    mock.custom_endpoint_read_timeout_seconds = 900
     mock.metrics_username = ""
     mock.metrics_password = SecretStr("")
     mock.otel_exporter_otlp_endpoint = "http://localhost:4317"
@@ -72,10 +71,42 @@ def test_get_config_json_path_is_inside_storage_dir(tmp_path: Path) -> None:
 # --- _migrate ---
 
 
-def test_migrate_is_identity() -> None:
+def test_migrate_mutates_and_returns_the_same_dict() -> None:
     raw = {"schema_version": 1, "foo": "bar"}
 
     assert _migrate(raw) is raw
+
+
+def test_migrate_bumps_schema_version_to_current() -> None:
+    raw = {"schema_version": 1, "settings": {}}
+
+    migrated = _migrate(raw)
+
+    assert migrated["schema_version"] == CURRENT_SCHEMA_VERSION
+
+
+def test_migrate_drops_retired_custom_endpoint_read_timeout_seconds_key() -> None:
+    raw = {"schema_version": 1, "settings": {"name": "node-a", "custom_endpoint_read_timeout_seconds": 900}}
+
+    migrated = _migrate(raw)
+
+    assert "custom_endpoint_read_timeout_seconds" not in migrated["settings"]
+    assert migrated["settings"]["name"] == "node-a"
+
+
+def test_migrate_is_noop_when_already_at_current_schema_version() -> None:
+    raw = {"schema_version": CURRENT_SCHEMA_VERSION, "settings": {"name": "node-a"}}
+
+    migrated = _migrate(raw)
+
+    assert migrated == {"schema_version": CURRENT_SCHEMA_VERSION, "settings": {"name": "node-a"}}
+
+
+def test_migrate_raises_config_error_on_non_int_schema_version() -> None:
+    raw = {"schema_version": "2", "settings": {"name": "node-a"}}
+
+    with pytest.raises(ConfigError, match="schema_version"):
+        _migrate(raw)
 
 
 # --- read_envelope ---
@@ -121,6 +152,35 @@ def test_read_envelope_raises_config_error_on_validation_failure(tmp_path: Path)
     config = _make_config(storage_dir=tmp_path)
 
     with pytest.raises(ConfigError, match="failed validation"):
+        read_envelope(config)
+
+
+def test_read_envelope_migrates_legacy_config_with_retired_custom_endpoint_read_timeout_seconds(tmp_path: Path) -> None:
+    data = {
+        "schema_version": 1,
+        "infra_version": get_infra_version(),
+        "settings": {"name": "node-a", "custom_endpoint_read_timeout_seconds": 900},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(data))
+    config = _make_config(storage_dir=tmp_path)
+
+    envelope = read_envelope(config)
+
+    assert envelope is not None
+    assert envelope.schema_version == CURRENT_SCHEMA_VERSION
+    assert envelope.settings.name == "node-a"
+
+
+def test_read_envelope_raises_config_error_on_non_int_schema_version(tmp_path: Path) -> None:
+    data = {
+        "schema_version": "2",
+        "infra_version": get_infra_version(),
+        "settings": {"name": "node-a"},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(data))
+    config = _make_config(storage_dir=tmp_path)
+
+    with pytest.raises(ConfigError, match="schema_version"):
         read_envelope(config)
 
 

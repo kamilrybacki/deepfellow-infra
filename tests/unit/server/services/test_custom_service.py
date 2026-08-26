@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
 
+from collections.abc import Callable
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -16,6 +17,7 @@ from server.services.custom_service import (
     DownloadedInfo,
     InstalledInfo,
     ModelInstalledInfo,
+    SrvCustomModel,
     _const,  # pyright: ignore[reportPrivateUsage]
     create_bge_m3_model,
     create_doc_chunker_model,
@@ -40,7 +42,7 @@ def deps() -> dict[str, Any]:
     docker_svc.get_docker_subnet.return_value = "172.20.0.0/16"
     docker_svc.get_docker_container_name.side_effect = lambda name: f"df-{name}"  # pyright: ignore[reportUnknownLambdaType]
     config = MagicMock()
-    config.custom_endpoint_read_timeout_seconds = 900
+    config.standard_proxy_timeout_seconds = 300
     return {
         "config": config,
         "endpoint_registry": MagicMock(),
@@ -94,6 +96,25 @@ def test_get_default_model_spec_contains_prefix_field(svc: CustomService) -> Non
     spec = svc.get_default_model_spec("my-prefix")
     field_names = [f.name for f in spec.fields]
     assert "prefix" in field_names
+
+
+def test_get_default_model_spec_contains_proxy_timeout_field_exactly_once(svc: CustomService) -> None:
+    """Covers bentoml, easyOCR and duplicated custom models, which all build their spec from this method."""
+    spec = svc.get_default_model_spec("my-prefix")
+    field_names = [f.name for f in spec.fields]
+    assert field_names.count("proxy_timeout_seconds") == 1
+
+
+@pytest.mark.parametrize(
+    "create_model",
+    [create_bge_m3_model, create_lemmatizer_model, create_gliner_model, create_doc_chunker_model, create_finetune_model],
+)
+def test_create_model_spec_contains_proxy_timeout_field_exactly_once(
+    svc: CustomService, create_model: Callable[[CustomService, str | None], SrvCustomModel]
+) -> None:
+    model = create_model(svc, "172.20.0.0/16")
+    field_names = [f.name for f in model.model_spec.fields]
+    assert field_names.count("proxy_timeout_seconds") == 1
 
 
 def test_model_installed_info_get_info() -> None:
@@ -660,12 +681,12 @@ async def test_install_model_success(svc: CustomService, deps: dict[str, Any]) -
     assert result.status == "OK"
     assert "lemmatizer" in svc.instances_info["default"].installed.models  # pyright: ignore[reportOptionalMemberAccess]
     registered_options = deps["endpoint_registry"].register_custom_endpoint_as_proxy.call_args.kwargs["options"]
-    assert registered_options.read_timeout_seconds == 900
+    assert registered_options.read_timeout_seconds == 300
 
 
 @pytest.mark.asyncio
-async def test_install_model_uses_configured_custom_endpoint_read_timeout(svc: CustomService, deps: dict[str, Any]) -> None:
-    deps["config"].custom_endpoint_read_timeout_seconds = 1800
+async def test_install_model_uses_configured_standard_proxy_timeout(svc: CustomService, deps: dict[str, Any]) -> None:
+    deps["config"].standard_proxy_timeout_seconds = 1800
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
     deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
@@ -681,6 +702,83 @@ async def test_install_model_uses_configured_custom_endpoint_read_timeout(svc: C
 
     registered_options = deps["endpoint_registry"].register_custom_endpoint_as_proxy.call_args.kwargs["options"]
     assert registered_options.read_timeout_seconds == 1800
+
+
+@pytest.mark.asyncio
+async def test_install_model_uses_spec_proxy_timeout_seconds(svc: CustomService, deps: dict[str, Any]) -> None:
+    deps["config"].standard_proxy_timeout_seconds = 1800
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
+    deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.1"
+    deps["docker_service"].get_container_port.return_value = 8090
+    deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
+
+    promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+        "default", "lemmatizer", InstallModelIn(spec={"prefix": "lemmatizer", "proxy_timeout_seconds": 120})
+    )
+    await promise.wait()
+
+    registered_options = deps["endpoint_registry"].register_custom_endpoint_as_proxy.call_args.kwargs["options"]
+    assert registered_options.read_timeout_seconds == 120
+
+
+@pytest.mark.asyncio
+async def test_install_model_treats_null_proxy_timeout_seconds_as_unset(svc: CustomService, deps: dict[str, Any]) -> None:
+    deps["config"].standard_proxy_timeout_seconds = 1800
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
+    deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.1"
+    deps["docker_service"].get_container_port.return_value = 8090
+    deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
+
+    promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+        "default", "lemmatizer", InstallModelIn(spec={"prefix": "lemmatizer", "proxy_timeout_seconds": None})
+    )
+    await promise.wait()
+
+    registered_options = deps["endpoint_registry"].register_custom_endpoint_as_proxy.call_args.kwargs["options"]
+    assert registered_options.read_timeout_seconds == 1800
+
+
+def test_proxy_timeout_field_has_no_baked_in_default(svc: CustomService) -> None:
+    field = svc.get_proxy_timeout_field()
+    assert field.default is None
+    assert field.placeholder is None
+
+
+@pytest.mark.asyncio
+async def test_install_model_rejects_invalid_proxy_timeout_seconds_before_starting_docker(svc: CustomService, deps: dict[str, Any]) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+
+    with pytest.raises(HTTPException) as exc:
+        await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+            "default", "lemmatizer", InstallModelIn(spec={"prefix": "lemmatizer", "proxy_timeout_seconds": "abc"})
+        )
+
+    assert exc.value.status_code == 400
+    deps["docker_service"].install_and_run_docker.assert_not_called()
+    assert "lemmatizer" not in svc.instances_info["default"].installed.models  # pyright: ignore[reportOptionalMemberAccess]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("proxy_timeout_seconds", [0, -1])
+async def test_install_model_rejects_non_positive_proxy_timeout_seconds_before_starting_docker(
+    svc: CustomService, deps: dict[str, Any], proxy_timeout_seconds: int
+) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+
+    with pytest.raises(HTTPException) as exc:
+        await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+            "default", "lemmatizer", InstallModelIn(spec={"prefix": "lemmatizer", "proxy_timeout_seconds": proxy_timeout_seconds})
+        )
+
+    assert exc.value.status_code == 400
+    deps["docker_service"].install_and_run_docker.assert_not_called()
+    assert "lemmatizer" not in svc.instances_info["default"].installed.models  # pyright: ignore[reportOptionalMemberAccess]
 
 
 @pytest.mark.asyncio

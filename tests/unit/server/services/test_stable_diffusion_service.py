@@ -1098,6 +1098,33 @@ async def test_install_instance_registers_proxy_when_prefix_set(svc: StableDiffu
 
 
 @pytest.mark.asyncio
+async def test_install_instance_registers_proxy_with_configured_standard_proxy_timeout(
+    svc: StableDiffusionService, deps: dict[str, Any]
+) -> None:
+    deps["config"].standard_proxy_timeout_seconds = 1800
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "df-stable-diffusion"
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(7860, True))
+    deps["docker_service"].get_container_host.return_value = "localhost"
+    deps["docker_service"].get_container_port.return_value = 7860
+    deps["docker_service"].get_user_for_docker = AsyncMock(return_value=None)
+    options = InstallServiceIn(spec={"hardware": False, "expose_api_at_prefix": "my-sd"})
+
+    with (
+        patch.object(svc, "_download_image_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_verify_docker_image", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+        patch.object(svc, "update_config", new_callable=AsyncMock),
+        patch("server.services.stable_diffusion_service.platform.system", return_value="Linux"),
+    ):
+        promise = await svc._install_instance("default", options)  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    registered_options = deps["endpoint_registry"].register_custom_endpoint_as_proxy.call_args.args[2]
+    assert registered_options.read_timeout_seconds == 1800
+
+
+@pytest.mark.asyncio
 async def test_uninstall_instance_does_nothing_when_not_installed(svc: StableDiffusionService, deps: dict[str, Any]) -> None:
     svc.instances_info["default"].installed = None
     deps["docker_service"].uninstall_docker = AsyncMock()

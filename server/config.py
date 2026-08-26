@@ -63,7 +63,6 @@ class AppSettings(BaseSettings):
     mcp_sse_max_sessions: int = 128
 
     standard_proxy_timeout_seconds: int = 300
-    custom_endpoint_read_timeout_seconds: int = 900
 
     # metrics are authorized by HTTPBasicAuth
     metrics_username: str = ""

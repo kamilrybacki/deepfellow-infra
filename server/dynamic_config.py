@@ -22,7 +22,7 @@ from server.config import AppSettings, ConfigError, get_main_dir
 
 logger = logging.getLogger("uvicorn.error")
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 @lru_cache(maxsize=1)
@@ -63,7 +63,6 @@ class DynamicSettings(BaseModel):
     mcp_sse_max_sessions: int = 128
 
     standard_proxy_timeout_seconds: int = 300
-    custom_endpoint_read_timeout_seconds: int = 900
 
     metrics_username: str = ""
     metrics_password: SecretStr = SecretStr("")
@@ -110,9 +109,22 @@ def get_config_json_path(config: AppSettings) -> Path:
 def _migrate(raw: dict[str, Any]) -> dict[str, Any]:
     """Apply schema migrations in order, from `raw["schema_version"]` up to CURRENT_SCHEMA_VERSION.
 
-    No migrations exist yet (this is schema version 1); this is the extension point for
-    future versions.
+    v1 -> v2: drops `custom_endpoint_read_timeout_seconds`, an option retired (superseded by the
+    per-service `proxy_timeout_seconds` install field) before it ever shipped in a release — but a
+    config.json written by an unreleased build in the interim could still have it on disk, and
+    `DynamicSettings`'s `extra="forbid"` would otherwise reject it outright.
+
+    Raises `ConfigError` if `schema_version` is present but not an int, e.g. a hand-edited config.json.
     """
+    schema_version = raw.get("schema_version", 1)
+    if not isinstance(schema_version, int):
+        message = f"config.json schema_version must be an int, got {type(schema_version).__name__}: {schema_version!r}"
+        raise ConfigError(message)
+    if schema_version < 2:
+        settings = raw.get("settings")
+        if isinstance(settings, dict):
+            settings.pop("custom_endpoint_read_timeout_seconds", None)
+        raw["schema_version"] = 2
     return raw
 
 

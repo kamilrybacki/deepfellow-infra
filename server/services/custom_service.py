@@ -95,6 +95,7 @@ class CustomConst:
 
 class CustomModelOptions(BaseModel):
     prefix: Annotated[str, Field(pattern=r"^[a-zA-Z0-9_-]+$")]
+    proxy_timeout_seconds: Annotated[int, Field(gt=0)] | None = None
 
 
 @dataclass
@@ -169,7 +170,22 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
                     placeholder="my-prefix",
                     default=default_prefix,
                 ),
+                self.get_proxy_timeout_field(),
             ]
+        )
+
+    def get_proxy_timeout_field(self) -> ModelField:
+        """Field for the per-install proxy read timeout.
+
+        Left unset, it falls back to the global admin default as of install time — a later change to the
+        global default does not affect already-installed services.
+        """
+        return ModelField(
+            type="number",
+            name="proxy_timeout_seconds",
+            description="Seconds the proxy waits for a response from this service before timing out. "
+            "Leave empty to use the global default.",
+            required=False,
         )
 
     async def stop_instance(self, instance: str) -> None:
@@ -466,8 +482,9 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
         if "prefix" not in options.spec:
             options.spec["prefix"] = model.default_prefix
         model.model_props.prefix = options.spec["prefix"]
-        parsed_model_options = try_parse_pydantic(CustomModelOptions, options.spec)
-        docker_options = model.options(options.spec) if isinstance(model.options, Callable) else model.options
+        spec = options.spec
+        parsed_model_options = try_parse_pydantic(CustomModelOptions, spec)
+        docker_options = model.options(spec) if isinstance(model.options, Callable) else model.options
         await self._verify_docker_image(docker_options.image, options.ignore_warnings)
 
         self._installing.add(key)
@@ -494,13 +511,16 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
                     prefix=parsed_model_options.prefix,
                     base_url=get_base_url(container_host, container_port),
                 )
+                proxy_timeout_seconds = (
+                    parsed_model_options.proxy_timeout_seconds
+                    if parsed_model_options.proxy_timeout_seconds is not None
+                    else self.config.standard_proxy_timeout_seconds
+                )
                 try:
                     model_info.registration_id = self.endpoint_registry.register_custom_endpoint_as_proxy(
                         url=model_info.prefix,
                         props=model.model_props,
-                        options=ProxyOptions(
-                            url=model_info.base_url, read_timeout_seconds=self.config.custom_endpoint_read_timeout_seconds
-                        ),
+                        options=ProxyOptions(url=model_info.base_url, read_timeout_seconds=proxy_timeout_seconds),
                         registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                     )
                     self.models_downloaded[model_id] = DownloadedInfo(image.name)
@@ -569,6 +589,7 @@ def create_bge_m3_model(custom_service: CustomService, subnet: str | None) -> Sr
                 placeholder="30",
                 default="30",
             ),
+            custom_service.get_proxy_timeout_field(),
         ]
     )
 
@@ -656,6 +677,7 @@ def create_lemmatizer_model(custom_service: CustomService, subnet: str | None) -
                 placeholder="30",
                 default="30",
             ),
+            custom_service.get_proxy_timeout_field(),
         ]
     )
 
@@ -714,6 +736,7 @@ def create_gliner_model(custom_service: CustomService, subnet: str | None) -> Sr
             default="gliner",
         )
     )
+    fields.append(custom_service.get_proxy_timeout_field())
 
     def generate_docker_options(model_fields: InstallModelOptions) -> DockerOptions:
         hardware_parts = custom_service.get_specified_hardware_parts(model_fields.get("hardware"))
@@ -892,6 +915,7 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
                 placeholder="",
                 default="",
             ),
+            custom_service.get_proxy_timeout_field(),
         ]
     )
 
@@ -963,6 +987,7 @@ def create_finetune_model(custom_service: CustomService, subnet: str | None) -> 
                 placeholder="deepfellow-finetune",
                 default="deepfellow-finetune",
             ),
+            custom_service.get_proxy_timeout_field(),
         ]
     )
 
