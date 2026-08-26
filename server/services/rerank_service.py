@@ -268,7 +268,11 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
             await self._download_image_or_set_progress(stream, image)
             self.service_downloaded = True
             stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
-            volumes = [f"{self._get_working_dir()}/main:/root/.cache/huggingface"]
+            # Create the HF cache dir before the container starts, otherwise the Docker daemon creates the
+            # bind-mount source as root:root and the host-side model download fails with PermissionError.
+            cache_dir = self._get_working_dir() / "main"
+            (cache_dir / "hub").mkdir(parents=True, exist_ok=True)
+            volumes = [f"{cache_dir}:/root/.cache/huggingface"]
             subnet = self.docker_service.get_docker_subnet()
             name = f"{self.get_service_id(instance)}"
             envs = {}
@@ -282,6 +286,7 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
                 image_port=8089,
                 hardware=hardware_parts,
                 volumes=volumes,
+                user=await self.docker_service.get_user_for_docker(),
                 restart="unless-stopped",
                 subnet=subnet,
                 healthcheck={
