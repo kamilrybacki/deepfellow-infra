@@ -5,6 +5,7 @@
 
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from fastapi import HTTPException
@@ -235,6 +236,22 @@ class BaseService(ABC):
         """Filter tags for the given hardware variant. Passthrough by default."""
         return tags
 
+    async def get_docker_tags_for_model(self, model_id: str | None, hardware: str | None) -> list[str]:  # noqa: ARG002
+        """Return available Docker image tags, optionally scoped to a specific model_id.
+
+        Delegates to get_docker_tags() by default; override for services (like CustomService) that
+        install several distinct models — each backed by a different image — under one service id.
+        """
+        return await self.get_docker_tags(hardware)
+
+    def get_default_docker_tag_for_model(self, model_id: str | None, hardware: str | None) -> str | None:  # noqa: ARG002
+        """Return the pinned default Docker image tag, optionally scoped to a specific model_id."""
+        return self.get_default_docker_tag(hardware)
+
+    def get_docker_image_repo_for_model(self, model_id: str | None, hardware: str | None) -> str | None:  # noqa: ARG002
+        """Return the Docker repo (no tag), optionally scoped to a specific model_id."""
+        return self.get_docker_image_repo(hardware)
+
     def _resolve_docker_image_repo(self, hardware: str | None) -> str | None:
         """Return the repo (no tag) backing get_docker_tags(), falling back to the spec field's static docker_image."""
         return self.get_docker_image_repo(hardware) or next(
@@ -252,18 +269,49 @@ class BaseService(ABC):
         tag missing from that list isn't necessarily invalid — e.g. installing an older tag via the
         CLI. Before rejecting, check the registry directly for that specific tag's existence.
         """
+        await self._validate_docker_image_version(
+            image_version,
+            hardware,
+            get_tags=self.get_docker_tags,
+            resolve_repo=self._resolve_docker_image_repo,
+        )
+
+    async def validate_docker_image_version_for_model(
+        self, model_id: str | None, image_version: str | None, hardware: str | bool | None
+    ) -> None:
+        """Validate the same way as validate_docker_image_version(), but scoped to a specific model_id.
+
+        For services (like CustomService) that install several distinct models — each backed by a
+        different image — under one service id, get_docker_tags()/get_docker_image_repo() alone
+        can't validate a model's image_version, since they aren't model-aware.
+        """
+        await self._validate_docker_image_version(
+            image_version,
+            hardware,
+            get_tags=lambda hw: self.get_docker_tags_for_model(model_id, hw),
+            resolve_repo=lambda hw: self.get_docker_image_repo_for_model(model_id, hw),
+        )
+
+    async def _validate_docker_image_version(
+        self,
+        image_version: str | None,
+        hardware: str | bool | None,
+        *,
+        get_tags: Callable[[str | None], Awaitable[list[str]]],
+        resolve_repo: Callable[[str | None], str | None],
+    ) -> None:
         if not image_version:
             return
         if isinstance(hardware, bool):
             hardware = "GPU" if hardware else "CPU"
         try:
-            tags = await self.get_docker_tags(hardware)
+            tags = await get_tags(hardware)
         except RegistryUnavailableError:
             logger.warning("Skipping docker image tag validation for %r: registry unavailable", image_version)
             return
         if image_version in tags:
             return
-        docker_image = self._resolve_docker_image_repo(hardware)
+        docker_image = resolve_repo(hardware)
         if docker_image:
             try:
                 client = registry_for(docker_image)

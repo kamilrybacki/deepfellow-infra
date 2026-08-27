@@ -64,6 +64,7 @@ from server.utils.core import (
     normalize_name,
     try_parse_pydantic,
 )
+from server.utils.docker_image_version import apply_image_version_override, docker_tags_model_field, split_image_repo_tag
 from server.utils.mcp_oauth import (
     McpOAuthConfig,
     McpOAuthError,
@@ -77,6 +78,7 @@ from server.utils.mcp_oauth import (
     refresh_access_token,
     register_dynamic_client,
 )
+from server.utils.registry_client import image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fmt_size
 
 
@@ -560,8 +562,50 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
         """Load default models to instance."""
         self.models[instance] = {}
         subnet = self.docker_service.get_docker_subnet()
-        for model in _const.models.copy():
-            self.models[instance][model] = _const.models[model](self, subnet)
+        for model_id in _const.models.copy():
+            model = _const.models[model_id](self, subnet)
+            self._attach_docker_tags_field(model)
+            self.models[instance][model_id] = model
+
+    def _attach_docker_tags_field(self, model: "SrvMcpModel") -> None:
+        """Append a "docker-tags" version-selection field, inferred from the model's own default image.
+
+        Skipped for models without a pinned registry image (proxy servers, user-built images) or
+        whose image is digest-pinned rather than tagged (no floating version to select).
+        """
+        if model.options is None or any(f.type == "docker-tags" for f in model.model_spec.fields):
+            return
+        repo, tag = split_image_repo_tag(model.options.image)
+        if not tag:
+            return
+        model.model_spec.fields.append(docker_tags_model_field(repo))
+
+    def _get_builtin_model(self, model_id: str | None) -> "SrvMcpModel | None":
+        if not model_id:
+            return None
+        return self.models.get("default", {}).get(model_id)
+
+    def get_docker_image_repo_for_model(self, model_id: str | None, hardware: str | None) -> str | None:  # noqa: ARG002
+        """Return the Docker repo for a built-in MCP model, derived from its own default image."""
+        model = self._get_builtin_model(model_id)
+        if not model or not model.options:
+            return None
+        return split_image_repo_tag(model.options.image)[0]
+
+    def get_default_docker_tag_for_model(self, model_id: str | None, hardware: str | None) -> str | None:  # noqa: ARG002
+        """Return a built-in MCP model's default image tag, derived from its own default image."""
+        model = self._get_builtin_model(model_id)
+        if not model or not model.options:
+            return None
+        return split_image_repo_tag(model.options.image)[1] or None
+
+    async def get_docker_tags_for_model(self, model_id: str | None, hardware: str | None) -> list[str]:
+        """Fetch available Docker image tags for a built-in MCP model."""
+        repo = self.get_docker_image_repo_for_model(model_id, hardware)
+        if not repo:
+            return []
+        client = registry_for(repo)
+        return await client.get_tags(image_without_registry_prefix(repo))
 
     def get_type(self) -> str:
         """Return the service id."""
@@ -1205,12 +1249,14 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
         installed_model = installed.models.get(model_id) if installed else None
         envs = {**(model.options.env_vars or {}), **(installed_model.envs or {})} if installed_model else model.options.env_vars
         headers = {**(model.headers or {}), **(installed_model.headers or {})} if installed_model else model.headers
+        image_version = (installed_model.options.spec or {}).get("image_version") if installed_model else None
+        docker_options = apply_image_version_override(model.options, image_version)
         return {
             "id": model_id,
             "private": True,
             "default_prefix": model.default_prefix,
             "size": model.size,
-            "image": model.options.image,
+            "image": docker_options.image,
             "image_port": model.options.image_port,
             "command": command,
             # See the equivalent CustomService.get_duplicate_spec for why the host side is stripped:
@@ -1854,8 +1900,13 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
 
             if model.options is None:
                 raise HTTPException(400, "options are required for this model kind.")  # noqa: TRY301
+            docker_options = model.options
             if model.kind != "user":
-                await self._verify_docker_image(model.options.image, options.ignore_warnings)
+                await self.validate_docker_image_version_for_model(
+                    model_id, options.spec.get("image_version"), options.spec.get("hardware")
+                )
+                docker_options = apply_image_version_override(docker_options, options.spec.get("image_version"))
+                await self._verify_docker_image(docker_options.image, options.ignore_warnings)
         except Exception:
             self._installing.discard(key)
             raise
@@ -1865,8 +1916,6 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                 model_dir = self._get_working_dir() / "models"
                 model_dir.mkdir(parents=True, exist_ok=True)
                 subnet = self.docker_service.get_docker_subnet()
-                docker_options = model.options
-                assert docker_options is not None
                 if model.kind == "user":
                     dockerfile_dir = self._get_dockerfile_dir(instance, model_id)
                     await self.docker_service.build_image(dockerfile_dir, docker_options.image, stream)

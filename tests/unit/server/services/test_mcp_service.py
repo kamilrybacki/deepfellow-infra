@@ -16,7 +16,14 @@ from pydantic import ValidationError
 
 from server.docker import DockerOptions
 from server.models.api import McpToolInfo
-from server.models.models import AddCustomModelIn, InstallModelIn, ListModelsFilters, McpHealthCheckResult, UninstallModelIn
+from server.models.models import (
+    AddCustomModelIn,
+    InstallModelIn,
+    ListModelsFilters,
+    McpHealthCheckResult,
+    ModelSpecification,
+    UninstallModelIn,
+)
 from server.models.services import InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import CustomModel, Instance, InstanceConfig
 from server.services.mcp_service import (
@@ -174,6 +181,101 @@ def test_get_custom_model_spec_has_required_fields(svc: McpService) -> None:
     assert spec is not None
     field_names = {f.name for f in spec.fields}
     assert {"id", "default_prefix", "size", "image", "image_port"} <= field_names
+
+
+def test_loaded_open_websearch_model_has_docker_tags_field(svc: McpService) -> None:
+    model = svc.models["default"]["open-websearch"]
+
+    field = next(f for f in model.model_spec.fields if f.name == "image_version")
+    assert field.type == "docker-tags"
+    assert field.docker_image == "hub.simplito.com/deepfellow/open-websearch"
+    assert field.depends_on is None
+
+
+def test_loaded_scrapling_model_has_no_docker_tags_field(svc: McpService) -> None:
+    # scrapling's image is digest-pinned (no floating tag), so there's nothing to select.
+    model = svc.models["default"]["scrapling"]
+
+    assert not any(f.type == "docker-tags" for f in model.model_spec.fields)
+
+
+def test_loaded_firecrawl_model_has_no_docker_tags_field(svc: McpService) -> None:
+    model = svc.models["default"]["firecrawl"]
+
+    assert not any(f.type == "docker-tags" for f in model.model_spec.fields)
+
+
+def test_attach_docker_tags_field_skips_proxy_models(svc: McpService) -> None:
+    proxy_model = SrvMcpModel(
+        model_props=MagicMock(),
+        model_spec=ModelSpecification(fields=[]),
+        model_type="mcp",
+        default_prefix="proxy",
+        size="",
+        options=None,
+        kind="proxy",
+    )
+
+    svc._attach_docker_tags_field(proxy_model)  # pyright: ignore[reportPrivateUsage]
+
+    assert not any(f.type == "docker-tags" for f in proxy_model.model_spec.fields)
+
+
+def test_attach_docker_tags_field_is_idempotent(svc: McpService) -> None:
+    model = svc.models["default"]["open-websearch"]
+    fields_before = len(model.model_spec.fields)
+
+    svc._attach_docker_tags_field(model)  # pyright: ignore[reportPrivateUsage]
+
+    assert len(model.model_spec.fields) == fields_before
+
+
+def test_get_docker_image_repo_for_model_open_websearch(svc: McpService) -> None:
+    assert svc.get_docker_image_repo_for_model("open-websearch", None) == "hub.simplito.com/deepfellow/open-websearch"
+
+
+def test_get_docker_image_repo_for_model_unknown_returns_none(svc: McpService) -> None:
+    assert svc.get_docker_image_repo_for_model("unknown-model", None) is None
+    assert svc.get_docker_image_repo_for_model(None, None) is None
+
+
+def test_get_docker_image_repo_for_model_proxy_returns_none(svc: McpService) -> None:
+    svc.models["default"]["proxy-model"] = SrvMcpModel(
+        model_props=MagicMock(),
+        model_spec=ModelSpecification(fields=[]),
+        model_type="mcp",
+        default_prefix="proxy",
+        size="",
+        options=None,
+        kind="proxy",
+    )
+
+    assert svc.get_docker_image_repo_for_model("proxy-model", None) is None
+
+
+def test_get_default_docker_tag_for_model_open_websearch(svc: McpService) -> None:
+    assert svc.get_default_docker_tag_for_model("open-websearch", None) == "v2.1.9"
+
+
+def test_get_default_docker_tag_for_model_unknown_returns_none(svc: McpService) -> None:
+    assert svc.get_default_docker_tag_for_model("unknown-model", None) is None
+
+
+@pytest.mark.asyncio
+async def test_get_docker_tags_for_model_fetches_from_registry(svc: McpService) -> None:
+    client = MagicMock()
+    client.get_tags = AsyncMock(return_value=["v2.1.9", "v2.1.8"])
+    with patch("server.services.mcp_service.registry_for", return_value=client) as mock_registry_for:
+        tags = await svc.get_docker_tags_for_model("open-websearch", None)
+
+    mock_registry_for.assert_called_once_with("hub.simplito.com/deepfellow/open-websearch")
+    client.get_tags.assert_called_once_with("deepfellow/open-websearch")
+    assert tags == ["v2.1.9", "v2.1.8"]
+
+
+@pytest.mark.asyncio
+async def test_get_docker_tags_for_model_unknown_returns_empty(svc: McpService) -> None:
+    assert await svc.get_docker_tags_for_model("unknown-model", None) == []
 
 
 def test_srv_mcp_custom_model_valid() -> None:
@@ -830,6 +932,56 @@ async def test_install_model_happy_path(svc: McpService, deps: dict[str, Any], t
     info = svc.get_instance_installed_info("default")
     assert model_id in info.models
     assert model_id in svc.models_downloaded
+
+
+@pytest.mark.asyncio
+async def test_install_model_rejects_unavailable_image_version(svc: McpService, deps: dict[str, Any]) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    model_id = "open-websearch"
+    client = MagicMock()
+    client.get_tags = AsyncMock(return_value=["v2.1.9"])
+    client.tag_exists = AsyncMock(return_value=False)
+
+    with (
+        patch("server.services.mcp_service.registry_for", return_value=client),
+        pytest.raises(HTTPException) as exc,
+    ):
+        await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+            "default", model_id, InstallModelIn(spec={"prefix": model_id, "image_version": "9.9.9-bogus"})
+        )
+
+    assert exc.value.status_code == 400
+    info = svc.get_instance_installed_info("default")
+    assert model_id not in info.models
+
+
+@pytest.mark.asyncio
+async def test_install_model_applies_selected_image_version(svc: McpService, deps: dict[str, Any], tmp_path: Path) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    model_id = "open-websearch"
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.2"
+    deps["docker_service"].get_container_port.return_value = 3000
+    deps["endpoint_registry"].register_mcp_endpoint_as_proxy.return_value = "reg-id"
+
+    with (
+        patch.object(svc, "_verify_docker_image", new=AsyncMock()) as mock_verify,
+        patch.object(svc, "_download_image_or_set_progress", new=AsyncMock()),
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),
+        patch.object(svc, "validate_docker_image_version_for_model", new_callable=AsyncMock),
+        patch("server.services.mcp_service.get_base_url", return_value="http://172.20.0.2:3000"),
+    ):
+        promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+            "default", model_id, InstallModelIn(spec={"prefix": model_id, "image_version": "v2.1.8"})
+        )
+        await promise.wait()
+
+    mock_verify.assert_called_once_with("hub.simplito.com/deepfellow/open-websearch:v2.1.8", False)
+    info = svc.get_instance_installed_info("default")
+    assert info.models[model_id].docker_options.image == "hub.simplito.com/deepfellow/open-websearch:v2.1.8"  # pyright: ignore[reportOptionalMemberAccess]
+    assert svc.models_downloaded[model_id].image == "hub.simplito.com/deepfellow/open-websearch:v2.1.8"
+    # The model's own default image is untouched for subsequent installs.
+    assert svc.models["default"]["open-websearch"].options.image == "hub.simplito.com/deepfellow/open-websearch:v2.1.9"  # pyright: ignore[reportOptionalMemberAccess]
 
 
 @pytest.mark.asyncio
@@ -2398,6 +2550,34 @@ async def test_get_duplicate_spec_catalog_model_uses_installed_envs_and_headers(
 
     assert spec["envs"] == {"BRAVE_API_KEY": "secret-key"}
     assert spec["headers"] == {"X-Custom": "value"}
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_preserves_selected_image_version(svc: McpService) -> None:
+    """Duplicating a model pinned to a non-default image_version must keep that version, not
+    silently revert to the catalog default tag."""
+    svc.instances_info["default"].installed = InstalledInfo(
+        models={
+            "open-websearch": ModelInstalledInfo(
+                id="open-websearch",
+                options=InstallModelIn(spec={"prefix": "open-websearch", "image_version": "v2.1.5"}),
+                docker_options=None,
+                container_host="open-websearch",
+                container_port=8080,
+                docker_exposed_port=8080,
+                registration_id="reg-1",
+                prefix="open-websearch",
+                base_url="http://open-websearch:8080",
+                headers={},
+                envs={},
+            )
+        },
+        options=InstallServiceIn(spec={}),
+    )
+
+    spec = await svc.get_duplicate_spec("default", "open-websearch")
+
+    assert spec["image"] == "hub.simplito.com/deepfellow/open-websearch:v2.1.5"
 
 
 @pytest.mark.asyncio

@@ -41,7 +41,7 @@ logger = logging.getLogger("uvicorn.error")
 class ServicesManager:
     def __init__(self):
         self.services: dict[str, BaseService] = {}
-        self.docker_tags_cache: dict[tuple[str, str | None], tuple[list[str], str, float]] = {}
+        self.docker_tags_cache: dict[tuple[str, str | None, str | None, str | None], tuple[list[str], str, float]] = {}
 
     def split_service_type_and_instance(self, service_id: str) -> tuple[str, str]:
         """Convert service id to service type and instance with validation."""
@@ -236,23 +236,23 @@ class ServicesManager:
         service_type, _instance = self.split_service_type_and_instance(service_id)
         return await self._get_service(service_type).refresh_catalog()
 
-    async def get_docker_tags_for_service(self, service_id: str, hardware: str | None) -> list[str]:
-        """Fetch available Docker image tags for the service, hardware-filtered."""
+    async def get_docker_tags_for_service(self, service_id: str, hardware: str | None, model_id: str | None = None) -> list[str]:
+        """Fetch available Docker image tags for the service, hardware-filtered and optionally model-scoped."""
         service_type, _instance = self.split_service_type_and_instance(service_id)
-        return await self._get_service(service_type).get_docker_tags(hardware)
+        return await self._get_service(service_type).get_docker_tags_for_model(model_id, hardware)
 
-    def get_default_docker_tag_for_service(self, service_id: str, hardware: str | None) -> str | None:
-        """Return the pinned default Docker image tag for the service, hardware-aware."""
+    def get_default_docker_tag_for_service(self, service_id: str, hardware: str | None, model_id: str | None = None) -> str | None:
+        """Return the pinned default Docker image tag for the service, hardware-aware and optionally model-scoped."""
         service_type, _instance = self.split_service_type_and_instance(service_id)
-        return self._get_service(service_type).get_default_docker_tag(hardware)
+        return self._get_service(service_type).get_default_docker_tag_for_model(model_id, hardware)
 
-    def get_docker_image_repo_for_service(self, service_id: str, hardware: str | None) -> str | None:
-        """Return the Docker repo tags are fetched from for the service, hardware-aware.
+    def get_docker_image_repo_for_service(self, service_id: str, hardware: str | None, model_id: str | None = None) -> str | None:
+        """Return the Docker repo tags are fetched from for the service, hardware-aware and optionally model-scoped.
 
         None if the service's tags come from the same repo regardless of hardware.
         """
         service_type, _instance = self.split_service_type_and_instance(service_id)
-        return self._get_service(service_type).get_docker_image_repo(hardware)
+        return self._get_service(service_type).get_docker_image_repo_for_model(model_id, hardware)
 
     async def get_docker_logs(self, service_id: str, model_id: str | None) -> str:
         """Get docker logs."""

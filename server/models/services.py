@@ -152,3 +152,6 @@ class DockerTagsOut(BaseModel):
     image: str
     tags: list[str]
     default: str | None = None
+    # True if `tags` is empty because the registry couldn't be reached, not because the image
+    # genuinely has no tags - lets the frontend show an error+retry state instead of "No tags found."
+    registry_unavailable: bool = False

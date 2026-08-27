@@ -7,7 +7,7 @@ import logging
 import time
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, Path, Query, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Request
 from fastapi.responses import JSONResponse, Response
 
 from server.core.dependencies import auth_admin, get_endpoint_registry, get_services_manager
@@ -172,30 +172,49 @@ async def get_docker_tags(
     services_manager: Annotated[ServicesManager, Depends(get_services_manager)],
     _: Annotated[str, Depends(auth_admin)],
     hardware: Annotated[str | None, Query(description="Hardware variant for tag filtering (e.g. gpu, cpu)")] = None,
+    field_name: Annotated[str | None, Query(description="Name of the docker-tags field requesting tags")] = None,
+    model_id: Annotated[str | None, Query(description="ID of the model requesting tags, for services installing several models")] = None,
 ) -> DockerTagsOut:
-    """Fetch available Docker image tags for the service from its registry, with hardware-aware filtering."""
-    default_tag = services_manager.get_default_docker_tag_for_service(service_id, hardware)
+    """Fetch available Docker image tags for the service from its registry, with hardware- and model-aware filtering."""
+    try:
+        default_tag = services_manager.get_default_docker_tag_for_service(service_id, hardware, model_id)
+    except RegistryUnavailableError:
+        default_tag = None
 
-    cache_key = (service_id, hardware)
+    cache_key = (service_id, hardware, field_name, model_id)
     cached = services_manager.docker_tags_cache.get(cache_key)
     if cached and time.monotonic() - cached[2] < _DOCKER_TAGS_TTL:
         cached_tags, cached_image, _ts = cached
         return DockerTagsOut(image=cached_image, tags=cached_tags, default=default_tag)
 
+    model_fields = []
+    if model_id:
+        try:
+            model = await services_manager.get_model_from_service(service_id, model_id)
+            model_fields = model.spec.fields
+        except HTTPException:
+            model_fields = []
+
     service = await services_manager.get_service(service_id)
-    docker_image = (
-        services_manager.get_docker_image_repo_for_service(service_id, hardware)
-        or next((f.docker_image for f in service.spec.fields if f.type == "docker-tags" and f.docker_image), None)
-        or service_id
+    docker_tags_fields = [f for f in [*service.spec.fields, *model_fields] if f.type == "docker-tags" and f.docker_image]
+    matched_field = (next((f for f in docker_tags_fields if f.name == field_name), None) if field_name else None) or (
+        docker_tags_fields[0] if docker_tags_fields else None
     )
     try:
-        tags = await services_manager.get_docker_tags_for_service(service_id, hardware)
+        docker_image_repo = services_manager.get_docker_image_repo_for_service(service_id, hardware, model_id)
     except RegistryUnavailableError:
-        logger.warning("Docker tags unavailable for service %r; registry unreachable", service_id)
+        docker_image_repo = None
+    docker_image = docker_image_repo or (matched_field.docker_image if matched_field else None) or service_id
+    registry_unavailable = False
+    try:
+        tags = await services_manager.get_docker_tags_for_service(service_id, hardware, model_id)
+    except RegistryUnavailableError:
+        logger.warning("Docker tags unavailable for service %r model %r; registry unreachable", service_id, model_id)
         tags = []
+        registry_unavailable = True
     if tags:
         services_manager.docker_tags_cache[cache_key] = (tags, docker_image, time.monotonic())
-    return DockerTagsOut(image=docker_image, tags=tags, default=default_tag)
+    return DockerTagsOut(image=docker_image, tags=tags, default=default_tag, registry_unavailable=registry_unavailable)
 
 
 @router.get(

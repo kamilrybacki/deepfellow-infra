@@ -361,6 +361,121 @@ class TestOciRegistryClient:
             with pytest.raises(RegistryUnavailableError):
                 await client.tag_exists("ggml-org/llama.cpp", "server-b1")
 
+    @pytest.mark.asyncio
+    async def test_tag_exists_true_when_registry_allows_anonymous_pulls(self) -> None:
+        discovery_resp = _make_response(200, {}, headers={})
+        manifest_resp = _make_response(200, {})
+        session = _make_session(discovery_resp, manifest_resp)
+        with patch("aiohttp.ClientSession", return_value=session):
+            client = OciRegistryClient(registry_base="https://hub.example.com", token_scope_template="repository:{image}:pull")
+            assert await client.tag_exists("deepfellow/doc-chunker-gpu", "v1.0.5") is True
+
+        manifest_call_headers = session.head.call_args.kwargs["headers"]
+        assert "Authorization" not in manifest_call_headers
+
+    @pytest.mark.asyncio
+    async def test_get_tags_discovers_token_endpoint_when_token_url_omitted(self) -> None:
+        discovery_resp = _make_response(
+            401, {}, headers={"WWW-Authenticate": 'Bearer realm="https://auth.example.com/token",service="Docker registry"'}
+        )
+        token_resp = _make_response(200, {"token": "anon-token"})
+        tags_resp = _make_response(200, {"tags": ["v1.0.5", "v1.0.4"]})
+        with patch("aiohttp.ClientSession", return_value=_make_session(discovery_resp, token_resp, tags_resp)):
+            client = OciRegistryClient(registry_base="https://hub.example.com", token_scope_template="repository:{image}:pull")
+            tags = await client.get_tags("deepfellow/doc-chunker-gpu")
+
+        assert tags == ["v1.0.5", "v1.0.4"]
+
+    @pytest.mark.asyncio
+    async def test_get_tags_discovers_token_endpoint_without_scope_template(self) -> None:
+        # Discovery path (no token_url configured) with no scope template: the scope param
+        # must be omitted from the token request entirely.
+        discovery_resp = _make_response(
+            401, {}, headers={"WWW-Authenticate": 'Bearer realm="https://auth.example.com/token",service="Docker registry"'}
+        )
+        token_resp = _make_response(200, {"token": "anon-token"})
+        tags_resp = _make_response(200, {"tags": ["v1.0.5"]})
+        session = _make_session(discovery_resp, token_resp, tags_resp)
+        with patch("aiohttp.ClientSession", return_value=session):
+            client = OciRegistryClient(registry_base="https://hub.example.com", token_scope_template=None)
+            tags = await client.get_tags("deepfellow/doc-chunker-gpu")
+
+        assert tags == ["v1.0.5"]
+        token_call_params = session.get.call_args_list[1].kwargs["params"]
+        assert "scope" not in token_call_params
+
+    @pytest.mark.asyncio
+    async def test_discovered_auth_is_cached_across_calls(self) -> None:
+        discovery_resp = _make_response(
+            401, {}, headers={"WWW-Authenticate": 'Bearer realm="https://auth.example.com/token",service="Docker registry"'}
+        )
+        token_resp_1 = _make_response(200, {"token": "anon-token-1"})
+        tags_resp_1 = _make_response(200, {"tags": ["v1.0.4"]})
+        token_resp_2 = _make_response(200, {"token": "anon-token-2"})
+        tags_resp_2 = _make_response(200, {"tags": ["v1.0.5"]})
+        session = _make_session(discovery_resp, token_resp_1, tags_resp_1, token_resp_2, tags_resp_2)
+        with patch("aiohttp.ClientSession", return_value=session):
+            client = OciRegistryClient(registry_base="https://hub.example.com", token_scope_template="repository:{image}:pull")
+            await client.get_tags("deepfellow/doc-chunker-gpu")
+            await client.get_tags("deepfellow/doc-chunker-gpu")
+
+        # Only 5 requests total (1 discovery + 2 * (token + tags)): the second get_tags() call reused
+        # the cached realm/service instead of issuing a second discovery request.
+        assert session.get.call_count == 5
+
+    @pytest.mark.asyncio
+    async def test_get_tags_discovery_without_service_param(self) -> None:
+        # Some registries advertise only a realm, with no "service" attribute in the challenge.
+        discovery_resp = _make_response(401, {}, headers={"WWW-Authenticate": 'Bearer realm="https://auth.example.com/token"'})
+        token_resp = _make_response(200, {"token": "anon-token"})
+        tags_resp = _make_response(200, {"tags": ["v1.0.5"]})
+        with patch("aiohttp.ClientSession", return_value=_make_session(discovery_resp, token_resp, tags_resp)):
+            client = OciRegistryClient(registry_base="https://hub.example.com", token_scope_template="repository:{image}:pull")
+            tags = await client.get_tags("deepfellow/doc-chunker-gpu")
+
+        assert tags == ["v1.0.5"]
+
+    @pytest.mark.asyncio
+    async def test_discover_auth_missing_realm_raises(self) -> None:
+        # Bearer scheme, but the challenge advertises no realm param at all.
+        discovery_resp = _make_response(401, {}, headers={"WWW-Authenticate": "Bearer"})
+        with patch("aiohttp.ClientSession", return_value=_make_session(discovery_resp)):
+            client = OciRegistryClient(registry_base="https://hub.example.com", token_scope_template="repository:{image}:pull")
+            with pytest.raises(RegistryUnavailableError, match="realm"):
+                await client.get_tags("deepfellow/doc-chunker-gpu")
+
+    @pytest.mark.asyncio
+    async def test_discover_auth_no_challenge_header_raises_unsupported_scheme(self) -> None:
+        discovery_resp = _make_response(401, {}, headers={})
+        with patch("aiohttp.ClientSession", return_value=_make_session(discovery_resp)):
+            client = OciRegistryClient(registry_base="https://hub.example.com", token_scope_template="repository:{image}:pull")
+            with pytest.raises(RegistryUnavailableError, match="unsupported auth scheme"):
+                await client.get_tags("deepfellow/doc-chunker-gpu")
+
+    @pytest.mark.asyncio
+    async def test_get_tags_skips_token_when_registry_allows_anonymous_pulls(self) -> None:
+        # A registry with anonymous read access answers 200 on the discovery probe with no
+        # WWW-Authenticate challenge at all - tags should be fetched without ever requesting a token.
+        discovery_resp = _make_response(200, {}, headers={})
+        tags_resp = _make_response(200, {"tags": ["v1.0.5"]})
+        session = _make_session(discovery_resp, tags_resp)
+        with patch("aiohttp.ClientSession", return_value=session):
+            client = OciRegistryClient(registry_base="https://hub.example.com", token_scope_template="repository:{image}:pull")
+            tags = await client.get_tags("deepfellow/doc-chunker-gpu")
+
+        assert tags == ["v1.0.5"]
+        assert session.get.call_count == 2
+        tags_call_headers = session.get.call_args_list[1].kwargs["headers"]
+        assert "Authorization" not in tags_call_headers
+
+    @pytest.mark.asyncio
+    async def test_discover_auth_basic_scheme_raises_clear_error(self) -> None:
+        discovery_resp = _make_response(401, {}, headers={"WWW-Authenticate": 'Basic realm="Registry Realm"'})
+        with patch("aiohttp.ClientSession", return_value=_make_session(discovery_resp)):
+            client = OciRegistryClient(registry_base="https://hub.example.com", token_scope_template="repository:{image}:pull")
+            with pytest.raises(RegistryUnavailableError, match="Basic"):
+                await client.get_tags("deepfellow/doc-chunker-gpu")
+
 
 class TestRegistryFor:
     def test_docker_hub_image(self) -> None:
@@ -374,6 +489,16 @@ class TestRegistryFor:
     def test_ecr_public_image(self) -> None:
         client = registry_for("public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo")
         assert isinstance(client, OciRegistryClient)
+
+    def test_self_hosted_registry_uses_generic_oci_client(self) -> None:
+        client = registry_for("hub.simplito.com/deepfellow/doc-chunker-gpu")
+        assert isinstance(client, OciRegistryClient)
+        assert not isinstance(client, DockerHubClient)
+
+    def test_self_hosted_registry_client_is_cached_per_host(self) -> None:
+        first = registry_for("hub.simplito.com/deepfellow/doc-chunker-gpu")
+        second = registry_for("hub.simplito.com/deepfellow/doc-chunker-cpu")
+        assert first is second
 
     @pytest.mark.asyncio
     async def test_docker_hub_token_forwarded(self) -> None:
@@ -396,3 +521,11 @@ class TestImageWithoutRegistryPrefix:
 
     def test_docker_hub_unchanged(self) -> None:
         assert image_without_registry_prefix("ollama/ollama") == "ollama/ollama"
+
+    def test_self_hosted_prefix_stripped(self) -> None:
+        assert image_without_registry_prefix("hub.simplito.com/deepfellow/doc-chunker-gpu") == "deepfellow/doc-chunker-gpu"
+
+    def test_self_hosted_single_segment_repo_prefix_stripped_without_library_namespace(self) -> None:
+        # No namespace segment - must not fall back to DockerImageNameInfo.parse()'s Hub-flavored
+        # "library" default, which would build a nonexistent /v2/library/myimage/tags/list URL.
+        assert image_without_registry_prefix("registry.local/myimage") == "myimage"

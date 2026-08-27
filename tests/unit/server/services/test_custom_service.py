@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
 
+import logging
 from collections.abc import Callable
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from fastapi import HTTPException
 
 from server.docker import DockerOptions
-from server.models.models import AddCustomModelIn, InstallModelIn, ListModelsFilters, ModelInfo, UninstallModelIn
+from server.models.api import ModelProps
+from server.models.models import AddCustomModelIn, InstallModelIn, ListModelsFilters, ModelInfo, ModelSpecification, UninstallModelIn
 from server.models.services import InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import CustomModel, Instance, InstanceConfig
 from server.services.custom_service import (
@@ -26,6 +28,7 @@ from server.services.custom_service import (
     create_lemmatizer_model,
 )
 from server.utils.hardware import NvidiaGpuInfo
+from server.utils.registry_client import RegistryUnavailableError
 
 _CUSTOM_MODEL_DATA: dict[str, Any] = {
     "id": "my-custom",
@@ -487,6 +490,29 @@ async def test_get_duplicate_spec_catalog_model_uses_installed_options(svc: Cust
 
 
 @pytest.mark.asyncio
+async def test_get_duplicate_spec_preserves_selected_image_version(svc: CustomService) -> None:
+    """Duplicating a model pinned to a non-default image_version must keep that version, not
+    silently revert to the catalog default tag."""
+    installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    installed.models["lemmatizer"] = ModelInstalledInfo(
+        id="lemmatizer",
+        options=InstallModelIn(spec={"image_version": "1.0.5-cpu"}),
+        docker_options=MagicMock(),
+        container_host="",
+        container_port=0,
+        docker_exposed_port=0,
+        registration_id="reg-1",
+        prefix="lemmatizer",
+        base_url="",
+    )
+    svc.instances_info["default"].installed = installed
+
+    spec = await svc.get_duplicate_spec("default", "lemmatizer")
+
+    assert spec["image"] == "hub.simplito.com/deepfellow/deepfellow-lemmatizer:1.0.5-cpu"
+
+
+@pytest.mark.asyncio
 async def test_get_duplicate_spec_catalog_model_spec_is_addable(svc: CustomService) -> None:
     """End-to-end regression: the synthesized spec must actually pass `_add_custom_model`'s validation
     (SrvCustomCustomModel), not just look plausible - catches type mismatches like int-valued envs."""
@@ -705,6 +731,69 @@ async def test_install_model_uses_configured_standard_proxy_timeout(svc: CustomS
 
 
 @pytest.mark.asyncio
+async def test_install_model_rejects_unavailable_image_version(svc: CustomService, deps: dict[str, Any]) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    client = MagicMock()
+    client.get_tags = AsyncMock(return_value=["1.0.0-cpu"])
+    client.tag_exists = AsyncMock(return_value=False)
+    with patch("server.services.custom_service.registry_for", return_value=client), pytest.raises(HTTPException) as exc:
+        await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+            "default", "lemmatizer", InstallModelIn(spec={"prefix": "lemmatizer", "image_version": "9.9.9-bogus"})
+        )
+
+    assert exc.value.status_code == 400
+    assert "lemmatizer" not in svc.instances_info["default"].installed.models  # pyright: ignore[reportOptionalMemberAccess]
+
+
+@pytest.mark.asyncio
+async def test_install_model_applies_selected_image_version(svc: CustomService, deps: dict[str, Any]) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
+    deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.1"
+    deps["docker_service"].get_container_port.return_value = 8090
+    deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
+
+    with patch.object(svc, "validate_docker_image_version_for_model", new_callable=AsyncMock):
+        promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+            "default", "lemmatizer", InstallModelIn(spec={"prefix": "lemmatizer", "image_version": "1.1.0-cpu"})
+        )
+    await promise.wait()
+
+    installed_model = svc.instances_info["default"].installed.models["lemmatizer"]  # pyright: ignore[reportOptionalMemberAccess]
+    assert installed_model.docker_options.image == "hub.simplito.com/deepfellow/deepfellow-lemmatizer:1.1.0-cpu"
+    # The model's own default image logic is untouched for subsequent installs.
+    assert svc.models["default"]["lemmatizer"].options({"hardware": "CPU"}).image == (  # pyright: ignore[reportCallIssue]
+        "hub.simplito.com/deepfellow/deepfellow-lemmatizer:1.0.0-cpu"
+    )
+
+
+@pytest.mark.asyncio
+async def test_install_model_applies_selected_image_version_for_static_image_model(svc: CustomService, deps: dict[str, Any]) -> None:
+    # "easyOCR" uses a single shared (non-callable) DockerOptions instance — the override must not
+    # mutate it in place, or the override would leak into every future install of this model.
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
+    deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.1"
+    deps["docker_service"].get_container_port.return_value = 8000
+    deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
+    original_image = svc.models["default"]["easyOCR"].options.image  # pyright: ignore[reportFunctionMemberAccess]
+
+    with patch.object(svc, "validate_docker_image_version_for_model", new_callable=AsyncMock):
+        promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+            "default", "easyOCR", InstallModelIn(spec={"prefix": "ocr", "image_version": "2.0.0"})
+        )
+    await promise.wait()
+
+    installed_model = svc.instances_info["default"].installed.models["easyOCR"]  # pyright: ignore[reportOptionalMemberAccess]
+    assert installed_model.docker_options.image == "hub.simplito.com/deepfellow/df-ocr:2.0.0"
+    assert svc.models["default"]["easyOCR"].options.image == original_image  # pyright: ignore[reportFunctionMemberAccess]
+
+
+@pytest.mark.asyncio
 async def test_install_model_uses_spec_proxy_timeout_seconds(svc: CustomService, deps: dict[str, Any]) -> None:
     deps["config"].standard_proxy_timeout_seconds = 1800
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
@@ -902,12 +991,356 @@ def test_create_doc_chunker_model_gpu_image(deps: dict[str, Any]) -> None:
     assert "gpu" in docker_opts.image
 
 
+def test_create_doc_chunker_model_falls_back_to_default_version(svc: CustomService) -> None:
+    model = create_doc_chunker_model(svc, "172.20.0.0/16")
+
+    docker_opts = model.options({"hardware": "CPU"})  # pyright: ignore[reportCallIssue]
+    assert docker_opts.image == "hub.simplito.com/deepfellow/doc-chunker-cpu:v1.0.3"
+
+
+def test_loaded_doc_chunker_model_has_docker_tags_field(svc: CustomService) -> None:
+    model = svc.models["default"]["doc_chunker"]
+
+    field = next(f for f in model.model_spec.fields if f.name == "image_version")
+    assert field.type == "docker-tags"
+    assert field.depends_on == "hardware"
+    assert field.docker_image == "hub.simplito.com/deepfellow/doc-chunker-cpu"
+
+
+def test_get_docker_image_repo_for_model_doc_chunker_cpu(svc: CustomService) -> None:
+    assert svc.get_docker_image_repo_for_model("doc_chunker", "CPU") == "hub.simplito.com/deepfellow/doc-chunker-cpu"
+
+
+def test_get_docker_image_repo_for_model_doc_chunker_gpu(deps: dict[str, Any]) -> None:
+    gpu = NvidiaGpuInfo(name="RTX 4090", vram="24GB", id=0)
+    deps["hardware"] = MagicMock(gpus=[gpu], cpu=MagicMock())
+    svc_gpu = CustomService(**deps)
+
+    assert svc_gpu.get_docker_image_repo_for_model("doc_chunker", "GPU") == "hub.simplito.com/deepfellow/doc-chunker-gpu"
+
+
+def test_get_docker_image_repo_for_model_unknown_model_returns_none(svc: CustomService) -> None:
+    assert svc.get_docker_image_repo_for_model("unknown-model", "CPU") is None
+    assert svc.get_docker_image_repo_for_model(None, "CPU") is None
+
+
+def test_get_default_docker_tag_for_model_doc_chunker(svc: CustomService) -> None:
+    assert svc.get_default_docker_tag_for_model("doc_chunker", "CPU") == "v1.0.3"
+
+
+def test_get_default_docker_tag_for_model_unknown_model_returns_none(svc: CustomService) -> None:
+    assert svc.get_default_docker_tag_for_model("unknown-model", "CPU") is None
+    assert svc.get_default_docker_tag_for_model(None, "CPU") is None
+
+
+@pytest.mark.asyncio
+async def test_get_docker_tags_for_model_doc_chunker_fetches_from_registry(svc: CustomService) -> None:
+    client = MagicMock()
+    client.get_tags = AsyncMock(return_value=["v1.0.5", "v1.0.4", "v1.0.3"])
+    with patch("server.services.custom_service.registry_for", return_value=client) as mock_registry_for:
+        tags = await svc.get_docker_tags_for_model("doc_chunker", "CPU")
+
+    mock_registry_for.assert_called_once_with("hub.simplito.com/deepfellow/doc-chunker-cpu")
+    client.get_tags.assert_called_once_with("deepfellow/doc-chunker-cpu")
+    assert tags == ["v1.0.5", "v1.0.4", "v1.0.3"]
+
+
+@pytest.mark.asyncio
+async def test_get_docker_tags_for_model_unknown_model_returns_empty(svc: CustomService) -> None:
+    assert await svc.get_docker_tags_for_model("unknown-model", "CPU") == []
+
+
+def _broken_model() -> SrvCustomModel:
+    """A model whose options() always raises, to exercise the probing failure path."""
+
+    def options(_spec: dict[str, Any]) -> DockerOptions:
+        raise RuntimeError("boom")
+
+    return SrvCustomModel(
+        model_props=ModelProps(private=True, type="custom", endpoints=[]),
+        model_spec=ModelSpecification(fields=[]),
+        model_type="custom",
+        default_prefix="broken",
+        size="1GB",
+        options=options,
+    )
+
+
+def _empty_image_model() -> SrvCustomModel:
+    """A model whose options() resolves cleanly but with an empty image (no exception involved)."""
+
+    def options(_spec: dict[str, Any]) -> DockerOptions:
+        return DockerOptions(image_port=8000, name="empty", container_name="empty", image="", subnet=None)
+
+    return SrvCustomModel(
+        model_props=ModelProps(private=True, type="custom", endpoints=[]),
+        model_spec=ModelSpecification(fields=[]),
+        model_type="custom",
+        default_prefix="empty",
+        size="1GB",
+        options=options,
+    )
+
+
+def test_get_default_docker_tag_for_model_returns_none_when_image_is_empty(svc: CustomService) -> None:
+    svc.models["default"]["empty"] = _empty_image_model()
+
+    assert svc.get_default_docker_tag_for_model("empty", "CPU") is None
+
+
+@pytest.mark.asyncio
+async def test_get_docker_tags_for_model_returns_empty_when_repo_is_empty(svc: CustomService) -> None:
+    svc.models["default"]["empty"] = _empty_image_model()
+
+    assert await svc.get_docker_tags_for_model("empty", "CPU") == []
+
+
+def test_filter_tags_for_hardware_returns_unfiltered_when_an_image_is_empty(svc: CustomService) -> None:
+    svc.models["default"]["empty"] = _empty_image_model()
+
+    tags = svc._filter_tags_for_hardware(svc.models["default"]["empty"], ["v1", "v2"], "CPU")  # pyright: ignore[reportPrivateUsage]
+
+    assert tags == ["v1", "v2"]
+
+
+def test_get_docker_image_repo_for_model_raises_registry_unavailable_when_options_raises(svc: CustomService) -> None:
+    svc.models["default"]["broken"] = _broken_model()
+
+    with pytest.raises(RegistryUnavailableError):
+        svc.get_docker_image_repo_for_model("broken", "CPU")
+
+
+def test_get_docker_image_repo_for_model_logs_when_options_raises(svc: CustomService, caplog: pytest.LogCaptureFixture) -> None:
+    svc.models["default"]["broken"] = _broken_model()
+
+    with caplog.at_level(logging.ERROR, logger="uvicorn.error"), pytest.raises(RegistryUnavailableError):
+        svc.get_docker_image_repo_for_model("broken", "CPU")
+
+    assert any("Failed to resolve default image" in record.message and "broken" in record.message for record in caplog.records)
+
+
+def test_get_default_docker_tag_for_model_raises_registry_unavailable_when_options_raises(svc: CustomService) -> None:
+    svc.models["default"]["broken"] = _broken_model()
+
+    with pytest.raises(RegistryUnavailableError):
+        svc.get_default_docker_tag_for_model("broken", "CPU")
+
+
+@pytest.mark.asyncio
+async def test_get_docker_tags_for_model_raises_registry_unavailable_when_options_raises(svc: CustomService) -> None:
+    svc.models["default"]["broken"] = _broken_model()
+
+    with pytest.raises(RegistryUnavailableError):
+        await svc.get_docker_tags_for_model("broken", "CPU")
+
+
+@pytest.mark.asyncio
+async def test_validate_docker_image_version_for_model_fails_open_when_options_raises(svc: CustomService) -> None:
+    """A regression in the model's own DockerOptions builder must fail open (skip validation),
+    not surface as HTTPException(400) claiming the tag itself is invalid."""
+    svc.models["default"]["broken"] = _broken_model()
+
+    await svc.validate_docker_image_version_for_model("broken", "v9.9", "CPU")
+
+
+def test_attach_docker_tags_field_skips_when_default_image_unavailable(svc: CustomService) -> None:
+    model = _broken_model()
+
+    svc._attach_docker_tags_field(model)  # pyright: ignore[reportPrivateUsage]
+
+    assert not any(f.type == "docker-tags" for f in model.model_spec.fields)
+
+
+def test_attach_docker_tags_field_skips_when_image_is_empty(svc: CustomService) -> None:
+    model = _empty_image_model()
+
+    svc._attach_docker_tags_field(model)  # pyright: ignore[reportPrivateUsage]
+
+    assert not any(f.type == "docker-tags" for f in model.model_spec.fields)
+
+
+def test_attach_docker_tags_field_skips_when_image_has_no_tag(svc: CustomService) -> None:
+    model = SrvCustomModel(
+        model_props=ModelProps(private=True, type="custom", endpoints=[]),
+        model_spec=ModelSpecification(fields=[]),
+        model_type="custom",
+        default_prefix="untagged",
+        size="1GB",
+        options=DockerOptions(
+            image_port=8000, name="untagged", container_name="untagged", image="hub.simplito.com/deepfellow/untagged", subnet=None
+        ),
+    )
+
+    svc._attach_docker_tags_field(model)  # pyright: ignore[reportPrivateUsage]
+
+    assert not any(f.type == "docker-tags" for f in model.model_spec.fields)
+
+
+def test_attach_docker_tags_field_is_idempotent(svc: CustomService) -> None:
+    model = svc.models["default"]["doc_chunker"]
+    fields_before = len(model.model_spec.fields)
+
+    svc._attach_docker_tags_field(model)  # pyright: ignore[reportPrivateUsage]
+
+    assert len(model.model_spec.fields) == fields_before
+
+
+@pytest.mark.asyncio
+async def test_get_docker_tags_for_model_not_filtered_when_gpu_probe_fails(svc: CustomService) -> None:
+    def flaky_options(spec: dict[str, Any]) -> DockerOptions:
+        if spec.get("hardware") == "GPU":
+            raise RuntimeError("boom")
+        return DockerOptions(
+            image_port=1234,
+            name="flaky",
+            container_name="flaky",
+            image="hub.simplito.com/deepfellow/flaky:1.0",
+            subnet=None,
+        )
+
+    svc.models["default"]["flaky"] = SrvCustomModel(
+        model_props=ModelProps(private=True, type="custom", endpoints=[]),
+        model_spec=ModelSpecification(fields=[]),
+        model_type="custom",
+        default_prefix="flaky",
+        size="1GB",
+        options=flaky_options,
+    )
+    client = MagicMock()
+    client.get_tags = AsyncMock(return_value=["1.0", "1.1"])
+    with patch("server.services.custom_service.registry_for", return_value=client):
+        tags = await svc.get_docker_tags_for_model("flaky", "CPU")
+
+    assert tags == ["1.0", "1.1"]
+
+
+@pytest.mark.asyncio
+async def test_get_docker_tags_for_model_doc_chunker_not_filtered_when_repo_differs_by_hardware(deps: dict[str, Any]) -> None:
+    gpu = NvidiaGpuInfo(name="RTX 4090", vram="24GB", id=0)
+    deps["hardware"] = MagicMock(gpus=[gpu], cpu=MagicMock())
+    svc_gpu = CustomService(**deps)
+    client = MagicMock()
+    client.get_tags = AsyncMock(return_value=["v1.0.3", "v1.0.4", "v1.0.5"])
+    with patch("server.services.custom_service.registry_for", return_value=client):
+        tags = await svc_gpu.get_docker_tags_for_model("doc_chunker", "CPU")
+
+    assert tags == ["v1.0.3", "v1.0.4", "v1.0.5"]
+
+
+def test_loaded_bge_m3_model_has_docker_tags_field(svc: CustomService) -> None:
+    model = svc.models["default"]["deepfellow-bge-m3"]
+
+    field = next(f for f in model.model_spec.fields if f.name == "image_version")
+    assert field.type == "docker-tags"
+    assert field.docker_image == "hub.simplito.com/deepfellow/deepfellow-bge-m3"
+
+
+def test_loaded_lemmatizer_model_has_docker_tags_field(svc: CustomService) -> None:
+    model = svc.models["default"]["lemmatizer"]
+
+    field = next(f for f in model.model_spec.fields if f.name == "image_version")
+    assert field.type == "docker-tags"
+    assert field.docker_image == "hub.simplito.com/deepfellow/deepfellow-lemmatizer"
+
+
+def test_get_docker_image_repo_for_model_bge_m3_same_repo_regardless_of_hardware(svc: CustomService) -> None:
+    assert (
+        svc.get_docker_image_repo_for_model("deepfellow-bge-m3", "CPU")
+        == svc.get_docker_image_repo_for_model("deepfellow-bge-m3", "GPU")
+        == "hub.simplito.com/deepfellow/deepfellow-bge-m3"
+    )
+
+
+def test_get_default_docker_tag_for_model_bge_m3_varies_by_hardware(deps: dict[str, Any]) -> None:
+    gpu = NvidiaGpuInfo(name="RTX 4090", vram="24GB", id=0)
+    deps["hardware"] = MagicMock(gpus=[gpu], cpu=MagicMock())
+    svc_gpu = CustomService(**deps)
+
+    assert svc_gpu.get_default_docker_tag_for_model("deepfellow-bge-m3", "CPU") == "1.0.0-cpu"
+    assert svc_gpu.get_default_docker_tag_for_model("deepfellow-bge-m3", "GPU") == "1.0.0-cuda-12.8"
+
+
+@pytest.mark.asyncio
+async def test_get_docker_tags_for_model_lemmatizer_filters_by_hardware(deps: dict[str, Any]) -> None:
+    # A GPU must actually be present for the model to know its image differs by hardware at all —
+    # on a CPU-only host, requesting "GPU" resolves to the same (CPU) image, same as production.
+    gpu = NvidiaGpuInfo(name="RTX 4090", vram="24GB", id=0)
+    deps["hardware"] = MagicMock(gpus=[gpu], cpu=MagicMock())
+    svc_gpu = CustomService(**deps)
+    client = MagicMock()
+    client.get_tags = AsyncMock(return_value=["1.0.0-cuda-12.8", "1.0.0-cpu"])
+    with patch("server.services.custom_service.registry_for", return_value=client):
+        cpu_tags = await svc_gpu.get_docker_tags_for_model("lemmatizer", "CPU")
+
+    assert cpu_tags == ["1.0.0-cpu"]
+
+
+@pytest.mark.asyncio
+async def test_get_docker_tags_for_model_no_filtering_when_no_gpu_present(svc: CustomService) -> None:
+    # Without a GPU present, the CPU-vs-GPU probe can't detect a hardware-dependent tag pattern
+    # (identical to how the plain hardcoded image logic behaves without a real GPU) — tags pass
+    # through unfiltered rather than being incorrectly narrowed.
+    client = MagicMock()
+    client.get_tags = AsyncMock(return_value=["1.0.0-cuda-12.8", "1.0.0-cpu"])
+    with patch("server.services.custom_service.registry_for", return_value=client):
+        tags = await svc.get_docker_tags_for_model("lemmatizer", "CPU")
+
+    assert tags == ["1.0.0-cuda-12.8", "1.0.0-cpu"]
+
+
+@pytest.mark.asyncio
+async def test_get_docker_tags_for_model_bge_m3_filters_by_hardware_gpu(deps: dict[str, Any]) -> None:
+    gpu = NvidiaGpuInfo(name="RTX 4090", vram="24GB", id=0)
+    deps["hardware"] = MagicMock(gpus=[gpu], cpu=MagicMock())
+    svc_gpu = CustomService(**deps)
+    client = MagicMock()
+    client.get_tags = AsyncMock(return_value=["1.0.0-cuda-12.8", "1.0.0-cpu"])
+    with patch("server.services.custom_service.registry_for", return_value=client):
+        gpu_tags = await svc_gpu.get_docker_tags_for_model("deepfellow-bge-m3", "GPU")
+
+    assert gpu_tags == ["1.0.0-cuda-12.8"]
+
+
+@pytest.mark.asyncio
+async def test_get_docker_tags_for_model_bge_m3_filters_by_token_not_substring(deps: dict[str, Any]) -> None:
+    # A CPU tag whose version numerically contains a GPU-only token (e.g. "12.8") must still match
+    # on the "cpu" token, not get dropped by a substring check against the unwanted "12.8" token.
+    gpu = NvidiaGpuInfo(name="RTX 4090", vram="24GB", id=0)
+    deps["hardware"] = MagicMock(gpus=[gpu], cpu=MagicMock())
+    svc_gpu = CustomService(**deps)
+    client = MagicMock()
+    client.get_tags = AsyncMock(return_value=["1.0.0-cuda-12.8", "1.12.8-cpu"])
+    with patch("server.services.custom_service.registry_for", return_value=client):
+        cpu_tags = await svc_gpu.get_docker_tags_for_model("deepfellow-bge-m3", "CPU")
+
+    assert cpu_tags == ["1.12.8-cpu"]
+
+
 def test_create_finetune_model_returns_docker_options(svc: CustomService) -> None:
     model = create_finetune_model(svc, "172.20.0.0/16")
 
     assert callable(model.options)
     docker_opts = model.options({})  # pyright: ignore[reportCallIssue]
     assert docker_opts.image_port == 8333
+    assert docker_opts.image == "hub.simplito.com/deepfellow/deepfellow-finetune:0.0.1"
+
+
+def test_loaded_finetune_model_has_docker_tags_field(svc: CustomService) -> None:
+    model = svc.models["default"]["deepfellow-finetune"]
+
+    field = next(f for f in model.model_spec.fields if f.name == "image_version")
+    assert field.type == "docker-tags"
+    assert field.docker_image == "hub.simplito.com/deepfellow/deepfellow-finetune"
+
+
+@pytest.mark.asyncio
+async def test_get_docker_tags_for_model_finetune_uses_identity_filter(svc: CustomService) -> None:
+    client = MagicMock()
+    client.get_tags = AsyncMock(return_value=["0.0.1", "0.0.3", "0.0.4", "0.0.6"])
+    with patch("server.services.custom_service.registry_for", return_value=client):
+        tags = await svc.get_docker_tags_for_model("deepfellow-finetune", None)
+
+    assert tags == ["0.0.1", "0.0.3", "0.0.4", "0.0.6"]
 
 
 @pytest.mark.asyncio

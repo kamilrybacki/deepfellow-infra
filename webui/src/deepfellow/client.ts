@@ -550,13 +550,25 @@ export class DeepFellowClient {
   async getDockerTags(
     serviceId: string,
     hardware?: string,
-  ): Promise<{ image: string; tags: string[]; default: string | null }> {
-    const params = hardware ? `?hardware=${encodeURIComponent(hardware)}` : "";
+    fieldName?: string,
+    modelId?: string,
+  ): Promise<{
+    image: string;
+    tags: string[];
+    default: string | null;
+    registry_unavailable: boolean;
+  }> {
+    const params = new URLSearchParams();
+    if (hardware) params.set("hardware", hardware);
+    if (fieldName) params.set("field_name", fieldName);
+    if (modelId) params.set("model_id", modelId);
+    const query = params.toString() ? `?${params.toString()}` : "";
     return this.makeRequest<{
       image: string;
       tags: string[];
       default: string | null;
-    }>(`/admin/services/${encodeURIComponent(serviceId)}/docker-tags${params}`);
+      registry_unavailable: boolean;
+    }>(`/admin/services/${encodeURIComponent(serviceId)}/docker-tags${query}`);
   }
 
   async getDockerLogs(

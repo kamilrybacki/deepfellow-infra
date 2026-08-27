@@ -50,6 +50,7 @@ export interface DynamicFormFieldsProps {
   errors: Record<string, string>;
   onChange: (name: string, value: unknown) => void;
   serviceId?: string;
+  modelId?: string;
   /** Field names to render read-only (grayed out) - e.g. `id` while editing, since the backend
    * rejects changing it there and only allows a new one via duplicate. */
   disabledFields?: string[];
@@ -61,6 +62,7 @@ interface DockerTagsFieldProps {
   onChange: (value: string) => void;
   serviceId: string;
   hardware: string | undefined;
+  modelId: string | undefined;
 }
 
 function DockerTagsField({
@@ -69,6 +71,7 @@ function DockerTagsField({
   onChange,
   serviceId,
   hardware,
+  modelId,
 }: DockerTagsFieldProps) {
   const [open, setOpen] = useState(false);
   const [tags, setTags] = useState<string[]>([]);
@@ -88,7 +91,13 @@ function DockerTagsField({
     setLoading(true);
     setError(false);
     try {
-      const result = await apiClient.getDockerTags(serviceId, hardware);
+      const result = await apiClient.getDockerTags(
+        serviceId,
+        hardware,
+        field.name,
+        modelId,
+      );
+      setError(result.registry_unavailable);
       setTags(result.tags);
       setDefaultTag(result.default);
     } catch {
@@ -97,15 +106,16 @@ function DockerTagsField({
     } finally {
       setLoading(false);
     }
-  }, [serviceId, hardware]);
+  }, [serviceId, hardware, field.name, modelId]);
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError(false);
-    void apiClient.getDockerTags(serviceId, hardware).then(
+    void apiClient.getDockerTags(serviceId, hardware, field.name, modelId).then(
       (result) => {
         if (!cancelled) {
+          setError(result.registry_unavailable);
           setTags(result.tags);
           setDefaultTag(result.default);
           setLoading(false);
@@ -122,7 +132,7 @@ function DockerTagsField({
     return () => {
       cancelled = true;
     };
-  }, [serviceId, hardware]);
+  }, [serviceId, hardware, field.name, modelId]);
 
   const busy = loading;
 
@@ -217,6 +227,7 @@ export function DynamicFormFields({
   errors,
   onChange,
   serviceId,
+  modelId,
   disabledFields,
 }: DynamicFormFieldsProps) {
   const visibleFields = useMemo(
@@ -261,6 +272,7 @@ export function DynamicFormFields({
                     ? (formData[field.depends_on] as string | undefined)
                     : undefined
                 }
+                modelId={modelId}
               />
             ) : field.type === "bool" ? (
               <div className="flex items-center space-x-2">

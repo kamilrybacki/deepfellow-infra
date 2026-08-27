@@ -1154,6 +1154,8 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
         modal.open(DynamicFormModal, {
           title: `Install ${modelDetail.id}`,
           fields: modelDetail.spec.fields,
+          serviceId,
+          modelId: modelDetail.id,
           onSubmit: (spec: Record<string, unknown>) => {
             const cleanedSpec = Object.fromEntries(
               Object.entries(spec).filter(
@@ -1254,6 +1256,8 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
           fields: modelDetail.spec.fields,
           initialData: (installedInfo?.spec ?? {}) as Record<string, unknown>,
           selfModelId: modelDetail.id,
+          serviceId,
+          modelId: modelDetail.id,
           deferRender: true,
           submitLabel: "Save",
           onSubmit: (spec: Record<string, unknown>) => {
@@ -1408,6 +1412,7 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
     modal.open(DynamicFormModal, {
       title: "Add custom model",
       fields,
+      serviceId,
       deferRender: true,
       submitLabel: "Add",
       submittingLabel: "Adding...",
@@ -1601,6 +1606,7 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
         title: `Edit custom model ${model.id}`,
         duplicateTitle: `Duplicate ${model.id}`,
         fields,
+        serviceId,
         initialData: (model.custom_spec ?? {}) as Record<string, unknown>,
         selfModelId: model.id,
         deferRender: true,
@@ -1649,6 +1655,7 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
     },
     [
       modal,
+      serviceId,
       serviceInfo,
       existingModelRefs,
       editCustomModelMutation.mutate,

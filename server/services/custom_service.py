@@ -4,7 +4,8 @@
 """Custom service."""
 
 import asyncio
-from collections.abc import Callable
+import logging
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
@@ -48,14 +49,49 @@ from server.utils.core import (
     normalize_name,
     try_parse_pydantic,
 )
-from server.utils.hardware import NvidiaGpuInfo
+from server.utils.docker_image_version import apply_image_version_override, docker_tags_model_field, split_image_repo_tag
+from server.utils.hardware import HardwarePartInfo, NvidiaGpuInfo
+from server.utils.registry_client import RegistryUnavailableError, image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fmt_size
 
 # Token window accepted by BAAI/bge-m3, which the deepfellow-bge-m3 image serves unmodified.
 BGE_M3_CONTEXT_WINDOW = 8192
 
+logger = logging.getLogger("uvicorn.error")
+
 type SrvCustomModelX = Callable[["CustomService", str | None], SrvCustomModel]
 type DockerOptionsOrCallable = DockerOptions | Callable[[InstallModelOptions], DockerOptions]
+
+
+def _is_gpu_hardware(hardware_parts: Sequence[HardwarePartInfo]) -> bool:
+    return any(isinstance(h, NvidiaGpuInfo) for h in hardware_parts)
+
+
+def _model_default_image(model: "SrvCustomModel", hardware: str | None) -> str | None:
+    """Return the image a model's own DockerOptions would use for the given hardware.
+
+    Used to derive image-version selection generically from each model's existing hardware-aware
+    (or static) image logic, instead of maintaining a separate per-model image registry.
+
+    Raises RegistryUnavailableError (logged at `exception` level, naming the model) if the
+    model's DockerOptions builder itself fails — a regression there is a server bug, not a "tag
+    not available" situation, so callers should route it through the same fail-open handling as a
+    genuinely unreachable registry rather than reporting it as an invalid tag.
+    """
+    try:
+        docker_options = model.options({"hardware": hardware}) if isinstance(model.options, Callable) else model.options
+    except Exception as exc:
+        logger.exception("Failed to resolve default image for custom model %r (hardware=%r)", model.default_prefix, hardware)
+        msg = f"Failed to resolve default image for custom model {model.default_prefix!r}"
+        raise RegistryUnavailableError(msg) from exc
+    return docker_options.image or None
+
+
+def _tag_diff_tokens(tag_a: str, tag_b: str) -> tuple[set[str], set[str]]:
+    """Return the "-"-separated tokens unique to each tag, e.g. ("1.0.0-cpu", "1.0.0-cuda-12.8") -> ({"cpu"}, {"cuda", "12.8"})."""
+    tokens_a = {t for t in tag_a.lower().split("-") if t}
+    tokens_b = {t for t in tag_b.lower().split("-") if t}
+    return tokens_a - tokens_b, tokens_b - tokens_a
 
 
 @dataclass
@@ -139,8 +175,30 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
         """Load default models to instance."""
         self.models[instance] = {}
         subnet = self.docker_service.get_docker_subnet()
-        for model in _const.models.copy():
-            self.models[instance][model] = _const.models[model](self, subnet)
+        for model_id in _const.models.copy():
+            model = _const.models[model_id](self, subnet)
+            self._attach_docker_tags_field(model)
+            self.models[instance][model_id] = model
+
+    def _attach_docker_tags_field(self, model: "SrvCustomModel") -> None:
+        """Append a "docker-tags" version-selection field, inferred from the model's own default image.
+
+        Every built-in model already knows how to build its own DockerOptions (hardware-aware or
+        not); this reuses that logic to derive the repo instead of requiring each model to also
+        register itself in a separate image lookup.
+        """
+        if any(f.type == "docker-tags" for f in model.model_spec.fields):
+            return
+        try:
+            default_image = _model_default_image(model, None)
+        except RegistryUnavailableError:
+            return
+        if not default_image:
+            return
+        repo, tag = split_image_repo_tag(default_image)
+        if not tag:
+            return
+        model.model_spec.fields.append(docker_tags_model_field(repo, depends_on="hardware"))
 
     def get_type(self) -> str:
         """Return the service id."""
@@ -230,6 +288,71 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
                 CustomModelField(type="text", name="repository_url", description="Repository URL", required=False),
             ]
         )
+
+    def _get_builtin_model(self, model_id: str | None) -> "SrvCustomModel | None":
+        if not model_id:
+            return None
+        return self.models.get("default", {}).get(model_id)
+
+    def get_docker_image_repo_for_model(self, model_id: str | None, hardware: str | None) -> str | None:
+        """Return the Docker repo for a built-in model, derived from its own default image."""
+        model = self._get_builtin_model(model_id)
+        if not model:
+            return None
+        image = _model_default_image(model, hardware)
+        return split_image_repo_tag(image)[0] if image else None
+
+    def get_default_docker_tag_for_model(self, model_id: str | None, hardware: str | None) -> str | None:
+        """Return a built-in model's default image tag, derived from its own default image."""
+        model = self._get_builtin_model(model_id)
+        if not model:
+            return None
+        image = _model_default_image(model, hardware)
+        if not image:
+            return None
+        return split_image_repo_tag(image)[1] or None
+
+    async def get_docker_tags_for_model(self, model_id: str | None, hardware: str | None) -> list[str]:
+        """Fetch available Docker image tags for a built-in model, hardware-filtered when the repo is shared."""
+        model = self._get_builtin_model(model_id)
+        if not model:
+            return []
+        repo = self.get_docker_image_repo_for_model(model_id, hardware)
+        if not repo:
+            return []
+        client = registry_for(repo)
+        tags = await client.get_tags(image_without_registry_prefix(repo))
+        return self._filter_tags_for_hardware(model, tags, hardware)
+
+    def _filter_tags_for_hardware(self, model: "SrvCustomModel", tags: list[str], hardware: str | None) -> list[str]:
+        """Narrow tags to the selected hardware when one repo's tags encode both variants (e.g. "1.0.0-cpu").
+
+        Compares the model's own default image at CPU vs GPU to discover whether hardware affects
+        the tag at all, and if so which tokens distinguish the variants — no per-model config needed.
+        """
+        try:
+            cpu_image = _model_default_image(model, "CPU")
+            gpu_image = _model_default_image(model, "GPU")
+        except RegistryUnavailableError:
+            return tags
+        if not cpu_image or not gpu_image:
+            return tags
+        cpu_repo, cpu_tag = split_image_repo_tag(cpu_image)
+        gpu_repo, gpu_tag = split_image_repo_tag(gpu_image)
+        if cpu_repo != gpu_repo:
+            # Hardware already selects the repo itself, so every tag in it is valid.
+            return tags
+        cpu_only, gpu_only = _tag_diff_tokens(cpu_tag, gpu_tag)
+        if not cpu_only and not gpu_only:
+            return tags
+        is_gpu = _is_gpu_hardware(self.get_specified_hardware_parts(hardware))
+        wanted, unwanted = (gpu_only, cpu_only) if is_gpu else (cpu_only, gpu_only)
+        result = []
+        for t in tags:
+            tokens = {x for x in t.lower().split("-") if x}
+            if wanted & tokens and not unwanted & tokens:
+                result.append(t)
+        return result
 
     async def _resolve_custom_model_size(self, spec: dict[str, Any], instance: str = "") -> str | None:  # noqa: ARG002
         try:
@@ -369,6 +492,7 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
         installed_model = installed.models.get(model_id) if installed else None
         install_spec: dict[str, Any] = (installed_model.options.spec or {}) if installed_model else {}
         docker_options = model.options(install_spec) if isinstance(model.options, Callable) else model.options
+        docker_options = apply_image_version_override(docker_options, install_spec.get("image_version"))
         command = docker_options.command if isinstance(docker_options.command, str) else None
         healthcheck = docker_options.healthcheck or {}
         hardware_spec = self.canonicalize_hardware_spec(install_spec["hardware"]) if "hardware" in install_spec else None
@@ -482,9 +606,10 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
         if "prefix" not in options.spec:
             options.spec["prefix"] = model.default_prefix
         model.model_props.prefix = options.spec["prefix"]
-        spec = options.spec
-        parsed_model_options = try_parse_pydantic(CustomModelOptions, spec)
-        docker_options = model.options(spec) if isinstance(model.options, Callable) else model.options
+        parsed_model_options = try_parse_pydantic(CustomModelOptions, options.spec)
+        await self.validate_docker_image_version_for_model(model_id, options.spec.get("image_version"), options.spec.get("hardware"))
+        docker_options = model.options(options.spec) if isinstance(model.options, Callable) else model.options
+        docker_options = apply_image_version_override(docker_options, options.spec.get("image_version"))
         await self._verify_docker_image(docker_options.image, options.ignore_warnings)
 
         self._installing.add(key)
@@ -597,7 +722,7 @@ def create_bge_m3_model(custom_service: CustomService, subnet: str | None) -> Sr
         hardware_parts = custom_service.get_specified_hardware_parts(model_fields.get("hardware"))
         image = (
             "hub.simplito.com/deepfellow/deepfellow-bge-m3:1.0.0-cuda-12.8"
-            if any(isinstance(h, NvidiaGpuInfo) for h in hardware_parts)
+            if _is_gpu_hardware(hardware_parts)
             else "hub.simplito.com/deepfellow/deepfellow-bge-m3:1.0.0-cpu"
         )
         return DockerOptions(
@@ -685,7 +810,7 @@ def create_lemmatizer_model(custom_service: CustomService, subnet: str | None) -
         hardware_parts = custom_service.get_specified_hardware_parts(model_fields.get("hardware"))
         image = (
             "hub.simplito.com/deepfellow/deepfellow-lemmatizer:1.0.0-cuda-12.8"
-            if any(isinstance(h, NvidiaGpuInfo) for h in hardware_parts)
+            if _is_gpu_hardware(hardware_parts)
             else "hub.simplito.com/deepfellow/deepfellow-lemmatizer:1.0.0-cpu"
         )
         return DockerOptions(
@@ -923,7 +1048,7 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
         hardware_parts = custom_service.get_specified_hardware_parts(model_fields.get("hardware"))
         image = (
             "hub.simplito.com/deepfellow/doc-chunker-gpu:v1.0.3"
-            if any(isinstance(h, NvidiaGpuInfo) for h in hardware_parts)
+            if _is_gpu_hardware(hardware_parts)
             else "hub.simplito.com/deepfellow/doc-chunker-cpu:v1.0.3"
         )
         return DockerOptions(
