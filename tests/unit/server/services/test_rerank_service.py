@@ -1263,4 +1263,7 @@ async def test_install_instance_creates_hf_cache_dir_before_container_and_sets_u
 
     assert hub_existed == [True]
     assert captured[0].user == "1000:1000"
-    assert captured[0].volumes == [f"{tmp_path}/rerank/main:/root/.cache/huggingface"]
+    assert captured[0].volumes == [f"{tmp_path}/rerank/main:/mnt/hf"]
+    assert captured[0].env_vars["HF_HOME"] == "/mnt/hf"
+    assert captured[0].env_vars["USER"] == "deepfellow"
+    assert captured[0].env_vars["HOME"] == "/mnt/hf"
