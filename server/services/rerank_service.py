@@ -142,6 +142,7 @@ class DownloadedInfo:
 
 
 class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
+    hugging_face_cache_path = "/mnt/hf"
     models: dict[str, dict[str, RerankModel]]
     _installing: set[tuple[str, str]]
 
@@ -272,10 +273,12 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
             # bind-mount source as root:root and the host-side model download fails with PermissionError.
             cache_dir = self._get_working_dir() / "main"
             (cache_dir / "hub").mkdir(parents=True, exist_ok=True)
-            volumes = [f"{cache_dir}:/root/.cache/huggingface"]
+            volumes = [f"{cache_dir}:{self.hugging_face_cache_path}"]
             subnet = self.docker_service.get_docker_subnet()
             name = f"{self.get_service_id(instance)}"
-            envs = {}
+            # USER is set because torch's inductor cache falls back to getpass.getuser(), which raises
+            # `KeyError: getpwuid(): uid not found` for a uid with no passwd entry in the image.
+            envs = {"HF_HOME": self.hugging_face_cache_path, "USER": "deepfellow", "HOME": self.hugging_face_cache_path}
             if parsed_options.keep_alive is not None:
                 envs["DF_RERANK_KEEP_ALIVE"] = str(parsed_options.keep_alive)
             docker_options = DockerOptions(
