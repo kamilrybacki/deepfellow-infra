@@ -5,6 +5,7 @@
 
 import logging
 import re
+from urllib.parse import quote
 
 import aiohttp
 
@@ -36,11 +37,12 @@ async def _fetch_file_size_bytes(url: str) -> int | None:
         return int(content_length) if content_length else None
 
 
-async def _fetch_hf_size_bytes(hf_id: str) -> int | None:
+async def _fetch_hf_size_bytes(hf_id: str, revision: str | None = None) -> int | None:
+    url = f"{HF_API}/models/{hf_id}/revision/{quote(revision, safe='')}" if revision else f"{HF_API}/models/{hf_id}"
     async with (
         aiohttp.ClientSession() as session,
         session.get(
-            f"{HF_API}/models/{hf_id}",
+            url,
             params={"blobs": "true"},
             headers=_HEADERS,
             timeout=aiohttp.ClientTimeout(total=15),
@@ -110,11 +112,11 @@ async def fetch_file_size_from_url(url: str) -> str | None:
         return None
 
 
-async def fetch_huggingface_model_size(hf_id: str) -> str | None:
+async def fetch_huggingface_model_size(hf_id: str, revision: str | None = None) -> str | None:
     """Return human-readable total size from HuggingFace Hub API, or None on failure."""
     try:
-        n = await _fetch_hf_size_bytes(hf_id)
+        n = await _fetch_hf_size_bytes(hf_id, revision)
         return fmt_size(n) if n is not None else None
     except Exception:
-        logger.warning("Failed to fetch HuggingFace model size for: %s", hf_id)
+        logger.warning("Failed to fetch HuggingFace model size for: %s, revision: %s", hf_id, revision)
         return None

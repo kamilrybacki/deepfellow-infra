@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from server.utils.size_fetcher import (
+    HF_API,
     _fetch_file_size_bytes,  # pyright: ignore[reportPrivateUsage]
     _fetch_hf_size_bytes,  # pyright: ignore[reportPrivateUsage]
     _fetch_ollama_size_bytes,  # pyright: ignore[reportPrivateUsage]
@@ -210,6 +211,36 @@ async def test_fetch_hf_size_bytes(json_response: dict[str, Any], expected: int 
         result = await _fetch_hf_size_bytes("google/gemma")
 
     assert result == expected
+
+
+@pytest.mark.asyncio
+async def test_fetch_hf_size_bytes_uses_revision_url() -> None:
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json = AsyncMock(return_value={"siblings": [{"size": 1024}]})
+    session_mock = _make_session_mock(resp, "get")
+
+    with patch("server.utils.size_fetcher.aiohttp.ClientSession", session_mock):
+        result = await _fetch_hf_size_bytes("google/gemma", revision="quantized-awq")
+
+    requested_url = session_mock.return_value.__aenter__.return_value.get.call_args.args[0]
+    assert requested_url == f"{HF_API}/models/google/gemma/revision/quantized-awq"
+    assert result == 1024
+
+
+@pytest.mark.asyncio
+async def test_fetch_hf_size_bytes_url_encodes_revision() -> None:
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json = AsyncMock(return_value={"siblings": [{"size": 1024}]})
+    session_mock = _make_session_mock(resp, "get")
+
+    with patch("server.utils.size_fetcher.aiohttp.ClientSession", session_mock):
+        result = await _fetch_hf_size_bytes("google/gemma", revision="refs/pr/1#notes")
+
+    requested_url = session_mock.return_value.__aenter__.return_value.get.call_args.args[0]
+    assert requested_url == f"{HF_API}/models/google/gemma/revision/refs%2Fpr%2F1%23notes"
+    assert result == 1024
 
 
 def _make_ollama_html_with_tag(tag: str, size_str: str) -> str:

@@ -184,6 +184,7 @@ def test_get_custom_model_spec_not_none(svc: VllmService) -> None:
     field_names = [f.name for f in result.fields]
     assert "id" in field_names
     assert "hf_id" in field_names
+    assert "revision" in field_names
     assert "size" in field_names
 
 
@@ -242,6 +243,7 @@ def test_generate_instance_config_embeds_definition_when_in_registry(svc: VllmSe
 
     assert (config.models or [])[0].definition == {
         "hf_id": "m1",
+        "revision": None,
         "env_vars": None,
         "quantization": None,
         "dtype": "auto",
@@ -351,6 +353,17 @@ def test_add_custom_model_registers_entry(svc: VllmService) -> None:
     assert "my-model" in svc.models["default"]
     assert svc.models["default"]["my-model"].custom == "c-1"
     assert svc.models["default"]["my-model"].hf_id == "google/gemma-3-270m-it"
+    assert svc.models["default"]["my-model"].revision is None
+
+
+def test_add_custom_model_registers_revision(svc: VllmService) -> None:
+    custom = CustomModel(
+        id="c-1b", data={"id": "my-model-rev", "hf_id": "google/gemma-3-270m-it", "revision": "quantized-awq", "size": "1GB"}
+    )
+
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    assert svc.models["default"]["my-model-rev"].revision == "quantized-awq"
 
 
 def test_add_custom_model_duplicate_raises_400(svc: VllmService) -> None:
@@ -455,12 +468,12 @@ async def test_download_model_emits_initial_and_final_progress(svc: VllmService,
     local_path = tmp_path / "model-files"
     local_path.mkdir()
 
-    async def mock_download(*args: object):  # type: ignore[misc]
+    async def mock_download(*args: object, **kwargs: object):  # type: ignore[misc]
         yield SuccessDownloadPacket(local_path=local_path, filename="model-files")
 
     deps["model_downloader"].download = mock_download
 
-    await svc._download_model(stream, "google/test-model", model, tmp_path)  # pyright: ignore[reportPrivateUsage]
+    await svc._download_model(stream, model, tmp_path)  # pyright: ignore[reportPrivateUsage]
 
     assert stream.emit.call_count >= 2
 
@@ -472,13 +485,13 @@ async def test_download_model_updates_progress_on_downloaded_packet(svc: VllmSer
     local_path = tmp_path / "model-files"
     local_path.mkdir()
 
-    async def mock_download(*args: object):  # type: ignore[misc]
+    async def mock_download(*args: object, **kwargs: object):  # type: ignore[misc]
         yield DownloadedPacket(downloaded_bytes_size=1024 * 1024)
         yield SuccessDownloadPacket(local_path=local_path, filename="model-files")
 
     deps["model_downloader"].download = mock_download
 
-    await svc._download_model(stream, "google/test-model", model, tmp_path)  # pyright: ignore[reportPrivateUsage]
+    await svc._download_model(stream, model, tmp_path)  # pyright: ignore[reportPrivateUsage]
 
     progress_calls = [call for call in stream.emit.call_args_list if hasattr(call.args[0], "get") and call.args[0].get("value", 0) > 0]
     assert len(progress_calls) >= 1
@@ -810,6 +823,99 @@ async def test_install_model_calls_docker_install(svc: VllmService, deps: dict[s
         await promise.wait()
 
     assert deps["docker_service"].install_and_run_docker.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_install_model_appends_revision_suffix_to_model_dir(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    _setup_install_mocks(svc, deps)
+    svc.models["default"]["custom-model"] = VllmModel(hf_id="google/gemma-3-270m-it", revision="quantized/awq", size="1GB")
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", "custom-model", InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert "google-gemma-3-270m-it--quantized_awq" in docker_options.volumes[0]
+
+
+@pytest.mark.asyncio
+async def test_install_model_dedups_download_by_revision_aware_key(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """Two custom models sharing an hf_id but differing only by revision must not share a download dedup key.
+
+    Otherwise the second install would see the first's (bare hf_id) key already "in progress" and be
+    handed the first revision's model_dir instead of downloading its own.
+    """
+    _setup_install_mocks(svc, deps)
+    svc.models["default"]["custom-model"] = VllmModel(hf_id="google/gemma-3-270m-it", revision="quantized/awq", size="1GB")
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model") as mock_download,  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", "custom-model", InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    download_key = mock_download.call_args.args[1]
+    assert download_key == "google-gemma-3-270m-it--quantized_awq"
+
+
+def test_purge_stale_download_removes_old_directory_when_path_changed(svc: VllmService, tmp_path: Path) -> None:
+    old_dir = tmp_path / "old-model"
+    old_dir.mkdir()
+    new_dir = tmp_path / "new-model"
+    svc.models_downloaded["custom-model"] = DownloadedInfo(model_path=str(old_dir))
+
+    svc._purge_stale_download("custom-model", new_dir)  # pyright: ignore[reportPrivateUsage]
+
+    assert not old_dir.exists()
+
+
+def test_purge_stale_download_keeps_directory_when_path_unchanged(svc: VllmService, tmp_path: Path) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    svc.models_downloaded["custom-model"] = DownloadedInfo(model_path=str(model_dir))
+
+    svc._purge_stale_download("custom-model", model_dir)  # pyright: ignore[reportPrivateUsage]
+
+    assert model_dir.exists()
+
+
+def test_purge_stale_download_noop_when_nothing_downloaded_yet(svc: VllmService, tmp_path: Path) -> None:
+    svc._purge_stale_download("custom-model", tmp_path / "model")  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_install_model_edit_cleans_up_previous_download_directory(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """Reinstalling a custom model under a new hf_id/revision must delete its old download directory.
+
+    Otherwise the old directory is orphaned forever - nothing references it once
+    `models_downloaded[model_id]` is overwritten with the new path.
+    """
+    _setup_install_mocks(svc, deps)
+    svc.models["default"]["custom-model"] = VllmModel(hf_id="google/gemma-3-270m-it", size="1GB")
+    old_dir = tmp_path / "old-model"
+    old_dir.mkdir()
+    svc.models_downloaded["custom-model"] = DownloadedInfo(model_path=str(old_dir))
+    new_dir = tmp_path / "new-model"
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=new_dir),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", "custom-model", InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    assert not old_dir.exists()
+    assert svc.models_downloaded["custom-model"].model_path == str(new_dir)
 
 
 @pytest.mark.asyncio
@@ -1619,14 +1725,14 @@ async def test_download_model_handles_pre_download_packet_with_size(svc: VllmSer
     model = VllmModel(hf_id="google/test", size="100MB")
     stream = MagicMock()
 
-    async def mock_download(*args: object):  # type: ignore[misc]
+    async def mock_download(*args: object, **kwargs: object):  # type: ignore[misc]
         yield PreDownloadPacket(file_bytes_size=50 * 1024 * 1024)
         yield SuccessDownloadPacket(local_path=tmp_path / "model", filename="model")
 
     deps["model_downloader"].download = mock_download
 
     with patch.object(svc, "_get_working_dir", return_value=tmp_path):  # pyright: ignore[reportPrivateUsage]
-        local_path = await svc._download_model(stream, "google/test", model, tmp_path)  # pyright: ignore[reportPrivateUsage]
+        local_path = await svc._download_model(stream, model, tmp_path)  # pyright: ignore[reportPrivateUsage]
 
     assert local_path is not None
 
@@ -1751,7 +1857,7 @@ async def test_download_model_raises_500_when_no_success_packet(svc: VllmService
     model = VllmModel(hf_id="google/test", size="100MB")
     stream = MagicMock()
 
-    async def mock_download(*args: object):  # type: ignore[misc]
+    async def mock_download(*args: object, **kwargs: object):  # type: ignore[misc]
         yield DownloadedPacket(downloaded_bytes_size=1024)
 
     deps["model_downloader"].download = mock_download
@@ -1760,7 +1866,7 @@ async def test_download_model_raises_500_when_no_success_packet(svc: VllmService
         patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
         pytest.raises(HTTPException) as exc_info,
     ):
-        await svc._download_model(stream, "google/test", model, tmp_path)  # pyright: ignore[reportPrivateUsage]
+        await svc._download_model(stream, model, tmp_path)  # pyright: ignore[reportPrivateUsage]
 
     assert exc_info.value.status_code == 500
 
@@ -1834,12 +1940,12 @@ async def test_download_model_handles_pre_download_packet_without_file_size(svc:
     local_path = tmp_path / "model-files"
     local_path.mkdir()
 
-    async def mock_download(*args: object):  # type: ignore[misc]
+    async def mock_download(*args: object, **kwargs: object):  # type: ignore[misc]
         yield PreDownloadPacket(file_bytes_size=None)  # pyright: ignore[reportArgumentType]
         yield SuccessDownloadPacket(local_path=local_path, filename="model-files")
 
     deps["model_downloader"].download = mock_download
-    result = await svc._download_model(stream, "google/test", model, tmp_path)  # pyright: ignore[reportPrivateUsage]
+    result = await svc._download_model(stream, model, tmp_path)  # pyright: ignore[reportPrivateUsage]
 
     assert result == local_path
 
@@ -1851,12 +1957,12 @@ async def test_download_model_ignores_zero_bytes_downloaded_packet(svc: VllmServ
     local_path = tmp_path / "model-files"
     local_path.mkdir()
 
-    async def mock_download(*args: object):  # type: ignore[misc]
+    async def mock_download(*args: object, **kwargs: object):  # type: ignore[misc]
         yield DownloadedPacket(downloaded_bytes_size=0)
         yield SuccessDownloadPacket(local_path=local_path, filename="model-files")
 
     deps["model_downloader"].download = mock_download
-    result = await svc._download_model(stream, "google/test", model, tmp_path)  # pyright: ignore[reportPrivateUsage]
+    result = await svc._download_model(stream, model, tmp_path)  # pyright: ignore[reportPrivateUsage]
 
     assert result == local_path
 

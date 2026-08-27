@@ -10,7 +10,7 @@ from abc import abstractmethod
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any, Never, NotRequired, TypedDict
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import quote, urlparse, urlunparse
 from uuid import uuid4
 
 from aiohttp import ClientSession
@@ -72,7 +72,9 @@ class BaseDownloader(BDownloader):
         """Check is url handled by this downloader."""
 
     @abstractmethod
-    def download(self, url: str, model_dir: Path, temp_dir: Path, filename: str | None = None) -> AsyncGenerator[DownloadPacket]:
+    def download(
+        self, url: str, model_dir: Path, temp_dir: Path, filename: str | None = None, revision: str | None = None
+    ) -> AsyncGenerator[DownloadPacket]:
         """Download model."""
 
 
@@ -81,7 +83,14 @@ class StandardModelDownloader(BaseDownloader):
         """Check is url handled by this downloader."""
         return True
 
-    async def download(self, url: str, model_dir: Path, temp_dir: Path, filename: str | None = None) -> AsyncGenerator[DownloadPacket]:
+    async def download(
+        self,
+        url: str,
+        model_dir: Path,
+        temp_dir: Path,
+        filename: str | None = None,
+        revision: str | None = None,  # noqa: ARG002
+    ) -> AsyncGenerator[DownloadPacket]:
         """Download model."""
         async for packet in Utils.ensure_model_downloaded(url, model_dir, temp_dir, filename):
             yield packet
@@ -247,10 +256,10 @@ class HuggingFaceRepoDownloader(BaseDownloader):
         return not url.startswith("http") or (bool(re.search(self.huggingface_url_pattern, url)))
 
     @staticmethod
-    async def get_filenames(model_id: str) -> tuple[list[str], int]:
+    async def get_filenames(model_id: str, revision: str | None = None) -> tuple[list[str], int]:
         """Get filenames from repository."""
         filenames: list[str] = []
-        url = f"https://huggingface.co/api/models/{model_id}/tree/main"
+        url = f"https://huggingface.co/api/models/{model_id}/tree/{quote(revision, safe='') if revision else 'main'}"
 
         data: list[dict[str, Any]] = []
         size = 0
@@ -269,7 +278,9 @@ class HuggingFaceRepoDownloader(BaseDownloader):
 
         return filenames, size
 
-    async def download(self, url: str, model_dir: Path, temp_dir: Path, filename: str | None = None) -> AsyncGenerator[DownloadPacket]:
+    async def download(
+        self, url: str, model_dir: Path, temp_dir: Path, filename: str | None = None, revision: str | None = None
+    ) -> AsyncGenerator[DownloadPacket]:
         """Download model."""
         url_parsed = urlparse(url)
         model_id = urlunparse(url_parsed._replace(query=""))
@@ -279,7 +290,7 @@ class HuggingFaceRepoDownloader(BaseDownloader):
                 model_id = match.group(1)
 
         try:
-            filenames, size = await self.get_filenames(model_id)
+            filenames, size = await self.get_filenames(model_id, revision)
         except HttpClientError as e:
             if e.status_code == 401:
                 # get_filenames never sends an auth header, so a 401 here can only mean HF didn't
@@ -288,7 +299,7 @@ class HuggingFaceRepoDownloader(BaseDownloader):
             self._raise_http_error(e, f"https://huggingface.co/{model_id}")
         yield PreDownloadPacket(size)
         for filename in filenames:
-            whole_url = f"https://huggingface.co/{model_id}/resolve/main/{filename}"
+            whole_url = f"https://huggingface.co/{model_id}/resolve/{quote(revision, safe='') if revision else 'main'}/{filename}"
             try:
                 async for packet in Utils.ensure_model_downloaded(whole_url, model_dir, temp_dir, filename, self.headers):
                     if not isinstance(packet, PreDownloadPacket):
@@ -330,7 +341,14 @@ class HuggingFaceModelDownloader(BaseDownloader):
         """Check is url handled by this downloader."""
         return bool(url.startswith("https://huggingface.co/") and ".gguf" in url)
 
-    async def download(self, url: str, model_dir: Path, temp_dir: Path, filename: str | None = None) -> AsyncGenerator[DownloadPacket]:
+    async def download(
+        self,
+        url: str,
+        model_dir: Path,
+        temp_dir: Path,
+        filename: str | None = None,
+        revision: str | None = None,  # noqa: ARG002
+    ) -> AsyncGenerator[DownloadPacket]:
         """Download model."""
         url_parsed = urlparse(url)
         url_without_query = urlunparse(url_parsed._replace(query=""))
@@ -363,7 +381,14 @@ class CivitaiModelDownloader(BaseDownloader):
         """Add token to url."""
         return Utils.add_url_parameter_if_missing(url, "token", self.token)
 
-    async def download(self, url: str, model_dir: Path, temp_dir: Path, filename: str | None = None) -> AsyncGenerator[DownloadPacket]:
+    async def download(
+        self,
+        url: str,
+        model_dir: Path,
+        temp_dir: Path,
+        filename: str | None = None,
+        revision: str | None = None,  # noqa: ARG002
+    ) -> AsyncGenerator[DownloadPacket]:
         """Download model."""
         try:
             async for packet in Utils.ensure_model_downloaded(self.add_token_to_url(url), model_dir, temp_dir, filename):
@@ -398,7 +423,14 @@ class AdapterRegistryDownloader(BaseDownloader):
         logger.debug("AdapterRegistryDownloader.check_url: url=%s, registry_url=%s, match=%s", url, self.registry_url, match)
         return match
 
-    async def download(self, url: str, model_dir: Path, temp_dir: Path, filename: str | None = None) -> AsyncGenerator[DownloadPacket]:
+    async def download(
+        self,
+        url: str,
+        model_dir: Path,
+        temp_dir: Path,
+        filename: str | None = None,
+        revision: str | None = None,  # noqa: ARG002
+    ) -> AsyncGenerator[DownloadPacket]:
         """Download adapter directly from the given URL using Bearer token authentication."""
         filename_out = filename if filename is not None else url.split("/")[-1].split("?")[0]
         local_path = model_dir / filename_out
@@ -455,7 +487,9 @@ class ModelDownloader:
             self.temp_dir,
         )
 
-    async def download(self, url: str, model_dir: Path, filename: str | None = None) -> AsyncGenerator[DownloadPacket]:
+    async def download(
+        self, url: str, model_dir: Path, filename: str | None = None, revision: str | None = None
+    ) -> AsyncGenerator[DownloadPacket]:
         """Download model."""
         specified_downloader = self.standard_downloader
         for downloader in self.custom_downloaders:
@@ -465,7 +499,7 @@ class ModelDownloader:
         logger.debug("ModelDownloader.download: url=%s, selected=%s", url, type(specified_downloader).__name__)
         progress = Progress(0)
         last_logged_percentage = 0.0
-        async for packet in specified_downloader.download(url, model_dir, self.temp_dir, filename):
+        async for packet in specified_downloader.download(url, model_dir, self.temp_dir, filename, revision):
             if isinstance(packet, PreDownloadPacket) and packet.file_bytes_size:
                 progress.set_max_value(packet.file_bytes_size)
             elif isinstance(packet, DownloadedPacket) and progress.max:
