@@ -10,7 +10,7 @@ ARG UI_VARIANT=legacy
 FROM hub.simplito.com/public/python-docker:3.13.11-docker29.1.2@sha256:11f127bf40f09b49f3b21ada7174242c391c81185811f8d413bd165680fa0d0b AS base
 
 FROM base AS builder
-COPY --from=hub.simplito.com/public/uv:0.8.12@sha256:f64ad69940b634e75d2e4d799eb5238066c5eeda49f76e782d4873c3d014ea33 /uv /uvx /bin/
+COPY --from=hub.simplito.com/public/uv:0.11.8@sha256:3b7b60a81d3c57ef471703e5c83fd4aaa33abcd403596fb22ab07db85ae91347 /uv /uvx /bin/
 
 WORKDIR /app
 COPY . .
