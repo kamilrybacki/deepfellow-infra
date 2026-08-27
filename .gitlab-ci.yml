@@ -152,6 +152,73 @@ build_and_publish_docker_image:
     - main
     - /^hotfix-.*$/
 
+# Builds the image with the DeepFellow Dashboard in place of the legacy web UI, so the alternative UI has a gate
+# rather than only a description. It builds and does not push, because nothing deploys this variant yet.
+#
+# Manual, and allowed to fail, on purpose. It is a proof of concept, and a red pipeline must never be the price of one.
+#
+# It needs one CI/CD variable, GITLAB_NPM_TOKEN, holding a read token for the Modular Frontend project's package
+# registry. Without it the job cannot install the Dashboard artifact, and it drops itself instead of failing.
+# `webui2/README.md` explains what kind of token that is.
+build_dashboard_variant_image:
+  stage: build
+  image: docker:27.3.1
+  services:
+    - name: docker:27.3.1-dind
+      command: ["--tls=false"]
+  variables:
+    # The registry is another project's, and `CI_JOB_TOKEN` reads it because that project lists this one in its inbound
+    # job-token allowlist. So no token is stored anywhere, nothing is readable by anybody else, and nothing to rotate.
+    # `.npmrc` in webui2/ reads this name, so the name stays.
+    GITLAB_NPM_TOKEN: $CI_JOB_TOKEN
+  script:
+    # The token reaches the build as a BuildKit secret, so it never becomes a layer or a build argument.
+    - echo "$GITLAB_NPM_TOKEN" > /tmp/gitlab_npm_token
+    - DOCKER_BUILDKIT=1 docker build --build-arg UI_VARIANT=dashboard --secret id=gitlab_npm_token,src=/tmp/gitlab_npm_token -t dashboard-variant-check .
+    # A build that succeeds proves nothing about what it produced. These three read the image itself.
+    # Without them the job stays green while the variant ships an empty `static/`, which is exactly the failure
+    # a reader of a green pipeline would never suspect.
+    - docker run --rm --entrypoint sh dashboard-variant-check -c 'test -f /app/static/index.html'
+    - docker run --rm --entrypoint sh dashboard-variant-check -c 'test -d /app/static/assets'
+    # A UI build must never remove the committed files this service serves from the same directory.
+    - docker run --rm --entrypoint sh dashboard-variant-check -c 'test -f /app/static/ollama.json'
+  after_script:
+    # `after_script` runs even when the build fails, and the last `script` line does not.
+    - rm -f /tmp/gitlab_npm_token
+  rules:
+    # A FORK is not on the artifact project's inbound job-token allowlist, so its `CI_JOB_TOKEN` cannot read the
+    # registry and this job would fail rather than drop. Only this project runs it.
+    - if: '$CI_PROJECT_PATH != "df/deepfellow-infra"'
+      when: never
+    # No job in this file runs on a merge request today, so this one must not be the first: it would start a detached
+    # pipeline holding this job alone.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    # Automatic, and blocking. It was manual and `allow_failure` while this was only a description. It now builds the
+    # image a service would ship, and reads what came out, so a break here is a break somebody has to see.
+    - when: on_success
+
+# Verify that .gitignore still covers every file name the Dashboard build emits.
+# That list lives in two places that cannot read each other: `.gitignore`, which git reads and cannot compute, and the
+# installed package's own manifest. A Dashboard release that renames a file makes them disagree, and the first sign
+# would be a build output committed by accident.
+check_dashboard_ui_ignores:
+  stage: build
+  image: node:24-alpine
+  variables:
+    GITLAB_NPM_TOKEN: $CI_JOB_TOKEN
+  before_script:
+    - apk add --no-cache git just
+  script:
+    - cd webui2 && npm ci && cd ..
+    - just ui2-check-ignores
+  rules:
+    - if: '$CI_PROJECT_PATH != "df/deepfellow-infra"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - when: on_success
+
 tag_docker_image:
   stage: build
   image: docker:27.3.1

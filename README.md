@@ -31,6 +31,9 @@ Requires [just](https://github.com/casey/just). To start the development server:
 just dev
 ```
 
+`webui2/` holds a proof of concept that installs the DeepFellow Dashboard as this service's web UI, in place of
+`webui/`. It is not what the image serves today. See [`webui2/README.md`](webui2/README.md).
+
 ## Docker Image
 
 Build the image:
