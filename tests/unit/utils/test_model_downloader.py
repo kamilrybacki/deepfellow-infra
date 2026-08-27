@@ -236,6 +236,82 @@ async def test_hf_repo_downloader_get_filenames_invalid_size_raises() -> None:
 
 
 @pytest.mark.asyncio
+async def test_hf_repo_downloader_get_filenames_uses_revision() -> None:
+    mock_response = AsyncMock()
+    mock_response.status = 200
+    mock_response.json = AsyncMock(return_value=[{"type": "file", "path": "model.safetensors", "size": 1000}])
+    client_session_mock = make_client_session_mock(mock_response)
+
+    with patch("server.utils.model_downloader.ClientSession", client_session_mock):
+        await HuggingFaceRepoDownloader.get_filenames("user/repo", revision="v2")
+
+    session_mock = client_session_mock.return_value.__aenter__.return_value
+    requested_url = session_mock.get.call_args.args[0]
+    assert requested_url == "https://huggingface.co/api/models/user/repo/tree/v2"
+
+
+@pytest.mark.asyncio
+async def test_hf_repo_downloader_download_uses_revision_in_resolve_url(tmp_path: Path) -> None:
+    dl = _make_hf_repo_dl()
+    model_dir = tmp_path / "models"
+    temp_dir = tmp_path / "temp"
+    model_dir.mkdir()
+
+    captured_urls: list[str] = []
+
+    async def mock_ensure(url: str, *args: Any, **kwargs: Any):
+        captured_urls.append(url)
+        yield DownloadedPacket(100)
+
+    with (
+        patch.object(HuggingFaceRepoDownloader, "get_filenames", new=AsyncMock(return_value=(["model.safetensors"], 1000))),
+        patch("server.utils.model_downloader.Utils.ensure_model_downloaded", side_effect=mock_ensure),
+    ):
+        packets = [p async for p in dl.download("user/repo", model_dir, temp_dir, revision="v2")]
+
+    assert captured_urls == ["https://huggingface.co/user/repo/resolve/v2/model.safetensors"]
+    assert isinstance(packets[-1], SuccessDownloadPacket)
+
+
+@pytest.mark.asyncio
+async def test_hf_repo_downloader_get_filenames_url_encodes_revision() -> None:
+    mock_response = AsyncMock()
+    mock_response.status = 200
+    mock_response.json = AsyncMock(return_value=[{"type": "file", "path": "model.safetensors", "size": 1000}])
+    client_session_mock = make_client_session_mock(mock_response)
+
+    with patch("server.utils.model_downloader.ClientSession", client_session_mock):
+        await HuggingFaceRepoDownloader.get_filenames("user/repo", revision="refs/pr/1#notes")
+
+    session_mock = client_session_mock.return_value.__aenter__.return_value
+    requested_url = session_mock.get.call_args.args[0]
+    assert requested_url == "https://huggingface.co/api/models/user/repo/tree/refs%2Fpr%2F1%23notes"
+
+
+@pytest.mark.asyncio
+async def test_hf_repo_downloader_download_url_encodes_revision_in_resolve_url(tmp_path: Path) -> None:
+    dl = _make_hf_repo_dl()
+    model_dir = tmp_path / "models"
+    temp_dir = tmp_path / "temp"
+    model_dir.mkdir()
+
+    captured_urls: list[str] = []
+
+    async def mock_ensure(url: str, *args: Any, **kwargs: Any):
+        captured_urls.append(url)
+        yield DownloadedPacket(100)
+
+    with (
+        patch.object(HuggingFaceRepoDownloader, "get_filenames", new=AsyncMock(return_value=(["model.safetensors"], 1000))),
+        patch("server.utils.model_downloader.Utils.ensure_model_downloaded", side_effect=mock_ensure),
+    ):
+        packets = [p async for p in dl.download("user/repo", model_dir, temp_dir, revision="refs/pr/1#notes")]
+
+    assert captured_urls == ["https://huggingface.co/user/repo/resolve/refs%2Fpr%2F1%23notes/model.safetensors"]
+    assert isinstance(packets[-1], SuccessDownloadPacket)
+
+
+@pytest.mark.asyncio
 async def test_hf_repo_downloader_download_extracts_model_id_from_tree_url(tmp_path: Path) -> None:
     dl = _make_hf_repo_dl()
     model_dir = tmp_path / "models"
@@ -303,7 +379,7 @@ async def test_hf_repo_downloader_download_maps_401_from_get_filenames_to_404_no
     model_dir = tmp_path / "models"
     temp_dir = tmp_path / "temp"
 
-    async def failing_get_filenames(model_id: str) -> tuple[list[str], int]:
+    async def failing_get_filenames(model_id: str, revision: str | None = None) -> tuple[list[str], int]:
         raise HttpClientError(
             message="error", status_code=401, headers=CIMultiDictProxy(CIMultiDict()), body="Invalid username or password."
         )
@@ -325,7 +401,7 @@ async def test_hf_repo_downloader_download_other_status_from_get_filenames_goes_
     model_dir = tmp_path / "models"
     temp_dir = tmp_path / "temp"
 
-    async def failing_get_filenames(model_id: str) -> tuple[list[str], int]:
+    async def failing_get_filenames(model_id: str, revision: str | None = None) -> tuple[list[str], int]:
         raise make_http_error("Invalid credentials in Authorization header")
 
     with (
@@ -346,7 +422,7 @@ async def test_hf_repo_downloader_download_http_url_not_matching_hf_pattern_uses
     model_dir.mkdir()
     captured_model_id: list[str] = []
 
-    async def capture(model_id: str) -> tuple[list[str], int]:
+    async def capture(model_id: str, revision: str | None = None) -> tuple[list[str], int]:
         captured_model_id.append(model_id)
         return ([], 0)
 
@@ -856,7 +932,7 @@ async def test_model_downloader_download_routes_civitai_url_to_civitai_downloade
     model_dir.mkdir()
     routed_to: list[str] = []
 
-    async def mock_civitai_download(url: str, model_dir: Path, temp_dir: Path, filename: str | None = None):
+    async def mock_civitai_download(url: str, model_dir: Path, temp_dir: Path, filename: str | None = None, revision: str | None = None):
         routed_to.append("civitai")
         yield SuccessDownloadPacket(model_dir)
 
@@ -876,7 +952,7 @@ async def test_model_downloader_download_falls_back_to_standard_downloader_for_u
     model_dir.mkdir()
     routed_to: list[str] = []
 
-    async def mock_standard_download(url: str, model_dir: Path, temp_dir: Path, filename: str | None = None):
+    async def mock_standard_download(url: str, model_dir: Path, temp_dir: Path, filename: str | None = None, revision: str | None = None):
         routed_to.append("standard")
         yield SuccessDownloadPacket(model_dir)
 
@@ -896,7 +972,7 @@ async def test_model_downloader_download_routes_huggingface_gguf_url_to_hf_model
     model_dir.mkdir()
     routed_to: list[str] = []
 
-    async def mock_hf_model_download(url: str, model_dir: Path, temp_dir: Path, filename: str | None = None):
+    async def mock_hf_model_download(url: str, model_dir: Path, temp_dir: Path, filename: str | None = None, revision: str | None = None):
         routed_to.append("hf_model")
         yield SuccessDownloadPacket(model_dir)
 
@@ -915,7 +991,7 @@ async def test_model_downloader_download_logs_progress_percentage(tmp_path: Path
     model_dir = tmp_path / "models"
     model_dir.mkdir()
 
-    async def mock_standard_download(url: str, model_dir: Path, temp_dir: Path, filename: str | None = None):
+    async def mock_standard_download(url: str, model_dir: Path, temp_dir: Path, filename: str | None = None, revision: str | None = None):
         yield PreDownloadPacket(100)
         yield DownloadedPacket(5)  # below the 10% log step, should not log yet
         yield DownloadedPacket(45)  # crosses 50%, should log
@@ -941,7 +1017,7 @@ async def test_model_downloader_download_does_not_log_progress_when_size_unknown
     model_dir = tmp_path / "models"
     model_dir.mkdir()
 
-    async def mock_standard_download(url: str, model_dir: Path, temp_dir: Path, filename: str | None = None):
+    async def mock_standard_download(url: str, model_dir: Path, temp_dir: Path, filename: str | None = None, revision: str | None = None):
         yield PreDownloadPacket(0)
         yield DownloadedPacket(50)
         yield SuccessDownloadPacket(model_dir)

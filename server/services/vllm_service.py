@@ -72,6 +72,7 @@ logger = logging.getLogger("uvicorn.error")
 
 class VllmModel(BaseModel):
     hf_id: str
+    revision: str | None = None
     env_vars: dict[str, str] | None = None
     quantization: str | None = None
     dtype: str = "auto"
@@ -87,6 +88,7 @@ class VllmModel(BaseModel):
 class VllmCustomModel(BaseModel):
     id: str
     hf_id: str
+    revision: str | None = None
     size: str
     model_type: Literal["llm", "reranker", "embedding"] = "llm"
 
@@ -293,6 +295,13 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             fields=[
                 CustomModelField(type="text", name="id", description="Model ID", placeholder="my-custom-model"),
                 CustomModelField(type="text", name="hf_id", description="Hugging face model ID", placeholder="google/gemma-3-270m-it"),
+                CustomModelField(
+                    type="text",
+                    name="revision",
+                    description="Hugging face branch, tag, or commit SHA (defaults to the repo's main branch)",
+                    placeholder="main",
+                    required=False,
+                ),
                 CustomModelField(type="text", name="size", description="Model size", placeholder="1 GB", required=False),
                 CustomModelField(
                     type="oneof",
@@ -307,9 +316,9 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
 
     async def _resolve_custom_model_size(self, spec: dict[str, Any], instance: str = "") -> str | None:  # noqa: ARG002
         try:
-            return await fetch_huggingface_model_size(spec["hf_id"])
+            return await fetch_huggingface_model_size(spec["hf_id"], spec.get("revision"))
         except Exception:
-            logger.debug("Couldn't resolve size for a custom model id = %s", spec["hf_id"])
+            logger.debug("Couldn't resolve size for a custom model id = %s, revision = %s", spec["hf_id"], spec.get("revision"))
             return None
 
     def get_installed_info(self, instance: str) -> bool | InstallServiceProgress | ServiceOptions:
@@ -455,7 +464,9 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         if parsed.id in self.models[instance]:
             raise HTTPException(400, "Model with given id already exists.")
 
-        self.models[instance][parsed.id] = VllmModel(hf_id=parsed.hf_id, size=parsed.size, custom=model.id, model_type=parsed.model_type)
+        self.models[instance][parsed.id] = VllmModel(
+            hf_id=parsed.hf_id, revision=parsed.revision, size=parsed.size, custom=model.id, model_type=parsed.model_type
+        )
 
     def _remove_custom_model(self, instance: str, model: CustomModel) -> None:
         installed = self.get_instance_info(instance).installed
@@ -530,11 +541,11 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             vram_estimate_gb=vram_estimate_gb,
         )
 
-    async def _download_model(self, stream: Stream[StreamChunk], model_id: str, model: VllmModel, model_dir: Path) -> Path | None:
+    async def _download_model(self, stream: Stream[StreamChunk], model: VllmModel, model_dir: Path) -> Path | None:
         local_model_path: Path | None = None
         progress = Progress(convert_size_to_bytes(model.size) or 0)
         stream.emit(StreamChunkProgress(type="progress", stage="download", value=0, data={}))
-        async for packet in self.model_downloader.download(model_id, model_dir):
+        async for packet in self.model_downloader.download(model.hf_id, model_dir, revision=model.revision):
             if isinstance(packet, DownloadedPacket) and packet.downloaded_bytes_size != 0:
                 progress.add_to_actual_value(packet.downloaded_bytes_size)
                 stream.emit(StreamChunkProgress(type="progress", stage="download", value=progress.get_percentage(), data={}))
@@ -546,20 +557,39 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         stream.emit(StreamChunkProgress(type="progress", stage="download", value=1, data={"local_model_path": str(local_model_path)}))
         if local_model_path is None:
-            raise HTTPException(500, f"Downloader doesn't return filepath in {model_dir} of {model_id} model")
+            raise HTTPException(500, f"Downloader doesn't return filepath in {model_dir} of {model.hf_id} model")
         return local_model_path
 
-    async def _download_model_or_set_progress(self, stream: Stream[StreamChunk], model_id: str, model: VllmModel, model_dir: Path) -> Path:
+    def _purge_stale_download(self, model_id: str, local_model_path: Path) -> None:
+        """Delete the previous download directory for `model_id` if this install now points at a different one.
+
+        An edit that changes hf_id/revision reinstalls the model into a new directory but leaves the old
+        one on disk with nothing referencing it anymore (`models_downloaded[model_id]` is about to be
+        overwritten) - clean it up here rather than leaking it forever.
+        """
+        old_downloaded = self.models_downloaded.get(model_id)
+        if old_downloaded and old_downloaded.model_path and old_downloaded.model_path != str(local_model_path):
+            shutil.rmtree(Path(old_downloaded.model_path), ignore_errors=True)
+
+    async def _download_model_or_set_progress(
+        self, stream: Stream[StreamChunk], download_key: str, model: VllmModel, model_dir: Path
+    ) -> Path:
+        """Download `model`, deduplicating concurrent installs by `download_key`.
+
+        `download_key` must uniquely identify the (hf_id, revision) pair being downloaded - using the
+        bare hf_id would make two concurrent installs of different revisions of the same repository
+        collide, handing the second caller the first one's (wrong) `model_dir`.
+        """
         local_model_path: Path | None = None
-        if model_id not in self.models_download_progress:
-            self.models_download_progress[model_id] = stream
+        if download_key not in self.models_download_progress:
+            self.models_download_progress[download_key] = stream
             try:
-                local_model_path = await self._download_model(stream, model_id, model, model_dir)
+                local_model_path = await self._download_model(stream, model, model_dir)
             finally:
-                del self.models_download_progress[model_id]
+                del self.models_download_progress[download_key]
         else:
             chunk: StreamChunk
-            async for chunk in self.models_download_progress[model_id].as_generator():
+            async for chunk in self.models_download_progress[download_key].as_generator():
                 if chunk.get("type") == "progress" and chunk.get("stage") == "download":
                     if data := chunk.get("data"):
                         local_model_path = Path(data.get("local_model_path", local_model_path) or "")
@@ -567,7 +597,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                 else:
                     break
         if local_model_path is None:
-            raise HTTPException(500, f"Downloader doesn't return filepath in {model_dir} of {model_id} model")
+            raise HTTPException(500, f"Downloader doesn't return filepath in {model_dir} of {model.hf_id} model")
         return local_model_path
 
     async def _get_default_gpu_memory_utilization(self) -> float:
@@ -802,10 +832,12 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             docker_stopped = False
             try:
                 model_id_fixed = model.hf_id.replace("/", "-")
+                if model.revision and model.revision != "main":
+                    model_id_fixed = f"{model_id_fixed}--{normalize_name(model.revision)}"
                 models_dir = self._get_working_dir() / "models"
                 model_dir = models_dir / model_id_fixed
                 model_dir.mkdir(parents=True, exist_ok=True)
-                local_model_path: Path | None = await self._download_model_or_set_progress(stream, model.hf_id, model, model_dir)
+                local_model_path: Path | None = await self._download_model_or_set_progress(stream, model_id_fixed, model, model_dir)
 
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
                 docker_model_path = Path(self.hugging_face_cache_path) / "hub" / model_id_fixed
@@ -913,6 +945,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     capacity=capacity,
                 )
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
+                self._purge_stale_download(model_id, local_model_path)
                 self.models_downloaded[model_id] = DownloadedInfo(str(local_model_path))
                 return InstallModelOut(status="OK", details="Installed")
             except BaseException:
