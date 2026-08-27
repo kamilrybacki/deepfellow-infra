@@ -32,6 +32,8 @@ class ModelField(BaseModel):
     required: bool = True
     values: list[OneOfOption | str] | None = None
     required_keys: list[str] | None = None
+    docker_image: str | None = None
+    depends_on: str | None = None
 
 
 class ModelSpecification(BaseModel):

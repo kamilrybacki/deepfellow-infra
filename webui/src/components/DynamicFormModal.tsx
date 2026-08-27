@@ -92,6 +92,7 @@ interface DynamicFormModalProps {
   submitLabel?: string;
   submittingLabel?: string;
   serviceId?: string;
+  modelId?: string;
 }
 
 export function DynamicFormModal({
@@ -113,6 +114,7 @@ export function DynamicFormModal({
   submitLabel = "Install",
   submittingLabel = "Installing...",
   serviceId,
+  modelId,
 }: DynamicFormModalProps) {
   const [renderFields, setRenderFields] = useState<SpecField[]>(
     deferRender ? [] : fields,
@@ -339,6 +341,7 @@ export function DynamicFormModal({
                 errors={errors}
                 onChange={handleChange}
                 serviceId={serviceId}
+                modelId={modelId}
                 disabledFields={onDuplicate && !duplicateMode ? ["id"] : []}
               />
             )}
