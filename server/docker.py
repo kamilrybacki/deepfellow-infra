@@ -9,12 +9,13 @@ import logging
 import os
 import platform
 import re
+import shlex
 import shutil
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict, cast
 
 import yaml
 from aiodocker import Docker, DockerError
@@ -90,7 +91,12 @@ def _diagnose_gpu_error(text: str) -> str | None:
     return None
 
 
-_CONTAINER_NAME_CONFLICT_PATTERNS = ("is already in use",)
+# Matches Docker's actual name-conflict wording, e.g.:
+#   Conflict. The container name "/ollama" is already in use by container "abc123"...
+# Anchored on "container name ... is already in use" rather than the bare "is already in use"
+# substring, so unrelated errors that happen to share that tail (e.g. port-bind failures) aren't
+# misclassified as a name conflict and routed into orphan-adoption.
+_CONTAINER_NAME_CONFLICT_RE = re.compile(r"container name .*is already in use", re.IGNORECASE)
 
 
 def _short_log_snippet(logs: str) -> str:
@@ -122,8 +128,7 @@ def _extract_error_excerpt(logs: str) -> str:
 
 def _is_container_name_conflict(text: str) -> bool:
     """Return True if *text* indicates a docker container name collision."""
-    lower = text.lower()
-    return any(p in lower for p in _CONTAINER_NAME_CONFLICT_PATTERNS)
+    return _CONTAINER_NAME_CONFLICT_RE.search(text) is not None
 
 
 DEFAULT_VARIANTS = {
@@ -316,6 +321,244 @@ class DockerPath(BaseModel):
     def add(self, path: Path) -> "DockerPath":
         """Add path part."""
         return DockerPath(local_path=self.local_path / path, docker_path=self.docker_path / path)
+
+
+def _extract_published_host_port(ports: dict[str, Any] | None, image_port: int) -> int | None:
+    """Return the loopback-bound host port for f"{image_port}/tcp" in a container's NetworkSettings.Ports, else None.
+
+    Only a binding whose HostIp is 127.0.0.1 counts - generate_docker_compose_content always publishes
+    as "127.0.0.1:{port}:{image_port}", so a container exposed more broadly (e.g. to 0.0.0.0, reachable
+    from the whole network) isn't the same configuration, even though its port is technically also
+    reachable from the host.
+    """
+    if not ports:
+        return None
+    bindings = ports.get(f"{image_port}/tcp")
+    if not bindings:
+        return None
+    for binding in bindings:
+        if binding.get("HostIp") != "127.0.0.1":
+            continue
+        host_port = binding.get("HostPort")
+        if not host_port:
+            continue
+        try:
+            return int(host_port)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _container_env_matches(container_env: list[str], expected: dict[str, str]) -> bool:
+    """Return True if every key/value in *expected* is present with an identical value in *container_env*.
+
+    *container_env* is a list of "KEY=VALUE" strings, as in a container's Config.Env. Extra
+    entries in *container_env* beyond what's in *expected* (e.g. image-default env vars) are ignored.
+    """
+    actual: dict[str, str] = {}
+    for entry in container_env:
+        key, sep, value = entry.partition("=")
+        if sep:
+            actual[key] = value
+    return all(actual.get(key) == value for key, value in expected.items())
+
+
+def _parse_bind_volume(volume: str) -> tuple[str, str, bool] | None:
+    """Parse a compose-style "host:container[:mode]" bind-mount string into (host_path, container_path, expect_rw)."""
+    parts = volume.split(":")
+    if len(parts) == 2:
+        host, container = parts
+        mode = "rw"
+    elif len(parts) == 3:
+        host, container, mode = parts
+    else:
+        return None
+    return host, container, "ro" not in mode.split(",")
+
+
+def _container_volumes_match(mounts: list[dict[str, Any]], expected_volumes: list[str]) -> bool:
+    """Return True if every configured bind-mount volume string has a matching bind Mount on the live container."""
+    binds = [mount for mount in mounts if mount.get("Type") == "bind"]
+    for volume in expected_volumes:
+        parsed = _parse_bind_volume(volume)
+        if parsed is None:
+            return False
+        host, container, expect_rw = parsed
+        if not any(
+            mount.get("Source") == host and mount.get("Destination") == container and bool(mount.get("RW")) == expect_rw for mount in binds
+        ):
+            return False
+    return True
+
+
+def _container_command_matches(actual_cmd: list[str] | None, configured_command: str | list[str] | None) -> bool:
+    """Return True if *configured_command* matches a container's live Config.Cmd.
+
+    No command configured always matches - command wasn't part of what was requested, so there's
+    nothing to compare. A configured list (e.g. a `bash -c "..."` wrapper) is compared as-is; a
+    configured string is split with shell-word rules first, since that's how docker compose turns a
+    string `command:` into the argv Docker actually records. A string that fails to split (unbalanced
+    quotes - possible for the free-text "Docker command" field on custom/MCP services) never matches,
+    same as any other mismatch.
+    """
+    if not configured_command:
+        return True
+    if isinstance(configured_command, list):
+        expected_cmd = configured_command
+    else:
+        try:
+            expected_cmd = shlex.split(configured_command)
+        except ValueError:
+            return False
+    return actual_cmd == expected_cmd
+
+
+_BYTE_SIZE_UNITS = {"b": 1, "k": 1024, "kb": 1024, "m": 1024**2, "mb": 1024**2, "g": 1024**3, "gb": 1024**3, "t": 1024**4, "tb": 1024**4}
+
+
+def _parse_byte_size(value: str) -> int | None:
+    """Parse a compose-style byte-size string (e.g. "16gb", "512m", "1024") into a byte count, or None if unparseable."""
+    match = re.fullmatch(r"\s*([0-9]*\.?[0-9]+)\s*([a-zA-Z]*)\s*", value)
+    if not match:
+        return None
+    number, unit = match.groups()
+    multiplier = 1 if not unit else _BYTE_SIZE_UNITS.get(unit.lower())
+    if multiplier is None:
+        return None
+    return int(float(number) * multiplier)
+
+
+def _container_user_matches(config: dict[str, Any], configured_user: str | None) -> bool:
+    """Return True if *configured_user* matches a container's live Config.User.
+
+    No user configured always matches - user wasn't part of what was requested, so there's nothing
+    to compare (mirrors _container_command_matches for an unconfigured command).
+    """
+    if not configured_user:
+        return True
+    return config.get("User") == configured_user
+
+
+def _container_shm_size_matches(host_config: dict[str, Any], configured_shm_size: str | None) -> bool:
+    """Return True if *configured_shm_size* matches the live container's HostConfig.ShmSize.
+
+    *configured_shm_size* is a compose byte-size string, e.g. "16gb". No shm_size configured always
+    matches - Docker reports its own default ShmSize on every
+    container regardless, so there's nothing meaningful to compare it against.
+    """
+    if not configured_shm_size:
+        return True
+    expected_bytes = _parse_byte_size(configured_shm_size)
+    return expected_bytes is not None and host_config.get("ShmSize") == expected_bytes
+
+
+def _container_restart_policy_matches(host_config: dict[str, Any], configured_restart: str | None) -> bool:
+    """Return True if *configured_restart* matches the live container's HostConfig.RestartPolicy.Name.
+
+    *configured_restart* is a compose restart string, e.g. "unless-stopped" or "on-failure:5". No
+    restart policy configured always matches - nothing was requested to compare against.
+    """
+    if not configured_restart:
+        return True
+    name, _sep, _max_retries = configured_restart.partition(":")
+    return (host_config.get("RestartPolicy") or {}).get("Name") == name
+
+
+def _container_attached_to_network(networks: dict[str, Any] | None, subnet: str) -> bool:
+    """Return True if a container's live NetworkSettings.Networks includes *subnet*.
+
+    In subnet mode the app addresses services by container name over this specific docker network
+    (see get_container_host), so attachment to it is what "reachable" actually means - the analogue
+    of the published-port check used outside subnet mode.
+    """
+    return bool(networks) and subnet in networks
+
+
+def _container_gpu_matches(host_config: dict[str, Any], hardware: Sequence[HardwarePartInfo] | None) -> bool:
+    """Return True if a container's live HostConfig GPU reservations match *hardware*.
+
+    Mirrors what generate_docker_compose_content writes: Nvidia GPUs become a HostConfig.DeviceRequests
+    entry with driver "nvidia" and an explicit DeviceIDs list, compared here as an exact set; Intel
+    GPUs become a /dev/dri HostConfig.Devices mapping, compared here by presence only (the compose
+    side doesn't encode which Intel card, just that one is wired in). A mismatch means the live
+    container could be holding VRAM on a different GPU than *hardware* now requests (or none at all),
+    which is unsafe to adopt silently.
+
+    A count-based Nvidia request (e.g. "--gpus all", recorded as DeviceIDs: null with a non-zero
+    Count) can reserve GPUs without naming any device ID, so it can't be verified against
+    *expected_nvidia_ids* at all — it's rejected outright rather than being read as "no GPU reserved".
+    """
+    nvidia_requests = [request for request in (host_config.get("DeviceRequests") or []) if request.get("Driver") == "nvidia"]
+    if any(not request.get("DeviceIDs") and request.get("Count", 0) != 0 for request in nvidia_requests):
+        return False
+
+    expected_nvidia_ids = sorted(str(gpu.id) for gpu in (hardware or []) if isinstance(gpu, NvidiaGpuInfo))
+    actual_nvidia_ids = sorted(device_id for request in nvidia_requests for device_id in request.get("DeviceIDs") or [])
+    if expected_nvidia_ids != actual_nvidia_ids:
+        return False
+
+    expects_intel = any(isinstance(gpu, IntelGpuInfo) for gpu in (hardware or []))
+    has_intel_device = any(device.get("PathOnHost") == "/dev/dri" for device in host_config.get("Devices") or [])
+    return expects_intel == has_intel_device
+
+
+def _matches_for_adoption(inspect_data: dict[str, Any], options: DockerOptions, expected_image_id: str) -> int | None:  # noqa: C901
+    """Return the port to reuse if *inspect_data* is a confident match for *options*, else None.
+
+    A confident match requires: the live container's resolved image ID (top-level Image, a sha256
+    digest fixed at container-creation time) equals *expected_image_id* — the current image ID that
+    options.image resolves to locally. Comparing Config.Image (the name:tag string, e.g. "x:latest")
+    instead would be too loose: a mutable tag can be repointed at a newer pull later, so an orphaned
+    container created from a stale pull of "x:latest" would still show Config.Image == "x:latest"
+    while actually running different software. The container is running; if a healthcheck is
+    configured, live health is "healthy" (not just running); every configured env var present with
+    an identical value; every configured bind-mount volume present; the configured command and
+    entrypoint (if any) match the live command/entrypoint — this matters most for vLLM/SGLang, which
+    encode the model path, revision, and context length in `command` rather than image or env vars;
+    the configured user, shm_size, and restart policy (if any) match their live Config/HostConfig
+    counterparts — otherwise a container built under a stale config could get adopted while still
+    running as the wrong user or with the wrong shared-memory size; the live GPU device reservations
+    match options.hardware (see _container_gpu_matches) — otherwise a container already holding VRAM
+    on the wrong GPU could get silently adopted; and either the container is attached to options.subnet
+    (subnet mode) or options.image_port is published to the host (otherwise). In subnet mode the port
+    isn't used, so -1 is returned as a placeholder instead of None (which signals "no match").
+
+    options.ulimits is intentionally not compared: generate_docker_compose_content never actually
+    writes it into the compose file, so there is nothing on the live container to compare it against.
+    """
+    config = inspect_data.get("Config", {}) or {}
+    state = inspect_data.get("State", {}) or {}
+    network_settings = inspect_data.get("NetworkSettings", {}) or {}
+    host_config = inspect_data.get("HostConfig", {}) or {}
+
+    if inspect_data.get("Image") != expected_image_id:
+        return None
+    if state.get("Status") != "running":
+        return None
+    if options.healthcheck and (state.get("Health", {}) or {}).get("Status") != "healthy":
+        return None
+    if not _container_env_matches(config.get("Env") or [], options.env_vars):
+        return None
+    if not _container_volumes_match(inspect_data.get("Mounts") or [], options.volumes or []):
+        return None
+    if not _container_command_matches(config.get("Cmd"), options.command):
+        return None
+    if not _container_command_matches(config.get("Entrypoint"), options.entrypoint):
+        return None
+    if not _container_user_matches(config, options.user):
+        return None
+    if not _container_shm_size_matches(host_config, options.shm_size):
+        return None
+    if not _container_restart_policy_matches(host_config, options.restart):
+        return None
+    if not _container_gpu_matches(host_config, options.hardware):
+        return None
+
+    if options.subnet:
+        if not _container_attached_to_network(network_settings.get("Networks"), options.subnet):
+            return None
+        return -1
+    return _extract_published_host_port(network_settings.get("Ports"), options.image_port)
 
 
 class DockerService:
@@ -740,11 +983,23 @@ class DockerService:
             uvicorn_logger.warning(f"Error while checking health of docker container {service_name}. Error: {exc}")
             return False
 
+    async def _inspect_container(self, container_name: str) -> dict[str, Any]:
+        """Return the raw docker inspect data for container_name.
+
+        Raises DockerError (404 if the container doesn't exist) or TypeError on a malformed
+        (non-dict) response. Callers decide how to interpret failures.
+        """
+        async with Docker() as docker:
+            data = await docker.containers.container(container_name).show()
+        if not isinstance(data, dict):  # pyright: ignore[reportUnnecessaryIsInstance]  # aiodocker's type hint isn't runtime-enforced
+            msg = f"Unexpected inspect response type {type(data)} for container {container_name!r}"
+            raise TypeError(msg)
+        return data
+
     async def get_container_status(self, container_name: str) -> ContainerStatus:
         """Return a container's real state (process status, healthcheck status, restart count) for reconciliation checks after install."""
         try:
-            async with Docker() as docker:
-                info = await docker.containers.container(container_name).show()
+            info = await self._inspect_container(container_name)
         except DockerError as e:
             if e.status == 404:
                 return ContainerStatus(exists=False, state="", health="", restart_count=0)
@@ -883,6 +1138,141 @@ class DockerService:
 
         return port
 
+    async def _inspect_container_for_adoption(self, container_name: str) -> dict[str, Any] | None:
+        """Return the raw docker inspect data for container_name, or None if it can't be inspected for any reason.
+
+        Any failure means adoption can't proceed, so this never raises — the caller falls back to the
+        normal conflict behavior. A missing container (404) is the expected, common case and stays
+        quiet; anything else (daemon unreachable, permission error, an unexpected DockerError status,
+        or a malformed non-dict response) is unusual enough to warrant an operator's attention, so
+        it's logged at warning instead.
+        """
+        try:
+            return await self._inspect_container(container_name)
+        except DockerError as e:
+            if e.status == 404:
+                return None
+            logger.warning(
+                "Could not inspect container %r for adoption (docker API error, status=%s)", container_name, e.status, exc_info=True
+            )
+            return None
+        except Exception:
+            logger.warning("Could not inspect container %r for adoption", container_name, exc_info=True)
+            return None
+
+    async def _resolve_image_id_for_adoption(self, image: str) -> str | None:
+        """Return the local image ID (sha256 digest) that *image* currently resolves to, or None if unresolvable.
+
+        A container's own Config.Image is just the name:tag string it was created with, which stays
+        stable even if a mutable tag like ":latest" is later repointed at a newer pull — so it can't be
+        used to prove an orphaned container is still running the same software. Resolving *image*'s
+        current ID here, to compare against the live container's fixed image ID, is what actually
+        detects that drift. Any failure (image not pulled locally, daemon unreachable, malformed
+        response) means it can't be proven safe to adopt, so the caller treats None as "no match".
+        """
+        try:
+            async with Docker() as docker:
+                data = await docker.images.inspect(image)
+        except DockerError as e:
+            if e.status != 404:
+                logger.warning("Could not resolve image %r for adoption (docker API error, status=%s)", image, e.status, exc_info=True)
+            return None
+        except Exception:
+            logger.warning("Could not resolve image %r for adoption", image, exc_info=True)
+            return None
+        if not isinstance(data, dict):  # pyright: ignore[reportUnnecessaryIsInstance]  # aiodocker's type hint isn't runtime-enforced
+            logger.warning("Could not resolve image %r for adoption (unexpected response type %s)", image, type(data))
+            return None
+        image_id = data.get("Id")
+        return image_id if isinstance(image_id, str) else None
+
+    async def _try_adopt_orphaned_container(self, options: DockerOptions) -> int | None:
+        """Return the port to adopt at if the pre-existing container for *options* is a confident match, else None.
+
+        Without an explicit container_name there's no reliable way to know what name Docker Compose
+        actually assigned the conflicting container — guessing options.name (the service name) risks
+        inspecting an unrelated container that happens to share it, so adoption is skipped entirely.
+        """
+        if options.container_name is None:
+            return None
+        inspect_data = await self._inspect_container_for_adoption(options.container_name)
+        if inspect_data is None:
+            return None
+        expected_image_id = await self._resolve_image_id_for_adoption(options.image)
+        if expected_image_id is None:
+            return None
+        port = _matches_for_adoption(inspect_data, options, expected_image_id)
+        if port is not None:
+            logger.info("Adopting pre-existing container %r for service %r (image=%r)", options.container_name, options.name, options.image)
+        else:
+            logger.info(
+                "Container %r exists but isn't a confident match for service %r — not adopting it",
+                options.container_name,
+                options.name,
+            )
+        return port
+
+    async def _assert_adopted_container_still_healthy(self, container_name: str, options: DockerOptions) -> None:
+        """Raise AppError unless a fresh inspect of *container_name* still looks adoptable.
+
+        `_try_adopt_orphaned_container`'s match decision is based on a single inspect snapshot taken
+        before this call; re-inspecting here, right before adoption is committed to and the caller
+        registers the endpoint as live, narrows (but can't eliminate) the window in which the container
+        could have crashed or flipped unhealthy — catching that here means it surfaces as a normal
+        failed-install error with logs, like any other failed start, instead of a live endpoint quietly
+        pointing at a dead container.
+        """
+        try:
+            info = await self._inspect_container(container_name)
+        except Exception as exc:
+            msg = f"Adopted container {container_name!r} for {options.name} could not be re-confirmed healthy: {exc}"
+            raise AppError(msg) from exc
+        state = info.get("State", {}) or {}
+        is_running = state.get("Status") == "running"
+        is_healthy = not options.healthcheck or (state.get("Health", {}) or {}).get("Status") == "healthy"
+        if is_running and is_healthy:
+            return
+        logs = ""
+        with suppress(Exception):
+            result = await Utils.run_command(["docker", "logs", "--tail", "200", container_name])
+            logs = result.stdout
+        short = _extract_error_excerpt(logs) if logs else ""
+        msg = (
+            f"Adopted container {container_name!r} for {options.name} is no longer healthy "
+            f"(status={state.get('Status')!r}): {short or 'unknown error, see server logs for details'}"
+        )
+        raise AppError(msg)
+
+    async def _adopt_on_name_conflict_or_raise(
+        self, compose_path: Path, options: DockerOptions, wrote_compose_file: bool, reserved_port: int | None
+    ) -> int:
+        """Adopt the conflicting container if it's a confident match, else raise the existing 409.
+
+        On adoption, deletes *compose_path* if this install attempt wrote it (see _ensure_compose_running).
+        Adoption is already a success at that point (the container itself is fine), so a failure to
+        remove the stale file is logged rather than allowed to turn a successful install into a crash.
+
+        *reserved_port* is the port this install attempt had reserved (or was about to reuse) before the
+        conflict; when adoption ends up using a different port, the reserved one is released back to the
+        pool instead of leaking for the lifetime of the process.
+        """
+        adopted_port = await self._try_adopt_orphaned_container(options)
+        if adopted_port is None:
+            name = options.container_name or options.name
+            raise HTTPException(409, f"A container named '{name}' already exists — remove it or choose a different name.") from None
+        # adopted_port is only ever non-None when options.container_name was set (see _try_adopt_orphaned_container).
+        await self._assert_adopted_container_still_healthy(cast("str", options.container_name), options)
+        if wrote_compose_file:
+            try:
+                compose_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning(
+                    "Adopted container for %r but failed to remove stale compose file %s", options.name, compose_path, exc_info=True
+                )
+        if reserved_port is not None and reserved_port != adopted_port:
+            self.port_service.release_port(reserved_port)
+        return adopted_port
+
     async def _ensure_compose_running(
         self,
         compose_path: Path,
@@ -890,30 +1280,41 @@ class DockerService:
         is_running: bool,
         has_difference: bool,
         port: int | None,
-    ) -> tuple[CommandResult2 | None, int | None]:
-        """Start, stop, or recreate the compose stack as needed. Returns (start_output, port)."""
+    ) -> tuple[CommandResult2 | None, int | None, bool]:
+        """Start, stop, or recreate the compose stack as needed. Returns (start_output, port, adopted).
+
+        When adopted is True, start_output is always None. Any compose file written during this call —
+        newly created, or an existing one overwritten before the restart — is deleted on adoption; a
+        compose file left untouched by this call (not written at all) stays that way — see
+        _adopt_on_name_conflict_or_raise. If adoption returns a different port than the one this call
+        was about to start with, that unused port is released back to the pool.
+        """
         uses_gpu = bool(options.hardware)
         start_output: CommandResult2 | None = None
+        wrote_compose_file = False
         try:
             if not is_running and not has_difference:
                 if port is not None and self.port_service.is_port_available(port):
                     start_output = await self.start_docker_compose(compose_path)
                 else:
                     port = await self.create_compose_file(compose_path, options)
+                    wrote_compose_file = True
                     start_output = await self.start_docker_compose(compose_path)
             elif not is_running and has_difference:
                 port = await self.create_compose_file(compose_path, options)
+                wrote_compose_file = True
                 start_output = await self.start_docker_compose(compose_path)
             elif is_running and has_difference:
                 logger.debug("%s config changed, restarting", options.service_name)
                 await self.stop_docker_compose(compose_path)
                 port = await self.create_compose_file(compose_path, options)
+                wrote_compose_file = True
                 start_output = await self.start_docker_compose(compose_path)
         except DockerComposeStartError as exc:
             exc_output = "\n".join(filter(None, [exc.stdout, exc.stderr]))
             if _is_container_name_conflict(exc_output):
-                name = options.container_name or options.name
-                raise HTTPException(409, f"A container named '{name}' already exists — remove it or choose a different name.") from None
+                adopted_port = await self._adopt_on_name_conflict_or_raise(compose_path, options, wrote_compose_file, port)
+                return None, adopted_port, True
             logs = ""
             with suppress(Exception):
                 logs = await self.get_docker_compose_logs(compose_path)
@@ -927,7 +1328,7 @@ class DockerService:
             short = "\n".join(filter(None, [exc_output, _extract_error_excerpt(logs)]))
             msg = f"Failed to start {options.name}: {short or 'unknown error, see server logs for details'}"
             raise AppError(msg) from None
-        return start_output, port
+        return start_output, port, False
 
     async def _assert_compose_healthy(self, compose_path: Path, options: DockerOptions, start_output: CommandResult2 | None) -> None:
         """Raise AppError if the container is not healthy after starting."""
@@ -976,8 +1377,9 @@ class DockerService:
 
         logger.debug("docker_compose_start: %s is_running=%s has_difference=%s", options.service_name, is_running, has_difference)
 
-        start_output, port = await self._ensure_compose_running(compose_path, options, is_running, has_difference, port)
-        await self._assert_compose_healthy(compose_path, options, start_output)
+        start_output, port, adopted = await self._ensure_compose_running(compose_path, options, is_running, has_difference, port)
+        if not adopted:
+            await self._assert_compose_healthy(compose_path, options, start_output)
 
         if not port and options.subnet:
             # in subnet mode the port is not used so it could be anything, for example -1

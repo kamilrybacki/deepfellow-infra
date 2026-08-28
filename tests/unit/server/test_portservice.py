@@ -93,3 +93,26 @@ def test_get_free_port_range_end_is_inclusive(port_service: PortService) -> None
         port = port_service.get_free_port(5000, 5001)
 
     assert port == 5001
+
+
+def test_release_port_removes_allocated_port(port_service: PortService) -> None:
+    port_service.allocated_ports.add(20000)
+
+    port_service.release_port(20000)
+
+    assert 20000 not in port_service.allocated_ports
+
+
+def test_release_port_is_noop_for_unallocated_port(port_service: PortService) -> None:
+    port_service.release_port(20000)
+
+    assert len(port_service.allocated_ports) == 0
+
+
+def test_release_port_allows_reallocation(port_service: PortService) -> None:
+    with patch.object(port_service, "is_port_available", return_value=True):
+        port = port_service.get_free_port(20000, 30000)
+        port_service.release_port(port)
+        reallocated = port_service.get_free_port(20000, 30000)
+
+    assert reallocated == port
