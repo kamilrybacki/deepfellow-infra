@@ -21,9 +21,21 @@ from server.docker import (
     DockerOptions,
     DockerPath,
     DockerService,
+    _container_attached_to_network,  # type: ignore[reportPrivateUsage]
+    _container_command_matches,  # type: ignore[reportPrivateUsage]
+    _container_env_matches,  # type: ignore[reportPrivateUsage]
+    _container_gpu_matches,  # type: ignore[reportPrivateUsage]
+    _container_restart_policy_matches,  # type: ignore[reportPrivateUsage]
+    _container_shm_size_matches,  # type: ignore[reportPrivateUsage]
+    _container_user_matches,  # type: ignore[reportPrivateUsage]
+    _container_volumes_match,  # type: ignore[reportPrivateUsage]
     _diagnose_gpu_error,  # type: ignore[reportPrivateUsage]
     _extract_error_excerpt,  # type: ignore[reportPrivateUsage]
+    _extract_published_host_port,  # type: ignore[reportPrivateUsage]
     _is_container_name_conflict,  # type: ignore[reportPrivateUsage]
+    _matches_for_adoption,  # type: ignore[reportPrivateUsage]
+    _parse_bind_volume,  # type: ignore[reportPrivateUsage]
+    _parse_byte_size,  # type: ignore[reportPrivateUsage]
     create_docker_service,
     get_docker_auths,
     normalize_docker_platform,
@@ -71,6 +83,9 @@ def docker_service(tmp_path: Path) -> DockerService:
             is_rootless=False,
             host_platform="linux/amd64",
         )
+
+
+DEFAULT_ADOPTION_IMAGE_ID = "sha256:" + "a" * 64
 
 
 def _opts(
@@ -533,13 +548,19 @@ async def test_remove_image_ignores_404(docker_service: DockerService) -> None:
         await docker_service.remove_image("ubuntu:latest")  # should not raise
 
 
-def _mock_container_show(inspect_data: dict[str, Any]) -> tuple[MagicMock, MagicMock]:
-    """Return (docker_cm, container_mock) with `.containers.container(name).show()` wired to return inspect_data."""
+def _mock_container_show(inspect_data: dict[str, Any], resolved_image_id: str = DEFAULT_ADOPTION_IMAGE_ID) -> tuple[MagicMock, MagicMock]:
+    """Return (docker_cm, container_mock) with `.containers.container(name).show()` wired to return inspect_data.
+
+    Also wires `.images.inspect(...)` to resolve to *resolved_image_id*, since adoption resolves the
+    configured image's current local ID to compare against the live container's fixed image ID.
+    """
     cm, instance = _make_docker_mock()
     container = MagicMock()
     container.show = AsyncMock(return_value=inspect_data)
     instance.containers = MagicMock()
     instance.containers.container = MagicMock(return_value=container)
+    instance.images = MagicMock()
+    instance.images.inspect = AsyncMock(return_value={"Id": resolved_image_id})
     return cm, instance.containers.container
 
 
@@ -1034,6 +1055,46 @@ async def test_install_and_run_docker_subnet_mode_port_is_minus_one(docker_servi
     ):
         port, restarted = await docker_service.install_and_run_docker(options)
 
+    assert port == -1
+    assert restarted is False
+
+
+@pytest.mark.asyncio
+async def test_install_and_run_docker_adoption_skips_health_check_and_reports_not_restarted(
+    docker_service: DockerService, tmp_path: Path
+) -> None:
+    options = _opts()
+    compose_file = tmp_path / "compose.yaml"
+
+    with (
+        patch.object(docker_service, "get_docker_compose_file_path", return_value=compose_file),
+        patch.object(docker_service, "is_docker_compose_running", new_callable=AsyncMock, return_value=False),
+        patch.object(docker_service, "has_docker_compose_difference", new_callable=AsyncMock, return_value=(True, None)),
+        patch.object(docker_service, "_ensure_compose_running", new_callable=AsyncMock, return_value=(None, 44444, True)),
+        patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock) as mock_healthy,
+    ):
+        port, restarted = await docker_service.install_and_run_docker(options)
+
+    mock_healthy.assert_not_called()
+    assert port == 44444
+    assert restarted is False
+
+
+@pytest.mark.asyncio
+async def test_install_and_run_docker_adoption_in_subnet_mode_returns_minus_one(docker_service: DockerService, tmp_path: Path) -> None:
+    options = _opts(subnet="my-net")
+    compose_file = tmp_path / "compose.yaml"
+
+    with (
+        patch.object(docker_service, "get_docker_compose_file_path", return_value=compose_file),
+        patch.object(docker_service, "is_docker_compose_running", new_callable=AsyncMock, return_value=False),
+        patch.object(docker_service, "has_docker_compose_difference", new_callable=AsyncMock, return_value=(True, None)),
+        patch.object(docker_service, "_ensure_compose_running", new_callable=AsyncMock, return_value=(None, -1, True)),
+        patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock) as mock_healthy,
+    ):
+        port, restarted = await docker_service.install_and_run_docker(options)
+
+    mock_healthy.assert_not_called()
     assert port == -1
     assert restarted is False
 
@@ -1573,15 +1634,555 @@ def test_diagnose_gpu_error_no_match_returns_none() -> None:
     [
         ('Conflict. The container name "/ollama" is already in use by container "abc".', True),
         ("the container name is already in use", True),
-        ("IS ALREADY IN USE", True),
+        ("THE CONTAINER NAME IS ALREADY IN USE", True),
         ("container started successfully", False),
         ("port is already allocated", False),
+        ("failed to bind host port 0.0.0.0:8080/tcp: address already in use", False),
+        ("Error starting userland proxy: listen tcp4 0.0.0.0:8080: bind: address already in use", False),
     ],
 )
 def test_is_container_name_conflict_matches_collision_messages(text: str, expected: bool):
     result = _is_container_name_conflict(text)
 
     assert result is expected
+
+
+# _matches_for_adoption and its helpers
+
+
+def _adoption_inspect(
+    image: str = "ubuntu:latest",
+    image_id: str = DEFAULT_ADOPTION_IMAGE_ID,
+    status: str = "running",
+    health: str | None = None,
+    env: list[str] | None = None,
+    mounts: list[dict[str, Any]] | None = None,
+    ports: dict[str, Any] | None = None,
+    cmd: list[str] | None = None,
+    entrypoint: list[str] | None = None,
+    user: str = "",
+    networks: dict[str, Any] | None = None,
+    host_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    state: dict[str, Any] = {"Status": status}
+    if health is not None:
+        state["Health"] = {"Status": health}
+    return {
+        "Image": image_id,
+        "Config": {"Image": image, "Env": env or [], "Cmd": cmd, "Entrypoint": entrypoint, "User": user},
+        "State": state,
+        "Mounts": mounts or [],
+        "NetworkSettings": {"Ports": ports or {}, "Networks": networks or {}},
+        "HostConfig": host_config or {},
+    }
+
+
+def _nvidia_device_request(*device_ids: str) -> dict[str, Any]:
+    return {"Driver": "nvidia", "Count": -1, "DeviceIDs": list(device_ids), "Capabilities": [["gpu"]]}
+
+
+def _intel_dri_device() -> dict[str, Any]:
+    return {"PathOnHost": "/dev/dri", "PathInContainer": "/dev/dri", "CgroupPermissions": "rwm"}
+
+
+def _bind_mount(source: str, destination: str, rw: bool = True) -> dict[str, Any]:
+    return {"Type": "bind", "Source": source, "Destination": destination, "RW": rw}
+
+
+def test_matches_for_adoption_success_no_healthcheck() -> None:
+    options = _opts(image="ubuntu:latest", image_port=8080, env_vars={"FOO": "bar"}, volumes=["/host/data:/data"])
+    inspect = _adoption_inspect(
+        image="ubuntu:latest",
+        env=["FOO=bar", "PATH=/usr/bin"],
+        mounts=[_bind_mount("/host/data", "/data")],
+        ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]},
+    )
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) == 44444
+
+
+def test_matches_for_adoption_success_with_healthcheck() -> None:
+    options = _opts(image_port=8080, healthcheck={"test": "CMD curl -f http://localhost/health"})
+    inspect = _adoption_inspect(health="healthy", ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "12345"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) == 12345
+
+
+def test_matches_for_adoption_success_subnet_mode_skips_port_check() -> None:
+    options = _opts(image_port=8080, subnet="my-net")
+    inspect = _adoption_inspect(ports={}, networks={"my-net": {}})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) == -1
+
+
+def test_matches_for_adoption_subnet_not_attached_fails() -> None:
+    options = _opts(image_port=8080, subnet="my-net")
+    inspect = _adoption_inspect(ports={}, networks={"some-other-net": {}})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_container_attached_to_network_true_when_present() -> None:
+    assert _container_attached_to_network({"my-net": {}}, "my-net") is True
+
+
+def test_container_attached_to_network_false_when_absent_or_missing() -> None:
+    assert _container_attached_to_network({"other-net": {}}, "my-net") is False
+    assert _container_attached_to_network(None, "my-net") is False
+    assert _container_attached_to_network({}, "my-net") is False
+
+
+def test_matches_for_adoption_same_tag_but_different_resolved_image_id_fails() -> None:
+    """A mutable tag like :latest can be repointed at a newer pull - matching on the tag name alone
+
+    would wrongly adopt a stale orphan still running the old image content. The live container's
+    actual image ID must match what the tag currently resolves to.
+    """
+    options = _opts(image="ubuntu:latest", image_port=8080)
+    stale_image_id = "sha256:" + "b" * 64
+    inspect = _adoption_inspect(
+        image="ubuntu:latest", image_id=stale_image_id, ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}
+    )
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_different_tag_but_same_resolved_image_id_matches() -> None:
+    """Image ID equality is what matters, not the name:tag string - e.g. the same image retagged."""
+    options = _opts(image="ubuntu:latest", image_port=8080)
+    inspect = _adoption_inspect(
+        image="ubuntu:22.04", image_id=DEFAULT_ADOPTION_IMAGE_ID, ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}
+    )
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) == 44444
+
+
+def test_matches_for_adoption_not_running_fails() -> None:
+    options = _opts(image_port=8080)
+    inspect = _adoption_inspect(status="exited", ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_healthcheck_configured_but_unhealthy_fails() -> None:
+    options = _opts(image_port=8080, healthcheck={"test": "CMD curl -f http://localhost/health"})
+    inspect = _adoption_inspect(health="unhealthy", ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_healthcheck_configured_but_health_missing_fails() -> None:
+    options = _opts(image_port=8080, healthcheck={"test": "CMD curl -f http://localhost/health"})
+    inspect = _adoption_inspect(ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_port_not_published_fails() -> None:
+    options = _opts(image_port=8080)
+    inspect = _adoption_inspect(ports={})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_port_published_non_loopback_fails() -> None:
+    """A container exposed to the whole network (0.0.0.0) isn't a match for a loopback-only install."""
+    options = _opts(image_port=8080)
+    inspect = _adoption_inspect(ports={"8080/tcp": [{"HostIp": "0.0.0.0", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_env_var_missing_fails() -> None:
+    options = _opts(image_port=8080, env_vars={"FOO": "bar"})
+    inspect = _adoption_inspect(env=["OTHER=1"], ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_env_var_value_mismatch_fails() -> None:
+    options = _opts(image_port=8080, env_vars={"FOO": "bar"})
+    inspect = _adoption_inspect(env=["FOO=other"], ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_extra_container_env_is_ignored() -> None:
+    options = _opts(image_port=8080, env_vars={"FOO": "bar"})
+    inspect = _adoption_inspect(env=["FOO=bar", "IMAGE_DEFAULT=1"], ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) == 44444
+
+
+def test_matches_for_adoption_volume_missing_fails() -> None:
+    options = _opts(image_port=8080, volumes=["/host/data:/data"])
+    inspect = _adoption_inspect(mounts=[], ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_volume_source_mismatch_fails() -> None:
+    """A container mounting a different host directory at the same container path must not match.
+
+    Guards against a regression that matched only by container-path + mode (ignoring the host path),
+    which would let a container backed by an entirely different host directory get adopted.
+    """
+    options = _opts(image_port=8080, volumes=["/host/data:/data"])
+    inspect = _adoption_inspect(
+        mounts=[_bind_mount("/some/other/host/dir", "/data")], ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}
+    )
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_volume_mode_mismatch_fails() -> None:
+    options = _opts(image_port=8080, volumes=["/host/data:/data:ro"])
+    inspect = _adoption_inspect(
+        mounts=[_bind_mount("/host/data", "/data", rw=True)], ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}
+    )
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_string_command_matches() -> None:
+    options = _opts(image_port=8080, command="--host 0.0.0.0 --port 8080")
+    inspect = _adoption_inspect(
+        cmd=["--host", "0.0.0.0", "--port", "8080"], ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}
+    )
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) == 44444
+
+
+def test_matches_for_adoption_string_command_mismatch_fails() -> None:
+    options = _opts(image_port=8080, command="--host 0.0.0.0 --port 8080 --max-model-len 4096")
+    inspect = _adoption_inspect(
+        cmd=["--host", "0.0.0.0", "--port", "8080"], ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}
+    )
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_list_command_matches() -> None:
+    options = _opts(image_port=8080, command=["-c", "exec server"])
+    inspect = _adoption_inspect(cmd=["-c", "exec server"], ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) == 44444
+
+
+def test_matches_for_adoption_list_command_mismatch_fails() -> None:
+    options = _opts(image_port=8080, command=["-c", "exec server"])
+    inspect = _adoption_inspect(cmd=["-c", "exec other"], ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_no_command_configured_ignores_live_cmd() -> None:
+    options = _opts(image_port=8080)
+    inspect = _adoption_inspect(cmd=["anything", "at", "all"], ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) == 44444
+
+
+def test_matches_for_adoption_entrypoint_mismatch_fails() -> None:
+    options = _opts(image_port=8080, entrypoint="/entrypoint.sh")
+    inspect = _adoption_inspect(entrypoint=["/other-entrypoint.sh"], ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_entrypoint_matches() -> None:
+    options = _opts(image_port=8080, entrypoint="/entrypoint.sh --flag")
+    inspect = _adoption_inspect(entrypoint=["/entrypoint.sh", "--flag"], ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) == 44444
+
+
+def test_matches_for_adoption_no_entrypoint_configured_ignores_live_entrypoint() -> None:
+    options = _opts(image_port=8080)
+    inspect = _adoption_inspect(entrypoint=["anything"], ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) == 44444
+
+
+def test_matches_for_adoption_user_mismatch_fails() -> None:
+    options = _opts(image_port=8080, user="app")
+    inspect = _adoption_inspect(user="root", ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_user_matches() -> None:
+    options = _opts(image_port=8080, user="app")
+    inspect = _adoption_inspect(user="app", ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) == 44444
+
+
+def test_matches_for_adoption_no_user_configured_ignores_live_user() -> None:
+    options = _opts(image_port=8080)
+    inspect = _adoption_inspect(user="root", ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) == 44444
+
+
+def test_matches_for_adoption_shm_size_mismatch_fails() -> None:
+    options = _opts(image_port=8080, shm_size="16gb")
+    inspect = _adoption_inspect(host_config={"ShmSize": 8 * 1024**3}, ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_shm_size_matches() -> None:
+    options = _opts(image_port=8080, shm_size="16gb")
+    inspect = _adoption_inspect(host_config={"ShmSize": 16 * 1024**3}, ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) == 44444
+
+
+def test_matches_for_adoption_no_shm_size_configured_ignores_live_shm_size() -> None:
+    options = _opts(image_port=8080)
+    inspect = _adoption_inspect(host_config={"ShmSize": 1}, ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) == 44444
+
+
+def test_matches_for_adoption_restart_policy_mismatch_fails() -> None:
+    options = _opts(image_port=8080, restart="unless-stopped")
+    inspect = _adoption_inspect(
+        host_config={"RestartPolicy": {"Name": "no"}}, ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}
+    )
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_restart_policy_matches() -> None:
+    options = _opts(image_port=8080, restart="unless-stopped")
+    inspect = _adoption_inspect(
+        host_config={"RestartPolicy": {"Name": "unless-stopped"}}, ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}
+    )
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) == 44444
+
+
+def test_matches_for_adoption_no_restart_policy_configured_ignores_live_restart_policy() -> None:
+    options = _opts(image_port=8080)
+    inspect = _adoption_inspect(
+        host_config={"RestartPolicy": {"Name": "no"}}, ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}
+    )
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) == 44444
+
+
+def test_matches_for_adoption_gpu_count_based_request_fails() -> None:
+    """A "--gpus all"-style reservation has no explicit DeviceIDs, so it can't be proven not to hold every GPU."""
+    options = _opts(image_port=8080)
+    all_gpus_request = {"Driver": "nvidia", "Count": -1, "DeviceIDs": None, "Capabilities": [["gpu"]]}
+    inspect = _adoption_inspect(
+        host_config={"DeviceRequests": [all_gpus_request]}, ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}
+    )
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_container_gpu_matches_count_based_request_without_device_ids_fails() -> None:
+    all_gpus_request = {"Driver": "nvidia", "Count": -1, "DeviceIDs": None, "Capabilities": [["gpu"]]}
+    assert _container_gpu_matches({"DeviceRequests": [all_gpus_request]}, None) is False
+    assert _container_gpu_matches({"DeviceRequests": [all_gpus_request]}, [NvidiaGpuInfo("RTX", "24 GB", 0)]) is False
+
+
+def test_container_user_matches_no_configured_user_always_matches() -> None:
+    assert _container_user_matches({"User": "root"}, None) is True
+    assert _container_user_matches({"User": ""}, None) is True
+
+
+def test_container_user_matches_compares_exact_value() -> None:
+    assert _container_user_matches({"User": "app"}, "app") is True
+    assert _container_user_matches({"User": "root"}, "app") is False
+
+
+def test_container_shm_size_matches_no_configured_value_always_matches() -> None:
+    assert _container_shm_size_matches({"ShmSize": 1}, None) is True
+
+
+def test_container_shm_size_matches_unparseable_configured_value_fails() -> None:
+    assert _container_shm_size_matches({"ShmSize": 1024}, "not-a-size") is False
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("1024", 1024),
+        ("16gb", 16 * 1024**3),
+        ("512m", 512 * 1024**2),
+        ("2kb", 2 * 1024),
+        ("1.5g", int(1.5 * 1024**3)),
+        ("not-a-size", None),
+        ("16xb", None),
+        ("", None),
+    ],
+)
+def test_parse_byte_size(value: str, expected: int | None) -> None:
+    assert _parse_byte_size(value) == expected
+
+
+def test_container_restart_policy_matches_no_configured_value_always_matches() -> None:
+    assert _container_restart_policy_matches({"RestartPolicy": {"Name": "always"}}, None) is True
+
+
+def test_container_restart_policy_matches_ignores_retry_count_suffix() -> None:
+    assert _container_restart_policy_matches({"RestartPolicy": {"Name": "on-failure"}}, "on-failure:5") is True
+
+
+def test_matches_for_adoption_gpu_device_missing_fails() -> None:
+    """A container adopted without a matching Nvidia device reservation could already be holding VRAM elsewhere."""
+    options = _opts(image_port=8080, hardware=[NvidiaGpuInfo("RTX", "24 GB", 0)])
+    inspect = _adoption_inspect(host_config={}, ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_gpu_device_id_mismatch_fails() -> None:
+    options = _opts(image_port=8080, hardware=[NvidiaGpuInfo("RTX", "24 GB", 0)])
+    inspect = _adoption_inspect(
+        host_config={"DeviceRequests": [_nvidia_device_request("1")]}, ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}
+    )
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_gpu_device_matches() -> None:
+    options = _opts(image_port=8080, hardware=[NvidiaGpuInfo("RTX", "24 GB", 0)])
+    inspect = _adoption_inspect(
+        host_config={"DeviceRequests": [_nvidia_device_request("0")]}, ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}
+    )
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) == 44444
+
+
+def test_matches_for_adoption_gpu_unexpectedly_attached_fails() -> None:
+    """No GPU configured but the live container has one reserved - the reverse mismatch must also fail."""
+    options = _opts(image_port=8080)
+    inspect = _adoption_inspect(
+        host_config={"DeviceRequests": [_nvidia_device_request("0")]}, ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}
+    )
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_intel_gpu_missing_fails() -> None:
+    options = _opts(image_port=8080, hardware=[IntelGpuInfo("Intel GPU", None, 0)])
+    inspect = _adoption_inspect(host_config={}, ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]})
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) is None
+
+
+def test_matches_for_adoption_intel_gpu_matches() -> None:
+    options = _opts(image_port=8080, hardware=[IntelGpuInfo("Intel GPU", None, 0)])
+    inspect = _adoption_inspect(
+        host_config={"Devices": [_intel_dri_device()]}, ports={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}
+    )
+
+    assert _matches_for_adoption(inspect, options, DEFAULT_ADOPTION_IMAGE_ID) == 44444
+
+
+def test_container_gpu_matches_no_hardware_configured_requires_no_live_devices() -> None:
+    assert _container_gpu_matches({}, None) is True
+    assert _container_gpu_matches({"DeviceRequests": [_nvidia_device_request("0")]}, None) is False
+
+
+def test_container_gpu_matches_nvidia_ids_compared_as_set_not_order() -> None:
+    hardware = [NvidiaGpuInfo("A", None, 1), NvidiaGpuInfo("B", None, 0)]
+    assert _container_gpu_matches({"DeviceRequests": [_nvidia_device_request("0", "1")]}, hardware) is True
+
+
+def test_container_command_matches_no_configured_command_always_matches() -> None:
+    assert _container_command_matches(["whatever"], None) is True
+    assert _container_command_matches(None, None) is True
+
+
+def test_container_command_matches_splits_string_command_with_shell_word_rules() -> None:
+    assert _container_command_matches(["--host", "0.0.0.0"], "--host 0.0.0.0") is True
+    assert _container_command_matches(["--host", "0.0.0.0"], "--host  0.0.0.0") is True
+
+
+def test_container_command_matches_compares_list_command_as_is() -> None:
+    assert _container_command_matches(["-c", "a && b"], ["-c", "a && b"]) is True
+    assert _container_command_matches(["-c", "a && b"], ["-c", "a"]) is False
+
+
+def test_container_command_matches_malformed_string_command_fails_safely() -> None:
+    assert _container_command_matches(["anything"], "unterminated 'quote") is False
+
+
+def test_extract_published_host_port_returns_none_when_unpublished() -> None:
+    assert _extract_published_host_port({}, 8080) is None
+    assert _extract_published_host_port(None, 8080) is None
+    assert _extract_published_host_port({"8080/tcp": None}, 8080) is None
+
+
+def test_extract_published_host_port_returns_host_port() -> None:
+    assert _extract_published_host_port({"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "9999"}]}, 8080) == 9999
+
+
+def test_extract_published_host_port_returns_none_for_non_numeric_host_port() -> None:
+    assert _extract_published_host_port({"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "not-a-port"}]}, 8080) is None
+
+
+def test_extract_published_host_port_ignores_non_loopback_binding() -> None:
+    """A container published to 0.0.0.0 (reachable network-wide) isn't the same config as 127.0.0.1-only."""
+    assert _extract_published_host_port({"8080/tcp": [{"HostIp": "0.0.0.0", "HostPort": "9999"}]}, 8080) is None
+
+
+def test_extract_published_host_port_finds_loopback_binding_among_several() -> None:
+    bindings = [{"HostIp": "0.0.0.0", "HostPort": "9999"}, {"HostIp": "127.0.0.1", "HostPort": "8888"}]
+    assert _extract_published_host_port({"8080/tcp": bindings}, 8080) == 8888
+
+
+def test_extract_published_host_port_keeps_looking_past_invalid_loopback_binding() -> None:
+    """A malformed/empty loopback binding earlier in the list must not short-circuit the search."""
+    bindings = [{"HostIp": "127.0.0.1", "HostPort": ""}, {"HostIp": "127.0.0.1", "HostPort": "8888"}]
+    assert _extract_published_host_port({"8080/tcp": bindings}, 8080) == 8888
+
+    bindings = [{"HostIp": "127.0.0.1", "HostPort": "not-a-port"}, {"HostIp": "127.0.0.1", "HostPort": "8888"}]
+    assert _extract_published_host_port({"8080/tcp": bindings}, 8080) == 8888
+
+
+def test_container_env_matches_ignores_extra_entries() -> None:
+    assert _container_env_matches(["FOO=bar", "EXTRA=1"], {"FOO": "bar"}) is True
+
+
+def test_container_env_matches_fails_on_missing_key() -> None:
+    assert _container_env_matches(["OTHER=1"], {"FOO": "bar"}) is False
+
+
+def test_container_env_matches_ignores_malformed_entries_without_equals_sign() -> None:
+    assert _container_env_matches(["MALFORMED", "FOO=bar"], {"FOO": "bar"}) is True
+
+
+def test_parse_bind_volume_parses_host_container_and_mode() -> None:
+    assert _parse_bind_volume("/host:/container") == ("/host", "/container", True)
+    assert _parse_bind_volume("/host:/container:ro") == ("/host", "/container", False)
+    assert _parse_bind_volume("/host:/container:rw") == ("/host", "/container", True)
+
+
+def test_parse_bind_volume_malformed_string_returns_none() -> None:
+    assert _parse_bind_volume("/just/a/path") is None
+
+
+def test_container_volumes_match_ignores_non_bind_mounts() -> None:
+    """A named/anonymous volume mount must not satisfy a configured bind-mount requirement, even with matching paths."""
+    mounts = [{"Type": "volume", "Source": "somevolume", "Destination": "/data"}]
+    assert _container_volumes_match(mounts, ["somevolume:/data"]) is False
+
+
+def test_container_volumes_match_matches_genuine_bind_mount() -> None:
+    """Sibling of the above: the same Source/Destination pair on a real bind mount does satisfy the requirement."""
+    mounts = [_bind_mount("somevolume", "/data")]
+    assert _container_volumes_match(mounts, ["somevolume:/data"]) is True
+
+
+def test_container_volumes_match_fails_on_malformed_configured_volume() -> None:
+    assert _container_volumes_match([], ["/just/a/path"]) is False
 
 
 # _extract_error_excerpt
@@ -1629,6 +2230,261 @@ async def test_start_docker_compose_raises_docker_compose_start_error_on_nonzero
         mock_run.return_value = make_result(exit_code=1, stdout="out", stderr="err")
         with pytest.raises(DockerComposeStartError):
             await docker_service.start_docker_compose(compose_file)
+
+
+# _inspect_container_for_adoption
+
+
+@pytest.mark.asyncio
+async def test_inspect_container_for_adoption_missing_container_is_quiet(
+    docker_service: DockerService, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A 404 (container doesn't exist) is the expected case - no warning-level log."""
+    instance = MagicMock()
+    instance.containers = MagicMock()
+    container = MagicMock()
+    container.show = AsyncMock(side_effect=DockerError(status=404, message="no such container"))
+    instance.containers.container = MagicMock(return_value=container)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=instance)
+    cm.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn.error"):
+        result = await docker_service._inspect_container_for_adoption("mymodel")  # type: ignore[reportPrivateUsage]
+
+    assert result is None
+    assert not any(record.levelname == "WARNING" for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_inspect_container_for_adoption_non_404_docker_error_logs_warning(
+    docker_service: DockerService, caplog: pytest.LogCaptureFixture
+) -> None:
+    instance = MagicMock()
+    instance.containers = MagicMock()
+    container = MagicMock()
+    container.show = AsyncMock(side_effect=DockerError(status=500, message="internal server error"))
+    instance.containers.container = MagicMock(return_value=container)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=instance)
+    cm.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn.error"):
+        result = await docker_service._inspect_container_for_adoption("mymodel")  # type: ignore[reportPrivateUsage]
+
+    assert result is None
+    assert any(record.levelname == "WARNING" and "mymodel" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_inspect_container_for_adoption_unexpected_exception_logs_warning_and_returns_none(
+    docker_service: DockerService, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A non-DockerError failure (e.g. daemon unreachable) still falls back gracefully, but is logged."""
+    instance = MagicMock()
+    instance.containers = MagicMock()
+    container = MagicMock()
+    container.show = AsyncMock(side_effect=ConnectionError("connection refused"))
+    instance.containers.container = MagicMock(return_value=container)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=instance)
+    cm.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn.error"):
+        result = await docker_service._inspect_container_for_adoption("mymodel")  # type: ignore[reportPrivateUsage]
+
+    assert result is None
+    assert any(record.levelname == "WARNING" and "mymodel" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_inspect_container_for_adoption_non_dict_response_logs_warning_and_returns_none(
+    docker_service: DockerService, caplog: pytest.LogCaptureFixture
+) -> None:
+    """aiodocker's return type hint isn't runtime-enforced - a malformed response must not crash adoption."""
+    instance = MagicMock()
+    instance.containers = MagicMock()
+    container = MagicMock()
+    container.show = AsyncMock(return_value=["not", "a", "dict"])
+    instance.containers.container = MagicMock(return_value=container)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=instance)
+    cm.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn.error"):
+        result = await docker_service._inspect_container_for_adoption("mymodel")  # type: ignore[reportPrivateUsage]
+
+    assert result is None
+    assert any(record.levelname == "WARNING" and "mymodel" in record.message for record in caplog.records)
+
+
+# _resolve_image_id_for_adoption
+
+
+@pytest.mark.asyncio
+async def test_resolve_image_id_for_adoption_returns_id(docker_service: DockerService) -> None:
+    cm, instance = _make_docker_mock()
+    instance.images = MagicMock()
+    instance.images.inspect = AsyncMock(return_value={"Id": DEFAULT_ADOPTION_IMAGE_ID})
+
+    with patch("server.docker.Docker", return_value=cm):
+        result = await docker_service._resolve_image_id_for_adoption("ubuntu:latest")  # type: ignore[reportPrivateUsage]
+
+    assert result == DEFAULT_ADOPTION_IMAGE_ID
+
+
+@pytest.mark.asyncio
+async def test_resolve_image_id_for_adoption_missing_image_is_quiet(
+    docker_service: DockerService, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A 404 (image not pulled locally) is the expected case - no warning-level log."""
+    cm, instance = _make_docker_mock()
+    instance.images = MagicMock()
+    instance.images.inspect = AsyncMock(side_effect=DockerError(status=404, message="no such image"))
+
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn.error"):
+        result = await docker_service._resolve_image_id_for_adoption("ubuntu:latest")  # type: ignore[reportPrivateUsage]
+
+    assert result is None
+    assert not any(record.levelname == "WARNING" for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_resolve_image_id_for_adoption_non_404_docker_error_logs_warning(
+    docker_service: DockerService, caplog: pytest.LogCaptureFixture
+) -> None:
+    cm, instance = _make_docker_mock()
+    instance.images = MagicMock()
+    instance.images.inspect = AsyncMock(side_effect=DockerError(status=500, message="internal server error"))
+
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn.error"):
+        result = await docker_service._resolve_image_id_for_adoption("ubuntu:latest")  # type: ignore[reportPrivateUsage]
+
+    assert result is None
+    assert any(record.levelname == "WARNING" and "ubuntu:latest" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_resolve_image_id_for_adoption_unexpected_exception_logs_warning_and_returns_none(
+    docker_service: DockerService, caplog: pytest.LogCaptureFixture
+) -> None:
+    cm, instance = _make_docker_mock()
+    instance.images = MagicMock()
+    instance.images.inspect = AsyncMock(side_effect=ConnectionError("connection refused"))
+
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn.error"):
+        result = await docker_service._resolve_image_id_for_adoption("ubuntu:latest")  # type: ignore[reportPrivateUsage]
+
+    assert result is None
+    assert any(record.levelname == "WARNING" and "ubuntu:latest" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_resolve_image_id_for_adoption_non_dict_response_logs_warning_and_returns_none(
+    docker_service: DockerService, caplog: pytest.LogCaptureFixture
+) -> None:
+    cm, instance = _make_docker_mock()
+    instance.images = MagicMock()
+    instance.images.inspect = AsyncMock(return_value=["not", "a", "dict"])
+
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn.error"):
+        result = await docker_service._resolve_image_id_for_adoption("ubuntu:latest")  # type: ignore[reportPrivateUsage]
+
+    assert result is None
+    assert any(record.levelname == "WARNING" and "ubuntu:latest" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_resolve_image_id_for_adoption_missing_id_field_returns_none(docker_service: DockerService) -> None:
+    cm, instance = _make_docker_mock()
+    instance.images = MagicMock()
+    instance.images.inspect = AsyncMock(return_value={"RepoTags": ["ubuntu:latest"]})
+
+    with patch("server.docker.Docker", return_value=cm):
+        result = await docker_service._resolve_image_id_for_adoption("ubuntu:latest")  # type: ignore[reportPrivateUsage]
+
+    assert result is None
+
+
+# _try_adopt_orphaned_container
+
+
+@pytest.mark.asyncio
+async def test_try_adopt_orphaned_container_logs_when_found_but_not_matched(
+    docker_service: DockerService, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A near-miss (e.g. wrong image) must not be totally silent - an operator needs a breadcrumb."""
+    options = _opts(name="ollama", image="ubuntu:latest")
+    options.container_name = "ollama"
+    cm, _ = _mock_container_show({"Config": {"Image": "ubuntu:22.04", "Env": []}, "State": {"Status": "running"}, "Mounts": []})
+
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("INFO", logger="uvicorn.error"):
+        result = await docker_service._try_adopt_orphaned_container(options)  # type: ignore[reportPrivateUsage]
+
+    assert result is None
+    assert any("ollama" in record.message and "not adopting" in record.message.lower() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_try_adopt_orphaned_container_logs_on_successful_adoption(
+    docker_service: DockerService, caplog: pytest.LogCaptureFixture
+) -> None:
+    options = _opts(name="ollama", image="ubuntu:latest", image_port=8080)
+    options.container_name = "ollama"
+    cm, _ = _mock_container_show(
+        {
+            "Image": DEFAULT_ADOPTION_IMAGE_ID,
+            "Config": {"Image": "ubuntu:latest", "Env": []},
+            "State": {"Status": "running"},
+            "Mounts": [],
+            "NetworkSettings": {"Ports": {"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}},
+        }
+    )
+
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("INFO", logger="uvicorn.error"):
+        result = await docker_service._try_adopt_orphaned_container(options)  # type: ignore[reportPrivateUsage]
+
+    assert result == 44444
+    assert any("ollama" in record.message and "adopting" in record.message.lower() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_try_adopt_orphaned_container_skips_lookup_when_container_name_not_set(docker_service: DockerService) -> None:
+    """Without an explicit container_name there's no reliable way to know what name Compose assigned - never guess."""
+    options = _opts(name="ollama", image="ubuntu:latest")
+    assert options.container_name is None
+
+    with patch("server.docker.Docker") as mock_docker:
+        result = await docker_service._try_adopt_orphaned_container(options)  # type: ignore[reportPrivateUsage]
+
+    assert result is None
+    mock_docker.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_try_adopt_orphaned_container_skips_adoption_when_image_id_unresolvable(docker_service: DockerService) -> None:
+    """If the configured image's current ID can't be resolved (e.g. not pulled locally), adoption
+
+    can't be proven safe, even if the container's Config.Image name/tag string matches - a name/tag
+    match alone doesn't confirm it's running the same software as what would actually be pulled/run now.
+    """
+    options = _opts(name="ollama", image="ubuntu:latest", image_port=8080)
+    options.container_name = "ollama"
+    cm, _ = _mock_container_show(
+        {
+            "Image": DEFAULT_ADOPTION_IMAGE_ID,
+            "Config": {"Image": "ubuntu:latest", "Env": []},
+            "State": {"Status": "running"},
+            "Mounts": [],
+            "NetworkSettings": {"Ports": {"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}},
+        }
+    )
+    cm.__aenter__.return_value.images.inspect = AsyncMock(side_effect=DockerError(status=404, message="no such image"))
+
+    with patch("server.docker.Docker", return_value=cm):
+        result = await docker_service._try_adopt_orphaned_container(options)  # type: ignore[reportPrivateUsage]
+
+    assert result is None
 
 
 # _ensure_compose_running
@@ -1707,6 +2563,11 @@ async def test_ensure_compose_running_name_conflict_raises_http_409(docker_servi
             new_callable=AsyncMock,
             side_effect=DockerComposeStartError("", stderr),
         ),
+        # The reason adoption doesn't succeed is covered by other tests (mismatched image,
+        # container not found, etc.); this test only cares that a failed adoption surfaces as a 409
+        # with the container name in the detail, so it stubs adoption directly instead of exercising
+        # a real Docker connection.
+        patch.object(docker_service, "_try_adopt_orphaned_container", new_callable=AsyncMock, return_value=None),
         pytest.raises(HTTPException) as exc_info,
     ):
         await docker_service._ensure_compose_running(compose_file, options, is_running=False, has_difference=True, port=None)  # type: ignore[reportPrivateUsage]
@@ -1732,9 +2593,345 @@ async def test_ensure_compose_running_name_conflict_phrase_in_logs_only_is_not_t
             side_effect=DockerComposeStartError("out", "err"),
         ),
         patch.object(docker_service, "get_docker_compose_logs", new_callable=AsyncMock, return_value="port is already in use"),
+        # If the routing logic ever mistook this for a name conflict it would try to adopt, which
+        # means touching Docker — fail loudly on that instead of silently depending on there being
+        # no real daemon reachable in the test environment.
+        patch("server.docker.Docker", side_effect=AssertionError("adoption path must not be reached for a non-conflict error")),
         pytest.raises(AppError, match="Failed to start"),
     ):
         await docker_service._ensure_compose_running(compose_file, options, is_running=False, has_difference=True, port=None)  # type: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_ensure_compose_running_adopts_matching_orphan_and_removes_written_compose_file(
+    docker_service: DockerService, tmp_path: Path
+) -> None:
+    options = _opts(name="ollama", image="ubuntu:latest", image_port=8080)
+    options.container_name = "ollama"
+    compose_file = tmp_path / "compose.yaml"
+    stderr = 'Conflict. The container name "/ollama" is already in use by container "abc123".'
+
+    async def _write_compose_file(path: Path, _opts: DockerOptions) -> int:
+        path.write_text("stub")
+        return 11434
+
+    cm, _ = _mock_container_show(
+        {
+            "Image": DEFAULT_ADOPTION_IMAGE_ID,
+            "Config": {"Image": "ubuntu:latest", "Env": []},
+            "State": {"Status": "running"},
+            "Mounts": [],
+            "NetworkSettings": {"Ports": {"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}},
+        }
+    )
+
+    with (
+        patch.object(docker_service, "create_compose_file", new_callable=AsyncMock, side_effect=_write_compose_file),
+        patch.object(
+            docker_service,
+            "start_docker_compose",
+            new_callable=AsyncMock,
+            side_effect=DockerComposeStartError("", stderr),
+        ),
+        patch("server.docker.Docker", return_value=cm),
+    ):
+        start_output, port, adopted = await docker_service._ensure_compose_running(  # type: ignore[reportPrivateUsage]
+            compose_file, options, is_running=False, has_difference=True, port=None
+        )
+
+    assert start_output is None
+    assert port == 44444
+    assert adopted is True
+    assert not compose_file.exists()
+    docker_service.port_service.release_port.assert_called_once_with(11434)  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@pytest.mark.asyncio
+async def test_ensure_compose_running_adoption_same_port_does_not_release_it(docker_service: DockerService, tmp_path: Path) -> None:
+    """The reserved port must only be released when adoption ends up using a *different* one."""
+    options = _opts(name="ollama", image="ubuntu:latest", image_port=8080)
+    options.container_name = "ollama"
+    compose_file = tmp_path / "compose.yaml"
+    stderr = 'Conflict. The container name "/ollama" is already in use by container "abc123".'
+
+    async def _write_compose_file(path: Path, _opts: DockerOptions) -> int:
+        path.write_text("stub")
+        return 44444
+
+    cm, _ = _mock_container_show(
+        {
+            "Image": DEFAULT_ADOPTION_IMAGE_ID,
+            "Config": {"Image": "ubuntu:latest", "Env": []},
+            "State": {"Status": "running"},
+            "Mounts": [],
+            "NetworkSettings": {"Ports": {"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}},
+        }
+    )
+
+    with (
+        patch.object(docker_service, "create_compose_file", new_callable=AsyncMock, side_effect=_write_compose_file),
+        patch.object(
+            docker_service,
+            "start_docker_compose",
+            new_callable=AsyncMock,
+            side_effect=DockerComposeStartError("", stderr),
+        ),
+        patch("server.docker.Docker", return_value=cm),
+    ):
+        _, port, adopted = await docker_service._ensure_compose_running(  # type: ignore[reportPrivateUsage]
+            compose_file, options, is_running=False, has_difference=True, port=None
+        )
+
+    assert port == 44444
+    assert adopted is True
+    docker_service.port_service.release_port.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@pytest.mark.asyncio
+async def test_ensure_compose_running_adoption_reverification_catches_crash_and_raises_app_error(
+    docker_service: DockerService, tmp_path: Path
+) -> None:
+    """The match decision is based on one inspect snapshot; if the container crashes before adoption is
+    committed, a fresh re-inspect right before commit must catch it instead of silently registering a
+    dead container as adopted."""
+    options = _opts(name="ollama", image="ubuntu:latest", image_port=8080)
+    options.container_name = "ollama"
+    compose_file = tmp_path / "compose.yaml"
+    stderr = 'Conflict. The container name "/ollama" is already in use by container "abc123".'
+
+    healthy_inspect = {
+        "Image": DEFAULT_ADOPTION_IMAGE_ID,
+        "Config": {"Image": "ubuntu:latest", "Env": []},
+        "State": {"Status": "running"},
+        "Mounts": [],
+        "NetworkSettings": {"Ports": {"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}},
+    }
+    crashed_inspect = {**healthy_inspect, "State": {"Status": "exited"}}
+
+    cm, instance = _make_docker_mock()
+    container = MagicMock()
+    container.show = AsyncMock(side_effect=[healthy_inspect, crashed_inspect])
+    instance.containers = MagicMock()
+    instance.containers.container = MagicMock(return_value=container)
+    instance.images = MagicMock()
+    instance.images.inspect = AsyncMock(return_value={"Id": DEFAULT_ADOPTION_IMAGE_ID})
+
+    async def _write_compose_file(path: Path, _opts: DockerOptions) -> int:
+        path.write_text("stub")
+        return 11434
+
+    with (
+        patch.object(docker_service, "create_compose_file", new_callable=AsyncMock, side_effect=_write_compose_file),
+        patch.object(
+            docker_service,
+            "start_docker_compose",
+            new_callable=AsyncMock,
+            side_effect=DockerComposeStartError("", stderr),
+        ),
+        patch("server.docker.Docker", return_value=cm),
+        patch("server.docker.Utils.run_command", new_callable=AsyncMock, return_value=make_result(stdout="crash logs")),
+        pytest.raises(AppError, match="no longer healthy"),
+    ):
+        await docker_service._ensure_compose_running(compose_file, options, is_running=False, has_difference=True, port=None)  # type: ignore[reportPrivateUsage]
+
+    # A failed re-verification must not delete the compose file this attempt wrote - same as any other failed start.
+    assert compose_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_ensure_compose_running_adoption_reverification_inspect_failure_raises_app_error(
+    docker_service: DockerService, tmp_path: Path
+) -> None:
+    """If the container disappears (or the daemon errors) between the match decision and the
+    re-verification inspect, that must surface as a failed install too, not a silent adoption."""
+    options = _opts(name="ollama", image="ubuntu:latest", image_port=8080)
+    options.container_name = "ollama"
+    compose_file = tmp_path / "compose.yaml"
+    stderr = 'Conflict. The container name "/ollama" is already in use by container "abc123".'
+
+    healthy_inspect = {
+        "Image": DEFAULT_ADOPTION_IMAGE_ID,
+        "Config": {"Image": "ubuntu:latest", "Env": []},
+        "State": {"Status": "running"},
+        "Mounts": [],
+        "NetworkSettings": {"Ports": {"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}},
+    }
+
+    cm, instance = _make_docker_mock()
+    container = MagicMock()
+    container.show = AsyncMock(side_effect=[healthy_inspect, DockerError(status=404, message="no such container")])
+    instance.containers = MagicMock()
+    instance.containers.container = MagicMock(return_value=container)
+    instance.images = MagicMock()
+    instance.images.inspect = AsyncMock(return_value={"Id": DEFAULT_ADOPTION_IMAGE_ID})
+
+    async def _write_compose_file(path: Path, _opts: DockerOptions) -> int:
+        path.write_text("stub")
+        return 11434
+
+    with (
+        patch.object(docker_service, "create_compose_file", new_callable=AsyncMock, side_effect=_write_compose_file),
+        patch.object(
+            docker_service,
+            "start_docker_compose",
+            new_callable=AsyncMock,
+            side_effect=DockerComposeStartError("", stderr),
+        ),
+        patch("server.docker.Docker", return_value=cm),
+        pytest.raises(AppError, match="could not be re-confirmed healthy"),
+    ):
+        await docker_service._ensure_compose_running(compose_file, options, is_running=False, has_difference=True, port=None)  # type: ignore[reportPrivateUsage]
+
+    assert compose_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_ensure_compose_running_adoption_survives_compose_file_unlink_failure(
+    docker_service: DockerService, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failure to remove the stale compose file (e.g. permission denied) must not crash a successful adoption."""
+    options = _opts(name="ollama", image="ubuntu:latest", image_port=8080)
+    options.container_name = "ollama"
+    compose_file = tmp_path / "compose.yaml"
+    compose_file.mkdir()  # unlink() on a directory raises IsADirectoryError, a plain OSError
+    stderr = 'Conflict. The container name "/ollama" is already in use by container "abc123".'
+
+    cm, _ = _mock_container_show(
+        {
+            "Image": DEFAULT_ADOPTION_IMAGE_ID,
+            "Config": {"Image": "ubuntu:latest", "Env": []},
+            "State": {"Status": "running"},
+            "Mounts": [],
+            "NetworkSettings": {"Ports": {"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}},
+        }
+    )
+
+    with (
+        patch.object(docker_service, "create_compose_file", new_callable=AsyncMock, return_value=11434),
+        patch.object(
+            docker_service,
+            "start_docker_compose",
+            new_callable=AsyncMock,
+            side_effect=DockerComposeStartError("", stderr),
+        ),
+        patch("server.docker.Docker", return_value=cm),
+        caplog.at_level("WARNING", logger="uvicorn.error"),
+    ):
+        start_output, port, adopted = await docker_service._ensure_compose_running(  # type: ignore[reportPrivateUsage]
+            compose_file, options, is_running=False, has_difference=True, port=None
+        )
+
+    assert start_output is None
+    assert port == 44444
+    assert adopted is True
+    assert compose_file.is_dir()  # unlink failed, so the (bogus) directory is still there
+    assert any(record.levelname == "WARNING" and "ollama" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_ensure_compose_running_adoption_keeps_preexisting_compose_file_untouched(
+    docker_service: DockerService, tmp_path: Path
+) -> None:
+    """A conflict on the no-create_compose_file branch must not delete a compose file it didn't write."""
+    options = _opts(name="ollama", image="ubuntu:latest", image_port=8080)
+    options.container_name = "ollama"
+    compose_file = tmp_path / "compose.yaml"
+    compose_file.write_text("preexisting")
+    stderr = 'Conflict. The container name "/ollama" is already in use by container "abc123".'
+    docker_service.port_service.is_port_available.return_value = True  # pyright: ignore[reportAttributeAccessIssue]
+
+    cm, _ = _mock_container_show(
+        {
+            "Image": DEFAULT_ADOPTION_IMAGE_ID,
+            "Config": {"Image": "ubuntu:latest", "Env": []},
+            "State": {"Status": "running"},
+            "Mounts": [],
+            "NetworkSettings": {"Ports": {"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}},
+        }
+    )
+
+    with (
+        patch.object(
+            docker_service,
+            "start_docker_compose",
+            new_callable=AsyncMock,
+            side_effect=DockerComposeStartError("", stderr),
+        ),
+        patch("server.docker.Docker", return_value=cm),
+    ):
+        start_output, port, adopted = await docker_service._ensure_compose_running(  # type: ignore[reportPrivateUsage]
+            compose_file, options, is_running=False, has_difference=False, port=11434
+        )
+
+    assert start_output is None
+    assert port == 44444
+    assert adopted is True
+    assert compose_file.read_text() == "preexisting"
+
+
+@pytest.mark.asyncio
+async def test_ensure_compose_running_non_matching_orphan_still_raises_http_409(docker_service: DockerService, tmp_path: Path) -> None:
+    options = _opts(name="ollama", image="ubuntu:latest", image_port=8080)
+    options.container_name = "ollama"
+    compose_file = tmp_path / "compose.yaml"
+    stderr = 'Conflict. The container name "/ollama" is already in use by container "abc123".'
+
+    cm, _ = _mock_container_show(
+        {
+            "Image": "sha256:" + "c" * 64,  # different resolved image id -> no match
+            "Config": {"Image": "ubuntu:latest", "Env": []},
+            "State": {"Status": "running"},
+            "Mounts": [],
+            "NetworkSettings": {"Ports": {"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "44444"}]}},
+        }
+    )
+
+    with (
+        patch.object(docker_service, "create_compose_file", new_callable=AsyncMock, return_value=11434),
+        patch.object(
+            docker_service,
+            "start_docker_compose",
+            new_callable=AsyncMock,
+            side_effect=DockerComposeStartError("", stderr),
+        ),
+        patch("server.docker.Docker", return_value=cm),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await docker_service._ensure_compose_running(compose_file, options, is_running=False, has_difference=True, port=None)  # type: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_ensure_compose_running_inspect_failure_falls_back_to_http_409(docker_service: DockerService, tmp_path: Path) -> None:
+    options = _opts(name="ollama")
+    options.container_name = "ollama"
+    compose_file = tmp_path / "compose.yaml"
+    stderr = 'Conflict. The container name "/ollama" is already in use by container "abc123".'
+
+    instance = MagicMock()
+    instance.containers = MagicMock()
+    container = MagicMock()
+    container.show = AsyncMock(side_effect=DockerError(status=404, message="no such container"))
+    instance.containers.container = MagicMock(return_value=container)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=instance)
+    cm.__aexit__ = AsyncMock(return_value=False)
+
+    with (
+        patch.object(docker_service, "create_compose_file", new_callable=AsyncMock, return_value=11434),
+        patch.object(
+            docker_service,
+            "start_docker_compose",
+            new_callable=AsyncMock,
+            side_effect=DockerComposeStartError("", stderr),
+        ),
+        patch("server.docker.Docker", return_value=cm),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await docker_service._ensure_compose_running(compose_file, options, is_running=False, has_difference=True, port=None)  # type: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 409
 
 
 @pytest.mark.asyncio

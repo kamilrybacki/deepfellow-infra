@@ -24,7 +24,15 @@ from server.services.vllm_service import (
     VllmService,
     _const,  # pyright: ignore[reportPrivateUsage]
 )
-from server.utils.core import DownloadedPacket, PreDownloadPacket, Stream, StreamChunk, StreamChunkProgress, SuccessDownloadPacket
+from server.utils.core import (
+    CommandResult,
+    DownloadedPacket,
+    PreDownloadPacket,
+    Stream,
+    StreamChunk,
+    StreamChunkProgress,
+    SuccessDownloadPacket,
+)
 from server.utils.exceptions import AppError
 from server.utils.hardware import NvidiaGpuInfo
 
@@ -974,7 +982,7 @@ async def test_install_model_reuses_persisted_capacity_when_container_not_restar
 async def test_install_model_capacity_unknown_when_not_restarted_and_never_persisted(
     svc: VllmService, deps: dict[str, Any], tmp_path: Path
 ) -> None:
-    """A no-op reinstall with no prior known capacity must leave capacity unknown rather than guessing."""
+    """A no-op reinstall with no prior known capacity and no recoverable log line must leave capacity unknown."""
     _setup_install_mocks(svc, deps)
     model_id = next(iter(svc.models["default"]))
     deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, False))
@@ -984,14 +992,45 @@ async def test_install_model_capacity_unknown_when_not_restarted_and_never_persi
         patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
         patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
         patch.object(svc, "get_specified_hardware_parts", return_value=[]),
-        patch("server.services.base2_service.Utils.run_command", new_callable=AsyncMock) as mock_run_command,
+        patch(
+            "server.services.base2_service.Utils.run_command",
+            new_callable=AsyncMock,
+            return_value=CommandResult(exit_code=0, stdout="", stderr=""),
+        ) as mock_run_command,
     ):
         promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
         await promise.wait()
 
-    mock_run_command.assert_not_called()
+    mock_run_command.assert_called_once()
     call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
     assert call_kwargs["registration_options"].capacity_state == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_install_model_capacity_recovered_from_logs_when_not_restarted_and_never_persisted(
+    svc: VllmService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    """An adopted orphan container with no persisted capacity should still recover it from its startup logs."""
+    _setup_install_mocks(svc, deps)
+    model_id = next(iter(svc.models["default"]))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, False))
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+        patch(
+            "server.services.base2_service.Utils.run_command",
+            new_callable=AsyncMock,
+            return_value=CommandResult(exit_code=0, stdout="Maximum concurrency for 4096 tokens per request: 2.00x", stderr=""),
+        ),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
+    assert call_kwargs["registration_options"].capacity_state == 2
 
 
 def test_get_persisted_model_capacity_returns_unknown_for_untracked_instance(svc: VllmService) -> None:

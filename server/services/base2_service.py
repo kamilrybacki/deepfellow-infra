@@ -320,7 +320,10 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         A container that's still running from before this process started never rewrote its
         startup capacity line, so re-reading its logs can't recover it (see `_get_docker_logs`);
         the last persisted value is reused instead, which is safe because an unchanged config
-        implies an unchanged real capacity.
+        implies an unchanged real capacity. If there's no persisted value either - e.g. an
+        orphan-adopted container (see `_try_adopt_orphaned_container`) that this process never
+        started and has no prior config entry for - the startup line may still be sitting in the
+        container's tailed log, so it's worth a best-effort read before giving up.
         """
         if restarted:
             self._log_cache.pop(container_name, None)
@@ -336,12 +339,26 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             return capacity, capacity_known
 
         capacity, capacity_known = self._get_persisted_model_capacity(instance, model_id)
-        if capacity is not None:
+        if capacity is not None or capacity_known:
             logger.debug("Container for %r wasn't (re)started; reusing last known %s concurrency %s.", model_id, backend_name, capacity)
-        elif not capacity_known:
-            logger.warning(
-                "Could not determine %s concurrency for %r: container already running, no prior known value.", backend_name, model_id
+            return capacity, capacity_known
+
+        recovered = await self._get_max_concurrency_from_logs(container_name, backend_name, parse)
+        if recovered is not None:
+            logger.info(
+                "Recovered %s concurrency %s for %r from its still-running container's logs (no prior known value).",
+                backend_name,
+                recovered,
+                model_id,
             )
+            return recovered, True
+
+        logger.warning(
+            "Could not determine %s concurrency for %r: container already running, no prior known value, "
+            "and its startup capacity line is no longer in the tailed logs.",
+            backend_name,
+            model_id,
+        )
         return capacity, capacity_known
 
     def load_default_models(self, instance: str) -> None:

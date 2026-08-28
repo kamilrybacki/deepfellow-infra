@@ -22,6 +22,10 @@ class PortService:
                 return port
         raise RuntimeError("No free port in range", (start, end))
 
+    def release_port(self, port: int) -> None:
+        """Return a previously allocated port to the pool."""
+        self.allocated_ports.discard(port)
+
     def is_port_available(self, port: int) -> bool:
         """Check whether port is available."""
         try:
