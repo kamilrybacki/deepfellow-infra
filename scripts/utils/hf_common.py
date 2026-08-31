@@ -10,8 +10,13 @@ from typing import Any
 import aiohttp
 
 
-async def get_json_with_retry(session: aiohttp.ClientSession, url: str, params: dict[str, str], max_retries: int = 5) -> Any:  # noqa: ANN401
-    """GET url as JSON, retrying with backoff when HuggingFace rate-limits (429) or errors transiently (5xx)."""
+async def get_json_with_retry(session: aiohttp.ClientSession, url: str, params: dict[str, str], max_retries: int = 8) -> Any:  # noqa: ANN401
+    """GET url as JSON, retrying with backoff when HuggingFace rate-limits (429) or errors transiently (5xx).
+
+    The default `max_retries`/backoff cap are sized for anonymous (unauthenticated) requests, whose
+    rate-limit window is short but can still take over a minute to clear once a batch of list/detail
+    calls has exhausted it — a handful of quick retries capped at 30s wasn't enough to ride that out.
+    """
     for attempt in range(max_retries):
         async with session.get(url, params=params) as resp:
             try:
@@ -20,7 +25,7 @@ async def get_json_with_retry(session: aiohttp.ClientSession, url: str, params: 
                 if (exc.status != 429 and exc.status < 500) or attempt == max_retries - 1:
                     raise
                 retry_after = resp.headers.get("Retry-After")
-                delay = float(retry_after) if retry_after else min(2.0**attempt, 30.0)
+                delay = float(retry_after) if retry_after else min(3.0 * 2.0**attempt, 60.0)
                 await asyncio.sleep(delay)
                 continue
             return await resp.json(content_type=None)
