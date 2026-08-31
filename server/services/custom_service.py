@@ -607,12 +607,13 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
             options.spec["prefix"] = model.default_prefix
         model.model_props.prefix = options.spec["prefix"]
         parsed_model_options = try_parse_pydantic(CustomModelOptions, options.spec)
+
+        self._installing.add(key)
+
         await self.validate_docker_image_version_for_model(model_id, options.spec.get("image_version"), options.spec.get("hardware"))
         docker_options = model.options(options.spec) if isinstance(model.options, Callable) else model.options
         docker_options = apply_image_version_override(docker_options, options.spec.get("image_version"))
         await self._verify_docker_image(docker_options.image, options.ignore_warnings)
-
-        self._installing.add(key)
 
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
             try:
