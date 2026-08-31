@@ -1175,19 +1175,19 @@
         {
             "name": "gemma4:12b-mlx",
             "size": "7.7GB",
-            "hash": "117d0d84cf2a",
+            "hash": "ded7a2735003",
             "context": 262144
         },
         {
             "name": "gemma4:26b",
-            "size": "18GB",
-            "hash": "5571076f3d70",
+            "size": "19GB",
+            "hash": "08ae7ec1744b",
             "context": 262144
         },
         {
             "name": "gemma4:26b-mlx",
             "size": "18GB",
-            "hash": "c8656f50f0a6",
+            "hash": "f0fc7e0ae494",
             "context": 262144
         },
         {
@@ -1199,7 +1199,7 @@
         {
             "name": "gemma4:31b-mlx",
             "size": "19GB",
-            "hash": "637cc0ff1570",
+            "hash": "a22a363052da",
             "context": 262144
         },
         {
@@ -1210,8 +1210,8 @@
         },
         {
             "name": "gemma4:e2b-mlx",
-            "size": "6.5GB",
-            "hash": "e98b54fe1913",
+            "size": "7.5GB",
+            "hash": "f4a8449d1781",
             "context": 131072
         },
         {
@@ -1222,8 +1222,8 @@
         },
         {
             "name": "gemma4:e4b-mlx",
-            "size": "8.8GB",
-            "hash": "aa6f2058d5dc",
+            "size": "9.5GB",
+            "hash": "5a08735df03c",
             "context": 131072
         },
         {
@@ -1533,6 +1533,30 @@
             "context": 131072
         },
         {
+            "name": "granite4.2",
+            "size": "5.3GB",
+            "hash": "f586c02fdecd",
+            "context": 131072
+        },
+        {
+            "name": "granite4.2:30b",
+            "size": "18GB",
+            "hash": "be22829aa92a",
+            "context": 131072
+        },
+        {
+            "name": "granite4.2:3b",
+            "size": "2.2GB",
+            "hash": "40577dc168a3",
+            "context": 131072
+        },
+        {
+            "name": "granite4.2:8b",
+            "size": "5.3GB",
+            "hash": "f586c02fdecd",
+            "context": 131072
+        },
+        {
             "name": "granite4:1b",
             "size": "3.3GB",
             "hash": "26e4cb132798",
@@ -1617,6 +1641,12 @@
             "context": 262144
         },
         {
+            "name": "laguna-s-2.1:dflash-nvfp4",
+            "size": "68GB",
+            "hash": "cbc809384a7c",
+            "context": 1048576
+        },
+        {
             "name": "laguna-s-2.1:f16",
             "size": "235GB",
             "hash": "8bad4c600f65",
@@ -1624,20 +1654,20 @@
         },
         {
             "name": "laguna-s-2.1:mlx-bf16",
-            "size": "235GB",
-            "hash": "f9fa40073739",
+            "size": "237GB",
+            "hash": "b5f23d44f7ed",
             "context": 1048576
         },
         {
             "name": "laguna-s-2.1:mxfp8",
             "size": "136GB",
-            "hash": "85623901a2bb",
+            "hash": "4d872a0116f7",
             "context": 1048576
         },
         {
             "name": "laguna-s-2.1:nvfp4",
-            "size": "67GB",
-            "hash": "6a25a6e6e44c",
+            "size": "66GB",
+            "hash": "9971870d882b",
             "context": 1048576
         },
         {
@@ -1666,20 +1696,20 @@
         },
         {
             "name": "laguna-xs-2.1:mlx-bf16",
-            "size": "67GB",
-            "hash": "0f9a63efe3ac",
+            "size": "68GB",
+            "hash": "989474a733e8",
             "context": 262144
         },
         {
             "name": "laguna-xs-2.1:mxfp8",
-            "size": "39GB",
-            "hash": "3bda218ff75c",
+            "size": "40GB",
+            "hash": "5a09682a78a6",
             "context": 262144
         },
         {
             "name": "laguna-xs-2.1:nvfp4",
-            "size": "19GB",
-            "hash": "6b0fae515b6d",
+            "size": "20GB",
+            "hash": "540825c4fccb",
             "context": 262144
         },
         {
@@ -2429,6 +2459,24 @@
             "context": 2048
         },
         {
+            "name": "muse-glimmer",
+            "size": "18GB",
+            "hash": "de878ce33ad8",
+            "context": 131072
+        },
+        {
+            "name": "muse-glimmer:30b",
+            "size": "18GB",
+            "hash": "de878ce33ad8",
+            "context": 131072
+        },
+        {
+            "name": "muse-glimmer:30b-mlx",
+            "size": "19GB",
+            "hash": "015fa21845be",
+            "context": 131072
+        },
+        {
             "name": "mythomax-l2",
             "size": "7.9GB",
             "hash": "",
@@ -2474,6 +2522,24 @@
             "name": "nemotron-3-super:120b",
             "size": "87GB",
             "hash": "95acc78b3ffd",
+            "context": 262144
+        },
+        {
+            "name": "nemotron-3.5-lightning",
+            "size": "25GB",
+            "hash": "e7a64ff15fb1",
+            "context": 1048576
+        },
+        {
+            "name": "nemotron-3.5-lightning:30b",
+            "size": "25GB",
+            "hash": "e7a64ff15fb1",
+            "context": 1048576
+        },
+        {
+            "name": "nemotron-3.5-lightning:30b-mlx",
+            "size": "23GB",
+            "hash": "8b1474be6e54",
             "context": 262144
         },
         {
@@ -2858,6 +2924,24 @@
             "name": "ornith",
             "size": "5.6GB",
             "hash": "a75697c14589",
+            "context": 262144
+        },
+        {
+            "name": "ornith-1.5:35b",
+            "size": "23GB",
+            "hash": "9f3b89b25219",
+            "context": 262144
+        },
+        {
+            "name": "ornith-1.5:397b",
+            "size": "242GB",
+            "hash": "337c6db6be12",
+            "context": 262144
+        },
+        {
+            "name": "ornith-1.5:9b",
+            "size": "6.6GB",
+            "hash": "e5df7dcdd8a2",
             "context": 262144
         },
         {
@@ -3368,32 +3452,56 @@
         },
         {
             "name": "qwen3.6",
-            "size": "24GB",
-            "hash": "07d35212591f",
+            "size": "23GB",
+            "hash": "096fdbd02fe6",
             "context": 262144
         },
         {
             "name": "qwen3.6:27b",
-            "size": "17GB",
-            "hash": "a50eda8ed977",
+            "size": "18GB",
+            "hash": "9d5803d493a9",
             "context": 262144
         },
         {
             "name": "qwen3.6:27b-mlx",
-            "size": "20GB",
-            "hash": "60b0437bbd02",
+            "size": "19GB",
+            "hash": "d49fd9e0da45",
             "context": 262144
         },
         {
             "name": "qwen3.6:35b",
-            "size": "24GB",
-            "hash": "07d35212591f",
+            "size": "23GB",
+            "hash": "096fdbd02fe6",
             "context": 262144
         },
         {
             "name": "qwen3.6:35b-mlx",
-            "size": "22GB",
-            "hash": "1b50c6fdc2d4",
+            "size": "24GB",
+            "hash": "e92a3e94bbca",
+            "context": 262144
+        },
+        {
+            "name": "qwen3.8",
+            "size": "18GB",
+            "hash": "22130167c4c2",
+            "context": 262144
+        },
+        {
+            "name": "qwen3.8-flash-next:125b-mlx",
+            "size": "105GB",
+            "hash": "c7b96ffe21af",
+            "context": 262144
+        },
+        {
+            "name": "qwen3.8:27b",
+            "size": "18GB",
+            "hash": "22130167c4c2",
+            "context": 262144
+        },
+        {
+            "name": "qwen3.8:27b-mlx",
+            "size": "18GB",
+            "hash": "5642e97495e1",
             "context": 262144
         },
         {

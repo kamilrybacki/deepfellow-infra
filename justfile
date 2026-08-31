@@ -189,7 +189,17 @@ get-llamacpp-models *FLAGS:
     uv run python -m scripts.get_llamacpp_models --top-by-downloads 200 --top-by-likes 100 --top-by-trending 50 --output static/llamacpp-min.json {{FLAGS}}
 
 get-sglang-models *FLAGS:
-    uv run python ./scripts/get_huggingface_models.py --type llm --top-by-downloads 200 --top-by-likes 100 --top-by-trending 50 --output static/sglang-min.json {{FLAGS}}
-    uv run python ./scripts/get_huggingface_models.py --type reranker --top-by-downloads 50 --top-by-likes 30 --top-by-trending 30 --allow-generative-rerankers --output static/sglang-min.json {{FLAGS}}
-    uv run python ./scripts/get_huggingface_models.py --type embedding --top-by-downloads 10 --top-by-trending 10 --output static/sglang-min.json {{FLAGS}}
+    uv run python -m scripts.get_huggingface_models --type llm --top-by-downloads 200 --top-by-likes 100 --top-by-trending 50 --output static/sglang-min.json {{FLAGS}}
+    uv run python -m scripts.get_huggingface_models --type reranker --top-by-downloads 50 --top-by-likes 30 --top-by-trending 30 --allow-generative-rerankers --output static/sglang-min.json {{FLAGS}}
+    uv run python -m scripts.get_huggingface_models --type embedding --top-by-downloads 10 --top-by-trending 10 --output static/sglang-min.json {{FLAGS}}
+
+# static/ holds nine *-min.json registries; these four are the generated ones. coqui, docker-model-runner,
+# rerank, speaches and stable-diffusion are maintained by hand and are deliberately not touched here — a new
+# service joins this list only once it has its own get-*-models recipe.
+#
+# An aggregate in the style of `check`: it takes no flags, so call an individual get-*-models recipe when you
+# need to pass any.
+
+# Refresh every model list generated from an upstream source, in one go.
+refresh-generated-model-lists: get-ollama-models get-vllm-models get-llamacpp-models get-sglang-models
 
