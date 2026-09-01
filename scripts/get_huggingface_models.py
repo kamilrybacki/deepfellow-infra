@@ -12,7 +12,7 @@ import asyncio
 import json
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +68,46 @@ def is_reranker(model: dict[str, Any]) -> bool:
     return "rerank" in name
 
 
+NON_RERANKER_CROSS_ENCODER_TASK_WORDS = re.compile(r"\b(?:sts|stsb|nli|qnli|mnli|quora|qqp|mrpc|paraphrase)\b", re.IGNORECASE)
+
+
+def is_reranking_cross_encoder(model: dict[str, Any]) -> bool:
+    """Exclude cross-encoders trained for a different scoring task than reranking.
+
+    `library_name == "sentence-transformers"` plus a text-ranking/text-classification pipeline_tag
+    only means "some CrossEncoder regression/classification head" — the same architecture is reused
+    for semantic-textual-similarity (STS/STSB), natural-language-inference (NLI/QNLI/MNLI), and
+    duplicate-question (Quora/QQP/MRPC) benchmarks, which score something other than relevance and
+    would return meaningless rankings if served as a reranker. These tasks are conventionally named
+    in the repo id (e.g. cross-encoder/stsb-*, cross-encoder/qnli-*, cross-encoder/quora-*), so
+    they're excluded by name.
+    """
+    name = model.get("id", "").lower()
+    return not NON_RERANKER_CROSS_ENCODER_TASK_WORDS.search(name)
+
+
+# Each pipeline_tag maps to a validator that decides whether a candidate carrying that tag is kept.
+# "sentence-similarity" is HF's dedicated tag for that task and is trusted as-is. "text-ranking" and
+# "text-classification" both get HF-tagged onto any CrossEncoder-style model regardless of what it
+# was actually trained to score — reranking relevance, but also semantic-textual-similarity (STS),
+# natural-language-inference (NLI), or duplicate-question detection, which return meaningless
+# rankings if served as a reranker — so every candidate from either tag is filtered through
+# `is_reranking_cross_encoder` to exclude those by name. "text-classification" is additionally far
+# broader still (sentiment classifiers, prompt-injection detectors, ...), so it also requires
+# corroborating evidence: rerankers published under text-classification are consistently shipped
+# with the sentence-transformers library (a survey of the top 100 by downloads found this held for
+# all of them and none of the non-reranker classifiers). "feature-extraction" is embeddings' analog
+# of the broad, noisy tag and is validated against the existing embedding name heuristic instead.
+RERANKER_TAGS: dict[str, Callable[[dict[str, Any]], bool]] = {
+    "text-ranking": is_reranking_cross_encoder,
+    "text-classification": lambda m: m.get("library_name") == "sentence-transformers" and is_reranking_cross_encoder(m),
+}
+EMBEDDING_TAGS: dict[str, Callable[[dict[str, Any]], bool]] = {
+    "sentence-similarity": lambda _m: True,
+    "feature-extraction": lambda m: is_embedding(m),
+}
+
+
 def is_supported_cross_encoder(architectures: list[str]) -> bool:
     """Return True if any architecture is a standard HF sequence-classification head.
 
@@ -92,9 +132,7 @@ async def has_chat_template(session: aiohttp.ClientSession, model_id: str, sibli
     if "tokenizer_config.json" not in filenames:
         return False
     try:
-        tokenizer_config = await get_json_with_retry(
-            session, f"https://huggingface.co/{model_id}/raw/main/tokenizer_config.json", {}, max_retries=3
-        )
+        tokenizer_config = await get_json_with_retry(session, f"https://huggingface.co/{model_id}/raw/main/tokenizer_config.json", {})
         return bool(tokenizer_config.get("chat_template"))
     except Exception:
         return False
@@ -151,60 +189,86 @@ async def collect_llm_models(session: aiohttp.ClientSession, active: dict[str, i
     return models
 
 
-async def collect_reranker_models(session: aiohttp.ClientSession, active: dict[str, int]) -> list[dict[str, Any]]:
-    """Fetch and deduplicate reranker models across all sort combinations."""
-    fetch_tasks = [fetch_popular_reranker_models(session, sort, limit) for sort, limit in active.items()]
-    results = await asyncio.gather(*fetch_tasks)
+async def _collect_by_tag_and_name(
+    session: aiohttp.ClientSession,
+    active: dict[str, int],
+    tags: dict[str, Callable[[dict[str, Any]], bool]],
+    fetch_by_name: Callable[[aiohttp.ClientSession, str, int], Coroutine[Any, Any, list[dict[str, Any]]]],
+    is_named_match: Callable[[dict[str, Any]], bool],
+) -> list[dict[str, Any]]:
+    """Merge tag-driven and name-driven candidate discovery, deduplicated across all sources.
+
+    A candidate qualifies if it satisfies *any* source: its pipeline_tag's own validator (see
+    `RERANKER_TAGS`/`EMBEDDING_TAGS`), or the legacy name-search heuristic. This is a strict OR —
+    the tag query surfaces models the name search can never find (its repo name doesn't contain
+    the word being searched for), while the name search still catches candidates that carry
+    neither pipeline_tag (e.g. generative rerankers tagged as plain text-generation models).
+    """
+    query_tags = [tag for _ in active for tag in tags]
+    tag_fetch_tasks = [fetch_popular_models(session, tag, sort, limit) for sort, limit in active.items() for tag in tags]
+    name_fetch_tasks = [fetch_by_name(session, sort, limit) for sort, limit in active.items()]
+    tag_results = await asyncio.gather(*tag_fetch_tasks)
+    name_results = await asyncio.gather(*name_fetch_tasks)
+
     seen: set[str] = set()
     models: list[dict[str, Any]] = []
-    for batch in results:
+
+    def add(m: dict[str, Any]) -> None:
+        mid = m["id"]
+        if mid not in seen and not is_gguf(m):
+            seen.add(mid)
+            models.append(m)
+
+    for tag, batch in zip(query_tags, tag_results, strict=True):
         for m in batch:
-            mid = m["id"]
-            if mid not in seen and is_reranker(m) and not is_gguf(m):
-                seen.add(mid)
-                models.append(m)
+            if tags[tag](m):
+                add(m)
+    for batch in name_results:
+        for m in batch:
+            if is_named_match(m):
+                add(m)
     return models
+
+
+async def collect_reranker_models(session: aiohttp.ClientSession, active: dict[str, int]) -> list[dict[str, Any]]:
+    """Fetch and deduplicate reranker models across all sort combinations, by tag and by name."""
+    return await _collect_by_tag_and_name(session, active, RERANKER_TAGS, fetch_popular_reranker_models, is_reranker)
 
 
 async def collect_embedding_models(session: aiohttp.ClientSession, active: dict[str, int]) -> list[dict[str, Any]]:
-    """Fetch and deduplicate embedding models across all sort combinations."""
-    fetch_tasks = [fetch_popular_embedding_models(session, sort, limit) for sort, limit in active.items()]
-    results = await asyncio.gather(*fetch_tasks)
-    seen: set[str] = set()
-    models: list[dict[str, Any]] = []
-    for batch in results:
-        for m in batch:
-            mid = m["id"]
-            if mid not in seen and is_embedding(m) and not is_gguf(m):
-                seen.add(mid)
-                models.append(m)
-    return models
+    """Fetch and deduplicate embedding models across all sort combinations, by tag and by name."""
+    return await _collect_by_tag_and_name(session, active, EMBEDDING_TAGS, fetch_popular_embedding_models, is_embedding)
 
 
 async def fetch_model_details(
     session: aiohttp.ClientSession, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
-) -> tuple[str, str, list[str], bool]:
+) -> tuple[str, str, list[str] | None, bool]:
     """Return (model_id, human_readable_size, architectures, has_chat_template).
 
     `has_chat_template` is only checked when `check_chat_template` is set (LLM candidates); it is
     True by default for reranker/embedding candidates, for which the check is meaningless.
+
+    `architectures` is `None` when the detail fetch itself failed (e.g. exhausted retries under
+    rate limiting), as opposed to `[]` when it succeeded but the model genuinely reports none —
+    `_drop_unsupported_models` needs to tell these apart so a fetch failure doesn't get treated as
+    "confirmed not a cross-encoder" and silently kept with fabricated data.
     """
     async with sem:
         try:
-            data = await get_json_with_retry(session, f"{HF_API}/models/{model_id}", {"blobs": "true"}, max_retries=3)
+            data = await get_json_with_retry(session, f"{HF_API}/models/{model_id}", {"blobs": "true"})
             siblings = data.get("siblings", [])
             total = sum(f.get("size", 0) for f in siblings if f.get("size"))
             architectures = data.get("config", {}).get("architectures") or []
             chat_ok = await has_chat_template(session, model_id, siblings) if check_chat_template else True
             return model_id, fmt_size(total) if total else "N/A", architectures, chat_ok
         except Exception:
-            return model_id, "N/A", [], False
+            return model_id, "N/A", None, False
 
 
 def _drop_unsupported_models(
     registry_key: str,
     models: list[dict[str, Any]],
-    architectures: dict[str, list[str]],
+    architectures: dict[str, list[str] | None],
     chat_capable: dict[str, bool],
     log: Callable[[str], None],
     keep_generative_rerankers: bool = False,
@@ -215,13 +279,18 @@ def _drop_unsupported_models(
     that can serve generative rerankers (e.g. SGLang, given the right startup flags) pass this so
     those candidates stay in and get tagged via `is_generative` instead of being dropped outright.
     """
-    before = len(models)
     if registry_key == "rerankers":
+        before = len(models)
+        models = [m for m in models if architectures.get(m["id"]) is not None]
+        if dropped := before - len(models):
+            log(f"Dropped {dropped} reranker candidate(s) whose details couldn't be fetched from HuggingFace.")
         if not keep_generative_rerankers:
-            models = [m for m in models if is_supported_cross_encoder(architectures.get(m["id"], []))]
+            before = len(models)
+            models = [m for m in models if is_supported_cross_encoder(architectures.get(m["id"]) or [])]
             if dropped := before - len(models):
                 log(f"Dropped {dropped} reranker candidate(s) whose architecture vLLM can't serve as a cross-encoder.")
     elif registry_key == "llms":
+        before = len(models)
         models = [m for m in models if chat_capable.get(m["id"], False)]
         if dropped := before - len(models):
             log(f"Dropped {dropped} LLM candidate(s) without a usable chat template (base/pretrain models vLLM can't serve for chat).")
@@ -288,7 +357,7 @@ async def main(
         size = fmt_size_compact(sizes.get(mid, "N/A"))
         entry: dict[str, Any] = {"name": mid, "size": size}
         if registry_key == "rerankers":
-            entry["is_generative"] = not is_supported_cross_encoder(architectures.get(mid, []))
+            entry["is_generative"] = not is_supported_cross_encoder(architectures.get(mid) or [])
         entries.append(entry)
     entries.sort(key=lambda e: e["name"].casefold())
 
