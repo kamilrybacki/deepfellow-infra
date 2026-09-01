@@ -107,6 +107,12 @@ export interface ServiceModel {
   custom_spec?: Record<string, unknown> | null;
   description?: string | null;
   repository_url?: string | null;
+  // False when this catalog entry's type/capabilities couldn't be resolved from either the
+  // live provider listing or the known model metadata - installing it is rejected.
+  capabilities_resolved?: boolean;
+  // True when this entry was previously seen (and possibly installed) but is no longer present
+  // in the most recent live provider listing.
+  stale?: boolean;
 }
 
 export interface GpuCardStats {

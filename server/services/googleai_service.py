@@ -3,7 +3,35 @@
 
 """GoogleAI service."""
 
-from server.services.remote_service import DefaultRemoteServiceOptions, RemoteConst, RemoteModel, RemoteService
+import json
+import logging
+from collections.abc import Sequence
+from urllib.parse import urljoin
+
+import aiohttp
+
+from server.services.remote_service import (
+    DefaultRemoteServiceOptions,
+    LiveModelEntry,
+    RemoteConst,
+    RemoteModel,
+    RemoteModelType,
+    RemoteService,
+)
+
+logger = logging.getLogger("uvicorn.error")
+
+_MAX_PAGES = 20
+_FETCH_TIMEOUT = aiohttp.ClientTimeout(total=15)
+
+# Google's native `GET /v1beta/models` reports each model's supported RPCs rather than a
+# DeepFellow-style type -- map the ones we care about. A model backing several of these (or none)
+# resolves to whichever comes first here; unmatched methods fall back to the RemoteConst overlay.
+_GENERATION_METHOD_TYPE: dict[str, RemoteModelType] = {
+    "generateContent": "llm",
+    "embedContent": "embedding",
+    "predict": "txt2img",
+}
 
 _const = RemoteConst(
     models={
@@ -152,3 +180,60 @@ class GoogleAIService(RemoteService):
     def get_models_registry(self) -> RemoteConst:
         """Return the models registry."""
         return _const
+
+    async def _fetch_live_models(self, instance: str) -> Sequence[LiveModelEntry] | None:
+        """Fetch the live model listing from Google AI's native, paginated `GET /v1beta/models`.
+
+        Distinct from the OpenAI-compatible `v1beta/openai/` proxy path this service uses for chat
+        (`api_version`) — Google's native listing has its own response shape (`models[].name` as
+        `"models/<id>"`, `nextPageToken` pagination). Returns None on any failure, discarding any
+        entries already accumulated from earlier pages, so a partial/incomplete listing never
+        silently overwrites the hardcoded catalog.
+        """
+        entries: list[LiveModelEntry] = []
+
+        try:
+            info = self.get_instance_installed_info(instance)
+            api_url = info.parsed_options.api_url
+            # Google's native endpoint (unlike the OpenAI-compat proxy path this service uses for
+            # chat) expects the key via x-goog-api-key, not an Authorization: Bearer header.
+            headers = {"x-goog-api-key": info.parsed_options.api_key}
+            models_url = urljoin(f"{api_url}/", "v1beta/models")
+
+            page_token: str | None = None
+            async with aiohttp.ClientSession(timeout=_FETCH_TIMEOUT) as session:
+                for _ in range(_MAX_PAGES):
+                    params = {"pageToken": page_token} if page_token else {}
+                    async with session.get(models_url, headers=headers, params=params) as response:
+                        if response.status != 200:
+                            logger.warning(
+                                "%s live model listing failed for instance %r: HTTP %d", self.get_type(), instance, response.status
+                            )
+                            return None
+                        body = json.loads(await response.text())
+                        for model in body["models"]:
+                            name = model["name"]
+                            if not name.startswith("models/"):
+                                logger.warning(
+                                    "%s live model listing returned an unexpected model name %r for instance %r",
+                                    self.get_type(),
+                                    name,
+                                    instance,
+                                )
+                                return None
+                            resolved_type: RemoteModelType | None = None
+                            for method in model.get("supportedGenerationMethods", []):
+                                if method in _GENERATION_METHOD_TYPE:
+                                    resolved_type = _GENERATION_METHOD_TYPE[method]
+                                    break
+                            entries.append(LiveModelEntry(id=name.removeprefix("models/"), type=resolved_type))
+
+                        next_page_token = body.get("nextPageToken")
+                        if not next_page_token:
+                            return entries
+                        page_token = next_page_token
+        except Exception:
+            logger.exception("%s live model listing failed for instance %r", self.get_type(), instance)
+            return None
+
+        return entries
