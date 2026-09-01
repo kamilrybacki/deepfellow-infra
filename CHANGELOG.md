@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [0.32.0] - 2026-09-01
 
 ### Added
 - New `just refresh-generated-model-lists` recipe refreshes the four generated model registries (ollama, vLLM, llama.cpp, SGLang) in one run, in the style of `just check`. The five hand-curated lists in `static/` are deliberately left alone.
