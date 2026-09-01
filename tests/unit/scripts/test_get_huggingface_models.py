@@ -12,6 +12,8 @@ import aiohttp
 import pytest
 
 from scripts.get_huggingface_models import (
+    EMBEDDING_TAGS,
+    RERANKER_TAGS,
     collect_embedding_models,
     collect_llm_models,
     collect_reranker_models,
@@ -26,6 +28,7 @@ from scripts.get_huggingface_models import (
     is_embedding,
     is_llm,
     is_reranker,
+    is_reranking_cross_encoder,
     is_supported_cross_encoder,
     main,
 )
@@ -434,6 +437,10 @@ async def test_collect_llm_models_filters_ocr_models() -> None:
     assert [m["id"] for m in result] == ["google/gemma-4-31B-it"]
 
 
+async def _no_tag_candidates(session: Mock, tag: str, sort: str, limit: int) -> list[dict[str, str]]:
+    return []
+
+
 @pytest.mark.asyncio
 async def test_collect_reranker_models_deduplicates() -> None:
     reranker = {"id": "org/bge-reranker-v2"}
@@ -441,9 +448,9 @@ async def test_collect_reranker_models_deduplicates() -> None:
     async def fake_fetch(session: Mock, sort: str, limit: int):
         return [reranker]
 
-    with patch(
-        "scripts.get_huggingface_models.fetch_popular_reranker_models",
-        side_effect=fake_fetch,
+    with (
+        patch("scripts.get_huggingface_models.fetch_popular_models", side_effect=_no_tag_candidates),
+        patch("scripts.get_huggingface_models.fetch_popular_reranker_models", side_effect=fake_fetch),
     ):
         result = await collect_reranker_models(MagicMock(), {"downloads": 10, "likes": 10})
 
@@ -455,13 +462,71 @@ async def test_collect_reranker_models_filters_non_rerankers() -> None:
     async def fake_fetch(session: Mock, sort: str, limit: int):
         return [{"id": "org/bert-base"}]
 
-    with patch(
-        "scripts.get_huggingface_models.fetch_popular_reranker_models",
-        side_effect=fake_fetch,
+    with (
+        patch("scripts.get_huggingface_models.fetch_popular_models", side_effect=_no_tag_candidates),
+        patch("scripts.get_huggingface_models.fetch_popular_reranker_models", side_effect=fake_fetch),
     ):
         result = await collect_reranker_models(MagicMock(), {"downloads": 10})
 
     assert result == []
+
+
+@pytest.mark.asyncio
+async def test_collect_reranker_models_finds_by_trusted_tag_without_name_match() -> None:
+    """A model with no "rerank" in its name (invisible to the name search) is still found via the
+    trusted text-ranking pipeline_tag."""
+
+    async def fake_tag_fetch(session: Mock, tag: str, sort: str, limit: int):
+        return [{"id": "cross-encoder/ms-marco-MiniLM-L6-v2"}] if tag == "text-ranking" else []
+
+    with (
+        patch("scripts.get_huggingface_models.fetch_popular_models", side_effect=fake_tag_fetch),
+        patch("scripts.get_huggingface_models.fetch_popular_reranker_models", return_value=[]),
+    ):
+        result = await collect_reranker_models(MagicMock(), {"downloads": 10})
+
+    assert [m["id"] for m in result] == ["cross-encoder/ms-marco-MiniLM-L6-v2"]
+
+
+@pytest.mark.asyncio
+async def test_collect_reranker_models_text_ranking_excludes_non_reranking_cross_encoders() -> None:
+    """text-ranking is tagged onto any CrossEncoder model regardless of what it scores, so STS/NLI/
+    duplicate-question cross-encoders sharing that tag with real rerankers must still be excluded."""
+
+    async def fake_tag_fetch(session: Mock, tag: str, sort: str, limit: int) -> list[dict[str, str]]:
+        if tag != "text-ranking":
+            return []
+        return [{"id": "cross-encoder/ms-marco-MiniLM-L6-v2"}, {"id": "cross-encoder/stsb-roberta-large"}]
+
+    with (
+        patch("scripts.get_huggingface_models.fetch_popular_models", side_effect=fake_tag_fetch),
+        patch("scripts.get_huggingface_models.fetch_popular_reranker_models", return_value=[]),
+    ):
+        result = await collect_reranker_models(MagicMock(), {"downloads": 10})
+
+    assert [m["id"] for m in result] == ["cross-encoder/ms-marco-MiniLM-L6-v2"]
+
+
+@pytest.mark.asyncio
+async def test_collect_reranker_models_text_classification_requires_sentence_transformers_library() -> None:
+    """text-classification is a noisy tag (dominated by sentiment/other classifiers sharing the
+    same architecture), so only sentence-transformers-library candidates from it are kept."""
+
+    async def fake_tag_fetch(session: Mock, tag: str, sort: str, limit: int) -> list[dict[str, str]]:
+        if tag != "text-classification":
+            return []
+        return [
+            {"id": "BAAI/bge-reranker-v2-m3", "library_name": "sentence-transformers"},
+            {"id": "ProsusAI/finbert", "library_name": "transformers"},
+        ]
+
+    with (
+        patch("scripts.get_huggingface_models.fetch_popular_models", side_effect=fake_tag_fetch),
+        patch("scripts.get_huggingface_models.fetch_popular_reranker_models", return_value=[]),
+    ):
+        result = await collect_reranker_models(MagicMock(), {"downloads": 10})
+
+    assert [m["id"] for m in result] == ["BAAI/bge-reranker-v2-m3"]
 
 
 @pytest.mark.asyncio
@@ -471,9 +536,9 @@ async def test_collect_embedding_models_deduplicates() -> None:
     async def fake_fetch(session: Mock, sort: str, limit: int):
         return [embedding]
 
-    with patch(
-        "scripts.get_huggingface_models.fetch_popular_embedding_models",
-        side_effect=fake_fetch,
+    with (
+        patch("scripts.get_huggingface_models.fetch_popular_models", side_effect=_no_tag_candidates),
+        patch("scripts.get_huggingface_models.fetch_popular_embedding_models", side_effect=fake_fetch),
     ):
         result = await collect_embedding_models(MagicMock(), {"downloads": 10, "trendingScore": 10})
 
@@ -485,13 +550,97 @@ async def test_collect_embedding_models_filters_non_embeddings() -> None:
     async def fake_fetch(session: Mock, sort: str, limit: int):
         return [{"id": "org/bert-base"}]
 
-    with patch(
-        "scripts.get_huggingface_models.fetch_popular_embedding_models",
-        side_effect=fake_fetch,
+    with (
+        patch("scripts.get_huggingface_models.fetch_popular_models", side_effect=_no_tag_candidates),
+        patch("scripts.get_huggingface_models.fetch_popular_embedding_models", side_effect=fake_fetch),
     ):
         result = await collect_embedding_models(MagicMock(), {"downloads": 10})
 
     assert result == []
+
+
+@pytest.mark.asyncio
+async def test_collect_embedding_models_finds_by_trusted_tag_without_name_match() -> None:
+    """A model with no "embed" in its name (invisible to the name search) is still found via the
+    trusted sentence-similarity pipeline_tag."""
+
+    async def fake_tag_fetch(session: Mock, tag: str, sort: str, limit: int):
+        return [{"id": "BAAI/bge-m3"}] if tag == "sentence-similarity" else []
+
+    with (
+        patch("scripts.get_huggingface_models.fetch_popular_models", side_effect=fake_tag_fetch),
+        patch("scripts.get_huggingface_models.fetch_popular_embedding_models", return_value=[]),
+    ):
+        result = await collect_embedding_models(MagicMock(), {"downloads": 10})
+
+    assert [m["id"] for m in result] == ["BAAI/bge-m3"]
+
+
+@pytest.mark.asyncio
+async def test_collect_embedding_models_feature_extraction_requires_name_match() -> None:
+    """feature-extraction is a noisy tag (audio/code encoders share it), so candidates from it
+    still need to pass the embedding name heuristic."""
+
+    async def fake_tag_fetch(session: Mock, tag: str, sort: str, limit: int) -> list[dict[str, str]]:
+        if tag != "feature-extraction":
+            return []
+        return [{"id": "intfloat/multilingual-e5-large"}, {"id": "facebook/w2v-bert-2.0"}]
+
+    with (
+        patch("scripts.get_huggingface_models.fetch_popular_models", side_effect=fake_tag_fetch),
+        patch("scripts.get_huggingface_models.fetch_popular_embedding_models", return_value=[]),
+    ):
+        result = await collect_embedding_models(MagicMock(), {"downloads": 10})
+
+    assert [m["id"] for m in result] == ["intfloat/multilingual-e5-large"]
+
+
+@pytest.mark.parametrize(
+    ("input_dict", "expected"),
+    [
+        ({"id": "cross-encoder/ms-marco-MiniLM-L6-v2"}, True),
+        ({"id": "BAAI/bge-reranker-v2-m3"}, True),
+        ({"id": "cross-encoder/stsb-roberta-large"}, False),
+        ({"id": "cross-encoder/stsb-distilroberta-base"}, False),
+        ({"id": "cross-encoder/qnli-electra-base"}, False),
+        ({"id": "cross-encoder/quora-roberta-base"}, False),
+        ({"id": ""}, True),
+        ({}, True),
+    ],
+    ids=[
+        "reranker_kept",
+        "reranker_kept_2",
+        "stsb_excluded",
+        "sts_excluded",
+        "qnli_excluded",
+        "quora_excluded",
+        "empty_id",
+        "missing_id",
+    ],
+)
+def test_is_reranking_cross_encoder(input_dict: dict[str, str], expected: bool) -> None:
+    assert is_reranking_cross_encoder(input_dict) is expected
+
+
+def test_reranker_tags_trust_text_ranking_only_for_reranking_cross_encoders() -> None:
+    assert RERANKER_TAGS["text-ranking"]({"id": "cross-encoder/ms-marco-MiniLM-L6-v2", "library_name": "transformers"}) is True
+    assert RERANKER_TAGS["text-ranking"]({"id": "cross-encoder/stsb-roberta-large", "library_name": "sentence-transformers"}) is False
+
+
+def test_reranker_tags_gate_text_classification_on_sentence_transformers_library() -> None:
+    assert RERANKER_TAGS["text-classification"]({"id": "BAAI/bge-reranker-v2-m3", "library_name": "sentence-transformers"}) is True
+    assert RERANKER_TAGS["text-classification"]({"id": "BAAI/bge-reranker-v2-m3", "library_name": "transformers"}) is False
+    assert RERANKER_TAGS["text-classification"]({"id": "BAAI/bge-reranker-v2-m3"}) is False
+    assert RERANKER_TAGS["text-classification"]({"id": "cross-encoder/qnli-electra-base", "library_name": "sentence-transformers"}) is False
+
+
+def test_embedding_tags_trust_sentence_similarity_unconditionally() -> None:
+    assert EMBEDDING_TAGS["sentence-similarity"]({"id": "anything"}) is True
+
+
+def test_embedding_tags_gate_feature_extraction_on_name_heuristic() -> None:
+    assert EMBEDDING_TAGS["feature-extraction"]({"id": "BAAI/bge-large-en-v1.5"}) is True
+    assert EMBEDDING_TAGS["feature-extraction"]({"id": "facebook/w2v-bert-2.0"}) is False
 
 
 @pytest.mark.asyncio
@@ -532,7 +681,7 @@ async def test_fetch_model_details_returns_na_on_exception() -> None:
 
     assert model_id == "org/missing"
     assert size == "N/A"
-    assert architectures == []
+    assert architectures is None
     assert chat_ok is False
 
 
@@ -725,6 +874,43 @@ async def test_main_reranker_keeps_generative_when_allowed(capsys: pytest.Captur
     entries = {e["name"]: e["is_generative"] for e in data["rerankers"]}
     assert entries == {"org/bge-reranker": False, "org/generative-reranker": True}
     assert "Dropped" not in out.err
+
+
+@pytest.mark.asyncio
+async def test_main_reranker_drops_failed_detail_fetch_even_when_generative_allowed(capsys: pytest.CaptureFixture[str]) -> None:
+    """A candidate whose detail fetch failed outright (e.g. exhausted retries under rate limiting)
+    must be dropped, not kept with fabricated `size: "N/A"` / `is_generative: true` — even under
+    `allow_generative_rerankers`, which otherwise skips the architecture-based drop entirely."""
+    models = [{"id": "org/bge-reranker"}, {"id": "org/unreachable-reranker"}]
+    sizes = {"org/bge-reranker": "1.0 GB"}
+    architectures: dict[str, list[str] | None] = {
+        "org/bge-reranker": ["XLMRobertaForSequenceClassification"],
+        "org/unreachable-reranker": None,
+    }
+
+    async def fake_collect(session: Mock, active: dict[str, str]) -> list[dict[str, str]]:
+        return models
+
+    async def fake_details(
+        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
+    ) -> tuple[str, str, list[str] | None, bool]:
+        return model_id, sizes.get(model_id, "N/A"), architectures.get(model_id), model_id in sizes
+
+    with (
+        patch("scripts.get_huggingface_models.collect_reranker_models", side_effect=fake_collect),
+        patch("scripts.get_huggingface_models.fetch_model_details", side_effect=fake_details),
+        patch(
+            "aiohttp.ClientSession",
+            return_value=AsyncMock(__aenter__=AsyncMock(return_value=MagicMock()), __aexit__=AsyncMock(return_value=False)),
+        ),
+    ):
+        await main(10, 0, 0, raw=False, model_type="reranker", allow_generative_rerankers=True)
+
+    out = capsys.readouterr()
+    data = json.loads(out.out)
+    names = [e["name"] for e in data["rerankers"]]
+    assert names == ["org/bge-reranker"]
+    assert "Dropped 1 reranker candidate(s) whose details couldn't be fetched" in out.err
 
 
 @pytest.mark.asyncio
