@@ -979,12 +979,17 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
   });
 
   const hasOllamaCatalog = serviceInfo?.type === "ollama";
+  const hasLiveCatalog =
+    hasOllamaCatalog ||
+    serviceInfo?.type === "openai" ||
+    serviceInfo?.type === "claude" ||
+    serviceInfo?.type === "google";
 
   const refreshMutation = useMutation({
     mutationFn: async () => {
       const [syncResult, catalogResult] = await Promise.allSettled([
         apiClient.syncModels(serviceId),
-        hasOllamaCatalog
+        hasLiveCatalog
           ? apiClient.refreshCatalog(serviceId, true)
           : Promise.resolve(null),
       ]);
@@ -2321,6 +2326,22 @@ const ModelRow = memo(function ModelRow({
             {!isInstalled && isDownloaded && (
               <Badge variant="outline">Downloaded</Badge>
             )}
+            {model.capabilities_resolved === false && (
+              <Badge
+                variant="destructive"
+                title="This model's type/capabilities could not be resolved from the provider's live listing or known metadata - it cannot be installed."
+              >
+                Unresolved
+              </Badge>
+            )}
+            {model.stale && (
+              <Badge
+                variant="outline"
+                title="This model no longer appears in the provider's live listing."
+              >
+                Stale
+              </Badge>
+            )}
             {isInstalled && model.is_loaded === true && (
               <Badge variant="outline">
                 {isCpuOnly ? "In RAM" : "In VRAM"}
@@ -2378,7 +2399,14 @@ const ModelRow = memo(function ModelRow({
             <Button
               onClick={() => onInstallClick(model)}
               size="sm"
-              disabled={isInstallingCurrent}
+              disabled={
+                isInstallingCurrent || model.capabilities_resolved === false
+              }
+              title={
+                model.capabilities_resolved === false
+                  ? "This model's type/capabilities could not be resolved from the provider's live listing or known metadata - it cannot be installed."
+                  : undefined
+              }
             >
               {isInstallingCurrent ? "Installing..." : "Install"}
             </Button>

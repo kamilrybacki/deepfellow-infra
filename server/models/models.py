@@ -109,6 +109,8 @@ class RetrieveModelOut(BaseModel):
     custom_spec: dict[str, Any] | None = None
     description: str | None = None
     repository_url: str | None = None
+    capabilities_resolved: bool = True
+    stale: bool = False
 
 
 class ListModelsFilters(BaseModel):

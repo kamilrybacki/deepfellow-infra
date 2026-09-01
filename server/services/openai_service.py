@@ -3,7 +3,18 @@
 
 """OpenAI service."""
 
-from server.services.remote_service import DefaultRemoteServiceOptions, RemoteConst, RemoteModel, RemoteService
+import json
+import logging
+from collections.abc import Sequence
+from urllib.parse import urljoin
+
+import aiohttp
+
+from server.services.remote_service import DefaultRemoteServiceOptions, LiveModelEntry, RemoteConst, RemoteModel, RemoteService
+
+logger = logging.getLogger("uvicorn.error")
+
+_FETCH_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 _const = RemoteConst(
     models={
@@ -125,3 +136,29 @@ class OpenAIService(RemoteService):
     def get_models_registry(self) -> RemoteConst:
         """Return the models registry."""
         return _const
+
+    async def _fetch_live_models(self, instance: str) -> Sequence[LiveModelEntry] | None:
+        """Fetch the live model listing from OpenAI's `GET /v1/models`. Returns None on any failure."""
+        try:
+            info = self.get_instance_installed_info(instance)
+            api_url = info.parsed_options.api_url
+            api_key = info.parsed_options.api_key
+            headers = {"Authorization": f"Bearer {api_key}"}
+            models_url = urljoin(urljoin(api_url, self.api_version), "models")
+
+            async with (
+                aiohttp.ClientSession(timeout=_FETCH_TIMEOUT) as session,
+                session.get(models_url, headers=headers) as response,
+            ):
+                if response.status != 200:
+                    logger.warning("%s live model listing failed for instance %r: HTTP %d", self.get_type(), instance, response.status)
+                    return None
+                body = json.loads(await response.text())
+                # Ollama's OpenAI-compatible /v1/models reports an empty catalog as
+                # {"data": null} rather than {"data": []} — treat that as zero models,
+                # not a malformed response.
+                data = body["data"] if body["data"] is not None else []
+                return [LiveModelEntry(id=model["id"]) for model in data]
+        except Exception:
+            logger.exception("%s live model listing failed for instance %r", self.get_type(), instance)
+            return None

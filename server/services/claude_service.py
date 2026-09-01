@@ -3,8 +3,20 @@
 
 """Claude service."""
 
+import json
+import logging
+from collections.abc import Sequence
+from urllib.parse import urljoin
+
+import aiohttp
+
 from server.models.services import ServiceField, ServiceSpecification
-from server.services.remote_service import BaseServiceOptions, RemoteConst, RemoteModel, RemoteService
+from server.services.remote_service import BaseServiceOptions, LiveModelEntry, RemoteConst, RemoteModel, RemoteService
+
+logger = logging.getLogger("uvicorn.error")
+
+_MAX_PAGES = 20
+_FETCH_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 _const = RemoteConst(
     models={
@@ -156,6 +168,44 @@ class ClaudeService(RemoteService[ClaudeServiceOptions]):
     def get_models_registry(self) -> RemoteConst:
         """Return the models registry."""
         return _const
+
+    async def _fetch_live_models(self, instance: str) -> Sequence[LiveModelEntry] | None:
+        """Fetch the live model listing from Anthropic's paginated `GET /v1/models`. Returns None on any failure."""
+        entries: list[LiveModelEntry] = []
+
+        try:
+            info = self.get_instance_installed_info(instance)
+            api_url = info.parsed_options.api_url
+            headers = info.parsed_options.headers
+            models_url = urljoin(urljoin(api_url, self.api_version), "models")
+
+            after_id: str | None = None
+            async with aiohttp.ClientSession(timeout=_FETCH_TIMEOUT) as session:
+                for _ in range(_MAX_PAGES):
+                    params = {"after_id": after_id} if after_id else {}
+                    async with session.get(models_url, headers=headers, params=params) as response:
+                        if response.status != 200:
+                            logger.warning(
+                                "%s live model listing failed for instance %r: HTTP %d", self.get_type(), instance, response.status
+                            )
+                            return None
+                        body = json.loads(await response.text())
+                        data = body["data"] if body["data"] is not None else []
+                        # Anthropic's model-listing API only ever lists LLMs -- set it explicitly rather than
+                        # relying on an id match against the RemoteConst overlay, which is keyed by alias
+                        # (e.g. "claude-sonnet-5") while the live listing reports dated snapshot ids.
+                        entries.extend(LiveModelEntry(id=model["id"], type="llm") for model in data)
+
+                        if not body.get("has_more"):
+                            return entries
+                        after_id = body["last_id"]
+        except Exception:
+            logger.exception("%s live model listing failed for instance %r", self.get_type(), instance)
+            return None
+
+        # Exhausted _MAX_PAGES while the provider still reported has_more: return what was
+        # collected rather than silently discarding it as a full failure.
+        return entries
 
     def get_spec(self) -> ServiceSpecification:
         """Provide the specification for the install service modal fields compatible with Claude."""

@@ -540,11 +540,12 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
                     except Exception:
                         logger.exception(f"{self.get_id(instance)} failed to record warning for custom model {model_id}")  # noqa: G004
 
-        promise = await self.install_instance(instance, instance_data.options, instance_data, save=False)
+        promise = await self.install_instance(instance, instance_data.options, instance_data, save=False, run_after_install=False)
         await promise.wait()
         logger.info(f"{self.get_id(instance)} service checked")  # noqa: G004
         tasks = [asyncio.create_task(self.load_model(instance, model)) for model in instance_data.models or []]
         await asyncio.gather(*tasks)
+        await self._after_install(instance)
 
     async def load_service(self, config: ServiceRawConfig) -> None:
         """Load service using the config."""
@@ -601,9 +602,20 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         return ServiceConfig(instances=instances_config, downloaded=self.models_downloaded, service_downloaded=self.service_downloaded)
 
     async def install_instance(
-        self, instance: str, options: InstallServiceIn, instance_config: InstanceConfig | None = None, save: bool = True
+        self,
+        instance: str,
+        options: InstallServiceIn,
+        instance_config: InstanceConfig | None = None,
+        save: bool = True,
+        run_after_install: bool = True,
     ) -> PromiseWithProgress[InstallServiceOut, StreamChunk]:
-        """Install the service."""
+        """Install the service.
+
+        `run_after_install=False` lets a caller that still needs to load persisted models onto the
+        fresh instance (see `load_instance`) defer `_after_install` until after that happens - running
+        it here for a restore would merge a live catalog against an empty `installed.models`, causing
+        every not-yet-reloaded model to look uninstalled and get dropped instead of preserved as stale.
+        """
         if self.instances_info and self.instances_info.get(instance):
             if self.instances_info[instance].installed:
                 raise HTTPException(status_code=400, detail=f"Service {self.get_id(instance)} on {instance} instance already installed")
@@ -614,6 +626,8 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
 
         async def func(data: InstalledInfoType) -> InstallServiceOut:
             self.instances_info[instance].installed = data
+            if run_after_install:
+                await self._after_install(instance)
             if save:
                 await self._save()
             self.instances_info[instance].installing = None
@@ -655,6 +669,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             self.instances_info[instance].installed = data
             for model in preserved_models:
                 await self.load_model(instance, model)
+            await self._after_install(instance)
             await self._save()
             self.instances_info[instance].installing = None
             try:
@@ -679,6 +694,14 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         options (e.g. an unavailable Docker image tag) — without this, update_instance's
         uninstall-then-reinstall ordering would destroy a working installation before the
         rejection surfaces, since `_install_instance` only validates after being invoked.
+        """
+
+    async def _after_install(self, instance: str) -> None:
+        """Run right after `instance` becomes installed, on both fresh install and update.
+
+        No-op by default. Override for services that should refresh derived state (e.g. a live
+        model catalog) as soon as connection details are known, instead of waiting for a manual
+        refresh.
         """
 
     @abstractmethod
