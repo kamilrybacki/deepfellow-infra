@@ -3,6 +3,8 @@
 
 """Services API."""
 
+import asyncio
+import contextlib
 import logging
 import time
 from typing import Annotated
@@ -147,20 +149,35 @@ async def refresh_catalog(
     services_manager: Annotated[ServicesManager, Depends(get_services_manager)],
     _: Annotated[str, Depends(auth_admin)],
     force: Annotated[bool, Query(description="Bypass the 6-hour TTL and force a fresh fetch")] = False,
-) -> CatalogRefreshOut:
+) -> Response:
     """Fetch trending models from the external catalog API and merge them into the service's model list.
 
-    Results are cached for 6 hours. Pass ?force=true to bypass the cache.
+    Results are cached for 6 hours. Pass ?force=true to bypass the cache. The fetch may run as a
+    background job with streamed progress (e.g. for vLLM/llama.cpp/SGLang, which hit HuggingFace
+    dozens-to-hundreds of times) instead of completing before the response is returned.
     """
     if not force:
         cached = catalog_refresh_cache.get(service_id)
         if cached and time.monotonic() - cached[2] < _CATALOG_REFRESH_TTL:
             cached_added, cached_total, _ts = cached
-            return CatalogRefreshOut(added=cached_added, total=cached_total)
+            return JSONResponse(CatalogRefreshOut(added=cached_added, total=cached_total).model_dump())
 
-    added, total = await services_manager.refresh_catalog(service_id)
-    catalog_refresh_cache[service_id] = (added, total, time.monotonic())
-    return CatalogRefreshOut(added=added, total=total)
+    promise = await services_manager.refresh_catalog(service_id)
+
+    if not promise.has_stream:
+        # Already resolved (e.g. Ollama's fast, non-streaming refresh) - update the cache
+        # synchronously so a following request within the TTL reliably observes it.
+        result = await promise.wait()
+        catalog_refresh_cache[service_id] = (result.added, result.total, time.monotonic())
+        return JSONResponse(result.model_dump())
+
+    async def _cache_when_done() -> None:
+        with contextlib.suppress(Exception):
+            result = await promise.wait()
+            catalog_refresh_cache[service_id] = (result.added, result.total, time.monotonic())
+
+    asyncio.create_task(_cache_when_done())  # noqa: RUF006 - fire-and-forget cache population, independent of the streamed response
+    return await convert_promise_with_progress_to_fastapi_response(promise)
 
 
 @router.get(

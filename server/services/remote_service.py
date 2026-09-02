@@ -31,6 +31,7 @@ from server.models.models import (
     UninstallModelIn,
 )
 from server.models.services import (
+    CatalogRefreshOut,
     InstallServiceIn,
     InstallServiceProgress,
     ServiceField,
@@ -290,7 +291,7 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
 
         return merged
 
-    async def refresh_catalog(self) -> tuple[int, int]:
+    async def refresh_catalog(self) -> PromiseWithProgress[CatalogRefreshOut, StreamChunk]:
         """Refresh model catalogs from live provider listings, for services that support one.
 
         Applies `_merge_live_models` per instance. Raises the inherited 405 if this provider
@@ -325,7 +326,7 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
                 "%s live catalog refresh failed for instance(s) %s; their catalogs were left unchanged", self.get_type(), failed_instances
             )
 
-        return added, total
+        return PromiseWithProgress(value=CatalogRefreshOut(added=added, total=total))
 
     async def _after_install(self, instance: str) -> None:
         """Best-effort live catalog refresh right after (re)installing `instance`.

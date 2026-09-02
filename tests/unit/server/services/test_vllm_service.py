@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
 
 import asyncio
+import json
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -14,6 +16,7 @@ from server.docker import ContainerStatus
 from server.models.models import InstallModelIn, ListModelsFilters, UninstallModelIn
 from server.models.services import GpuStats, InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import CustomModel, Instance, InstanceConfig, ModelConfig
+from server.services.model_catalog_refresh import huggingface_refresh_guard
 from server.services.vllm_service import (
     DownloadedInfo,
     InstalledInfo,
@@ -2813,3 +2816,226 @@ async def test_reconciliation_loop_logs_and_continues_on_tick_exception(svc: Vll
         await asyncio.wait_for(task, timeout=1)
 
     assert calls == 2
+
+
+async def _fake_fetch_registry_entries(
+    _session: Any,
+    _top_by_downloads: int,
+    _top_by_likes: int,
+    _top_by_trending: int,
+    model_type: str,
+    log: Any,
+    allow_generative_rerankers: bool = False,
+) -> tuple[str, list[dict[str, Any]]]:
+    if model_type == "llm":
+        return "llms", [{"name": "new/model", "size": "2GB"}]
+    if model_type == "reranker":
+        return "rerankers", []
+    return "embeddings", []
+
+
+@pytest.fixture(autouse=True)
+def _reset_catalog_refresh_guard() -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]
+    huggingface_refresh_guard.release()
+    yield
+    huggingface_refresh_guard.release()
+
+
+def test_get_catalog_refresh_unavailable_reason_none_when_supported(svc: VllmService) -> None:
+    with patch("server.services.vllm_service.model_catalog_refresh.catalog_refresh_supported", True):
+        assert svc.get_catalog_refresh_unavailable_reason() is None
+
+
+def test_get_catalog_refresh_unavailable_reason_set_when_unsupported(svc: VllmService) -> None:
+    with patch("server.services.vllm_service.model_catalog_refresh.catalog_refresh_supported", False):
+        assert svc.get_catalog_refresh_unavailable_reason() is not None
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalog_writes_registry_and_reloads_const(svc: VllmService, tmp_path: Path) -> None:
+    (tmp_path / "static").mkdir()
+    (tmp_path / "static" / "vllm-min.json").write_text(json.dumps({"llms": [{"name": "old/model", "size": "1GB"}]}), encoding="utf-8")
+
+    original_models = dict(_const.models)
+    try:
+        with (
+            patch("server.services.vllm_service.model_catalog_refresh.catalog_refresh_supported", True),
+            patch("server.services.vllm_service.get_main_dir", return_value=tmp_path),
+            patch("server.services.vllm_service.fetch_registry_entries", new=AsyncMock(side_effect=_fake_fetch_registry_entries)),
+        ):
+            promise = await svc.refresh_catalog()
+            result = await promise.wait()
+
+        assert result.added == 1
+        assert "new/model" in _const.models
+        assert "old/model" not in _const.models
+        written = json.loads((tmp_path / "static" / "vllm-min.json").read_text(encoding="utf-8"))
+        assert written["llms"] == [{"name": "new/model", "size": "2GB"}]
+        assert set(svc.models["default"].keys()) == set(_const.models.keys())
+    finally:
+        _const.models = original_models
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalog_raises_when_unsupported(svc: VllmService) -> None:
+    with (
+        patch("server.services.vllm_service.model_catalog_refresh.catalog_refresh_supported", False),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc.refresh_catalog()
+    assert exc_info.value.status_code == 405
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalog_rejects_concurrent_refresh(svc: VllmService) -> None:
+    huggingface_refresh_guard.acquire("llamacpp")
+    try:
+        with (
+            patch("server.services.vllm_service.model_catalog_refresh.catalog_refresh_supported", True),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await svc.refresh_catalog()
+        assert exc_info.value.status_code == 429
+    finally:
+        huggingface_refresh_guard.release()
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalog_leaves_catalog_unchanged_on_failure(svc: VllmService, tmp_path: Path) -> None:
+    (tmp_path / "static").mkdir()
+    original_content = json.dumps({"llms": [{"name": "old/model", "size": "1GB"}]})
+    (tmp_path / "static" / "vllm-min.json").write_text(original_content, encoding="utf-8")
+
+    original_models = dict(_const.models)
+    try:
+        with (
+            patch("server.services.vllm_service.model_catalog_refresh.catalog_refresh_supported", True),
+            patch("server.services.vllm_service.get_main_dir", return_value=tmp_path),
+            patch("server.services.vllm_service.fetch_registry_entries", new=AsyncMock(side_effect=RuntimeError("boom"))),
+        ):
+            promise = await svc.refresh_catalog()
+            with pytest.raises(RuntimeError):
+                await promise.wait()
+
+        assert (tmp_path / "static" / "vllm-min.json").read_text(encoding="utf-8") == original_content
+        assert _const.models == original_models
+    finally:
+        _const.models = original_models
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalog_raises_502_when_catalog_shrinks_too_much(svc: VllmService, tmp_path: Path) -> None:
+    (tmp_path / "static").mkdir()
+    original_content = json.dumps({"llms": [{"name": f"old/model-{i}", "size": "1GB"} for i in range(10)]})
+    (tmp_path / "static" / "vllm-min.json").write_text(original_content, encoding="utf-8")
+
+    async def _degraded_fetch(
+        _session: Any,
+        _top_by_downloads: int,
+        _top_by_likes: int,
+        _top_by_trending: int,
+        model_type: str,
+        log: Any,
+        allow_generative_rerankers: bool = False,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        if model_type == "llm":
+            return "llms", [{"name": "new/model", "size": "2GB"}]
+        return ("rerankers" if model_type == "reranker" else "embeddings"), []
+
+    original_models = dict(_const.models)
+    try:
+        with (
+            patch("server.services.vllm_service.model_catalog_refresh.catalog_refresh_supported", True),
+            patch("server.services.vllm_service.get_main_dir", return_value=tmp_path),
+            patch("server.services.vllm_service.fetch_registry_entries", new=AsyncMock(side_effect=_degraded_fetch)),
+        ):
+            promise = await svc.refresh_catalog()
+            with pytest.raises(HTTPException) as exc_info:
+                await promise.wait()
+            assert exc_info.value.status_code == 502
+
+        assert (tmp_path / "static" / "vllm-min.json").read_text(encoding="utf-8") == original_content
+        assert _const.models == original_models
+    finally:
+        _const.models = original_models
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalog_restores_installed_model_dropped_from_catalog(svc: VllmService, tmp_path: Path) -> None:
+    (tmp_path / "static").mkdir()
+    (tmp_path / "static" / "vllm-min.json").write_text(json.dumps({"llms": [{"name": "old/model", "size": "1GB"}]}), encoding="utf-8")
+
+    installed = _make_installed_info()
+    installed.models["old/model"] = _make_model_installed_info("old/model")
+    svc.instances_info["default"].installed = installed
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id="old/model", options=InstallModelIn(spec={}), definition={"hf_id": "old/model", "size": "1GB"})]
+    )
+
+    original_models = dict(_const.models)
+    try:
+        with (
+            patch("server.services.vllm_service.model_catalog_refresh.catalog_refresh_supported", True),
+            patch("server.services.vllm_service.get_main_dir", return_value=tmp_path),
+            patch("server.services.vllm_service.fetch_registry_entries", new=AsyncMock(side_effect=_fake_fetch_registry_entries)),
+        ):
+            promise = await svc.refresh_catalog()
+            await promise.wait()
+
+        assert "old/model" not in _const.models
+        assert svc.models["default"]["old/model"] == VllmModel(hf_id="old/model", size="1GB")
+    finally:
+        _const.models = original_models
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalog_drops_installed_model_with_no_persisted_definition(svc: VllmService, tmp_path: Path) -> None:
+    (tmp_path / "static").mkdir()
+    (tmp_path / "static" / "vllm-min.json").write_text(json.dumps({"llms": [{"name": "old/model", "size": "1GB"}]}), encoding="utf-8")
+
+    installed = _make_installed_info()
+    installed.models["old/model"] = _make_model_installed_info("old/model")
+    svc.instances_info["default"].installed = installed
+
+    original_models = dict(_const.models)
+    try:
+        with (
+            patch("server.services.vllm_service.model_catalog_refresh.catalog_refresh_supported", True),
+            patch("server.services.vllm_service.get_main_dir", return_value=tmp_path),
+            patch("server.services.vllm_service.fetch_registry_entries", new=AsyncMock(side_effect=_fake_fetch_registry_entries)),
+        ):
+            promise = await svc.refresh_catalog()
+            await promise.wait()
+
+        assert "old/model" not in svc.models["default"]
+    finally:
+        _const.models = original_models
+
+
+@pytest.mark.asyncio
+async def test_sync_models_triggers_refresh_without_awaiting_completion(svc: VllmService) -> None:
+    with patch.object(svc, "refresh_catalog", new=AsyncMock()) as mock_refresh:
+        await svc.sync_models("default")
+    mock_refresh.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sync_models_suppresses_unsupported_error(svc: VllmService) -> None:
+    with patch("server.services.vllm_service.model_catalog_refresh.catalog_refresh_supported", False):
+        await svc.sync_models("default")  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_sync_models_logs_warning_when_background_refresh_fails(svc: VllmService) -> None:
+    class _FailingPromise:
+        async def wait(self) -> None:
+            raise RuntimeError("boom")
+
+    with (
+        patch.object(svc, "refresh_catalog", new=AsyncMock(return_value=_FailingPromise())),
+        patch("server.services.vllm_service.logger") as mock_logger,
+    ):
+        await svc.sync_models("default")
+        await asyncio.sleep(0)  # let the fire-and-forget task run
+
+    mock_logger.warning.assert_called_once()

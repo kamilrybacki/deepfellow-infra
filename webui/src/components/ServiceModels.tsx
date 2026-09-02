@@ -64,6 +64,12 @@ import {
   useModelInstallProgress,
 } from "@/state/install-progress-store";
 import {
+  getCatalogRefreshToast,
+  getRefreshButtonLabel,
+  serviceHasCatalogRefresh,
+  syncModelsTriggersCatalogRefresh,
+} from "@/utils/catalog-refresh";
+import {
   renderMarkdownLinks,
   stripMarkdownLinks,
 } from "@/utils/markdown-links";
@@ -978,18 +984,25 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
     },
   });
 
-  const hasOllamaCatalog = serviceInfo?.type === "ollama";
-  const hasLiveCatalog =
-    hasOllamaCatalog ||
-    serviceInfo?.type === "openai" ||
-    serviceInfo?.type === "claude" ||
-    serviceInfo?.type === "google";
+  const hasCatalogRefresh = serviceHasCatalogRefresh(serviceInfo?.type);
+  const syncIsCatalogRefresh = syncModelsTriggersCatalogRefresh(
+    serviceInfo?.type,
+  );
+  const catalogRefreshUnavailableReason =
+    serviceInfo?.catalog_refresh_unavailable_reason ?? null;
 
   const refreshMutation = useMutation({
     mutationFn: async () => {
+      // vLLM/llama.cpp/SGLang's sync_models already delegates to the same background refresh as
+      // refreshCatalog - calling both there would race two concurrent triggers against the
+      // shared HuggingFace in-flight guard, so for those the sync call is skipped. Every other
+      // service type keeps calling both: sync_models is either a real sync (ollama-external) or
+      // a no-op, and never touches the catalog.
       const [syncResult, catalogResult] = await Promise.allSettled([
-        apiClient.syncModels(serviceId),
-        hasLiveCatalog
+        syncIsCatalogRefresh
+          ? Promise.resolve(null)
+          : apiClient.syncModels(serviceId),
+        hasCatalogRefresh
           ? apiClient.refreshCatalog(serviceId, true)
           : Promise.resolve(null),
       ]);
@@ -1000,29 +1013,21 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
         queryKey: ["admin", "services", serviceId, "models"],
       });
 
-      const syncFailed = syncResult.status === "rejected";
-      const catalogFailed = catalogResult.status === "rejected";
-      const syncedLabel = isOllamaExternal
-        ? "Models synced successfully"
-        : "Models refreshed successfully";
-
-      if (syncFailed && catalogFailed) {
-        toast.error("Failed to refresh models and catalog.");
-      } else if (syncFailed) {
-        toast.error(
-          `Failed to ${isOllamaExternal ? "sync" : "refresh"} models, but the catalog was refreshed.`,
-        );
-      } else if (catalogFailed) {
-        toast.error(`${syncedLabel}, but catalog refresh failed.`);
-      } else {
-        const data =
-          catalogResult.status === "fulfilled" ? catalogResult.value : null;
-        const catalogMsg =
-          data && data.added > 0
-            ? ` ${data.added} new model${data.added === 1 ? "" : "s"} added to catalog.`
-            : "";
-        toast.success(`${syncedLabel}.${catalogMsg}`);
-      }
+      const toastMsg = getCatalogRefreshToast({
+        syncFailed: syncResult.status === "rejected",
+        catalogFailed: catalogResult.status === "rejected",
+        isOllamaExternal,
+        catalogAdded:
+          catalogResult.status === "fulfilled" && catalogResult.value
+            ? catalogResult.value.added
+            : null,
+        catalogFailureReason:
+          catalogResult.status === "rejected" &&
+          catalogResult.reason instanceof Error
+            ? catalogResult.reason.message
+            : undefined,
+      });
+      toast[toastMsg.variant](toastMsg.message);
     },
   });
 
@@ -1735,19 +1740,33 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
         <div className="flex items-center justify-between mb-6">
           <h1 className="text-3xl font-bold">Models for {serviceId}</h1>
           <div className="flex gap-2">
-            <Button
-              variant="outline"
-              onClick={() => refreshMutation.mutate()}
-              disabled={refreshMutation.isPending}
-            >
-              {refreshMutation.isPending
-                ? isOllamaExternal
-                  ? "Syncing…"
-                  : "Refreshing…"
-                : isOllamaExternal
-                  ? "↺ Sync"
-                  : "↺ Refresh"}
-            </Button>
+            {catalogRefreshUnavailableReason ? (
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span>
+                      <Button variant="outline" disabled>
+                        ↺ Refresh
+                      </Button>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    {catalogRefreshUnavailableReason}
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            ) : (
+              <Button
+                variant="outline"
+                onClick={() => refreshMutation.mutate()}
+                disabled={refreshMutation.isPending}
+              >
+                {getRefreshButtonLabel(
+                  refreshMutation.isPending,
+                  isOllamaExternal,
+                )}
+              </Button>
+            )}
             {serviceId === "mcp" && serviceInfo?.custom_model_spec && (
               <Button
                 onClick={() => {

@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- vLLM, llama.cpp, and SGLang catalogs can now be refreshed at runtime instead of only via the offline `just get-vllm-models`/`just get-llamacpp-models`/`just get-sglang-models` release recipes: an admin can trigger `POST /admin/services/{service_id}/catalog/refresh` (or the model list's "Refresh catalog" WebUI action) to re-crawl HuggingFace for the current top trending/downloaded/liked models and reload the service's default model list, without a redeploy. Runtime refresh is only available when `static/` is writable; it shares a single in-flight HuggingFace rate-limit budget across all three services, and refuses to write a catalog that shrank suspiciously compared to the one it would replace.
+
 ### Fixed
 - Reranker/embedding registries (`static/vllm-min.json`, `static/sglang-min.json`) are no longer discovered by name search alone (`search=rerank`/`search=embed`), which missed any real reranker or embedding model whose repo name didn't spell out that word — e.g. `BAAI/bge-m3`, `intfloat/multilingual-e5-large`, `cross-encoder/ms-marco-MiniLM-L6-v2`. Candidates are now also discovered via HuggingFace's `pipeline_tag`, kept alongside the old name search; candidates found this way are filtered to exclude cross-encoders trained for a different task than reranking (e.g. `cross-encoder/stsb-*`, `cross-encoder/qnli-*`, `cross-encoder/quora-*`), which share the same architecture and tag as real rerankers but return meaningless rankings if served as one. A candidate whose HF detail lookup ultimately fails is now dropped instead of kept with fabricated data (`size: "N/A"`, incorrect `is_generative: true`). `just get-sglang-models` is also fixed — it always failed with `ModuleNotFoundError`.
 

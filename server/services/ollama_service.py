@@ -39,6 +39,7 @@ from server.models.models import (
     UninstallModelIn,
 )
 from server.models.services import (
+    CatalogRefreshOut,
     InstallServiceIn,
     InstallServiceProgress,
     ServiceField,
@@ -298,11 +299,12 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             if model_config.model_id not in self.models[instance] and model_config.definition:
                 self._restore_model_definition(instance, model_config.model_id, model_config.definition)
 
-    async def refresh_catalog(self) -> tuple[int, int]:
+    async def refresh_catalog(self) -> PromiseWithProgress[CatalogRefreshOut, StreamChunk]:
         """Fetch trending models from the Ollama library and merge them into the dynamic catalog.
 
-        Returns (added, total) where added is the number of newly-discovered models and
-        total is the combined count of static + dynamic models.
+        Fast enough to complete within the request, so it's wrapped in an already-resolved
+        promise rather than a background task — this only exists to match the shared
+        `BaseService.refresh_catalog` contract used generically across service types.
         """
         client = OllamaCatalogClient()
         entries = await client.fetch_trending()
@@ -325,7 +327,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             self.load_default_models(instance)
 
         total = len(_const.models) + len(self._dynamic_models)
-        return added, total
+        return PromiseWithProgress(value=CatalogRefreshOut(added=added, total=total))
 
     def get_type(self) -> str:
         """Return the type."""

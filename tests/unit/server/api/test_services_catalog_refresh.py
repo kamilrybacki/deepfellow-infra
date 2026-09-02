@@ -3,6 +3,7 @@
 
 """Tests for POST /admin/services/{id}/catalog/refresh endpoint."""
 
+import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock
 
@@ -11,8 +12,10 @@ from fastapi import FastAPI, HTTPException
 from starlette.testclient import TestClient
 
 import server.api.services as services_module
-from server.api.services import router
+from server.api.services import refresh_catalog, router
 from server.core.dependencies import auth_admin, get_services_manager
+from server.models.services import CatalogRefreshOut
+from server.utils.core import PromiseWithProgress, Stream, StreamChunk
 
 SERVICE_ID = "ollama"
 
@@ -25,7 +28,11 @@ def clear_cache() -> None:
 @pytest.fixture
 def services_manager() -> MagicMock:
     manager = MagicMock()
-    manager.refresh_catalog = AsyncMock(return_value=(10, 700))
+
+    async def _refresh_catalog(*_args: object, **_kwargs: object) -> PromiseWithProgress[CatalogRefreshOut, object]:
+        return PromiseWithProgress(value=CatalogRefreshOut(added=10, total=700))
+
+    manager.refresh_catalog = AsyncMock(side_effect=_refresh_catalog)
     return manager
 
 
@@ -85,3 +92,26 @@ def test_refresh_catalog_unsupported_service_returns_405(client: TestClient, ser
     services_manager.refresh_catalog = AsyncMock(side_effect=HTTPException(405, "Not supported"))
     response = client.post("/admin/services/vllm/catalog/refresh")
     assert response.status_code == 405
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalog_streaming_updates_cache_once_done() -> None:
+    """A streaming (background-job) refresh, as used by vLLM/llama.cpp, still populates the cache."""
+    services_module.catalog_refresh_cache.clear()
+
+    async def fetch_func(_stream: Stream[StreamChunk]) -> CatalogRefreshOut:
+        return CatalogRefreshOut(added=3, total=50)
+
+    async def _refresh_catalog(*_args: object, **_kwargs: object) -> PromiseWithProgress[CatalogRefreshOut, StreamChunk]:
+        return PromiseWithProgress(func=fetch_func)
+
+    manager = MagicMock()
+    manager.refresh_catalog = AsyncMock(side_effect=_refresh_catalog)
+
+    response = await refresh_catalog("vllm", manager, "admin", False)
+
+    async for _chunk in response.body_iterator:  # pyright: ignore[reportAttributeAccessIssue]
+        pass
+    await asyncio.sleep(0)
+
+    assert services_module.catalog_refresh_cache["vllm"][:2] == (3, 50)

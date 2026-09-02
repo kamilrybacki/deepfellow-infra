@@ -14,9 +14,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
+import aiohttp
 from fastapi import HTTPException
 from pydantic import BaseModel
 
+from scripts.get_huggingface_models import fetch_registry_entries
 from server.applicationcontext import get_base_url
 from server.config import get_main_dir
 from server.docker import (
@@ -40,6 +42,7 @@ from server.models.models import (
     UninstallModelIn,
 )
 from server.models.services import (
+    CatalogRefreshOut,
     InstallServiceIn,
     InstallServiceProgress,
     OneOfOption,
@@ -49,7 +52,9 @@ from server.models.services import (
     ServiceSpecification,
     UninstallServiceIn,
 )
+from server.services import model_catalog_refresh
 from server.services.base2_service import Base2Service, CustomModel, Instance, InstanceConfig, ModelConfig
+from server.services.model_catalog_refresh import huggingface_refresh_guard
 from server.utils.core import (
     DownloadedPacket,
     PreDownloadPacket,
@@ -103,6 +108,17 @@ _TOOL_CALL_PARSER_HINTS: tuple[tuple[str, str], ...] = (
     ("glm4.5", "glm45"),
     ("kimi", "kimi_k2"),
 )
+
+
+# Mirrors the `just get-sglang-models` release recipe (see justfile): one fetch per model type,
+# each merged into its own registry key so a refresh reproduces exactly what the offline, reviewed
+# release process would generate. Unlike vLLM, SGLang's reranker fetch allows generative
+# candidates, tagging each with `is_generative` instead of dropping it.
+_SGLANG_FETCH_PLAN: list[tuple[int, int, int, str, bool]] = [
+    (200, 100, 50, "llm", False),
+    (50, 30, 30, "reranker", True),
+    (10, 0, 10, "embedding", False),
+]
 
 
 class SglangModel(BaseModel):
@@ -253,6 +269,99 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
     def load_default_models(self, instance: str) -> None:
         """Load default models to instance."""
         self.models[instance] = {model_id: model.model_copy(deep=True) for model_id, model in _const.models.items()}
+
+    def get_catalog_refresh_unavailable_reason(self) -> str | None:
+        """Return why a catalog refresh can't run right now, or None if it can."""
+        if not model_catalog_refresh.catalog_refresh_supported:
+            return "The static model-catalog directory isn't writable, so catalog refresh is disabled."
+        return None
+
+    async def refresh_catalog(self) -> PromiseWithProgress[CatalogRefreshOut, StreamChunk]:
+        """Fetch current top SGLang-compatible LLM/reranker/embedding models from HuggingFace.
+
+        Runs as a background job (dozens-to-hundreds of HTTP requests) and, on success, writes the
+        merged registry to `static/sglang-min.json` and reloads `_const.models` in memory. Failure
+        (including the shared in-flight guard rejecting a concurrent refresh) leaves the existing
+        file and in-memory catalog untouched.
+        """
+        if not model_catalog_refresh.catalog_refresh_supported:
+            raise HTTPException(405, self.get_catalog_refresh_unavailable_reason())
+
+        service_id = self.get_type()
+        huggingface_refresh_guard.acquire(service_id)
+
+        async def func(stream: Stream[StreamChunk]) -> CatalogRefreshOut:
+            try:
+                before_ids = set(_const.models.keys())
+                sglang_path = get_main_dir() / "./static/sglang-min.json"
+                existing_registry: dict[str, Any] = json.loads(sglang_path.read_text(encoding="utf-8")) if sglang_path.exists() else {}
+
+                merged: dict[str, list[dict[str, Any]]] = {}
+                async with aiohttp.ClientSession() as session:
+                    for i, (top_downloads, top_likes, top_trending, model_type, allow_generative) in enumerate(_SGLANG_FETCH_PLAN):
+                        stream.emit(
+                            StreamChunkProgress(
+                                type="progress", stage="install", value=i / len(_SGLANG_FETCH_PLAN), data={"stage": model_type}
+                            )
+                        )
+                        registry_key, entries = await fetch_registry_entries(
+                            session,
+                            top_downloads,
+                            top_likes,
+                            top_trending,
+                            model_type,
+                            log=lambda _msg: None,
+                            allow_generative_rerankers=allow_generative,
+                        )
+                        try:
+                            model_catalog_refresh.ensure_catalog_not_degraded(
+                                registry_key, len(entries), len(existing_registry.get(registry_key, []))
+                            )
+                        except model_catalog_refresh.CatalogTooSmallError as exc:
+                            raise HTTPException(502, str(exc)) from exc
+                        merged[registry_key] = entries
+
+                registry = {**existing_registry, **merged}
+                model_catalog_refresh.atomic_write_json(sglang_path, registry)
+
+                _const.models = _read_models()
+                for instance in list(self.models):
+                    self._reload_instance_models(instance)
+
+                after_ids = set(_const.models.keys())
+                stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
+                return CatalogRefreshOut(added=len(after_ids - before_ids), total=len(after_ids))
+            finally:
+                huggingface_refresh_guard.release()
+
+        return PromiseWithProgress(func=func)
+
+    def _reload_instance_models(self, instance: str) -> None:
+        """Reload `instance`'s models from the refreshed catalog, preserving custom models and installed ones that fell out of it."""
+        installed = self.get_instance_info(instance).installed
+        installed_ids = set(installed.models) if installed else set()
+        custom_models = {mid: m for mid, m in self.models[instance].items() if m.custom is not None}
+        self.load_default_models(instance)
+        self.models[instance].update(custom_models)
+        for model_id in installed_ids:
+            if model_id not in self.models[instance] and (definition := self._get_persisted_model_definition(instance, model_id)):
+                self._restore_model_definition(instance, model_id, definition)
+
+    async def sync_models(self, instance: str) -> None:  # noqa: ARG002
+        """Trigger a background catalog refresh (fire-and-forget; matches the base no-blocking sync contract)."""
+        with suppress(HTTPException):
+            promise = await self.refresh_catalog()
+
+            async def _consume_result() -> None:
+                try:
+                    await promise.wait()
+                except Exception:
+                    logger.warning("Background catalog refresh triggered by sync_models failed", exc_info=True)
+
+            asyncio.create_task(_consume_result())  # noqa: RUF006 - fire-and-forget, retrieves the promise's exception
+
+    def _restore_model_definition(self, instance: str, model_id: str, definition: dict[str, Any]) -> None:
+        self.models[instance][model_id] = SglangModel.model_validate(definition)
 
     def get_type(self) -> str:
         """Return the service id."""

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
 
+import asyncio
 import json
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -10,10 +12,12 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
+from scripts.get_llamacpp_models import DegradedFetchError
 from server.docker import ContainerStatus
 from server.models.models import InstallModelIn, ListModelsFilters, UninstallModelIn
+from server.models.registries import LlamacppRegistryEntry
 from server.models.services import InstallServiceIn, UninstallServiceIn
-from server.services.base2_service import CustomModel, Instance, InstanceConfig
+from server.services.base2_service import CustomModel, Instance, InstanceConfig, ModelConfig
 from server.services.llamacpp_service import (
     DownloadedInfo,
     InstalledInfo,
@@ -24,6 +28,7 @@ from server.services.llamacpp_service import (
     _const,  # pyright: ignore[reportPrivateUsage]
     _read_models,  # pyright: ignore[reportPrivateUsage]
 )
+from server.services.model_catalog_refresh import huggingface_refresh_guard
 from server.utils.core import DownloadedPacket, PreDownloadPacket, Stream, StreamChunk, StreamChunkProgress, SuccessDownloadPacket
 from server.utils.hardware import CpuInfo, GpuInfo, IntelGpuInfo, NvidiaGpuInfo
 
@@ -1464,3 +1469,220 @@ async def test_stop_instance_cancels_reconciliation_task(svc: LLamacppService) -
     await svc.stop_instance("default")
 
     assert "default" not in svc._reconciliation_tasks  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.fixture(autouse=True)
+def _reset_catalog_refresh_guard() -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]
+    huggingface_refresh_guard.release()
+    yield
+    huggingface_refresh_guard.release()
+
+
+def test_get_catalog_refresh_unavailable_reason_none_when_supported(svc: LLamacppService) -> None:
+    with patch("server.services.llamacpp_service.model_catalog_refresh.catalog_refresh_supported", True):
+        assert svc.get_catalog_refresh_unavailable_reason() is None
+
+
+def test_get_catalog_refresh_unavailable_reason_set_when_unsupported(svc: LLamacppService) -> None:
+    with patch("server.services.llamacpp_service.model_catalog_refresh.catalog_refresh_supported", False):
+        assert svc.get_catalog_refresh_unavailable_reason() is not None
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalog_writes_registry_and_reloads_const(svc: LLamacppService, tmp_path: Path) -> None:
+    (tmp_path / "static").mkdir()
+    (tmp_path / "static" / "llamacpp-min.json").write_text(
+        json.dumps({"llms": [{"name": "old-model", "url": "https://old", "size": "1GB", "jinja": True}]}), encoding="utf-8"
+    )
+
+    fetched = [LlamacppRegistryEntry(name="new-model", url="https://old", size="2GB")]
+
+    original_models = dict(_const.models)
+    try:
+        with (
+            patch("server.services.llamacpp_service.model_catalog_refresh.catalog_refresh_supported", True),
+            patch("server.services.llamacpp_service.get_main_dir", return_value=tmp_path),
+            patch("server.services.llamacpp_service.fetch_llamacpp_entries", new=AsyncMock(return_value=fetched)),
+        ):
+            promise = await svc.refresh_catalog()
+            result = await promise.wait()
+
+        assert result.added == 1
+        assert "new-model" in _const.models
+        assert "old-model" not in _const.models
+        written = json.loads((tmp_path / "static" / "llamacpp-min.json").read_text(encoding="utf-8"))
+        # jinja flag carried forward because the URL matches the previous entry
+        assert written["llms"] == [{"name": "new-model", "url": "https://old", "size": "2GB", "jinja": True}]
+        assert set(svc.models["default"].keys()) == set(_const.models.keys())
+    finally:
+        _const.models = original_models
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalog_raises_when_unsupported(svc: LLamacppService) -> None:
+    with (
+        patch("server.services.llamacpp_service.model_catalog_refresh.catalog_refresh_supported", False),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc.refresh_catalog()
+    assert exc_info.value.status_code == 405
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalog_rejects_concurrent_refresh(svc: LLamacppService) -> None:
+    huggingface_refresh_guard.acquire("vllm")
+    try:
+        with (
+            patch("server.services.llamacpp_service.model_catalog_refresh.catalog_refresh_supported", True),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await svc.refresh_catalog()
+        assert exc_info.value.status_code == 429
+    finally:
+        huggingface_refresh_guard.release()
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalog_leaves_catalog_unchanged_on_degraded_fetch(svc: LLamacppService, tmp_path: Path) -> None:
+    (tmp_path / "static").mkdir()
+    original_content = json.dumps({"llms": [{"name": "old-model", "url": "https://old", "size": "1GB"}]})
+    (tmp_path / "static" / "llamacpp-min.json").write_text(original_content, encoding="utf-8")
+
+    original_models = dict(_const.models)
+    try:
+        with (
+            patch("server.services.llamacpp_service.model_catalog_refresh.catalog_refresh_supported", True),
+            patch("server.services.llamacpp_service.get_main_dir", return_value=tmp_path),
+            patch(
+                "server.services.llamacpp_service.fetch_llamacpp_entries",
+                new=AsyncMock(side_effect=DegradedFetchError("too many failures")),
+            ),
+        ):
+            promise = await svc.refresh_catalog()
+            with pytest.raises(HTTPException) as exc_info:
+                await promise.wait()
+            assert exc_info.value.status_code == 502
+
+        assert (tmp_path / "static" / "llamacpp-min.json").read_text(encoding="utf-8") == original_content
+        assert _const.models == original_models
+    finally:
+        _const.models = original_models
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalog_raises_502_when_catalog_shrinks_too_much(svc: LLamacppService, tmp_path: Path) -> None:
+    (tmp_path / "static").mkdir()
+    original_content = json.dumps({"llms": [{"name": f"old-model-{i}", "url": "https://old", "size": "1GB"} for i in range(10)]})
+    (tmp_path / "static" / "llamacpp-min.json").write_text(original_content, encoding="utf-8")
+
+    fetched = [LlamacppRegistryEntry(name="new-model", url="https://new", size="2GB")]
+
+    original_models = dict(_const.models)
+    try:
+        with (
+            patch("server.services.llamacpp_service.model_catalog_refresh.catalog_refresh_supported", True),
+            patch("server.services.llamacpp_service.get_main_dir", return_value=tmp_path),
+            patch("server.services.llamacpp_service.fetch_llamacpp_entries", new=AsyncMock(return_value=fetched)),
+        ):
+            promise = await svc.refresh_catalog()
+            with pytest.raises(HTTPException) as exc_info:
+                await promise.wait()
+            assert exc_info.value.status_code == 502
+
+        assert (tmp_path / "static" / "llamacpp-min.json").read_text(encoding="utf-8") == original_content
+        assert _const.models == original_models
+    finally:
+        _const.models = original_models
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalog_restores_installed_model_dropped_from_catalog(svc: LLamacppService, tmp_path: Path) -> None:
+    (tmp_path / "static").mkdir()
+    (tmp_path / "static" / "llamacpp-min.json").write_text(
+        json.dumps({"llms": [{"name": "old-model", "url": "https://old", "size": "1GB"}]}), encoding="utf-8"
+    )
+
+    fetched = [LlamacppRegistryEntry(name="new-model", url="https://new", size="2GB")]
+
+    installed = _make_installed_info(svc)
+    installed.models["old-model"] = _make_model_installed_info("old-model")
+    svc.instances_info["default"].installed = installed
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[
+            ModelConfig(
+                model_id="old-model", options=InstallModelIn(spec={}), definition={"url": "https://old", "size": "1GB", "jinja": False}
+            )
+        ]
+    )
+
+    original_models = dict(_const.models)
+    try:
+        with (
+            patch("server.services.llamacpp_service.model_catalog_refresh.catalog_refresh_supported", True),
+            patch("server.services.llamacpp_service.get_main_dir", return_value=tmp_path),
+            patch("server.services.llamacpp_service.fetch_llamacpp_entries", new=AsyncMock(return_value=fetched)),
+        ):
+            promise = await svc.refresh_catalog()
+            await promise.wait()
+
+        assert "old-model" not in _const.models
+        assert svc.models["default"]["old-model"] == LlamacppModel(url="https://old", size="1GB", jinja=False)
+    finally:
+        _const.models = original_models
+
+
+@pytest.mark.asyncio
+async def test_refresh_catalog_drops_installed_model_with_no_persisted_definition(svc: LLamacppService, tmp_path: Path) -> None:
+    (tmp_path / "static").mkdir()
+    (tmp_path / "static" / "llamacpp-min.json").write_text(
+        json.dumps({"llms": [{"name": "old-model", "url": "https://old", "size": "1GB"}]}), encoding="utf-8"
+    )
+
+    fetched = [LlamacppRegistryEntry(name="new-model", url="https://new", size="2GB")]
+
+    installed = _make_installed_info(svc)
+    installed.models["old-model"] = _make_model_installed_info("old-model")
+    svc.instances_info["default"].installed = installed
+
+    original_models = dict(_const.models)
+    try:
+        with (
+            patch("server.services.llamacpp_service.model_catalog_refresh.catalog_refresh_supported", True),
+            patch("server.services.llamacpp_service.get_main_dir", return_value=tmp_path),
+            patch("server.services.llamacpp_service.fetch_llamacpp_entries", new=AsyncMock(return_value=fetched)),
+        ):
+            promise = await svc.refresh_catalog()
+            await promise.wait()
+
+        assert "old-model" not in svc.models["default"]
+    finally:
+        _const.models = original_models
+
+
+@pytest.mark.asyncio
+async def test_sync_models_triggers_refresh_without_awaiting_completion(svc: LLamacppService) -> None:
+    with patch.object(svc, "refresh_catalog", new=AsyncMock()) as mock_refresh:
+        await svc.sync_models("default")
+    mock_refresh.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sync_models_suppresses_unsupported_error(svc: LLamacppService) -> None:
+    with patch("server.services.llamacpp_service.model_catalog_refresh.catalog_refresh_supported", False):
+        await svc.sync_models("default")  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_sync_models_logs_warning_when_background_refresh_fails(svc: LLamacppService) -> None:
+    class _FailingPromise:
+        async def wait(self) -> None:
+            raise RuntimeError("boom")
+
+    with (
+        patch.object(svc, "refresh_catalog", new=AsyncMock(return_value=_FailingPromise())),
+        patch("server.services.llamacpp_service.logger") as mock_logger,
+    ):
+        await svc.sync_models("default")
+        await asyncio.sleep(0)  # let the fire-and-forget task run
+
+    mock_logger.warning.assert_called_once()

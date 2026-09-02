@@ -1087,10 +1087,10 @@ async def test_refresh_catalog_merges_live_models_when_supported(openai_svc: Ope
 
     openai_svc._fetch_live_models = fake_fetch  # type: ignore[method-assign] # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
 
-    added, total = await openai_svc.refresh_catalog()
+    result = await (await openai_svc.refresh_catalog()).wait()
 
-    assert added == 1
-    assert total == 1
+    assert result.added == 1
+    assert result.total == 1
     assert "gpt-4o-freshly-listed" in openai_svc.models["default"]
 
 
@@ -1120,10 +1120,10 @@ async def test_refresh_catalog_logs_partial_failure_without_raising(openai_svc: 
     openai_svc._fetch_live_models = partial_fetch  # type: ignore[method-assign] # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
 
     with caplog.at_level("WARNING"):
-        added, total = await openai_svc.refresh_catalog()
+        result = await (await openai_svc.refresh_catalog()).wait()
 
-    assert added == 1
-    assert total == len(openai_svc.models["default"])
+    assert result.added == 1
+    assert result.total == len(openai_svc.models["default"])
     assert any("instance2" in record.message for record in caplog.records)
 
 

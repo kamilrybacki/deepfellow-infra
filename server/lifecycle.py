@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from server.applicationcontext import ApplicationContext
-from server.config import ConfigError, load_config
+from server.config import ConfigError, get_main_dir, load_config
 from server.docker import create_docker_service
 from server.dynamic_config import load_or_init as load_dynamic_config
 from server.endpointregistry import EndpointRegistry
@@ -32,6 +32,7 @@ from server.services.googleai_service import GoogleAIService
 from server.services.kimi_service import KimiService
 from server.services.llamacpp_service import LLamacppService
 from server.services.mcp_service import McpService
+from server.services.model_catalog_refresh import probe_static_dir_writable, set_catalog_refresh_supported
 from server.services.ollama_cloud_service import OllamaCloudService
 from server.services.ollama_external_service import OllamaExternalService
 from server.services.ollama_service import OllamaService
@@ -83,6 +84,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
         app.state.hardware = hardware = Hardware()
         await hardware.init_async()
+
+        set_catalog_refresh_supported(probe_static_dir_writable(get_main_dir() / "static"))
 
         app.state.metrics_registry = metrics_registry = MetricsRegistry()
         app.state.task_manager = task_manager = TaskManager()
