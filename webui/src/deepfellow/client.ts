@@ -536,15 +536,81 @@ export class DeepFellowClient {
     );
   }
 
+  /**
+   * Trigger a catalog refresh. The backend may answer immediately with the result (a cache hit,
+   * or a fast provider like Ollama) or as a background job streamed via SSE (vLLM/llama.cpp,
+   * which hit HuggingFace dozens-to-hundreds of times) - this resolves with the final counts
+   * either way, forwarding any progress events to `onProgress` when the response does stream.
+   */
   async refreshCatalog(
     serviceId: string,
     force?: boolean,
+    onProgress?: (event: ProgressEvent) => void,
   ): Promise<{ added: number; total: number }> {
     const params = force ? "?force=true" : "";
-    return this.makeRequest<{ added: number; total: number }>(
-      `/admin/services/${serviceId}/catalog/refresh${params}`,
-      { method: "POST" },
-    );
+    const url = `${this.baseURL}/admin/services/${serviceId}/catalog/refresh${params}`;
+    const adminApiKey = AdminApiKeyStorage.get();
+    const headers: Record<string, string> = {};
+    if (adminApiKey) {
+      headers.Authorization = `Bearer ${adminApiKey}`;
+    }
+
+    const response = await fetch(url, { method: "POST", headers });
+
+    if (!response.ok) {
+      const content = await response.text();
+      try {
+        const errorData = JSON.parse(content);
+        const errorMessage = formatApiErrorMessage(errorData, content);
+        throw new Error(`HTTP ${response.status}: ${errorMessage}`);
+      } catch (e) {
+        if (e instanceof SyntaxError) {
+          throw new Error(
+            `HTTP ${response.status}: ${content || response.statusText}`,
+          );
+        }
+        throw e;
+      }
+    }
+
+    const contentType = (response.headers.get("content-type") || "")
+      .split(";")[0]
+      .trim();
+
+    if (contentType !== "text/event-stream") {
+      return JSON.parse(await response.text());
+    }
+
+    let result: { added: number; total: number } | null = null;
+    let errorMessage: string | null = null;
+    await readSSEStream(response, (event) => {
+      onProgress?.(event);
+      if (event.type !== "finish") {
+        return;
+      }
+      if (
+        event.status === "ok" &&
+        event.details &&
+        typeof event.details === "object" &&
+        typeof event.details.added === "number" &&
+        typeof event.details.total === "number"
+      ) {
+        result = { added: event.details.added, total: event.details.total };
+      } else {
+        errorMessage =
+          typeof event.details === "string"
+            ? event.details
+            : "Catalog refresh failed";
+      }
+    });
+
+    if (errorMessage) {
+      throw new Error(errorMessage);
+    }
+    if (!result) {
+      throw new Error("Catalog refresh stream ended without a result");
+    }
+    return result;
   }
 
   async getDockerTags(

@@ -4,6 +4,8 @@
 """Llamacpp service."""
 
 import asyncio
+import contextlib
+import json
 import logging
 import re
 from collections.abc import Sequence
@@ -11,9 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, NoReturn
 
+import aiohttp
 from fastapi import HTTPException
 from pydantic import BaseModel, field_validator
 
+from scripts.get_llamacpp_models import DegradedFetchError, fetch_llamacpp_entries, preserve_jinja_flags
 from server.applicationcontext import get_base_url
 from server.config import get_main_dir
 from server.docker import DockerImage, DockerOptions
@@ -35,6 +39,7 @@ from server.models.models import (
 )
 from server.models.registries import LlamacppRegistry
 from server.models.services import (
+    CatalogRefreshOut,
     InstallServiceIn,
     InstallServiceProgress,
     ServiceField,
@@ -43,7 +48,9 @@ from server.models.services import (
     ServiceSpecification,
     UninstallServiceIn,
 )
+from server.services import model_catalog_refresh
 from server.services.base2_service import Base2Service, CustomModel, Instance, InstanceConfig, ModelConfig
+from server.services.model_catalog_refresh import huggingface_refresh_guard
 from server.utils.core import (
     DownloadedPacket,
     PreDownloadPacket,
@@ -65,6 +72,9 @@ from server.utils.validators import clamp_non_positive_to_one
 from server.utils.vram_calculator import estimate_vram_gb, parse_cache_type_bits
 
 logger = logging.getLogger("uvicorn.error")
+
+# Mirrors the `just get-llamacpp-models` release recipe (see justfile).
+_LLAMACPP_FETCH_PLAN = (200, 100, 50)  # top_by_downloads, top_by_likes, top_by_trending
 
 
 class LlamacppModel(BaseModel):
@@ -184,6 +194,83 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
     def load_default_models(self, instance: str) -> None:
         """Load default models to instance."""
         self.models[instance] = _const.models.copy()
+
+    def get_catalog_refresh_unavailable_reason(self) -> str | None:
+        """Return why a catalog refresh can't run right now, or None if it can."""
+        if not model_catalog_refresh.catalog_refresh_supported:
+            return "The static model-catalog directory isn't writable, so catalog refresh is disabled."
+        return None
+
+    async def refresh_catalog(self) -> PromiseWithProgress[CatalogRefreshOut, StreamChunk]:
+        """Fetch current top GGUF-quantized models from HuggingFace.
+
+        Runs as a background job (dozens-to-hundreds of HTTP requests) and, on success, writes the
+        merged registry to `static/llamacpp-min.json` (preserving hand-set `jinja` flags) and
+        reloads the in-memory catalog. A failure, including the shared in-flight guard rejecting a
+        concurrent refresh or the existing 10%-failure-rate guard tripping, leaves the existing
+        file and in-memory catalog untouched.
+        """
+        if not model_catalog_refresh.catalog_refresh_supported:
+            raise HTTPException(405, self.get_catalog_refresh_unavailable_reason())
+
+        service_id = self.get_type()
+        huggingface_refresh_guard.acquire(service_id)
+
+        async def func(stream: Stream[StreamChunk]) -> CatalogRefreshOut:
+            try:
+                before_ids = set(_const.models.keys())
+                stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
+                async with aiohttp.ClientSession() as session:
+                    try:
+                        entries = await fetch_llamacpp_entries(session, *_LLAMACPP_FETCH_PLAN, log=lambda _msg: None)
+                    except DegradedFetchError as exc:
+                        raise HTTPException(502, f"HuggingFace catalog refresh degraded, aborting: {exc}") from exc
+
+                llamacpp_path = get_main_dir() / "./static/llamacpp-min.json"
+                registry: dict[str, Any] = json.loads(llamacpp_path.read_text(encoding="utf-8")) if llamacpp_path.exists() else {}
+                try:
+                    model_catalog_refresh.ensure_catalog_not_degraded("llms", len(entries), len(registry.get("llms", [])))
+                except model_catalog_refresh.CatalogTooSmallError as exc:
+                    raise HTTPException(502, str(exc)) from exc
+                preserve_jinja_flags(entries, registry)
+                registry["llms"] = [e.model_dump() for e in entries]
+                model_catalog_refresh.atomic_write_json(llamacpp_path, registry)
+
+                _const.models = _read_models()
+                for instance in list(self.models):
+                    self._reload_instance_models(instance)
+
+                after_ids = set(_const.models.keys())
+                stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
+                return CatalogRefreshOut(added=len(after_ids - before_ids), total=len(after_ids))
+            finally:
+                huggingface_refresh_guard.release()
+
+        return PromiseWithProgress(func=func)
+
+    def _reload_instance_models(self, instance: str) -> None:
+        """Reload `instance`'s models from the refreshed catalog, preserving custom models and installed ones that fell out of it."""
+        installed = self.get_instance_info(instance).installed
+        installed_ids = set(installed.models) if installed else set()
+        custom_models = {mid: m for mid, m in self.models[instance].items() if m.custom is not None}
+        self.load_default_models(instance)
+        self.models[instance].update(custom_models)
+        for model_id in installed_ids:
+            if model_id not in self.models[instance] and (definition := self._get_persisted_model_definition(instance, model_id)):
+                self._restore_model_definition(instance, model_id, definition)
+
+    async def sync_models(self, instance: str) -> None:  # noqa: ARG002
+        """Trigger a background catalog refresh (fire-and-forget; matches the base no-blocking sync contract)."""
+        with contextlib.suppress(HTTPException):
+            promise = await self.refresh_catalog()
+
+            async def _consume_result() -> None:
+                try:
+                    await promise.wait()
+                except Exception:
+                    logger.warning("Background catalog refresh triggered by sync_models failed", exc_info=True)
+
+            asyncio.create_task(_consume_result())  # noqa: RUF006 - fire-and-forget, retrieves the promise's exception
 
     def get_type(self) -> str:
         """Return the service id."""

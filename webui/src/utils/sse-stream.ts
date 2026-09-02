@@ -15,10 +15,9 @@ export interface ProgressEvent {
   value?: number; // 0.0 to 1.0
   status?: "ok" | "error";
   // On failure this is a plain error string. On success it's the backend's full
-  // install-result object (e.g. `{ status, details, requires_oauth }`), dumped as-is.
-  details?:
-    | string
-    | { status?: string; details?: string; requires_oauth?: boolean };
+  // result object, dumped as-is (e.g. `{ status, details, requires_oauth }` for an install,
+  // `{ added, total }` for a catalog refresh) - callers narrow it for the call that produced it.
+  details?: string | Record<string, unknown>;
 }
 
 class SSEStream {

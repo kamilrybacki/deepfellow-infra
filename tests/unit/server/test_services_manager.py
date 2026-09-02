@@ -17,6 +17,7 @@ from server.models.models import (
     UninstallModelIn,
 )
 from server.models.services import (
+    CatalogRefreshOut,
     InstallServiceIn,
     ListAllModelsFilters,
     ListServicesFilters,
@@ -27,6 +28,7 @@ from server.services.base2_service import Base2Service
 from server.services.mcp_service import McpService
 from server.services.ollama_service import OllamaService
 from server.services_manager import ServicesManager
+from server.utils.core import PromiseWithProgress
 from tests.unit.server.fakes import FakeService
 
 if TYPE_CHECKING:
@@ -669,14 +671,15 @@ async def test_stop_all_services_continues_on_error(services_manager: ServicesMa
 async def test_refresh_catalog_calls_refresh_catalog(services_manager: ServicesManager):
     svc = MagicMock(spec=OllamaService)
     svc.get_type = MagicMock(return_value="ollama")
-    svc.refresh_catalog = AsyncMock(return_value=(5, 700))
+    svc.refresh_catalog = AsyncMock(return_value=PromiseWithProgress(value=CatalogRefreshOut(added=5, total=700)))
     services_manager.register_service(svc)
 
-    added, total = await services_manager.refresh_catalog("ollama")
+    promise = await services_manager.refresh_catalog("ollama")
+    result = await promise.wait()
 
     svc.refresh_catalog.assert_awaited_once()
-    assert added == 5
-    assert total == 700
+    assert result.added == 5
+    assert result.total == 700
 
 
 @pytest.mark.asyncio

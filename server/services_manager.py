@@ -21,6 +21,7 @@ from server.models.models import (
     UninstallModelIn,
 )
 from server.models.services import (
+    CatalogRefreshOut,
     InstallServiceIn,
     InstallServiceOut,
     ListAllModelsFilters,
@@ -228,10 +229,10 @@ class ServicesManager:
         service_type, instance = self.split_service_type_and_instance(service_id)
         await self._get_service(service_type).sync_models(instance)
 
-    async def refresh_catalog(self, service_id: str) -> tuple[int, int]:
+    async def refresh_catalog(self, service_id: str) -> PromiseWithProgress[CatalogRefreshOut, StreamChunk]:
         """Refresh the model catalog from the external library API.
 
-        Returns (added, total). Raises HTTPException 405 if the service does not support catalog refresh.
+        Raises HTTPException 405 if the service does not support catalog refresh.
         """
         service_type, _instance = self.split_service_type_and_instance(service_id)
         return await self._get_service(service_type).refresh_catalog()

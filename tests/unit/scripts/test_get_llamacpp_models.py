@@ -15,6 +15,7 @@ import pytest
 from scripts.get_llamacpp_models import (
     build_entries,
     collect_gguf_models,
+    fetch_llamacpp_entries,
     fetch_model_files,
     fetch_popular_gguf_models,
     fmt_size,
@@ -412,6 +413,12 @@ async def test_fetch_model_files_returns_none_on_error(capsys: pytest.CaptureFix
 
     assert siblings is None
     assert "org/missing" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_fetch_llamacpp_entries_raises_when_no_sort_active() -> None:
+    with pytest.raises(ValueError, match="Specify at least one"):
+        await fetch_llamacpp_entries(MagicMock(), 0, 0, 0, log=lambda _msg: None)
 
 
 @pytest.mark.asyncio

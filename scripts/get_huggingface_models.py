@@ -297,6 +297,69 @@ def _drop_unsupported_models(
     return models
 
 
+async def fetch_registry_entries(
+    session: aiohttp.ClientSession,
+    top_by_downloads: int,
+    top_by_likes: int,
+    top_by_trending: int,
+    model_type: str,
+    log: Callable[[str], None],
+    allow_generative_rerankers: bool = False,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Fetch one registry_key's worth of entries (llms/rerankers/embeddings) from HuggingFace.
+
+    Shared by the CLI's `main()` and the server's in-process runtime refresh, so both go through
+    the exact same fetch/filter/format pipeline. Returns (registry_key, entries); raises on a hard
+    fetch failure (network/parse error propagates from `collect_*_models`/`fetch_model_details`).
+    """
+    active = {
+        k: v
+        for k, v in {
+            "downloads": top_by_downloads,
+            "likes": top_by_likes,
+            "trendingScore": top_by_trending,
+        }.items()
+        if v > 0
+    }
+    if not active:
+        raise ValueError("Specify at least one of: top_by_downloads, top_by_likes, top_by_trending")
+
+    label = {"downloads": "downloads", "likes": "likes", "trendingScore": "trending"}
+    summary = ", ".join(f"top {n} by {label[s]}" for s, n in active.items())
+    log(f"Fetching {model_type} models from HuggingFace ({summary})...\n")
+
+    if model_type == "reranker":
+        models = await collect_reranker_models(session, active)
+        registry_key = "rerankers"
+    elif model_type == "embedding":
+        models = await collect_embedding_models(session, active)
+        registry_key = "embeddings"
+    else:
+        models = await collect_llm_models(session, active)
+        registry_key = "llms"
+
+    log(f"Fetching disk sizes for {len(models)} unique models concurrently (max {CONCURRENCY} at a time)...")
+    sem = asyncio.Semaphore(CONCURRENCY)
+    check_chat_template = registry_key == "llms"
+    details = await asyncio.gather(*[fetch_model_details(session, m["id"], sem, check_chat_template) for m in models])
+    sizes = {mid: size for mid, size, _, _ in details}
+    architectures = {mid: arch for mid, _, arch, _ in details}
+    chat_capable = {mid: chat_ok for mid, _, _, chat_ok in details}
+
+    models = _drop_unsupported_models(registry_key, models, architectures, chat_capable, log, allow_generative_rerankers)
+
+    entries: list[dict[str, Any]] = []
+    for m in models:
+        mid = m["id"]
+        size = fmt_size_compact(sizes.get(mid, "N/A"))
+        entry: dict[str, Any] = {"name": mid, "size": size}
+        if registry_key == "rerankers":
+            entry["is_generative"] = not is_supported_cross_encoder(architectures.get(mid) or [])
+        entries.append(entry)
+    entries.sort(key=lambda e: e["name"].casefold())
+    return registry_key, entries
+
+
 async def main(
     top_by_downloads: int,
     top_by_likes: int,
@@ -312,54 +375,14 @@ async def main(
         if not raw:
             print(msg, file=sys.stderr)
 
-    active = {
-        k: v
-        for k, v in {
-            "downloads": top_by_downloads,
-            "likes": top_by_likes,
-            "trendingScore": top_by_trending,
-        }.items()
-        if v > 0
-    }
-
-    if not active:
+    if top_by_downloads <= 0 and top_by_likes <= 0 and top_by_trending <= 0:
         print("Specify at least one of: --top-by-downloads, --top-by-likes, --top-by-trending", file=sys.stderr)
         return
 
-    label = {"downloads": "downloads", "likes": "likes", "trendingScore": "trending"}
-    summary = ", ".join(f"top {n} by {label[s]}" for s, n in active.items())
-    log(f"Fetching {model_type} models from HuggingFace ({summary})...\n")
-
     async with aiohttp.ClientSession() as session:
-        if model_type == "reranker":
-            models = await collect_reranker_models(session, active)
-            registry_key = "rerankers"
-        elif model_type == "embedding":
-            models = await collect_embedding_models(session, active)
-            registry_key = "embeddings"
-        else:
-            models = await collect_llm_models(session, active)
-            registry_key = "llms"
-
-        log(f"Fetching disk sizes for {len(models)} unique models concurrently (max {CONCURRENCY} at a time)...")
-        sem = asyncio.Semaphore(CONCURRENCY)
-        check_chat_template = registry_key == "llms"
-        details = await asyncio.gather(*[fetch_model_details(session, m["id"], sem, check_chat_template) for m in models])
-        sizes = {mid: size for mid, size, _, _ in details}
-        architectures = {mid: arch for mid, _, arch, _ in details}
-        chat_capable = {mid: chat_ok for mid, _, _, chat_ok in details}
-
-    models = _drop_unsupported_models(registry_key, models, architectures, chat_capable, log, allow_generative_rerankers)
-
-    entries: list[dict[str, Any]] = []
-    for m in models:
-        mid = m["id"]
-        size = fmt_size_compact(sizes.get(mid, "N/A"))
-        entry: dict[str, Any] = {"name": mid, "size": size}
-        if registry_key == "rerankers":
-            entry["is_generative"] = not is_supported_cross_encoder(architectures.get(mid) or [])
-        entries.append(entry)
-    entries.sort(key=lambda e: e["name"].casefold())
+        registry_key, entries = await fetch_registry_entries(
+            session, top_by_downloads, top_by_likes, top_by_trending, model_type, log, allow_generative_rerankers
+        )
 
     if output is None:
         print(json.dumps({registry_key: entries}, indent=4))

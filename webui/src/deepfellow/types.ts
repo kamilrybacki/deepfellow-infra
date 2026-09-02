@@ -68,6 +68,7 @@ export interface Service {
   has_docker?: boolean;
   is_cloud?: boolean;
   disabled_reason?: string | null;
+  catalog_refresh_unavailable_reason?: string | null;
 }
 
 export interface InfraSettings {

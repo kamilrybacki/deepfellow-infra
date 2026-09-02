@@ -13,6 +13,7 @@ import json
 import re
 import sys
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -205,13 +206,23 @@ def build_entries(model_id: str, siblings: list[dict[str, Any]]) -> list[Llamacp
     return entries
 
 
-async def main(top_by_downloads: int, top_by_likes: int, top_by_trending: int, raw: bool, output: str | None = None) -> None:
-    """Fetch GGUF models from HuggingFace and print (or write) a llamacpp-min.json compatible registry."""
+class DegradedFetchError(Exception):
+    """Raised when the HuggingFace file-listing fetch failure rate exceeds MAX_FETCH_FAILURE_RATE."""
 
-    def log(msg: str) -> None:
-        if not raw:
-            print(msg, file=sys.stderr)
 
+async def fetch_llamacpp_entries(
+    session: aiohttp.ClientSession,
+    top_by_downloads: int,
+    top_by_likes: int,
+    top_by_trending: int,
+    log: Callable[[str], None],
+) -> list[LlamacppRegistryEntry]:
+    """Fetch, filter, and build the full list of llama.cpp registry entries from HuggingFace.
+
+    Shared by the CLI's `main()` and the server's in-process runtime refresh. Raises
+    `DegradedFetchError` instead of writing a possibly-degraded registry when more than
+    `MAX_FETCH_FAILURE_RATE` of the repo file-listing fetches failed.
+    """
     active = {
         k: v
         for k, v in {
@@ -221,21 +232,18 @@ async def main(top_by_downloads: int, top_by_likes: int, top_by_trending: int, r
         }.items()
         if v > 0
     }
-
     if not active:
-        print("Specify at least one of: --top-by-downloads, --top-by-likes, --top-by-trending", file=sys.stderr)
-        return
+        raise ValueError("Specify at least one of: top_by_downloads, top_by_likes, top_by_trending")
 
     label = {"downloads": "downloads", "likes": "likes", "trendingScore": "trending"}
     summary = ", ".join(f"top {n} by {label[s]}" for s, n in active.items())
     log(f"Fetching GGUF models from HuggingFace ({summary})...\n")
 
-    async with aiohttp.ClientSession() as session:
-        models = await collect_gguf_models(session, active)
+    models = await collect_gguf_models(session, active)
 
-        log(f"Fetching file listings for {len(models)} unique repos concurrently (max {CONCURRENCY} at a time)...")
-        sem = asyncio.Semaphore(CONCURRENCY)
-        file_lists = await asyncio.gather(*[fetch_model_files(session, m["id"], sem) for m in models])
+    log(f"Fetching file listings for {len(models)} unique repos concurrently (max {CONCURRENCY} at a time)...")
+    sem = asyncio.Semaphore(CONCURRENCY)
+    file_lists = await asyncio.gather(*[fetch_model_files(session, m["id"], sem) for m in models])
 
     entries, failed, dropped = split_fetch_results(models, file_lists)
 
@@ -246,14 +254,47 @@ async def main(top_by_downloads: int, top_by_likes: int, top_by_trending: int, r
 
     failure_rate = failed / len(models) if models else 0.0
     if failure_rate > MAX_FETCH_FAILURE_RATE:
-        print(
-            f"Error: {failed}/{len(models)} repo file-listing fetches failed ({failure_rate:.0%}, exceeds "
-            f"{MAX_FETCH_FAILURE_RATE:.0%} threshold) — refusing to write a possibly-degraded registry.",
-            file=sys.stderr,
+        msg = (
+            f"{failed}/{len(models)} repo file-listing fetches failed ({failure_rate:.0%}, exceeds "
+            f"{MAX_FETCH_FAILURE_RATE:.0%} threshold) — refusing to write a possibly-degraded registry."
         )
-        sys.exit(1)
+        raise DegradedFetchError(msg)
 
     entries.sort(key=lambda e: e.name.casefold())
+    return entries
+
+
+def preserve_jinja_flags(entries: list[LlamacppRegistryEntry], existing_registry: dict[str, Any]) -> None:
+    """Copy the `jinja` flag forward from matching URLs in an existing registry dict, mutating entries in place.
+
+    Whether a GGUF repo needs `--jinja` isn't derivable from the HuggingFace API response — it's set
+    by hand after observing a model's chat template misbehave without it — so a refresh must not
+    silently drop flags a maintainer (or a prior refresh) already set for URLs that still appear.
+    """
+    existing_entries = [LlamacppRegistryEntry.model_validate(e) for e in existing_registry.get("llms", [])]
+    jinja_urls = {e.url for e in existing_entries if e.jinja}
+    for entry in entries:
+        if entry.url in jinja_urls:
+            entry.jinja = True
+
+
+async def main(top_by_downloads: int, top_by_likes: int, top_by_trending: int, raw: bool, output: str | None = None) -> None:
+    """Fetch GGUF models from HuggingFace and print (or write) a llamacpp-min.json compatible registry."""
+
+    def log(msg: str) -> None:
+        if not raw:
+            print(msg, file=sys.stderr)
+
+    if top_by_downloads <= 0 and top_by_likes <= 0 and top_by_trending <= 0:
+        print("Specify at least one of: --top-by-downloads, --top-by-likes, --top-by-trending", file=sys.stderr)
+        return
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            entries = await fetch_llamacpp_entries(session, top_by_downloads, top_by_likes, top_by_trending, log)
+        except DegradedFetchError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
 
     if output is None:
         print(json.dumps({"llms": [e.model_dump() for e in entries]}, indent=4))
@@ -262,11 +303,7 @@ async def main(top_by_downloads: int, top_by_likes: int, top_by_trending: int, r
     output_path = Path(output)
     registry: dict[str, Any] = json.loads(output_path.read_text(encoding="utf-8")) if output_path.exists() else {}
 
-    existing_entries = [LlamacppRegistryEntry.model_validate(e) for e in registry.get("llms", [])]
-    jinja_urls = {e.url for e in existing_entries if e.jinja}
-    for entry in entries:
-        if entry.url in jinja_urls:
-            entry.jinja = True
+    preserve_jinja_flags(entries, registry)
 
     registry["llms"] = [e.model_dump() for e in entries]
     output_path.parent.mkdir(parents=True, exist_ok=True)

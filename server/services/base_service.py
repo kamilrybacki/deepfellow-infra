@@ -22,6 +22,7 @@ from server.models.models import (
     UninstallModelIn,
 )
 from server.models.services import (
+    CatalogRefreshOut,
     InstallServiceIn,
     InstallServiceOut,
     InstallServiceProgress,
@@ -93,7 +94,17 @@ class BaseService(ABC):
             has_docker=self.service_has_docker(),
             is_cloud=self.is_cloud_service(),
             disabled_reason=self.get_hardware_unsupported_reason(),
+            catalog_refresh_unavailable_reason=self.get_catalog_refresh_unavailable_reason(),
         )
+
+    def get_catalog_refresh_unavailable_reason(self) -> str | None:
+        """Return why this service's catalog refresh can't run right now, or None if it can.
+
+        None by default (no catalog refresh concept, or nothing blocking it). Services backing a
+        catalog refresh with the static-directory writability capability flag (vLLM, llama.cpp,
+        SGLang) override this to surface that flag to the WebUI.
+        """
+        return None
 
     @abstractmethod
     def get_instance_install_progress(self, instance: str) -> PromiseWithProgress[InstallServiceOut, StreamChunk]:
@@ -107,7 +118,7 @@ class BaseService(ABC):
         """Cancel an in-progress model install. Services without install progress cannot cancel."""
         raise HTTPException(405, f"Service for model {model_id} does not support cancelling an installation.")
 
-    async def refresh_catalog(self) -> tuple[int, int]:
+    async def refresh_catalog(self) -> PromiseWithProgress[CatalogRefreshOut, StreamChunk]:
         """Refresh the model catalog from an external library API. Services without a catalog cannot refresh."""
         raise HTTPException(405, "This service does not support catalog refresh")
 

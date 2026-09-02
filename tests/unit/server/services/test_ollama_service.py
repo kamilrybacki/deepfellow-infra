@@ -3038,11 +3038,11 @@ async def test_refresh_catalog_adds_new_models(svc: OllamaService) -> None:
         mock_client.fetch_trending.return_value = [new_entry]
         mock_cls.return_value = mock_client
 
-        added, total = await svc.refresh_catalog()
+        result = await (await svc.refresh_catalog()).wait()
 
-    assert added == 1
+    assert result.added == 1
     assert "new-model:7b" in svc._dynamic_models  # pyright: ignore[reportPrivateUsage]
-    assert total == len(svc.models["default"])
+    assert result.total == len(svc.models["default"])
 
 
 @pytest.mark.asyncio
@@ -3054,9 +3054,9 @@ async def test_refresh_catalog_skips_existing_static_models(svc: OllamaService) 
         mock_client.fetch_trending.return_value = [existing_entry]
         mock_cls.return_value = mock_client
 
-        added, _ = await svc.refresh_catalog()
+        result = await (await svc.refresh_catalog()).wait()
 
-    assert added == 0
+    assert result.added == 0
     assert existing_id not in svc._dynamic_models  # pyright: ignore[reportPrivateUsage]
 
 

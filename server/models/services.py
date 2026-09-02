@@ -65,6 +65,7 @@ class RetrieveServiceOut(BaseModel):
     has_docker: bool
     is_cloud: bool = False
     disabled_reason: str | None = None
+    catalog_refresh_unavailable_reason: str | None = None
 
 
 class ListServicesFilters(BaseModel):

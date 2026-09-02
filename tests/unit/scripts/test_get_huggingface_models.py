@@ -21,6 +21,7 @@ from scripts.get_huggingface_models import (
     fetch_popular_embedding_models,
     fetch_popular_models,
     fetch_popular_reranker_models,
+    fetch_registry_entries,
     fmt_size,
     fmt_size_compact,
     get_json_with_retry,
@@ -1084,3 +1085,10 @@ async def test_main_active_dict_built_correctly() -> None:
     assert "likes" not in captured_active
     assert "trendingScore" in captured_active
     assert captured_active["trendingScore"] == 3
+
+
+@pytest.mark.asyncio
+async def test_fetch_registry_entries_raises_without_any_active_criterion() -> None:
+    session = MagicMock()
+    with pytest.raises(ValueError, match="Specify at least one"):
+        await fetch_registry_entries(session, 0, 0, 0, "llm", log=lambda _msg: None)
