@@ -959,6 +959,30 @@ async def test_install_model_happy_path(svc: McpService, deps: dict[str, Any], t
 
 
 @pytest.mark.asyncio
+async def test_install_model_cleans_up_installing_set_when_cancelled_during_setup(svc: McpService) -> None:
+    """A cancellation during the pre-promise docker-image verification must still discard the
+    `_installing` entry - not just ordinary exceptions - or the model gets stuck looking installed.
+    """
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    model_id = "open-websearch"
+    reached = asyncio.Event()
+
+    async def hanging_verify(*_args: Any, **_kwargs: Any) -> None:
+        reached.set()
+        await asyncio.Event().wait()  # never completes on its own - must be cancelled
+
+    with patch.object(svc, "_verify_docker_image", new=hanging_verify):
+        task = asyncio.create_task(svc._install_model("default", model_id, InstallModelIn()))  # pyright: ignore[reportPrivateUsage]
+        await reached.wait()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert ("default", model_id) not in svc._installing  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
 async def test_install_model_rejects_unavailable_image_version(svc: McpService, deps: dict[str, Any]) -> None:
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     model_id = "open-websearch"

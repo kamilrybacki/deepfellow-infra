@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
 
+import asyncio
 import logging
 from collections.abc import Callable
 from typing import Any
@@ -779,6 +780,35 @@ async def test_install_model_applies_selected_image_version(svc: CustomService, 
     assert svc.models["default"]["lemmatizer"].options({"hardware": "CPU"}).image == (  # pyright: ignore[reportCallIssue]
         "hub.simplito.com/deepfellow/deepfellow-lemmatizer:1.0.0-cpu"
     )
+
+
+@pytest.mark.asyncio
+async def test_install_model_cleans_up_installing_set_when_cancelled_during_setup(svc: CustomService) -> None:
+    """A cancellation during the pre-promise docker-image verification must still discard the
+    `_installing` entry - there was no cleanup at all for this window before this fix.
+    """
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    model_id = "lemmatizer"
+    reached = asyncio.Event()
+
+    async def hanging_verify(*_args: Any, **_kwargs: Any) -> None:
+        reached.set()
+        await asyncio.Event().wait()  # never completes on its own - must be cancelled
+
+    with (
+        patch.object(svc, "validate_docker_image_version_for_model", new_callable=AsyncMock),
+        patch.object(svc, "_verify_docker_image", new=hanging_verify),
+    ):
+        task = asyncio.create_task(
+            svc._install_model("default", model_id, InstallModelIn(spec={"prefix": model_id}))  # pyright: ignore[reportPrivateUsage]
+        )
+        await reached.wait()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert ("default", model_id) not in svc._installing  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio

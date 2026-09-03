@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
 
 import asyncio
+import contextlib
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -589,7 +590,11 @@ async def test_installing_model_init_creates_task() -> None:
     promise: PromiseWithProgress[InstallModelOut, StreamChunk] = PromiseWithProgress(value=value)
     promise.progress.close()
 
-    installing = InstallingModel(promise=promise)
+    async def on_success(data: InstallModelOut) -> InstallModelOut:
+        return data
+
+    installing = InstallingModel()
+    installing.resolve(promise, on_success, lambda _e: None)
 
     assert installing.promise is promise
     assert installing.task is not None
@@ -617,7 +622,11 @@ async def test_installing_model_stores_last_chunk_from_progress() -> None:
     promise.progress.emit(chunk)
     promise.progress.close()
 
-    installing = InstallingModel(promise=promise)
+    async def on_success(data: InstallModelOut) -> InstallModelOut:
+        return data
+
+    installing = InstallingModel()
+    installing.resolve(promise, on_success, lambda _e: None)
     await asyncio.sleep(0)
 
     assert installing.last_chunk == chunk
@@ -650,21 +659,23 @@ def test_get_instance_info_returns_instance(base2_svc: _Base2Impl) -> None:
     assert result is base2_svc.instances_info["default"]
 
 
-def test_get_model_install_progress_raises_when_not_installing(base2_svc: _Base2Impl) -> None:
+@pytest.mark.asyncio
+async def test_get_model_install_progress_raises_when_not_installing(base2_svc: _Base2Impl) -> None:
     with pytest.raises(HTTPException) as exc_info:
-        base2_svc.get_model_install_progress("default", "unknown-model")
+        await base2_svc.get_model_install_progress("default", "unknown-model")
 
     assert exc_info.value.status_code == 404
 
 
-def test_get_model_install_progress_returns_promise(base2_svc: _Base2Impl) -> None:
+@pytest.mark.asyncio
+async def test_get_model_install_progress_returns_promise(base2_svc: _Base2Impl) -> None:
     mock_promise = MagicMock()
     mock_installing = MagicMock()
-    mock_installing.promise = mock_promise
+    mock_installing.wait_ready = AsyncMock(return_value=mock_promise)
 
     base2_svc.instances_info["default"].installing_model_progress["m1"] = mock_installing
 
-    assert base2_svc.get_model_install_progress("default", "m1") is mock_promise
+    assert await base2_svc.get_model_install_progress("default", "m1") is mock_promise
 
 
 @pytest.mark.asyncio
@@ -698,11 +709,279 @@ async def test_cancel_model_install_cancels_tasks_and_clears_tracking(base2_svc:
 
     assert "m1" not in base2_svc.instances_info["default"].installing_model_progress
     assert promise.task.cancelled()
+    assert installing.task is not None
     assert installing.task.cancelled()
     assert promise.progress._closed  # pyright: ignore[reportPrivateUsage]
     assert promise._future.cancelled()  # pyright: ignore[reportPrivateUsage]
     assert returned_promise.task.done()
     assert returned_promise._future.cancelled()  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_cancel_model_install_during_pre_promise_setup_interrupts_it(base2_svc: _Base2Impl) -> None:
+    """Cancelling while `_install_model()` is still doing pre-promise setup must actually interrupt
+    it, not just wait around for it to finish on its own.
+    """
+    reached_slow_point = asyncio.Event()
+    was_cancelled = False
+
+    async def slow_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+        nonlocal was_cancelled
+        reached_slow_point.set()
+        try:
+            await asyncio.Event().wait()  # never completes on its own
+        except asyncio.CancelledError:
+            was_cancelled = True
+            raise
+
+    with patch.object(base2_svc, "_install_model", new=slow_install_model):
+        task = asyncio.create_task(base2_svc.install_model("default", "m1", InstallModelIn()))
+        await reached_slow_point.wait()
+
+        await asyncio.wait_for(base2_svc.cancel_model_install("default", "m1"), timeout=1)
+
+        # install_model()'s own task was never asked to cancel - only the pending setup task it was
+        # awaiting was, by a different request. A raw CancelledError here would be unfixable by
+        # FastAPI (a bare 500); this caller should see a clean, ordinary "it got cancelled" error.
+        with pytest.raises(HTTPException) as exc_info:
+            await task
+        assert exc_info.value.status_code == 409
+
+    assert was_cancelled
+    assert "m1" not in base2_svc.instances_info["default"].installing_model_progress
+
+
+@pytest.mark.asyncio
+async def test_cancel_model_install_propagates_its_own_cancellation_instead_of_swallowing_it(
+    base2_svc: _Base2Impl,
+) -> None:
+    """If cancel_model_install()'s own caller is cancelled (e.g. its request disconnects) while it's
+    waiting to learn the pending setup's outcome, that cancellation must propagate - not be treated
+    as if the cancel it requested had simply completed.
+    """
+    reached_slow_point = asyncio.Event()
+
+    async def slow_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+        reached_slow_point.set()
+        await asyncio.Event().wait()  # never completes on its own
+
+    with patch.object(base2_svc, "_install_model", new=slow_install_model):
+        install_task = asyncio.create_task(base2_svc.install_model("default", "m1", InstallModelIn()))
+        await reached_slow_point.wait()
+
+        cancel_task = asyncio.create_task(base2_svc.cancel_model_install("default", "m1"))
+        await asyncio.sleep(0)  # let cancel_model_install() cancel the pending task and start waiting
+
+        cancel_task.cancel()  # cancel cancel_model_install()'s OWN task, not a second cancel request
+
+        with pytest.raises(asyncio.CancelledError):
+            await cancel_task
+
+        # install_model()'s own task was never cancelled here either - only its pending setup task
+        # was, as a side effect of cancel_model_install() cancelling it. That's not this caller's own
+        # cancellation, so it should see a clean HTTPException, not a raw CancelledError.
+        with pytest.raises(HTTPException) as exc_info:
+            await install_task
+        assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_cancel_model_install_cleans_up_when_pending_task_already_failed_with_ordinary_exception(
+    base2_svc: _Base2Impl,
+) -> None:
+    """If the pending setup already finished with an ordinary exception (unrelated to the cancel
+    request) by the time cancel_model_install() is waiting on it, cancel must clean up gracefully
+    instead of propagating that unrelated failure as if cancelling itself had failed.
+    """
+    reservation = InstallingModel()
+    base2_svc.instances_info["default"].installing_model_progress["m1"] = reservation
+
+    async def already_failed() -> PromiseWithProgress[InstallModelOut, StreamChunk]:
+        raise RuntimeError("setup blew up")
+
+    reservation.pending_task = asyncio.create_task(already_failed())
+    with pytest.raises(RuntimeError):
+        await reservation.pending_task  # pending_task is done (failed)...
+
+    cancel_task = asyncio.create_task(base2_svc.cancel_model_install("default", "m1"))
+    await asyncio.sleep(0)
+    assert not cancel_task.done()  # correctly waiting - reject() hasn't been called yet
+
+    reservation.reject(RuntimeError("setup blew up"))  # install_model() "catches up" now
+
+    await cancel_task  # must not raise - a stale cancel on an already-failed install is a no-op
+
+    assert "m1" not in base2_svc.instances_info["default"].installing_model_progress
+
+
+@pytest.mark.asyncio
+async def test_cancel_model_install_logs_when_pending_setup_fails_independently(
+    base2_svc: _Base2Impl, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A pending setup failure that's unrelated to the cancel request (e.g. a real Docker error that
+    happens to coincide with someone clicking cancel) must leave a trace in the logs - otherwise it's
+    indistinguishable from an ordinary successful cancellation and vanishes without explanation.
+    """
+    reservation = InstallingModel()
+    base2_svc.instances_info["default"].installing_model_progress["m1"] = reservation
+
+    async def already_failed() -> PromiseWithProgress[InstallModelOut, StreamChunk]:
+        raise RuntimeError("setup blew up")
+
+    reservation.pending_task = asyncio.create_task(already_failed())
+    with pytest.raises(RuntimeError):
+        await reservation.pending_task
+
+    with caplog.at_level("ERROR", logger="uvicorn.error"):
+        cancel_task = asyncio.create_task(base2_svc.cancel_model_install("default", "m1"))
+        await asyncio.sleep(0)
+
+        reservation.reject(RuntimeError("setup blew up"))
+
+        await cancel_task
+
+    assert "m1" in caplog.text
+    assert "independently of the cancel request" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cancel_model_install_does_not_log_on_genuine_cancellation(base2_svc: _Base2Impl, caplog: pytest.LogCaptureFixture) -> None:
+    """A genuine, successful cancellation must not be logged as if it were an unrelated failure."""
+    reached_slow_point = asyncio.Event()
+
+    async def slow_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+        reached_slow_point.set()
+        await asyncio.Event().wait()  # never completes on its own
+
+    with caplog.at_level("ERROR", logger="uvicorn.error"), patch.object(base2_svc, "_install_model", new=slow_install_model):
+        task = asyncio.create_task(base2_svc.install_model("default", "m1", InstallModelIn()))
+        await reached_slow_point.wait()
+
+        await asyncio.wait_for(base2_svc.cancel_model_install("default", "m1"), timeout=1)
+
+        with pytest.raises(HTTPException):
+            await task
+
+    assert "independently of the cancel request" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cancel_model_install_waits_for_resolve_when_pending_task_already_done(base2_svc: _Base2Impl) -> None:
+    """Reproduces the race the fix closes: `pending_task` can finish before `install_model()` gets
+    around to calling `resolve()` on the reservation. Cancelling in that exact window must not
+    conclude "nothing to cancel" just because the pending task looks done - it must wait for the
+    real promise to actually attach, then cancel it for real, instead of walking away while the
+    real install keeps running untouched.
+    """
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def func(_stream: Stream[StreamChunk]) -> InstallModelOut:
+        started.set()
+        await release.wait()
+        return InstallModelOut(status="OK", details="done")
+
+    promise: PromiseWithProgress[InstallModelOut, StreamChunk] = PromiseWithProgress(func=func)
+    await started.wait()  # the real background work is genuinely already running
+
+    reservation = InstallingModel()
+    base2_svc.instances_info["default"].installing_model_progress["m1"] = reservation
+
+    async def already_finished() -> PromiseWithProgress[InstallModelOut, StreamChunk]:
+        return promise
+
+    reservation.pending_task = asyncio.create_task(already_finished())
+    await reservation.pending_task  # pending_task is done...
+    assert reservation.promise is None  # ...but resolve() hasn't been called yet - the race window
+
+    cancel_task = asyncio.create_task(base2_svc.cancel_model_install("default", "m1"))
+    await asyncio.sleep(0)
+    assert not cancel_task.done()  # correctly waiting, not giving up because pending_task looked done
+
+    async def on_success(data: InstallModelOut) -> InstallModelOut:
+        return data
+
+    reservation.resolve(promise, on_success, lambda _e: None)  # install_model() "catches up" now
+
+    await cancel_task
+
+    assert "m1" not in base2_svc.instances_info["default"].installing_model_progress
+    assert promise.task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_cancel_model_install_does_not_clobber_a_newer_reservation(base2_svc: _Base2Impl) -> None:
+    """cancel_model_install() must only ever remove *its own* reservation - not whatever happens to
+    be sitting at installing_model_progress[model_id] once it's done waiting. If a brand new install
+    for the same model_id gets reserved (e.g. a retry) while this call was awaiting confirmation, that
+    new reservation must survive untouched instead of getting silently deleted out from under it.
+    """
+
+    async def install_func(_stream: Stream[StreamChunk]) -> InstallModelOut:
+        await asyncio.Event().wait()  # never completes on its own
+        return InstallModelOut(status="OK", details="done")
+
+    promise: PromiseWithProgress[InstallModelOut, StreamChunk] = PromiseWithProgress(func=install_func)
+
+    installing = InstallingModel()
+    base2_svc.instances_info["default"].installing_model_progress["m1"] = installing
+
+    async def already_finished() -> PromiseWithProgress[InstallModelOut, StreamChunk]:
+        return promise
+
+    installing.pending_task = asyncio.create_task(already_finished())
+    await installing.pending_task
+
+    async def on_success(data: InstallModelOut) -> InstallModelOut:
+        return data
+
+    installing.resolve(promise, on_success, lambda _e: None)
+
+    newer_reservation = InstallingModel()
+    original_wait_ready = installing.wait_ready
+
+    async def wait_ready_then_get_replaced() -> PromiseWithProgress[InstallModelOut, StreamChunk]:
+        result = await original_wait_ready()
+        # Simulates a retry reserving the same model_id while cancel_model_install() was waiting.
+        base2_svc.instances_info["default"].installing_model_progress["m1"] = newer_reservation
+        return result
+
+    installing.wait_ready = wait_ready_then_get_replaced  # type: ignore[method-assign]
+
+    await base2_svc.cancel_model_install("default", "m1")
+
+    assert base2_svc.instances_info["default"].installing_model_progress["m1"] is newer_reservation
+
+
+@pytest.mark.asyncio
+async def test_cancel_model_install_unblocks_concurrent_progress_watcher(base2_svc: _Base2Impl) -> None:
+    """A caller blocked in `get_model_install_progress()` during pre-promise setup must be unblocked
+    when someone else cancels the install, instead of hanging forever - with a clean error, not the
+    raw `CancelledError` (an unrelated caller's own request handling shouldn't have to deal with a
+    `BaseException` it never asked to be cancelled by).
+    """
+    reached_slow_point = asyncio.Event()
+
+    async def slow_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+        reached_slow_point.set()
+        await asyncio.Event().wait()  # never completes on its own
+
+    with patch.object(base2_svc, "_install_model", new=slow_install_model):
+        install_task = asyncio.create_task(base2_svc.install_model("default", "m1", InstallModelIn()))
+        await reached_slow_point.wait()
+
+        watcher_task = asyncio.create_task(base2_svc.get_model_install_progress("default", "m1"))
+        await asyncio.sleep(0)  # let the watcher reach wait_ready()
+
+        await asyncio.wait_for(base2_svc.cancel_model_install("default", "m1"), timeout=1)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await asyncio.wait_for(watcher_task, timeout=1)
+        assert exc_info.value.status_code == 409
+        # install_model()'s own task was never cancelled either - only its pending setup task was.
+        with pytest.raises(HTTPException) as install_exc_info:
+            await install_task
+        assert install_exc_info.value.status_code == 409
 
 
 @pytest.mark.asyncio
@@ -1354,6 +1633,397 @@ async def test_install_model_on_error_records_warning(base2_svc: _Base2Impl, bas
     call_kwargs = base2_deps["service_provider"].add_warning.await_args.kwargs
     assert call_kwargs["model_id"] == "m1"
     assert call_kwargs["instance"] == "default"
+
+
+@pytest.mark.asyncio
+async def test_install_model_already_installed_fast_path_resolves_immediately(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """A model that a service's own `_install_model()` recognizes as already installed still resolves right away."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    value = InstallModelOut(status="OK", details="Already installed or being installed right now.")
+    promise: PromiseWithProgress[InstallModelOut, StreamChunk] = PromiseWithProgress(value=value)
+
+    with patch.object(base2_svc, "_install_model", new=AsyncMock(return_value=promise)):
+        result_promise = await base2_svc.install_model("default", "m1", InstallModelIn())
+        result = await result_promise.wait()
+
+    assert result.status == "OK"
+    assert "m1" not in base2_svc.instances_info["default"].installing_model_progress
+
+
+@pytest.mark.asyncio
+async def test_install_model_second_call_during_slow_install_reattaches_instead_of_duplicating(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any]
+) -> None:
+    """Simulates vllm/sglang/mcp's shape: `_install_model()` itself awaits before producing a promise.
+
+    A concurrent second call landing in that window must not start a second real install, and must not
+    get an instant fabricated success - it has to wait for and reflect the real, eventual outcome.
+    """
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    call_count = 0
+    resume = asyncio.Event()
+
+    async def slow_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+        nonlocal call_count
+        call_count += 1
+        await resume.wait()
+        value = InstallModelOut(status="OK", details="Installed")
+        return PromiseWithProgress(value=value)
+
+    with patch.object(base2_svc, "_install_model", new=slow_install_model):
+        first_task = asyncio.create_task(base2_svc.install_model("default", "m1", InstallModelIn()))
+        await asyncio.sleep(0)  # let the first call reserve the slot and enter the simulated slow work
+
+        second_task = asyncio.create_task(base2_svc.install_model("default", "m1", InstallModelIn()))
+        await asyncio.sleep(0)  # let the second call run its check - it must not call _install_model again
+
+        assert call_count == 1
+
+        resume.set()
+        first_promise = await first_task
+        second_promise = await second_task
+
+    first_result = await first_promise.wait()
+    second_result = await second_promise.wait()
+
+    assert first_result.status == "OK"
+    assert second_result.status == "OK"
+    assert call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_load_model_reservation_prevents_concurrent_install_model_from_duplicating(base2_svc: _Base2Impl) -> None:
+    """load_model() (used to restore models at startup) must reserve model_id the same way
+    install_model() does. A concurrent install_model() call landing while load_model() is still
+    inside its own (possibly slow) `_install_model()` setup must join that same reservation instead
+    of racing a duplicate install or getting a fabricated instant "OK".
+    """
+    call_count = 0
+    resume = asyncio.Event()
+
+    async def slow_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+        nonlocal call_count
+        call_count += 1
+        await resume.wait()
+        value = InstallModelOut(status="OK", details="Installed")
+        return PromiseWithProgress(value=value)
+
+    model = ModelConfig(model_id="m1", options=InstallModelIn())
+
+    with patch.object(base2_svc, "_install_model", new=slow_install_model):
+        load_task = asyncio.create_task(base2_svc.load_model("default", model))
+        await asyncio.sleep(0)  # let load_model() reserve the slot and enter the simulated slow work
+
+        install_task = asyncio.create_task(base2_svc.install_model("default", "m1", InstallModelIn()))
+        await asyncio.sleep(0)  # let install_model() run its check...
+        await asyncio.sleep(0)  # ...and, if it wrongly reserved a second time, let that pending_task actually start
+
+        assert call_count == 1
+        assert not install_task.done()  # must genuinely wait, not fabricate an instant result
+
+        resume.set()
+        await load_task
+        install_promise = await install_task
+
+    install_result = await install_promise.wait()
+    assert install_result.status == "OK"
+    assert call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_install_model_concurrent_callers_run_bookkeeping_only_once(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """Two callers joining the same install must share one post-install bookkeeping run, not each
+    trigger their own copy of it - a second concurrent caller must not cause a second config save or
+    a second warnings-dismiss call for what is really one successful install.
+    """
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    value = InstallModelOut(status="OK", details="Installed")
+    promise: PromiseWithProgress[InstallModelOut, StreamChunk] = PromiseWithProgress(value=value)
+
+    with patch.object(base2_svc, "_install_model", new=AsyncMock(return_value=promise)):
+        first_promise = await base2_svc.install_model("default", "m1", InstallModelIn())
+        second_promise = await base2_svc.install_model("default", "m1", InstallModelIn())
+
+    assert first_promise is second_promise
+
+    first_result = await first_promise.wait()
+    second_result = await second_promise.wait()
+
+    assert first_result.status == "OK"
+    assert second_result.status == "OK"
+    assert base2_deps["service_provider"].save_service_config.call_count == 1
+    base2_deps["service_provider"].dismiss_warnings_matching.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_install_model_concurrent_callers_record_only_one_warning_on_failure(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any]
+) -> None:
+    """Two callers joining an install that ultimately fails must not each record their own duplicate
+    warning - exactly one warning should be recorded for the one real failure.
+    """
+    resume = asyncio.Event()
+
+    async def failing_func(_stream: Stream[StreamChunk]) -> InstallModelOut:
+        await resume.wait()
+        raise RuntimeError("install blew up")
+
+    promise: PromiseWithProgress[InstallModelOut, StreamChunk] = PromiseWithProgress(func=failing_func)
+
+    with patch.object(base2_svc, "_install_model", new=AsyncMock(return_value=promise)):
+        first_promise = await base2_svc.install_model("default", "m1", InstallModelIn())
+        second_promise = await base2_svc.install_model("default", "m1", InstallModelIn())
+
+    assert first_promise is second_promise
+
+    resume.set()
+    with pytest.raises(RuntimeError):
+        await first_promise.wait()
+    with pytest.raises(RuntimeError):
+        await second_promise.wait()
+
+    await asyncio.gather(*base2_svc._warning_tasks)  # pyright: ignore[reportPrivateUsage]
+
+    base2_deps["service_provider"].add_warning.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_model_install_progress_reattach_shows_history_then_live_updates(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any]
+) -> None:
+    """A caller that joins an in-progress install via the progress endpoint sees prior progress, not a blank slate."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    reached_midpoint = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
+        stream.emit(StreamChunkProgress(type="progress", stage="download", value=0.3, data={}))
+        reached_midpoint.set()
+        await proceed.wait()
+        stream.emit(StreamChunkProgress(type="progress", stage="download", value=0.9, data={}))
+        return InstallModelOut(status="OK", details="done")
+
+    promise: PromiseWithProgress[InstallModelOut, StreamChunk] = PromiseWithProgress(func=func)
+
+    with patch.object(base2_svc, "_install_model", new=AsyncMock(return_value=promise)):
+        await base2_svc.install_model("default", "m1", InstallModelIn())
+        await reached_midpoint.wait()
+
+        rejoined_promise = await base2_svc.get_model_install_progress("default", "m1")
+        seen: list[StreamChunk] = []
+
+        async def collect() -> None:
+            async for chunk in rejoined_promise.progress.as_generator():
+                seen.append(chunk)
+
+        collector = asyncio.create_task(collect())
+        await asyncio.sleep(0)
+
+        assert {"type": "progress", "stage": "download", "value": 0.3, "data": {}} in seen
+
+        proceed.set()
+        await collector
+
+    assert any(chunk.get("type") == "progress" and chunk.get("value") == 0.9 for chunk in seen)
+
+
+@pytest.mark.asyncio
+async def test_get_model_install_progress_times_out_when_setup_hangs(base2_svc: _Base2Impl) -> None:
+    """A genuinely hung pre-promise setup must not block a progress-watcher forever - it should
+    time out with a clean error instead.
+    """
+    reached = asyncio.Event()
+
+    async def hanging_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+        reached.set()
+        await asyncio.Event().wait()  # never completes
+
+    with (
+        patch.object(base2_svc, "_install_model", new=hanging_install_model),
+        patch("server.services.base2_service._INSTALL_STATUS_WAIT_TIMEOUT_SECONDS", 0.05),
+    ):
+        install_task = asyncio.create_task(base2_svc.install_model("default", "m1", InstallModelIn()))
+        await reached.wait()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await base2_svc.get_model_install_progress("default", "m1")
+        assert exc_info.value.status_code == 504
+
+        install_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await install_task
+
+
+@pytest.mark.asyncio
+async def test_install_model_join_branch_times_out_when_setup_hangs(base2_svc: _Base2Impl) -> None:
+    """A concurrent caller joining an install stuck in a genuinely hung pre-promise setup must not
+    wait forever for it - it should time out with a clean error, and the reservation must be left
+    untouched so the real eventual outcome is still observable afterward.
+    """
+    reached = asyncio.Event()
+
+    async def hanging_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+        reached.set()
+        await asyncio.Event().wait()  # never completes
+
+    with (
+        patch.object(base2_svc, "_install_model", new=hanging_install_model),
+        patch("server.services.base2_service._INSTALL_STATUS_WAIT_TIMEOUT_SECONDS", 0.05),
+    ):
+        first_task = asyncio.create_task(base2_svc.install_model("default", "m1", InstallModelIn()))
+        await reached.wait()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await base2_svc.install_model("default", "m1", InstallModelIn())
+        assert exc_info.value.status_code == 504
+
+        assert "m1" in base2_svc.instances_info["default"].installing_model_progress
+
+        first_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_task
+
+
+@pytest.mark.asyncio
+async def test_cancel_model_install_times_out_and_leaves_reservation_untouched(base2_svc: _Base2Impl) -> None:
+    """If the pending setup doesn't respond to cancellation in time, cancel_model_install() must
+    time out with a clean error rather than hanging forever - and must leave the reservation as-is,
+    since it genuinely doesn't know whether the cancel eventually lands or the install keeps going.
+    """
+    reached = asyncio.Event()
+
+    async def stubborn_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+        reached.set()
+        # Swallow exactly one cancellation to simulate setup that doesn't respond within the
+        # timeout window - but still respond to a second cancel, so the test can clean up its task.
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.sleep(1000)
+        await asyncio.sleep(1000)
+
+    with (
+        patch.object(base2_svc, "_install_model", new=stubborn_install_model),
+        patch("server.services.base2_service._CANCEL_WAIT_TIMEOUT_SECONDS", 0.05),
+    ):
+        install_task = asyncio.create_task(base2_svc.install_model("default", "m1", InstallModelIn()))
+        await reached.wait()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await base2_svc.cancel_model_install("default", "m1")
+        assert exc_info.value.status_code == 504
+
+        assert "m1" in base2_svc.instances_info["default"].installing_model_progress
+
+        install_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await install_task
+
+
+@pytest.mark.asyncio
+async def test_install_model_reservation_removed_when_install_model_raises_before_promise(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any]
+) -> None:
+    """If `_install_model()` itself raises before ever producing a promise, the model must not get stuck as installing."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+
+    async def raising_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+        raise HTTPException(400, "bad request")
+
+    with patch.object(base2_svc, "_install_model", new=raising_install_model), pytest.raises(HTTPException):
+        await base2_svc.install_model("default", "m1", InstallModelIn())
+
+    assert "m1" not in base2_svc.instances_info["default"].installing_model_progress
+
+    value = InstallModelOut(status="OK", details="done")
+    promise: PromiseWithProgress[InstallModelOut, StreamChunk] = PromiseWithProgress(value=value)
+
+    with patch.object(base2_svc, "_install_model", new=AsyncMock(return_value=promise)):
+        result_promise = await base2_svc.install_model("default", "m1", InstallModelIn())
+        result = await result_promise.wait()
+
+    assert result.status == "OK"
+
+
+@pytest.mark.asyncio
+async def test_install_model_concurrent_waiter_gets_error_instead_of_hanging_when_install_model_raises(
+    base2_svc: _Base2Impl,
+) -> None:
+    """A caller blocked on an in-flight reservation must learn of the real failure, not hang forever."""
+    reached_slow_point = asyncio.Event()
+    fail_now = asyncio.Event()
+
+    async def slow_failing_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+        reached_slow_point.set()
+        await fail_now.wait()
+        raise RuntimeError("install blew up")
+
+    with patch.object(base2_svc, "_install_model", new=slow_failing_install_model):
+        first_task = asyncio.create_task(base2_svc.install_model("default", "m1", InstallModelIn()))
+        await reached_slow_point.wait()
+
+        second_task = asyncio.create_task(base2_svc.install_model("default", "m1", InstallModelIn()))
+        await asyncio.sleep(0)  # let the second call reserve-check and start waiting on the first's reservation
+
+        fail_now.set()
+
+        with pytest.raises(RuntimeError, match="install blew up"):
+            await asyncio.wait_for(first_task, timeout=1)
+        with pytest.raises(RuntimeError, match="install blew up"):
+            await asyncio.wait_for(second_task, timeout=1)
+
+    assert "m1" not in base2_svc.instances_info["default"].installing_model_progress
+
+
+@pytest.mark.asyncio
+async def test_install_model_concurrent_waiter_gets_error_instead_of_hanging_when_instance_removed_mid_install(
+    base2_svc: _Base2Impl,
+) -> None:
+    """The instance can be removed (uninstall_instance(purge=True)) while one of its models is still
+    mid-install - it doesn't wait on in-progress installs. A caller blocked on that reservation must
+    still learn of the real failure once it lands, not hang forever because cleanup can no longer
+    find the now-missing instance.
+    """
+    reached_slow_point = asyncio.Event()
+    fail_now = asyncio.Event()
+
+    async def slow_failing_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+        reached_slow_point.set()
+        await fail_now.wait()
+        raise RuntimeError("install blew up")
+
+    with patch.object(base2_svc, "_install_model", new=slow_failing_install_model):
+        first_task = asyncio.create_task(base2_svc.install_model("default", "m1", InstallModelIn()))
+        await reached_slow_point.wait()
+
+        second_task = asyncio.create_task(base2_svc.install_model("default", "m1", InstallModelIn()))
+        await asyncio.sleep(0)  # let the second call reserve-check and start waiting on the first's reservation
+
+        del base2_svc.instances_info["default"]  # simulates uninstall_instance(purge=True)
+        fail_now.set()
+
+        with pytest.raises(RuntimeError, match="install blew up"):
+            await asyncio.wait_for(first_task, timeout=1)
+        with pytest.raises(RuntimeError, match="install blew up"):
+            await asyncio.wait_for(second_task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_install_model_reservation_cleaned_up_when_install_model_cancelled(base2_svc: _Base2Impl) -> None:
+    """A cancelled `_install_model()` call (e.g. client disconnect) must clean up its reservation too, not just ordinary exceptions."""
+    started = asyncio.Event()
+
+    async def hanging_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+        started.set()
+        await asyncio.Event().wait()  # never completes on its own - must be cancelled to end
+
+    with patch.object(base2_svc, "_install_model", new=hanging_install_model):
+        task = asyncio.create_task(base2_svc.install_model("default", "m1", InstallModelIn()))
+        await started.wait()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert "m1" not in base2_svc.instances_info["default"].installing_model_progress
 
 
 @pytest.mark.asyncio

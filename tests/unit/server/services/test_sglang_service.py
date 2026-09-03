@@ -898,6 +898,32 @@ async def test_install_model_raises_400_for_unknown_model(svc: SglangService) ->
 
 
 @pytest.mark.asyncio
+async def test_install_model_cleans_up_installing_set_when_cancelled_during_setup(svc: SglangService) -> None:
+    """A cancellation during the pre-promise GPU/quantization setup must still discard the
+    `_installing` entry - not just ordinary exceptions - or the model gets stuck looking installed.
+    """
+    installed = _make_installed_info()
+    svc.instances_info["default"].installed = installed
+    model_id = next(iter(svc.models["default"]))
+    reached = asyncio.Event()
+
+    async def hanging_gpu_check(*_args: Any, **_kwargs: Any) -> float:
+        reached.set()
+        await asyncio.Event().wait()  # never completes on its own - must be cancelled
+        return 0.0  # unreachable - satisfies the return type
+
+    with patch.object(svc, "_get_gpu_memory_utilization", new=hanging_gpu_check):
+        task = asyncio.create_task(svc._install_model("default", model_id, InstallModelIn(spec={})))  # pyright: ignore[reportPrivateUsage]
+        await reached.wait()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert ("default", model_id) not in svc._installing  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
 async def test_install_model_calls_docker_install(svc: SglangService, gpu_deps: dict[str, Any], tmp_path: Path) -> None:
     _setup_install_mocks(svc, gpu_deps)
     model_id = next(iter(svc.models["default"]))
