@@ -361,7 +361,7 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
                 },
             )
             try:
-                docker_exposed_port, _ = await self.docker_service.install_and_run_docker(docker_options)
+                docker_exposed_port, _, _ = await self.docker_service.install_and_run_docker(docker_options)
             except RuntimeError as e:
                 stderr = e.args[1][3] if len(e.args) > 1 and len(e.args[1]) > 3 else ""
                 if "cuda>=" in stderr or "please update your driver" in stderr:
@@ -431,13 +431,13 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
             return
         await self._stop_docker(installed.docker)
 
-    def get_docker_compose_file_path(self, instance: str, model_id: str | None) -> Path:
-        """Get docker compose file path."""
+    def get_docker_options(self, instance: str, model_id: str | None) -> DockerOptions:
+        """Return the resolved DockerOptions for this instance/model."""
         info = self.get_instance_installed_info(instance)
         if model_id:
             raise HTTPException(400, "Docker is not bound with this object")
 
-        return self.docker_service.get_docker_compose_file_path(info.docker.name)
+        return info.docker
 
     def service_has_docker(self) -> bool:
         """Return true when docker is started when service is installed."""

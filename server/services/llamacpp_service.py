@@ -428,8 +428,8 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
             else:
                 del self.instances_info[instance]
 
-    def get_docker_compose_file_path(self, instance: str, model_id: str | None) -> Path:
-        """Get docker compose file path."""
+    def get_docker_options(self, instance: str, model_id: str | None) -> DockerOptions:
+        """Return the resolved DockerOptions for this instance/model."""
         info = self.get_instance_installed_info(instance)
         if not model_id:
             raise HTTPException(400, "Docker is not bound with this object")
@@ -438,7 +438,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
         if not model_installed:
             raise HTTPException(status_code=400, detail="Model not installed")
 
-        return self.docker_service.get_docker_compose_file_path(model_installed.docker.name)
+        return model_installed.docker
 
     def _add_custom_model(self, instance: str, model: CustomModel) -> None:
         parsed = try_parse_pydantic(LlamacppCustomModel, model.data)
@@ -652,6 +652,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
             docker_options: DockerOptions | None = None
             model_info: ModelInstalledInfo | None = None
+            adopted = False
             try:
                 local_model_path, model_filename = await self._download_model_or_set_progress(stream, model, model_id)
 
@@ -695,7 +696,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
                     hardware=hardware_parts,
                     subnet=subnet,
                 )
-                docker_exposed_port, _ = await self.docker_service.install_and_run_docker(docker_options)
+                docker_exposed_port, _, adopted = await self.docker_service.install_and_run_docker(docker_options)
                 self._log_cache.pop(docker_options.container_name or "", None)
                 registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
                 container_host = self.docker_service.get_container_host(subnet, docker_options.name)
@@ -738,7 +739,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
                 if model_info is not None and installed.models.get(model_id) is model_info:
                     installed.models.pop(model_id, None)
                 if docker_options is not None:
-                    await self._stop_docker(docker_options)
+                    await self._rollback_failed_install_docker(docker_options, adopted=adopted)
                 raise
             finally:
                 self._installing.discard(key)

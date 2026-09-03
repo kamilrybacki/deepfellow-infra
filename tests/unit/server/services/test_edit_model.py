@@ -32,7 +32,7 @@ def deps() -> dict[str, Any]:
     docker_svc.get_docker_container_name.side_effect = lambda name: f"df-{name}"  # pyright: ignore[reportUnknownLambdaType]
     docker_svc.get_image_warnings = AsyncMock(return_value=[])
     docker_svc.is_docker_image_pulled = AsyncMock(return_value=True)
-    docker_svc.install_and_run_docker = AsyncMock(return_value=(8090, True))
+    docker_svc.install_and_run_docker = AsyncMock(return_value=(8090, True, False))
     docker_svc.get_container_host.return_value = "172.20.0.1"
     docker_svc.get_container_port.return_value = 8090
     docker_svc.uninstall_docker = AsyncMock()
@@ -215,7 +215,7 @@ async def test_edit_model_rollback_keeps_old_prefix_after_default_prefix_change_
     """The reinstall attempt uses a recomputed prefix, but a failed reinstall must roll back using the
     original (pre-edit) install options - including its original `prefix` - not the half-applied one."""
     await _add_and_install(svc)
-    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[RuntimeError("boom"), (8090, True)])
+    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[RuntimeError("boom"), (8090, True, False)])
 
     with pytest.raises(RuntimeError, match="boom"):
         await svc.edit_model("default", "cm-1", AddCustomModelIn(spec={**_CUSTOM_MODEL_DATA, "default_prefix": "new-prefix"}))
@@ -229,7 +229,7 @@ async def test_edit_model_rollback_keeps_old_prefix_after_default_prefix_change_
 async def test_edit_model_restores_definition_and_install_on_reinstall_failure(svc: CustomService, deps: dict[str, Any]) -> None:
     await _add_and_install(svc)
 
-    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[RuntimeError("boom"), (8090, True)])
+    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[RuntimeError("boom"), (8090, True, False)])
 
     with pytest.raises(RuntimeError, match="boom"):
         await svc.edit_model("default", "cm-1", AddCustomModelIn(spec={**_CUSTOM_MODEL_DATA, "image": "test/updated:latest"}))
@@ -246,7 +246,7 @@ async def test_edit_model_logs_original_failure_when_reinstall_fails_but_rollbac
     the best-effort rollback (restore old definition + reinstall) succeeds, and the original failure
     must still be logged."""
     await _add_and_install(svc)
-    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[RuntimeError("boom"), (8090, True)])
+    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[RuntimeError("boom"), (8090, True, False)])
 
     with patch("server.services.base2_service.logger") as mock_logger:
         with pytest.raises(RuntimeError, match="boom"):
@@ -455,7 +455,7 @@ async def test_edit_model_install_options_reinstalls_with_new_options(svc: Custo
 async def test_edit_model_install_options_restores_old_options_on_failure(svc: CustomService, deps: dict[str, Any]) -> None:
     await _add_and_install(svc)
 
-    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[RuntimeError("boom"), (8090, True)])
+    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[RuntimeError("boom"), (8090, True, False)])
 
     with pytest.raises(RuntimeError, match="boom"):
         await svc.edit_model_install_options("default", "my-custom", InstallModelIn(spec={"prefix": "new-prefix"}))
@@ -470,7 +470,7 @@ async def test_edit_model_install_options_logs_original_failure_when_rollback_su
     """Same as edit_model's rollback-succeeds cases above, but for edit_model_install_options: the
     reinstall fails, the best-effort rollback succeeds, and the original failure must still be logged."""
     await _add_and_install(svc)
-    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[RuntimeError("boom"), (8090, True)])
+    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[RuntimeError("boom"), (8090, True, False)])
 
     with patch("server.services.base2_service.logger") as mock_logger:
         with pytest.raises(RuntimeError, match="boom"):

@@ -9,7 +9,6 @@ import logging
 import re
 import shutil
 from collections.abc import Sequence
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypedDict
@@ -604,8 +603,8 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
             self.endpoint_registry.unregister_chat_completion(model_info.registered_name, model_info.registration_id)
         await self._save()
 
-    def get_docker_compose_file_path(self, instance: str, model_id: str | None) -> Path:
-        """Get docker compose file path."""
+    def get_docker_options(self, instance: str, model_id: str | None) -> DockerOptions:
+        """Return the resolved DockerOptions for this instance/model."""
         info = self.get_instance_installed_info(instance)
         if not model_id:
             raise HTTPException(400, "Docker is not bound with this object")
@@ -614,7 +613,7 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
         if not model_installed:
             raise HTTPException(status_code=400, detail="Model not installed")
 
-        return self.docker_service.get_docker_compose_file_path(model_installed.docker.name)
+        return model_installed.docker
 
     def _add_custom_model(self, instance: str, model: CustomModel) -> None:
         parsed = try_parse_pydantic(SglangCustomModel, model.data)
@@ -1038,6 +1037,7 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
             model_info: ModelInstalledInfo | None = None
             docker_options: DockerOptions | None = None
+            adopted = False
             try:
                 model_id_fixed = model.hf_id.replace("/", "-")
                 if model.revision and model.revision != "main":
@@ -1096,7 +1096,9 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                         "start_period": "240s",
                     },
                 )
-                docker_exposed_port, restarted = await self._start_container_with_embedding_fallback(docker_options, sglang_command)
+                docker_exposed_port, restarted, adopted = await self._start_container_with_embedding_fallback(
+                    docker_options, sglang_command
+                )
 
                 capacity, capacity_known = await self._resolve_model_capacity(
                     instance, model_id, "SGLang", docker_options.container_name or "", restarted, self._parse_max_concurrency
@@ -1145,21 +1147,22 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                 if model_info is not None and info.models.get(model_id) is model_info:
                     info.models.pop(model_id, None)
                 if docker_options is not None:
-                    with suppress(Exception):
-                        await self.docker_service.stop_docker(docker_options)
+                    await self._rollback_failed_install_docker(docker_options, adopted=adopted)
                 raise
             finally:
                 self._installing.discard(key)
 
         return PromiseWithProgress(func=func)
 
-    async def _start_container_with_embedding_fallback(self, docker_options: DockerOptions, sglang_command: list[str]) -> tuple[int, bool]:
+    async def _start_container_with_embedding_fallback(
+        self, docker_options: DockerOptions, sglang_command: list[str]
+    ) -> tuple[int, bool, bool]:
         """Start the container, retrying once without `--is-embedding` if the engine rejects it.
 
         Our `--is-embedding` heuristic (model_type/reranker-family based) isn't perfect; when SGLang
         itself rejects the flag at startup, retrying without it lets the install succeed without
         requiring the user to intervene.
-        Returns (docker_exposed_port, whether the container was (re)started).
+        Returns (docker_exposed_port, whether the container was (re)started, whether it was adopted).
         """
         try:
             return await self.docker_service.install_and_run_docker(docker_options)

@@ -615,7 +615,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                     "start_period": "10s",
                 },
             )
-            docker_exposed_port, _ = await self.docker_service.install_and_run_docker(docker_options)
+            docker_exposed_port, _, _ = await self.docker_service.install_and_run_docker(docker_options)
             container_host = self.docker_service.get_container_host(subnet, docker_options.name)
             container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
             info = InstalledInfo(
@@ -707,13 +707,13 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         if result.status_code != 200:
             logger.warning("Failed to delete model %r from Ollama: %s (%s)", model_id, result.data, result.status_code)
 
-    def get_docker_compose_file_path(self, instance: str, model_id: str | None) -> Path:
-        """Get docker compose file path."""
+    def get_docker_options(self, instance: str, model_id: str | None) -> DockerOptions:
+        """Return the resolved DockerOptions for this instance/model."""
         info = self.get_instance_installed_info(instance)
         if model_id:
             raise HTTPException(400, "Docker is not bound with this object")
 
-        return self.docker_service.get_docker_compose_file_path(info.docker.name)
+        return info.docker
 
     def service_has_docker(self) -> bool:
         """Return true when docker is started when service is installed."""

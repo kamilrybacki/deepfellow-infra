@@ -10,7 +10,7 @@ import pytest
 from fastapi import HTTPException
 from pydantic import SecretStr
 
-from server.docker import DockerImage
+from server.docker import DockerImage, DockerOptions
 from server.models.models import (
     AddCustomModelIn,
     CustomModelSpecification,
@@ -1459,12 +1459,13 @@ async def test_get_docker_compose_file_reads_file(base2_svc: _Base2Impl) -> None
 @pytest.mark.asyncio
 async def test_restart_docker_calls_docker_service(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
     base2_deps["docker_service"].restart_docker_compose = AsyncMock()
+    options = DockerOptions(name="mymodel", container_name="mymodel", image="ubuntu:latest", image_port=8080)
 
-    with patch.object(base2_svc, "get_docker_compose_file_path", return_value=Path("/tmp/dc.yml")):
+    with patch.object(base2_svc, "get_docker_options", return_value=options):
         await base2_svc.restart_docker("default", None)
 
     assert base2_deps["docker_service"].restart_docker_compose.call_count == 1
-    assert base2_deps["docker_service"].restart_docker_compose.call_args == call(Path("/tmp/dc.yml"))
+    assert base2_deps["docker_service"].restart_docker_compose.call_args == call(options)
 
 
 def test_get_docker_compose_file_path_raises_when_not_installed(base2_svc: _Base2Impl) -> None:
@@ -1479,6 +1480,22 @@ def test_get_docker_compose_file_path_raises_no_docker_when_installed(base2_svc:
 
     with pytest.raises(HTTPException) as exc_info:
         base2_svc.get_docker_compose_file_path("default", None)
+
+    assert exc_info.value.status_code == 400
+
+
+def test_get_docker_options_raises_when_not_installed(base2_svc: _Base2Impl) -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        base2_svc.get_docker_options("default", None)
+
+    assert exc_info.value.status_code == 400
+
+
+def test_get_docker_options_raises_no_docker_when_installed(base2_svc: _Base2Impl) -> None:
+    base2_svc.instances_info["default"].installed = object()
+
+    with pytest.raises(HTTPException) as exc_info:
+        base2_svc.get_docker_options("default", None)
 
     assert exc_info.value.status_code == 400
 

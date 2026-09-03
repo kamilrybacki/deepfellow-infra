@@ -625,6 +625,25 @@ def test_get_docker_compose_file_path_returns_path_without_model_id(svc: OllamaS
     assert result == expected
 
 
+def test_get_docker_options_returns_docker_options_without_model_id(svc: OllamaService) -> None:
+    installed = _make_installed_info(svc)
+    svc.instances_info["default"].installed = installed
+
+    result = svc.get_docker_options("default", None)
+
+    assert result is installed.docker
+
+
+def test_get_docker_options_raises_400_with_model_id(svc: OllamaService) -> None:
+    installed = _make_installed_info(svc)
+    svc.instances_info["default"].installed = installed
+
+    with pytest.raises(HTTPException) as exc_info:
+        svc.get_docker_options("default", "some-model")
+
+    assert exc_info.value.status_code == 400
+
+
 def test_add_custom_model_creates_models_dict_for_new_instance(svc: OllamaService) -> None:
     svc.instances_info["extra"] = Instance(None, None, {}, InstanceConfig())
     custom = CustomModel(id="c-10", data={"id": "new-model", "size": "1GB", "type": "llm"})
@@ -1396,7 +1415,7 @@ async def test_uninstall_model_logs_warning_when_delete_fails(svc: OllamaService
 async def test_install_instance_calls_docker_and_returns_installed_info(svc: OllamaService, deps: dict[str, Any]) -> None:
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-ollama"
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(11434, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(11434, True, False))
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 11434
     options = InstallServiceIn(spec={})
@@ -1417,7 +1436,7 @@ async def test_install_instance_calls_docker_and_returns_installed_info(svc: Oll
 async def test_install_instance_starts_warmth_poll_task(svc: OllamaService, deps: dict[str, Any]) -> None:
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-ollama"
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(11434, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(11434, True, False))
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 11434
     options = InstallServiceIn(spec={})
@@ -1505,7 +1524,7 @@ async def test_install_instance_loads_default_models_for_new_instance(svc: Ollam
     svc.instances_info["gpu-1"] = Instance(None, None, {}, InstanceConfig())
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-ollama-gpu1"
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(11434, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(11434, True, False))
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 11434
 
@@ -1524,7 +1543,7 @@ async def test_install_instance_loads_default_models_for_new_instance(svc: Ollam
 async def test_install_instance_does_not_override_hardware_when_already_in_spec(svc: OllamaService, deps: dict[str, Any]) -> None:
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-ollama"
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(11434, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(11434, True, False))
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 11434
     options = InstallServiceIn(spec={"hardware": False})

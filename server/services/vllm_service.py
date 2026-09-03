@@ -548,8 +548,8 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             self.endpoint_registry.unregister_chat_completion(model_info.registered_name, model_info.registration_id)
         await self._save()
 
-    def get_docker_compose_file_path(self, instance: str, model_id: str | None) -> Path:
-        """Get docker compose file path."""
+    def get_docker_options(self, instance: str, model_id: str | None) -> DockerOptions:
+        """Return the resolved DockerOptions for this instance/model."""
         info = self.get_instance_installed_info(instance)
         if not model_id:
             raise HTTPException(400, "Docker is not bound with this object")
@@ -558,7 +558,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         if not model_installed:
             raise HTTPException(status_code=400, detail="Model not installed")
 
-        return self.docker_service.get_docker_compose_file_path(model_installed.docker.name)
+        return model_installed.docker
 
     def _add_custom_model(self, instance: str, model: CustomModel) -> None:
         parsed = try_parse_pydantic(VllmCustomModel, model.data)
@@ -852,7 +852,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         gpu_memory_utilization: float | None,
         user_model_length: int | None,
         use_gpu: bool,
-    ) -> tuple[int, int | None, bool]:
+    ) -> tuple[int, int | None, bool, bool]:
         """Start the vLLM container, tearing it down on any failure.
 
         If startup fails because the model's default context length needs more KV cache than is
@@ -860,10 +860,10 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         failure (including a retry that still doesn't fit) is translated into a clear "not enough
         GPU VRAM" or "missing model files" AppError when recognized, instead of the raw docker/vLLM
         traceback.
-        Returns (docker_exposed_port, effective user_model_length, whether the container was (re)started).
+        Returns (docker_exposed_port, effective user_model_length, whether the container was (re)started, whether it was adopted).
         """
         try:
-            docker_exposed_port, restarted = await self.docker_service.install_and_run_docker(docker_options)
+            docker_exposed_port, restarted, adopted = await self.docker_service.install_and_run_docker(docker_options)
         except Exception as exc:
             await self.docker_service.stop_docker(docker_options)
             if missing_files_msg := self._diagnose_missing_model_files(model_id, str(exc)):
@@ -890,7 +890,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             )
             docker_options.command = " ".join(vllm_command)
             try:
-                docker_exposed_port, restarted = await self.docker_service.install_and_run_docker(docker_options)
+                docker_exposed_port, restarted, adopted = await self.docker_service.install_and_run_docker(docker_options)
             except Exception as retry_exc:
                 await self.docker_service.stop_docker(docker_options)
                 if missing_files_msg := self._diagnose_missing_model_files(model_id, str(retry_exc)):
@@ -898,7 +898,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                 if vram_msg := self._diagnose_insufficient_vram(model_id, str(retry_exc)):
                     raise AppError(vram_msg) from retry_exc
                 raise
-        return docker_exposed_port, user_model_length, restarted
+        return docker_exposed_port, user_model_length, restarted, adopted
 
     async def _install_model(  # noqa: C901
         self, instance: str, model_id: str, options: InstallModelIn
@@ -935,6 +935,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             model_info: ModelInstalledInfo | None = None
             docker_options: DockerOptions | None = None
             docker_stopped = False
+            adopted = False
             try:
                 model_id_fixed = model.hf_id.replace("/", "-")
                 if model.revision and model.revision != "main":
@@ -999,7 +1000,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     },
                 )
                 try:
-                    docker_exposed_port, user_model_length, restarted = await self._start_vllm_container_with_retry(
+                    docker_exposed_port, user_model_length, restarted, adopted = await self._start_vllm_container_with_retry(
                         docker_options=docker_options,
                         model_id=model_id,
                         docker_model_path=docker_model_path,
@@ -1058,7 +1059,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                 if model_info is not None and info.models.get(model_id) is model_info:
                     info.models.pop(model_id, None)
                 if docker_options is not None and not docker_stopped:
-                    await self._stop_docker(docker_options)
+                    await self._rollback_failed_install_docker(docker_options, adopted=adopted)
                 raise
             finally:
                 self._installing.discard(key)
