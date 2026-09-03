@@ -18,7 +18,7 @@ class ConvertMcpJsonIn(BaseModel):
     config: dict[str, Any]
 
 
-@router.post("/convert-config", summary="Convert a standard MCP client JSON config into DeepFellow's custom-model parameters.")
+@router.post("/convert-config", summary="Convert Mcp Config.")
 async def convert_mcp_config(
     body: Annotated[ConvertMcpJsonIn, Body()],
     _: Annotated[str, Depends(auth_admin)],
