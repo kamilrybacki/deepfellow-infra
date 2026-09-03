@@ -9,6 +9,7 @@ import logging
 import re
 import shutil
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypedDict
