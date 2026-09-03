@@ -3173,6 +3173,24 @@ async def test_uninstall_model_raises_409_when_model_is_being_installed(svc: Oll
 
 
 @pytest.mark.asyncio
+async def test_install_model_direct_call_dedupes_against_installing_set(svc: OllamaService) -> None:
+    """A direct `_install_model()` call (e.g. via `load_model()`, which bypasses `install_model()`'s
+    reservation entirely) must still be deduped via `self._installing` - not start a second real install
+    just because it didn't go through the reservation.
+    """
+    installed = _make_installed_info(svc)
+    svc.instances_info["default"].installed = installed
+    model_id = "test-llm"
+    svc.models["default"][model_id] = OllamaModel(id=model_id, size="1GB", type="llm", hash="abc", context=4096, modelfile=None)
+    svc._installing.add(("default", model_id))  # pyright: ignore[reportPrivateUsage]  # a real install is already in flight
+
+    promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+    result = await promise.wait()
+
+    assert result.details == "Already installed or being installed right now."
+
+
+@pytest.mark.asyncio
 async def test_install_model_post_registration_failure_unregisters_and_rolls_back(svc: OllamaService, deps: dict[str, Any]) -> None:
     installed = _make_installed_info(svc)
     svc.instances_info["default"].installed = installed

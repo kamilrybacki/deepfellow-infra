@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 - Reranker/embedding registries (`static/vllm-min.json`, `static/sglang-min.json`) are no longer discovered by name search alone (`search=rerank`/`search=embed`), which missed any real reranker or embedding model whose repo name didn't spell out that word — e.g. `BAAI/bge-m3`, `intfloat/multilingual-e5-large`, `cross-encoder/ms-marco-MiniLM-L6-v2`. Candidates are now also discovered via HuggingFace's `pipeline_tag`, kept alongside the old name search; candidates found this way are filtered to exclude cross-encoders trained for a different task than reranking (e.g. `cross-encoder/stsb-*`, `cross-encoder/qnli-*`, `cross-encoder/quora-*`), which share the same architecture and tag as real rerankers but return meaningless rankings if served as one. A candidate whose HF detail lookup ultimately fails is now dropped instead of kept with fabricated data (`size: "N/A"`, incorrect `is_generative: true`). `just get-sglang-models` is also fixed — it always failed with `ModuleNotFoundError`.
+- Retrying a model install while the original install is still running (e.g. after the client disconnects and reconnects) no longer reports instant fake success: the retry now waits for and reflects the real outcome of the in-progress install instead of a fabricated "already installing" response.
 
 ## [0.32.0] - 2026-09-01
 

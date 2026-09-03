@@ -1907,7 +1907,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                 )
                 docker_options = apply_image_version_override(docker_options, options.spec.get("image_version"))
                 await self._verify_docker_image(docker_options.image, options.ignore_warnings)
-        except Exception:
+        except BaseException:
             self._installing.discard(key)
             raise
 

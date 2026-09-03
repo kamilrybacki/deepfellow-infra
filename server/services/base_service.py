@@ -111,7 +111,7 @@ class BaseService(ABC):
         """Return actually installing instance."""
 
     @abstractmethod
-    def get_model_install_progress(self, instance: str, model: str) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
+    async def get_model_install_progress(self, instance: str, model: str) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         """Return actually installing models."""
 
     async def cancel_model_install(self, instance: str, model_id: str) -> None:  # noqa: ARG002

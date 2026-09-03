@@ -4,13 +4,12 @@
 """Base2 service."""
 
 import asyncio
-import contextlib
 import logging
 import shutil
 import time
 import uuid
 from abc import abstractmethod
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generic, Protocol, TypeVar, cast
@@ -45,7 +44,15 @@ from server.models.services import (
 )
 from server.serviceprovider import ServiceProvider, ServiceRawConfig
 from server.services.base_service import BaseService
-from server.utils.core import PromiseWithProgress, Stream, StreamChunk, StreamChunkProgress, Utils, convert_size_to_bytes
+from server.utils.core import (
+    PromiseWithProgress,
+    Stream,
+    StreamChunk,
+    StreamChunkProgress,
+    Utils,
+    convert_size_to_bytes,
+    is_own_cancellation,
+)
 from server.utils.hardware import GpuInfo, Hardware, HardwarePartInfo, NvidiaGpuInfo
 from server.utils.model_downloader import ModelDownloader
 
@@ -90,16 +97,81 @@ logger = logging.getLogger("uvicorn.error")
 
 
 class InstallingModel:
+    """Tracks one model install.
+
+    Reserved as soon as `install_model()` decides to start one, resolved once the service's
+    `_install_model()` actually produces the real promise - so a concurrent caller can find the
+    reservation and wait for the real promise instead of racing `_install_model()` a second time.
+    """
+
     last_chunk: StreamChunk | None = None
 
-    def __init__(self, promise: PromiseWithProgress[InstallModelOut, StreamChunk]):
+    def __init__(self) -> None:
+        self.promise: PromiseWithProgress[InstallModelOut, StreamChunk] | None = None
+        self.chained_promise: PromiseWithProgress[InstallModelOut, StreamChunk] | None = None
+        self.task: asyncio.Task[None] | None = None
+        self.pending_task: asyncio.Task[PromiseWithProgress[InstallModelOut, StreamChunk]] | None = None
+        self._ready = asyncio.Event()
+        self._error: BaseException | None = None
+
+    def resolve(
+        self,
+        promise: PromiseWithProgress[InstallModelOut, StreamChunk],
+        on_success: Callable[[InstallModelOut], Awaitable[InstallModelOut]],
+        on_error: Callable[[Exception], None],
+    ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
+        """Attach the real install promise once it exists, unblocking any concurrent waiters.
+
+        Chains the one-time post-install bookkeeping (`on_success`/`on_error`) onto the real promise
+        exactly once here, rather than letting each caller of `install_model()` chain its own copy -
+        every caller (the original one and any that joined this reservation) shares the single
+        resulting promise, so bookkeeping like persisting config or recording a warning runs once per
+        real install, not once per concurrent caller.
+        """
         self.promise = promise
+        self.chained_promise = promise.next(on_success, on_error)
 
         async def the_func() -> None:
             async for chunk in promise.progress.as_generator():
                 self.last_chunk = chunk
 
         self.task = asyncio.create_task(the_func())
+        self._ready.set()
+        return self.chained_promise
+
+    def reject(self, error: BaseException) -> None:
+        """Unblock any concurrent waiters with a failure - no promise will ever exist for this reservation.
+
+        A raw `CancelledError` is converted to a plain `HTTPException` before being stored: it's
+        only meaningful as a real cancellation to whichever task actually owned it (that task sees
+        the original error via its own `raise`, untouched by this) - an unrelated waiter (a
+        progress-watcher, a concurrent joiner) reattaching later just needs a clean, ordinary error
+        to turn into a response, not a `BaseException` most frameworks won't handle gracefully.
+        """
+        if isinstance(error, asyncio.CancelledError):
+            error = HTTPException(409, "Model install was cancelled")
+        self._error = error
+        self._ready.set()
+
+    async def wait_ready(self) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
+        """Wait until the real install promise is available, then return it.
+
+        Re-raises the original failure if the reservation was rejected instead of resolved, so a
+        concurrent caller learns the real outcome instead of hanging forever.
+        """
+        await self._ready.wait()
+        if self._error is not None:
+            raise self._error
+        assert self.promise is not None
+        return self.promise
+
+    async def wait_chained(self) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
+        """Wait until the reservation resolves, then return the single shared post-bookkeeping promise."""
+        await self._ready.wait()
+        if self._error is not None:
+            raise self._error
+        assert self.chained_promise is not None
+        return self.chained_promise
 
 
 class InstallingInstance:
@@ -128,6 +200,12 @@ _FAILED_LOG_CACHE_TTL = 1.0
 _DOCKER_LOGS_TAIL_LINES = 1000  # generous for a startup capacity line; bounds memory on a long-running container
 _RECONCILE_INTERVAL_SECONDS = 90
 _RECONCILE_DEAD_THRESHOLD = 3
+# Bounds how long a caller waits for a model install's pre-promise setup work (GPU/image/registry
+# checks) to settle - not the install itself, which can legitimately run far longer than this and is
+# awaited separately once a promise exists. A generous bound for setup work specifically, so a
+# genuinely hung service doesn't leave every caller waiting forever with no way to notice or recover.
+_INSTALL_STATUS_WAIT_TIMEOUT_SECONDS = 30
+_CANCEL_WAIT_TIMEOUT_SECONDS = 30
 
 
 class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  # noqa: UP046
@@ -388,14 +466,37 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             raise HTTPException(404, "Instance doesn't exist.")
         return instance_info
 
-    def get_model_install_progress(self, instance: str, model: str) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
+    def _pop_installing_if_current(self, instance: str, model_id: str, reservation: InstallingModel) -> None:
+        """Remove model_id's reservation if it's still this exact one and the instance still exists.
+
+        No-ops otherwise instead of raising, since callers use this before reject()/resolve() and
+        must not be blocked by either a superseded reservation or an already-uninstalled instance.
+        """
+        instance_info = self.instances_info.get(instance)
+        if instance_info is None:
+            return
+        progress = instance_info.installing_model_progress
+        if progress.get(model_id) is reservation:
+            del progress[model_id]
+
+    @staticmethod
+    async def _wait_for_install_setup(
+        model_id: str, awaitable: Awaitable[PromiseWithProgress[InstallModelOut, StreamChunk]]
+    ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
+        """Await a reservation's pre-promise setup, converting a timeout into a clean 504."""
+        try:
+            return await asyncio.wait_for(awaitable, timeout=_INSTALL_STATUS_WAIT_TIMEOUT_SECONDS)
+        except TimeoutError:
+            raise HTTPException(504, f"Model {model_id} is still preparing to install; try again shortly.") from None
+
+    async def get_model_install_progress(self, instance: str, model: str) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         """Return actually installing models."""
         installing = self.get_instance_info(instance).installing_model_progress.get(model)
 
         if not installing:
             raise HTTPException(404, "This model is not installing now.")
 
-        return installing.promise
+        return await self._wait_for_install_setup(model, installing.wait_ready())
 
     async def cancel_model_install(self, instance: str, model_id: str) -> None:
         """Cancel an in-progress model install, stopping the underlying Docker image pull."""
@@ -404,17 +505,55 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         if not installing:
             raise HTTPException(404, f"Model {model_id} is not installing now.")
 
+        # Always attempt to cancel the pending setup call first, unconditionally - cancelling an
+        # already-finished task is a harmless no-op. Deciding which of "still setting up" vs
+        # "real promise exists" applies *before* attempting cancellation would race: the setup
+        # work can finish (and install_model() resolve the reservation) in the gap between that
+        # check and acting on it, silently leaving the real install running untouched while this
+        # reports success. Cancelling first, then waiting for the reservation to settle, means we
+        # always act on the real outcome instead of a stale snapshot of it.
+        assert installing.pending_task is not None
+        installing.pending_task.cancel()
+
+        try:
+            promise = await asyncio.wait_for(installing.wait_ready(), timeout=_CANCEL_WAIT_TIMEOUT_SECONDS)
+        except TimeoutError:
+            # We genuinely don't know whether the cancel above landed or the pending setup is just
+            # slow - leaving the reservation untouched lets a later call (retry cancel, or simply
+            # waiting) observe the real eventual outcome instead of us guessing and potentially
+            # hiding a still-running install by clearing its tracking prematurely.
+            raise HTTPException(504, f"Timed out waiting to confirm cancellation for model {model_id}.") from None
+        except Exception as e:
+            # wait_ready() re-raising here means the pending setup work was cancelled (reject()
+            # converts any CancelledError into a clean HTTPException(409) before storing it, so this
+            # never surfaces as a raw one from that) or failed on its own - either way, nothing
+            # further to cancel. A raw CancelledError reaching this point instead can only mean
+            # this call's own task is being cancelled (e.g. its request disconnected); `except
+            # Exception` doesn't catch that, so it propagates naturally instead of being treated
+            # as if the cancel we asked for had completed.
+            #
+            # Log the "failed on its own" case specifically - it's otherwise indistinguishable from
+            # an ordinary successful cancellation, and a real setup failure that happens to coincide
+            # with someone clicking cancel would vanish without a trace.
+            if not (isinstance(e, HTTPException) and e.status_code == 409):
+                logger.exception(
+                    f"{self.get_id(instance)} pending setup for model {model_id} failed independently of the cancel request"  # noqa: G004
+                )
+            self._pop_installing_if_current(instance, model_id, installing)
+            return
+
         # Cancel the real pull work and every chained promise (cancel() propagates down the chain),
         # plus the chunk reader, then await them all so no task is left pending and GC'd mid-run.
         # promise.tasks() also returns the chained promise's task (it is registered as a child).
-        installing.promise.cancel()
+        promise.cancel()
+        assert installing.task is not None
         installing.task.cancel()
-        tasks = [*installing.promise.tasks(), installing.task]
+        tasks = [*promise.tasks(), installing.task]
         await asyncio.gather(*tasks, return_exceptions=True)
 
-        installing.promise.progress.close()
+        promise.progress.close()
 
-        self.get_instance_info(instance).installing_model_progress.pop(model_id, None)
+        self._pop_installing_if_current(instance, model_id, installing)
 
     def get_instance_install_progress(self, instance: str) -> PromiseWithProgress[InstallServiceOut, StreamChunk]:
         """Return actually installing service."""
@@ -490,7 +629,17 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
                     f"{self.get_id(instance)} model {model.model_id} missing from current registry, restoring from persisted definition"  # noqa: G004
                 )
                 self._restore_model_definition(instance, model.model_id, model.definition)
-            await (await self._install_model(instance, model.model_id, model.options)).wait()
+
+            async def on_success(data: InstallModelOut) -> InstallModelOut:
+                return data
+
+            # Reserve like install_model() does, so a concurrent POST /install for this model_id
+            # joins this load instead of racing it or getting a fabricated "already installing"
+            # response - but with no-op bookkeeping callbacks, since this method already has its own
+            # separate success/failure handling below. Routing through install_model() directly
+            # would run both, double-recording the warning on failure.
+            promise = await self._reserve_and_install(instance, model.model_id, model.options, on_success, lambda _e: None)
+            await promise.wait()
         except Exception as exc:
             logger.exception(f"{self.get_id(instance)} get error while loading model {model.model_id}")  # noqa: G004
             self._failed_models.setdefault(instance, set()).add(model.model_id)
@@ -973,13 +1122,74 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
                 raise
             return was_installed, promise
 
+    async def _reserve_and_install(
+        self,
+        instance: str,
+        model_id: str,
+        options: InstallModelIn,
+        on_success: Callable[[InstallModelOut], Awaitable[InstallModelOut]],
+        on_error: Callable[[Exception], None],
+    ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
+        """Reserve model_id for install, or join an already-in-progress reservation for it.
+
+        Shared by install_model() (the public entry point) and load_model() (which starts an
+        install directly at startup, bypassing the public API) so a concurrent call through either
+        one sees the same reservation, instead of racing a duplicate install or fabricating a
+        result. on_success/on_error carry each caller's own post-install bookkeeping; reservation
+        cleanup itself always happens here regardless of what they do.
+        """
+        installing_model_progress = self.get_instance_info(instance).installing_model_progress
+
+        async def wrapped_on_success(data: InstallModelOut) -> InstallModelOut:
+            self._pop_installing_if_current(instance, model_id, reservation)
+            return await on_success(data)
+
+        def wrapped_on_error(e: Exception) -> None:
+            self._pop_installing_if_current(instance, model_id, reservation)
+            on_error(e)
+
+        existing = installing_model_progress.get(model_id)
+        if existing is not None:
+            # Already installing (or reserved a moment ago by a concurrent call): join the real
+            # install instead of asking the service to start a second one or fabricating a result.
+            # The bookkeeping continuation is shared (see resolve()), not re-chained per caller.
+            # wait_chained() only waits for the (short) pre-promise setup to settle, not the whole
+            # install - the real download is awaited separately, by whoever calls promise.wait()
+            # on what this returns - so a bounded wait here doesn't cut a legitimately long install
+            # short, only a genuinely hung setup phase.
+            return await self._wait_for_install_setup(model_id, existing.wait_chained())
+
+        # Reserve the slot synchronously (no `await` before this point) so a concurrent call can
+        # never observe "not reserved yet" once this one has started, no matter how long the
+        # service's own `_install_model()` takes to actually produce the real promise.
+        reservation = InstallingModel()
+        installing_model_progress[model_id] = reservation
+        # Run _install_model() as its own task (rather than awaiting it inline) so cancel_model_install(),
+        # called from a completely different request, has something real to cancel even before this
+        # produces a promise - not just something to wait on.
+        reservation.pending_task = asyncio.create_task(self._install_model(instance, model_id, options))
+        try:
+            promise = await reservation.pending_task
+        except BaseException as e:
+            self._pop_installing_if_current(instance, model_id, reservation)
+            reservation.reject(e)
+            # A CancelledError here can mean two different things: this call's own task was
+            # cancelled (e.g. its request disconnected) - which must propagate as-is - or someone
+            # else cancelled the pending setup task (cancel_model_install(), from a different
+            # request) while this call was merely awaiting it - which isn't this caller's own
+            # cancellation and shouldn't surface as a raw CancelledError FastAPI can't handle.
+            if isinstance(e, asyncio.CancelledError) and not is_own_cancellation():
+                raise HTTPException(409, f"Model {model_id} install was cancelled") from None
+            raise
+
+        return reservation.resolve(promise, wrapped_on_success, wrapped_on_error)
+
     async def install_model(
         self, instance: str, model_id: str, options: InstallModelIn
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         """Install the model."""
-        installing_model_progress = self.get_instance_info(instance).installing_model_progress
 
-        async def func(data: InstallModelOut) -> InstallModelOut:
+        async def on_success(data: InstallModelOut) -> InstallModelOut:
             if instance_failures := self._failed_models.get(instance):
                 instance_failures.discard(model_id)
             await self._save()
@@ -989,21 +1199,13 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
                 logger.exception(f"{self.get_id(instance)} failed to dismiss warnings for model {model_id} after successful install")  # noqa: G004
             msg = f"{model_id} model installed."
             logger.debug(msg)
-            with contextlib.suppress(KeyError):
-                del installing_model_progress[model_id]
             return data
 
         def on_error(e: Exception) -> None:
-            with contextlib.suppress(KeyError):
-                del installing_model_progress[model_id]
             error = str(e)
             self._record_warning_in_background(error, instance=instance, model_id=model_id)
 
-        promise = await self._install_model(instance, model_id, options)
-
-        installing_model_progress[model_id] = InstallingModel(promise)
-
-        return promise.next(func, on_error)
+        return await self._reserve_and_install(instance, model_id, options, on_success, on_error)
 
     @abstractmethod
     async def _install_model(

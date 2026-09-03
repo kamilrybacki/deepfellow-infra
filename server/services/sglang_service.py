@@ -1030,7 +1030,7 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
             gpu_memory_utilization = await self._get_gpu_memory_utilization(instance, model_id, parsed_model_options, model)
             max_model_length = parsed_model_options.max_model_length or model.max_model_len or None
             quantization = await self._get_quantization(parsed_model_options, model)
-        except Exception:
+        except BaseException:
             self._release_gpu_utilization(gpu_memory_utilization)
             self._installing.discard(key)
             raise

@@ -610,10 +610,14 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         self._installing.add(key)
 
-        await self.validate_docker_image_version_for_model(model_id, options.spec.get("image_version"), options.spec.get("hardware"))
-        docker_options = model.options(options.spec) if isinstance(model.options, Callable) else model.options
-        docker_options = apply_image_version_override(docker_options, options.spec.get("image_version"))
-        await self._verify_docker_image(docker_options.image, options.ignore_warnings)
+        try:
+            await self.validate_docker_image_version_for_model(model_id, options.spec.get("image_version"), options.spec.get("hardware"))
+            docker_options = model.options(options.spec) if isinstance(model.options, Callable) else model.options
+            docker_options = apply_image_version_override(docker_options, options.spec.get("image_version"))
+            await self._verify_docker_image(docker_options.image, options.ignore_warnings)
+        except BaseException:
+            self._installing.discard(key)
+            raise
 
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
             try:

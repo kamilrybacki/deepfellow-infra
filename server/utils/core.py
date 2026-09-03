@@ -502,6 +502,17 @@ class PromiseWithProgress[T, U]:
         return promise
 
 
+def is_own_cancellation() -> bool:
+    """Whether the running task's own cancellation caused the CancelledError just caught.
+
+    True: someone asked this task itself to stop (client disconnect, shutdown) - it must propagate.
+    False: something this task awaited was cancelled by an unrelated caller - safe to treat as a
+    normal, recoverable outcome instead.
+    """
+    current = asyncio.current_task()
+    return current is not None and bool(current.cancelling())
+
+
 async def convert_promise_with_progress_to_fastapi_response(promise: PromiseWithProgress[BaseModel, StreamChunk]) -> Response:
     """Convert to StreamingResult."""
     if not promise.has_stream:
@@ -524,8 +535,7 @@ async def convert_promise_with_progress_to_fastapi_response(promise: PromiseWith
             # a CancelledError. Finish the SSE stream cleanly so the ASGI response completes instead of
             # raising ("ASGI callable returned without completing response"). If the response task itself
             # is being cancelled (client disconnect / shutdown), propagate so cancellation is honoured.
-            current = asyncio.current_task()
-            if current is not None and current.cancelling():
+            if is_own_cancellation():
                 raise
             return
         except Exception as e:
