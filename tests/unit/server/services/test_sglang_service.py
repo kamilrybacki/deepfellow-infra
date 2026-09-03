@@ -96,7 +96,7 @@ def _make_model_installed_info(
 def _setup_install_mocks(svc: SglangService, deps: dict[str, Any], hardware: str | bool | None = True) -> InstalledInfo:
     installed = _make_installed_info(hardware=hardware)
     svc.instances_info["default"].installed = installed
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(30000, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(30000, True, False))
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
     deps["docker_service"].get_container_host.return_value = "localhost"
@@ -1109,11 +1109,11 @@ async def test_install_model_retries_without_is_embedding_flag_on_mismatch(
     svc.instances_info["default"].installed = installed
     observed_commands: list[str] = []
 
-    async def fake_install_and_run_docker(docker_options: Any) -> tuple[int, bool]:
+    async def fake_install_and_run_docker(docker_options: Any) -> tuple[int, bool, bool]:
         observed_commands.append(docker_options.command)
         if len(observed_commands) == 1:
             raise RuntimeError("Please relaunch without --is-embedding for this model")
-        return 30000, True
+        return 30000, True, False
 
     gpu_deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=fake_install_and_run_docker)
     gpu_deps["docker_service"].get_docker_subnet.return_value = None

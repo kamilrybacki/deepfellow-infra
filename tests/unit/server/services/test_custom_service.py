@@ -288,6 +288,18 @@ def test_get_docker_compose_file_path_success(svc: CustomService, deps: dict[str
     assert result == expected
 
 
+def test_get_docker_options_returns_docker_options_for_installed_model(svc: CustomService) -> None:
+    model_installed = MagicMock()
+    svc.instances_info["default"].installed = InstalledInfo(
+        models={"lemmatizer": model_installed},
+        options=InstallServiceIn(spec={}),
+    )
+
+    result = svc.get_docker_options("default", "lemmatizer")
+
+    assert result is model_installed.docker_options
+
+
 def test_add_custom_model_adds_to_models(svc: CustomService) -> None:
     model = CustomModel(id="cm-1", data=_CUSTOM_MODEL_DATA)
 
@@ -694,7 +706,7 @@ async def test_install_model_success(svc: CustomService, deps: dict[str, Any]) -
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
     deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True, False))
     deps["docker_service"].get_container_host.return_value = "172.20.0.1"
     deps["docker_service"].get_container_port.return_value = 8090
     deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
@@ -716,7 +728,7 @@ async def test_install_model_uses_configured_standard_proxy_timeout(svc: CustomS
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
     deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True, False))
     deps["docker_service"].get_container_host.return_value = "172.20.0.1"
     deps["docker_service"].get_container_port.return_value = 8090
     deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
@@ -750,7 +762,7 @@ async def test_install_model_applies_selected_image_version(svc: CustomService, 
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
     deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True, False))
     deps["docker_service"].get_container_host.return_value = "172.20.0.1"
     deps["docker_service"].get_container_port.return_value = 8090
     deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
@@ -776,7 +788,7 @@ async def test_install_model_applies_selected_image_version_for_static_image_mod
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
     deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True, False))
     deps["docker_service"].get_container_host.return_value = "172.20.0.1"
     deps["docker_service"].get_container_port.return_value = 8000
     deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
@@ -799,7 +811,7 @@ async def test_install_model_uses_spec_proxy_timeout_seconds(svc: CustomService,
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
     deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True, False))
     deps["docker_service"].get_container_host.return_value = "172.20.0.1"
     deps["docker_service"].get_container_port.return_value = 8090
     deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
@@ -819,7 +831,7 @@ async def test_install_model_treats_null_proxy_timeout_seconds_as_unset(svc: Cus
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
     deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True, False))
     deps["docker_service"].get_container_host.return_value = "172.20.0.1"
     deps["docker_service"].get_container_port.return_value = 8090
     deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
@@ -1426,7 +1438,7 @@ async def test_install_model_uses_default_prefix_when_no_spec(svc: CustomService
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
     deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True, False))
     deps["docker_service"].get_container_host.return_value = "172.20.0.1"
     deps["docker_service"].get_container_port.return_value = 8090
     deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
@@ -1443,7 +1455,7 @@ async def test_install_model_uses_default_prefix_when_prefix_missing(svc: Custom
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
     deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True, False))
     deps["docker_service"].get_container_host.return_value = "172.20.0.1"
     deps["docker_service"].get_container_port.return_value = 8090
     deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
@@ -1549,7 +1561,7 @@ async def test_install_model_registration_failure_rolls_back_model(svc: CustomSe
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
     deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True, False))
     deps["docker_service"].get_container_host.return_value = "172.20.0.1"
     deps["docker_service"].get_container_port.return_value = 8090
     deps["endpoint_registry"].register_custom_endpoint_as_proxy.side_effect = RuntimeError("registry down")
@@ -1570,7 +1582,7 @@ async def test_install_model_registration_failure_skips_rollback_when_already_re
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
     deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True, False))
     deps["docker_service"].get_container_host.return_value = "172.20.0.1"
     deps["docker_service"].get_container_port.return_value = 8090
 

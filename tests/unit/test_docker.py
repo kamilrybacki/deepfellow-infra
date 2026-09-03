@@ -92,9 +92,10 @@ def _opts(
     name: str = "mymodel",
     image: str = "ubuntu:latest",
     image_port: int = 8080,
+    container_name: str | None = None,
     **kwargs: Any,
 ) -> DockerOptions:
-    return DockerOptions(name=name, container_name=None, image=image, image_port=image_port, **kwargs)
+    return DockerOptions(name=name, container_name=container_name, image=image, image_port=image_port, **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -391,13 +392,48 @@ async def test_stop_docker_compose_command_contains_keywords(docker_service: Doc
 @pytest.mark.asyncio
 async def test_restart_docker_compose_command_contains_keywords(docker_service: DockerService, tmp_path: Path) -> None:
     compose_file = tmp_path / "compose.yaml"
+    compose_file.write_text("services: {}")
+    options = _opts()
 
-    with patch("server.docker.Utils.run_command_for_success", new_callable=AsyncMock) as mock_run:
+    with (
+        patch.object(docker_service, "get_docker_compose_file_path", return_value=compose_file),
+        patch("server.docker.Utils.run_command_for_success", new_callable=AsyncMock) as mock_run,
+    ):
         mock_run.return_value = make_result2()
-        await docker_service.restart_docker_compose(compose_file)
+        await docker_service.restart_docker_compose(options)
 
     cmd = mock_run.call_args[0][0]
     assert "restart" in cmd
+
+
+@pytest.mark.asyncio
+async def test_restart_docker_compose_falls_back_to_container_when_file_missing(docker_service: DockerService, tmp_path: Path) -> None:
+    compose_file = tmp_path / "missing.yaml"
+    options = _opts(container_name="my-container")
+
+    with (
+        patch.object(docker_service, "get_docker_compose_file_path", return_value=compose_file),
+        patch("server.docker.Utils.run_command_for_success", new_callable=AsyncMock) as mock_run,
+        patch.object(docker_service, "_restart_container", new_callable=AsyncMock) as mock_restart_container,
+    ):
+        await docker_service.restart_docker_compose(options)
+
+    assert mock_run.call_count == 0
+    mock_restart_container.assert_called_once_with("my-container")
+
+
+@pytest.mark.asyncio
+async def test_restart_docker_compose_raises_when_no_file_and_no_container_name(docker_service: DockerService, tmp_path: Path) -> None:
+    compose_file = tmp_path / "missing.yaml"
+    options = _opts()  # container_name=None
+
+    with (
+        patch.object(docker_service, "get_docker_compose_file_path", return_value=compose_file),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await docker_service.restart_docker_compose(options)
+
+    assert exc_info.value.status_code == 400
 
 
 @pytest.mark.asyncio
@@ -417,17 +453,39 @@ async def test_stop_docker_calls_stop_compose_when_file_exists(docker_service: D
 
 
 @pytest.mark.asyncio
-async def test_stop_docker_does_not_call_stop_compose_when_file_missing(docker_service: DockerService, tmp_path: Path) -> None:
+async def test_stop_docker_does_not_call_stop_compose_when_file_missing(
+    docker_service: DockerService, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     compose_file = tmp_path / "missing.yaml"
-    options = _opts()
+    options = _opts()  # container_name=None: no compose file and no way to identify the container
 
     with (
         patch.object(docker_service, "get_docker_compose_file_path", return_value=compose_file),
         patch.object(docker_service, "stop_docker_compose", new_callable=AsyncMock) as mock_stop,
+        patch.object(docker_service, "_stop_and_remove_container", new_callable=AsyncMock) as mock_stop_and_remove,
+        caplog.at_level("WARNING", logger="uvicorn.error"),
     ):
         await docker_service.stop_docker(options)
 
     assert mock_stop.call_count == 0
+    mock_stop_and_remove.assert_not_called()
+    assert any(record.levelname == "WARNING" and "mymodel" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_stop_docker_falls_back_to_container_when_file_missing(docker_service: DockerService, tmp_path: Path) -> None:
+    compose_file = tmp_path / "missing.yaml"
+    options = _opts(container_name="my-container")
+
+    with (
+        patch.object(docker_service, "get_docker_compose_file_path", return_value=compose_file),
+        patch.object(docker_service, "stop_docker_compose", new_callable=AsyncMock) as mock_stop,
+        patch.object(docker_service, "_stop_and_remove_container", new_callable=AsyncMock) as mock_stop_and_remove,
+    ):
+        await docker_service.stop_docker(options)
+
+    assert mock_stop.call_count == 0
+    mock_stop_and_remove.assert_called_once_with("my-container")
 
 
 @pytest.mark.asyncio
@@ -645,6 +703,125 @@ async def test_remove_image_reraises_non_404(docker_service: DockerService) -> N
 
     with patch("server.docker.Docker", return_value=cm), pytest.raises(DockerError):
         await docker_service.remove_image("ubuntu:latest")
+
+
+@pytest.mark.asyncio
+async def test_stop_and_remove_container_stops_and_deletes(docker_service: DockerService) -> None:
+    container = MagicMock()
+    container.stop = AsyncMock()
+    container.delete = AsyncMock()
+    instance = MagicMock()
+    instance.containers.container = MagicMock(return_value=container)
+    cm, _ = _make_docker_mock()
+    cm.__aenter__ = AsyncMock(return_value=instance)
+
+    with patch("server.docker.Docker", return_value=cm):
+        await docker_service._stop_and_remove_container("mymodel")  # type: ignore[reportPrivateUsage]
+
+    instance.containers.container.assert_called_once_with("mymodel")
+    container.stop.assert_called_once()
+    container.delete.assert_called_once_with(force=True)
+
+
+@pytest.mark.asyncio
+async def test_stop_and_remove_container_tolerates_404_on_stop(docker_service: DockerService) -> None:
+    container = MagicMock()
+    container.stop = AsyncMock(side_effect=DockerError(status=404, message="no such container"))
+    container.delete = AsyncMock()
+    instance = MagicMock()
+    instance.containers.container = MagicMock(return_value=container)
+    cm, _ = _make_docker_mock()
+    cm.__aenter__ = AsyncMock(return_value=instance)
+
+    with patch("server.docker.Docker", return_value=cm):
+        await docker_service._stop_and_remove_container("mymodel")  # type: ignore[reportPrivateUsage]  # should not raise
+
+    container.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stop_and_remove_container_tolerates_404_on_delete(docker_service: DockerService) -> None:
+    container = MagicMock()
+    container.stop = AsyncMock()
+    container.delete = AsyncMock(side_effect=DockerError(status=404, message="no such container"))
+    instance = MagicMock()
+    instance.containers.container = MagicMock(return_value=container)
+    cm, _ = _make_docker_mock()
+    cm.__aenter__ = AsyncMock(return_value=instance)
+
+    with patch("server.docker.Docker", return_value=cm):
+        await docker_service._stop_and_remove_container("mymodel")  # type: ignore[reportPrivateUsage]  # should not raise
+
+
+@pytest.mark.asyncio
+async def test_stop_and_remove_container_reraises_non_404_on_stop(docker_service: DockerService) -> None:
+    container = MagicMock()
+    container.stop = AsyncMock(side_effect=DockerError(status=500, message="server error"))
+    instance = MagicMock()
+    instance.containers.container = MagicMock(return_value=container)
+    cm, _ = _make_docker_mock()
+    cm.__aenter__ = AsyncMock(return_value=instance)
+
+    with patch("server.docker.Docker", return_value=cm), pytest.raises(DockerError):
+        await docker_service._stop_and_remove_container("mymodel")  # type: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_stop_and_remove_container_reraises_non_404_on_delete(docker_service: DockerService) -> None:
+    container = MagicMock()
+    container.stop = AsyncMock()
+    container.delete = AsyncMock(side_effect=DockerError(status=500, message="server error"))
+    instance = MagicMock()
+    instance.containers.container = MagicMock(return_value=container)
+    cm, _ = _make_docker_mock()
+    cm.__aenter__ = AsyncMock(return_value=instance)
+
+    with patch("server.docker.Docker", return_value=cm), pytest.raises(DockerError):
+        await docker_service._stop_and_remove_container("mymodel")  # type: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_restart_container_calls_restart(docker_service: DockerService) -> None:
+    container = MagicMock()
+    container.restart = AsyncMock()
+    instance = MagicMock()
+    instance.containers.container = MagicMock(return_value=container)
+    cm, _ = _make_docker_mock()
+    cm.__aenter__ = AsyncMock(return_value=instance)
+
+    with patch("server.docker.Docker", return_value=cm):
+        await docker_service._restart_container("mymodel")  # type: ignore[reportPrivateUsage]
+
+    instance.containers.container.assert_called_once_with("mymodel")
+    container.restart.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_restart_container_raises_http_exception_on_404(docker_service: DockerService) -> None:
+    container = MagicMock()
+    container.restart = AsyncMock(side_effect=DockerError(status=404, message="no such container"))
+    instance = MagicMock()
+    instance.containers.container = MagicMock(return_value=container)
+    cm, _ = _make_docker_mock()
+    cm.__aenter__ = AsyncMock(return_value=instance)
+
+    with patch("server.docker.Docker", return_value=cm), pytest.raises(HTTPException) as exc_info:
+        await docker_service._restart_container("mymodel")  # type: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_restart_container_reraises_non_404_docker_error(docker_service: DockerService) -> None:
+    container = MagicMock()
+    container.restart = AsyncMock(side_effect=DockerError(status=500, message="server error"))
+    instance = MagicMock()
+    instance.containers.container = MagicMock(return_value=container)
+    cm, _ = _make_docker_mock()
+    cm.__aenter__ = AsyncMock(return_value=instance)
+
+    with patch("server.docker.Docker", return_value=cm), pytest.raises(DockerError):
+        await docker_service._restart_container("mymodel")  # type: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
@@ -928,12 +1105,13 @@ async def test_install_and_run_docker_not_running_no_diff_port_available(docker_
         patch.object(docker_service, "create_compose_file", new_callable=AsyncMock, return_value=11434) as mock_create,
         patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock, return_value=True),
     ):
-        port, restarted = await docker_service.install_and_run_docker(options)
+        port, restarted, adopted = await docker_service.install_and_run_docker(options)
 
     assert mock_start.call_count == 1
     assert mock_create.call_count == 0
     assert port == 11434
     assert restarted is True
+    assert adopted is False
 
 
 @pytest.mark.asyncio
@@ -950,12 +1128,13 @@ async def test_install_and_run_docker_not_running_no_diff_port_taken(docker_serv
         patch.object(docker_service, "start_docker_compose", new_callable=AsyncMock, return_value="") as mock_start,
         patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock, return_value=True),
     ):
-        port, restarted = await docker_service.install_and_run_docker(options)
+        port, restarted, adopted = await docker_service.install_and_run_docker(options)
 
     assert mock_create.call_count == 1
     assert mock_start.call_count == 1
     assert port == 22222
     assert restarted is True
+    assert adopted is False
 
 
 @pytest.mark.asyncio
@@ -971,12 +1150,13 @@ async def test_install_and_run_docker_not_running_has_difference(docker_service:
         patch.object(docker_service, "start_docker_compose", new_callable=AsyncMock, return_value="") as mock_start,
         patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock, return_value=True),
     ):
-        port, restarted = await docker_service.install_and_run_docker(options)
+        port, restarted, adopted = await docker_service.install_and_run_docker(options)
 
     assert mock_create.call_count == 1
     assert mock_start.call_count == 1
     assert port == 55555
     assert restarted is True
+    assert adopted is False
 
 
 @pytest.mark.asyncio
@@ -993,13 +1173,14 @@ async def test_install_and_run_docker_running_has_difference(docker_service: Doc
         patch.object(docker_service, "start_docker_compose", new_callable=AsyncMock, return_value="") as mock_start,
         patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock, return_value=True),
     ):
-        port, restarted = await docker_service.install_and_run_docker(options)
+        port, restarted, adopted = await docker_service.install_and_run_docker(options)
 
     assert mock_stop.call_count == 1
     assert mock_create.call_count == 1
     assert mock_start.call_count == 1
     assert port == 66666
     assert restarted is True
+    assert adopted is False
 
 
 @pytest.mark.asyncio
@@ -1016,13 +1197,14 @@ async def test_install_and_run_docker_running_no_difference(docker_service: Dock
         patch.object(docker_service, "start_docker_compose", new_callable=AsyncMock) as mock_start,
         patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock, return_value=True),
     ):
-        port, restarted = await docker_service.install_and_run_docker(options)
+        port, restarted, adopted = await docker_service.install_and_run_docker(options)
 
     assert mock_stop.call_count == 0
     assert mock_create.call_count == 0
     assert mock_start.call_count == 0
     assert port == 11434
     assert restarted is False
+    assert adopted is False
 
 
 @pytest.mark.asyncio
@@ -1053,10 +1235,11 @@ async def test_install_and_run_docker_subnet_mode_port_is_minus_one(docker_servi
         patch.object(docker_service, "has_docker_compose_difference", new_callable=AsyncMock, return_value=(False, None)),
         patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock, return_value=True),
     ):
-        port, restarted = await docker_service.install_and_run_docker(options)
+        port, restarted, adopted = await docker_service.install_and_run_docker(options)
 
     assert port == -1
     assert restarted is False
+    assert adopted is False
 
 
 @pytest.mark.asyncio
@@ -1073,11 +1256,12 @@ async def test_install_and_run_docker_adoption_skips_health_check_and_reports_no
         patch.object(docker_service, "_ensure_compose_running", new_callable=AsyncMock, return_value=(None, 44444, True)),
         patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock) as mock_healthy,
     ):
-        port, restarted = await docker_service.install_and_run_docker(options)
+        port, restarted, adopted = await docker_service.install_and_run_docker(options)
 
     mock_healthy.assert_not_called()
     assert port == 44444
     assert restarted is False
+    assert adopted is True
 
 
 @pytest.mark.asyncio
@@ -1092,11 +1276,12 @@ async def test_install_and_run_docker_adoption_in_subnet_mode_returns_minus_one(
         patch.object(docker_service, "_ensure_compose_running", new_callable=AsyncMock, return_value=(None, -1, True)),
         patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock) as mock_healthy,
     ):
-        port, restarted = await docker_service.install_and_run_docker(options)
+        port, restarted, adopted = await docker_service.install_and_run_docker(options)
 
     mock_healthy.assert_not_called()
     assert port == -1
     assert restarted is False
+    assert adopted is True
 
 
 @pytest.mark.asyncio
@@ -1571,19 +1756,62 @@ async def test_install_and_run_docker_port_none_raises_app_error(docker_service:
 
 
 @pytest.mark.asyncio
-async def test_uninstall_docker_file_not_present_skips_unlink(docker_service: DockerService, tmp_path: Path) -> None:
-    options = _opts()
+async def test_uninstall_docker_file_not_present_skips_unlink(
+    docker_service: DockerService, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    options = _opts()  # container_name=None: no compose file and no way to identify the container
     compose_file = tmp_path / "nonexistent.yaml"  # does not exist
     with (
         patch.object(docker_service, "get_docker_compose_file_path", return_value=compose_file),
         patch("server.docker.Utils.run_command", new_callable=AsyncMock) as mock_run,
+        patch.object(docker_service, "_stop_and_remove_container", new_callable=AsyncMock) as mock_stop_and_remove,
+        caplog.at_level("WARNING", logger="uvicorn.error"),
     ):
         mock_run.return_value = make_result()
 
         await docker_service.uninstall_docker(options)
 
-    assert mock_run.call_count == 1
+    assert mock_run.call_count == 0
+    mock_stop_and_remove.assert_not_called()
     assert not compose_file.exists()
+    assert any(record.levelname == "WARNING" and "mymodel" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_uninstall_docker_falls_back_to_container_when_file_missing(docker_service: DockerService, tmp_path: Path) -> None:
+    options = _opts(container_name="my-container")
+    compose_file = tmp_path / "nonexistent.yaml"  # does not exist
+    with (
+        patch.object(docker_service, "get_docker_compose_file_path", return_value=compose_file),
+        patch("server.docker.Utils.run_command", new_callable=AsyncMock) as mock_run,
+        patch.object(docker_service, "_stop_and_remove_container", new_callable=AsyncMock) as mock_stop_and_remove,
+    ):
+        await docker_service.uninstall_docker(options)
+
+    assert mock_run.call_count == 0
+    mock_stop_and_remove.assert_called_once_with("my-container")
+
+
+@pytest.mark.asyncio
+async def test_uninstall_docker_tolerates_docker_error_from_fallback(
+    docker_service: DockerService, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    options = _opts(container_name="my-container")
+    compose_file = tmp_path / "nonexistent.yaml"  # does not exist
+
+    with (
+        patch.object(docker_service, "get_docker_compose_file_path", return_value=compose_file),
+        patch.object(
+            docker_service,
+            "_stop_and_remove_container",
+            new_callable=AsyncMock,
+            side_effect=DockerError(status=500, message="daemon unreachable"),
+        ),
+        caplog.at_level("WARNING", logger="uvicorn.error"),
+    ):
+        await docker_service.uninstall_docker(options)  # must not raise: uninstall is best-effort
+
+    assert any(record.levelname == "WARNING" and "my-container" in record.message for record in caplog.records)
 
 
 @pytest.mark.asyncio

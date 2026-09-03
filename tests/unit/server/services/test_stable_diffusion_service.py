@@ -1053,7 +1053,7 @@ async def test_install_instance_raises_400_on_macos(svc: StableDiffusionService)
 async def test_install_instance_calls_docker_and_returns_installed_info(svc: StableDiffusionService, deps: dict[str, Any]) -> None:
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-stable-diffusion"
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(7860, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(7860, True, False))
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 7860
     deps["docker_service"].get_user_for_docker = AsyncMock(return_value=None)
@@ -1077,7 +1077,7 @@ async def test_install_instance_calls_docker_and_returns_installed_info(svc: Sta
 async def test_install_instance_registers_proxy_when_prefix_set(svc: StableDiffusionService, deps: dict[str, Any]) -> None:
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-stable-diffusion"
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(7860, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(7860, True, False))
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 7860
     deps["docker_service"].get_user_for_docker = AsyncMock(return_value=None)
@@ -1104,7 +1104,7 @@ async def test_install_instance_registers_proxy_with_configured_standard_proxy_t
     deps["config"].standard_proxy_timeout_seconds = 1800
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-stable-diffusion"
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(7860, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(7860, True, False))
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 7860
     deps["docker_service"].get_user_for_docker = AsyncMock(return_value=None)
@@ -1741,7 +1741,7 @@ async def test_install_instance_loads_default_models_for_new_instance(svc: Stabl
     svc.instances_info["extra"] = Instance(None, None, {}, InstanceConfig())
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-stable-diffusion-extra"
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(7860, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(7860, True, False))
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 7860
     deps["docker_service"].get_user_for_docker = AsyncMock(return_value=None)

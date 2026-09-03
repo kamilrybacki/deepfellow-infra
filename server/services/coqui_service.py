@@ -300,8 +300,8 @@ class CoquiService(Base2Service[InstalledInfo, DownloadedInfo]):
             else:
                 del self.instances_info[instance]
 
-    def get_docker_compose_file_path(self, instance: str, model_id: str | None) -> Path:
-        """Get docker compose file path."""
+    def get_docker_options(self, instance: str, model_id: str | None) -> DockerOptions:
+        """Return the resolved DockerOptions for this instance/model."""
         info = self.get_instance_installed_info(instance)
         if not model_id:
             raise HTTPException(400, "Docker is not bound with this object")
@@ -310,7 +310,7 @@ class CoquiService(Base2Service[InstalledInfo, DownloadedInfo]):
         if not model_installed:
             raise HTTPException(status_code=400, detail="Model not installed")
 
-        return self.docker_service.get_docker_compose_file_path(model_installed.docker.name)
+        return model_installed.docker
 
     async def list_models(self, input_instance: str | list[str] | None, filters: ListModelsFilters) -> ListModelsOut:
         """List models."""
@@ -421,7 +421,7 @@ class CoquiService(Base2Service[InstalledInfo, DownloadedInfo]):
                         "start_period": "5s",
                     },
                 )
-                docker_exposed_port, _ = await self.docker_service.install_and_run_docker(docker_options)
+                docker_exposed_port, _, _ = await self.docker_service.install_and_run_docker(docker_options)
                 registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,

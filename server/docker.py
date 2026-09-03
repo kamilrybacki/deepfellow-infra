@@ -817,10 +817,19 @@ class DockerService:
         return CommandResult2(stdout=result.stdout, stderr=result.stderr)
 
     async def stop_docker(self, options: DockerOptions) -> None:
-        """Stop docker."""
+        """Stop the service's compose stack, or stop/remove the container directly if it has no compose file.
+
+        Falls back to stopping/removing the container directly (see DFINFRA-281 for why a service may have no
+        compose file, e.g. an adopted container). Logs a warning and does nothing if neither a compose file nor
+        a container name is available.
+        """
         docker_compose_file_path = self.get_docker_compose_file_path(options.name)
         if docker_compose_file_path.exists():
             await self.stop_docker_compose(docker_compose_file_path)
+        elif options.container_name:
+            await self._stop_and_remove_container(options.container_name)
+        else:
+            logger.warning("Cannot stop %r: no compose file and no container name to fall back to", options.name)
 
     async def stop_docker_compose(self, docker_compose_file_path: Path) -> None:
         """Stop given docker compose."""
@@ -828,11 +837,22 @@ class DockerService:
         cmd_parts = [*docker_compose_cmd.split(), "-f", str(docker_compose_file_path), "down", "--remove-orphans"]
         await Utils.run_command_for_success(cmd_parts)
 
-    async def restart_docker_compose(self, docker_compose_file_path: Path) -> None:
-        """Restart given docker compose."""
-        docker_compose_cmd = self.docker_compose_cmd
-        cmd_parts = [*docker_compose_cmd.split(), "-f", str(docker_compose_file_path), "restart"]
-        await Utils.run_command_for_success(cmd_parts)
+    async def restart_docker_compose(self, options: DockerOptions) -> None:
+        """Restart the compose-managed service for options, or the container directly if no compose file exists for it.
+
+        Raises HTTPException(400) if neither a compose file nor a container name is available to restart —
+        unlike stop_docker/uninstall_docker, there's no idempotent "nothing to do" reading for a restart.
+        """
+        docker_compose_file_path = self.get_docker_compose_file_path(options.name)
+        if docker_compose_file_path.exists():
+            docker_compose_cmd = self.docker_compose_cmd
+            cmd_parts = [*docker_compose_cmd.split(), "-f", str(docker_compose_file_path), "restart"]
+            await Utils.run_command_for_success(cmd_parts)
+        elif options.container_name:
+            await self._restart_container(options.container_name)
+        else:
+            msg = f"Cannot restart {options.name}: no compose file and no container name"
+            raise HTTPException(400, msg)
 
     async def get_docker_compose_logs(self, docker_compose_file_path: Path) -> str:
         """Get docker compose logs."""
@@ -995,6 +1015,46 @@ class DockerService:
             msg = f"Unexpected inspect response type {type(data)} for container {container_name!r}"
             raise TypeError(msg)
         return data
+
+    async def _stop_and_remove_container(self, container_name: str) -> None:
+        """Stop and remove container_name directly via the Docker API, tolerating it already being gone.
+
+        Fallback for stop_docker/uninstall_docker when no compose file exists for the service (e.g. an
+        adopted container, see DFINFRA-281).
+        """
+        logger.info("No compose file for this service; stopping and removing container %r directly", container_name)
+        async with Docker() as docker:
+            container = docker.containers.container(container_name)
+            try:
+                await container.stop()
+            except DockerError as e:
+                if e.status != 404:
+                    raise
+                logger.info("Container %r already gone; nothing to stop/remove", container_name)
+                return
+            try:
+                await container.delete(force=True)
+            except DockerError as e:
+                if e.status != 404:
+                    raise
+                logger.info("Container %r already removed", container_name)
+
+    async def _restart_container(self, container_name: str) -> None:
+        """Restart container_name directly via the Docker API.
+
+        Fallback for restart_docker_compose when no compose file exists for the service (e.g. an
+        adopted container, see DFINFRA-281). Unlike _stop_and_remove_container, does not tolerate the
+        container being missing — raises HTTPException(400) on a 404.
+        """
+        logger.info("No compose file for this service; restarting container %r directly", container_name)
+        try:
+            async with Docker() as docker:
+                await docker.containers.container(container_name).restart()
+        except DockerError as e:
+            if e.status == 404:
+                msg = f"Cannot restart {container_name!r}: container not found"
+                raise HTTPException(400, msg) from e
+            raise
 
     async def get_container_status(self, container_name: str) -> ContainerStatus:
         """Return a container's real state (process status, healthcheck status, restart count) for reconciliation checks after install."""
@@ -1369,8 +1429,13 @@ class DockerService:
             msg = f"{msg}:\n{short}"
         raise AppError(msg)
 
-    async def install_and_run_docker(self, options: DockerOptions) -> tuple[int, bool]:
-        """Run docker compose and return (port, whether the container was (re)started)."""
+    async def install_and_run_docker(self, options: DockerOptions) -> tuple[int, bool, bool]:
+        """Run docker compose and return (port, whether the container was (re)started, whether it was adopted).
+
+        An adopted container (see `_try_adopt_orphaned_container`) pre-dates this call — it wasn't created by
+        it — which callers doing rollback-on-later-failure need to know so they don't tear down a container
+        this install attempt never created (see DFINFRA-297 follow-up).
+        """
         compose_path = self.get_docker_compose_file_path(options.name)
         is_running = await self.is_docker_compose_running(compose_path, options.service_name)
         has_difference, port = await self.has_docker_compose_difference(compose_path, options)
@@ -1386,13 +1451,32 @@ class DockerService:
             port = -1
         if port is None:
             raise AppError("Engine not available: cannot allocate service port")
-        return port, start_output is not None
+        return port, start_output is not None, adopted
 
     async def uninstall_docker(self, options: DockerOptions) -> None:
-        """Stop docker compose and remove the file."""
+        """Stop the service and remove its compose file, or remove the container directly if it has no compose file.
+
+        Falls back to stopping/removing the container directly (and removes nothing on disk) when no compose file
+        exists for the service — e.g. an adopted container, see DFINFRA-281.
+        """
         docker_compose_cmd = self.docker_compose_cmd
         docker_compose_file = self.get_docker_compose_file_path(options.name)
-        await Utils.run_command([*docker_compose_cmd.split(), "-f", str(docker_compose_file), "down"])
+        if docker_compose_file.is_file():
+            await Utils.run_command([*docker_compose_cmd.split(), "-f", str(docker_compose_file), "down"])
+        elif options.container_name:
+            # Uninstall is best-effort by design (the compose branch above ignores `down`'s exit code too): a
+            # Docker daemon hiccup here must not abort uninstall and leave the service stuck as still-installed.
+            try:
+                await self._stop_and_remove_container(options.container_name)
+            except DockerError:
+                logger.warning(
+                    "Failed to remove container %r while uninstalling %r; continuing uninstall anyway",
+                    options.container_name,
+                    options.name,
+                    exc_info=True,
+                )
+        else:
+            logger.warning("Cannot uninstall %r: no compose file and no container name to fall back to", options.name)
         if docker_compose_file.is_file():
             docker_compose_file.unlink()
         if self.config.compose_prefix:

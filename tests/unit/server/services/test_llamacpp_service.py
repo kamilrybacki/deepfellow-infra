@@ -82,7 +82,7 @@ def _make_model_installed_info(model_id: str = "test-model", registration_id: st
 def _setup_install_mocks(svc: LLamacppService, deps: dict[str, Any]) -> InstalledInfo:
     installed = _make_installed_info(svc)
     svc.instances_info["default"].installed = installed
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8080, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8080, True, False))
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
     deps["docker_service"].get_container_host.return_value = "localhost"
@@ -670,9 +670,9 @@ async def test_install_model_appends_ctx_size_when_max_model_length_set(svc: LLa
     model_id = next(iter(svc.models["default"]))
     captured: list[object] = []
 
-    async def capture_docker(opts: object) -> tuple[int, bool]:
+    async def capture_docker(opts: object) -> tuple[int, bool, bool]:
         captured.append(opts)
-        return (8080, True)
+        return (8080, True, False)
 
     deps["docker_service"].install_and_run_docker = capture_docker
 
@@ -696,9 +696,9 @@ async def test_install_model_appends_jinja_flag_for_jinja_model(svc: LLamacppSer
     svc.models["default"][jinja_model_id] = LlamacppModel(url="https://example.com/model.gguf", size="1GB", jinja=True)
     captured: list[object] = []
 
-    async def capture_docker(opts: object) -> tuple[int, bool]:
+    async def capture_docker(opts: object) -> tuple[int, bool, bool]:
         captured.append(opts)
-        return (8080, True)
+        return (8080, True, False)
 
     deps["docker_service"].install_and_run_docker = capture_docker
 
@@ -1165,16 +1165,16 @@ async def test_install_model_appends_kv_cache_type_when_not_f16(svc: LLamacppSer
     installed = _make_installed_info(svc)
     installed.parsed_options.kv_cache_type = "q8_0"
     svc.instances_info["default"].installed = installed
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8080, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8080, True, False))
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 8080
     captured: list[object] = []
 
-    async def capture_docker(opts: object) -> tuple[int, bool]:
+    async def capture_docker(opts: object) -> tuple[int, bool, bool]:
         captured.append(opts)
-        return (8080, True)
+        return (8080, True, False)
 
     deps["docker_service"].install_and_run_docker = capture_docker
     model_id = next(iter(svc.models["default"]))
@@ -1202,9 +1202,9 @@ async def test_install_model_appends_parallel_flag_when_num_parallel_gt_1(
     svc.instances_info["default"].installed = installed
     captured: list[object] = []
 
-    async def capture_docker(opts: object) -> tuple[int, bool]:
+    async def capture_docker(opts: object) -> tuple[int, bool, bool]:
         captured.append(opts)
-        return (8080, True)
+        return (8080, True, False)
 
     deps["docker_service"].install_and_run_docker = capture_docker
     deps["docker_service"].get_docker_subnet.return_value = None

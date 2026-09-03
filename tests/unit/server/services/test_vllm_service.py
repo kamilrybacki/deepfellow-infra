@@ -97,7 +97,7 @@ def _make_model_installed_info(
 def _setup_install_mocks(svc: VllmService, deps: dict[str, Any], hardware: str | bool | None = False) -> InstalledInfo:
     installed = _make_installed_info(hardware=hardware)
     svc.instances_info["default"].installed = installed
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True, False))
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
     deps["docker_service"].get_container_host.return_value = "localhost"
@@ -354,6 +354,30 @@ def test_get_docker_compose_file_path_returns_path_for_installed_model(svc: Vllm
     result = svc.get_docker_compose_file_path("default", "test-model")
 
     assert result == expected
+
+
+def test_get_docker_options_returns_docker_options_for_installed_model(svc: VllmService) -> None:
+    installed = _make_installed_info()
+    model_installed = _make_model_installed_info("test-model")
+    installed.models["test-model"] = model_installed
+    svc.instances_info["default"].installed = installed
+
+    result = svc.get_docker_options("default", "test-model")
+
+    assert result is model_installed.docker
+
+
+@pytest.mark.asyncio
+async def test_restart_docker_forwards_installed_model_docker_options(svc: VllmService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info()
+    model_installed = _make_model_installed_info("test-model")
+    installed.models["test-model"] = model_installed
+    svc.instances_info["default"].installed = installed
+    deps["docker_service"].restart_docker_compose = AsyncMock()
+
+    await svc.restart_docker("default", "test-model")
+
+    deps["docker_service"].restart_docker_compose.assert_called_once_with(model_installed.docker)
 
 
 def test_add_custom_model_registers_entry(svc: VllmService) -> None:
@@ -961,7 +985,7 @@ async def test_install_model_reuses_persisted_capacity_when_container_not_restar
     """A no-op reinstall (container already running, config unchanged) must reuse the last known capacity, not re-read logs."""
     _setup_install_mocks(svc, deps)
     model_id = next(iter(svc.models["default"]))
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, False))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, False, False))
     svc.instances_info["default"].config = InstanceConfig(
         models=[ModelConfig(model_id=model_id, options=InstallModelIn(spec={}), capacity=16, capacity_known=True)]
     )
@@ -988,7 +1012,7 @@ async def test_install_model_capacity_unknown_when_not_restarted_and_never_persi
     """A no-op reinstall with no prior known capacity and no recoverable log line must leave capacity unknown."""
     _setup_install_mocks(svc, deps)
     model_id = next(iter(svc.models["default"]))
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, False))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, False, False))
 
     with (
         patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
@@ -1016,7 +1040,7 @@ async def test_install_model_capacity_recovered_from_logs_when_not_restarted_and
     """An adopted orphan container with no persisted capacity should still recover it from its startup logs."""
     _setup_install_mocks(svc, deps)
     model_id = next(iter(svc.models["default"]))
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, False))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, False, False))
 
     with (
         patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
@@ -1223,7 +1247,7 @@ async def test_install_model_retries_with_suggested_max_len_on_kv_cache_error(
         "(4.0 GiB KV cache is needed, which is larger than the available KV cache memory (3.37 GiB). "
         "Based on the available memory, the estimated maximum model length is 110256."
     )
-    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[kv_cache_error, (8000, True)])
+    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[kv_cache_error, (8000, True, False)])
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
     deps["docker_service"].get_container_host.return_value = "localhost"
@@ -2408,7 +2432,7 @@ async def test_install_model_releases_gpu_and_stops_container_when_post_start_fa
     svc2 = VllmService(**deps)
     installed = _make_installed_info(hardware=True)
     svc2.instances_info["default"].installed = installed
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True, False))
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
     deps["docker_service"].get_container_host.return_value = "localhost"
@@ -2435,6 +2459,45 @@ async def test_install_model_releases_gpu_and_stops_container_when_post_start_fa
     assert svc2.gpu_memory_utilization == 0.0
     assert model_id not in installed.models
     deps["docker_service"].stop_docker.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_install_model_does_not_stop_adopted_container_when_post_start_fails(
+    svc: VllmService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    """An adopted container pre-dates this install attempt, so a later failure must not tear it down (DFINFRA-297)."""
+    nvidia = MagicMock(spec=NvidiaGpuInfo)
+    deps["hardware"].gpus = [nvidia]
+    svc2 = VllmService(**deps)
+    installed = _make_installed_info(hardware=True)
+    svc2.instances_info["default"].installed = installed
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, False, True))
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "container"
+    deps["docker_service"].get_container_host.return_value = "localhost"
+    deps["docker_service"].get_container_port.return_value = 8000
+    deps["docker_service"].stop_docker = AsyncMock()
+    model_id = "adopted-post-start-model"
+    svc2.models["default"][model_id] = VllmModel(hf_id=model_id, size="1GB", gpu_memory_utilization=0.5)
+
+    with (
+        patch.object(svc2, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch(
+            "server.services.vllm_service.get_model_dir_context_window",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("context read failed"),
+        ),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc2, "get_specified_hardware_parts", return_value=[nvidia]),
+        patch.object(svc2, "is_given_hardware_support_gpu", return_value=True),
+    ):
+        promise = await svc2._install_model("default", model_id, InstallModelIn(spec={"gpu_memory_utilization": 0.5}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    assert svc2.gpu_memory_utilization == 0.0
+    assert model_id not in installed.models
+    deps["docker_service"].stop_docker.assert_not_called()
 
 
 @pytest.mark.asyncio

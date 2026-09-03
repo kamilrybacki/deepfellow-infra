@@ -410,8 +410,8 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
             else:
                 del self.instances_info[instance]
 
-    def get_docker_compose_file_path(self, instance: str, model_id: str | None) -> Path:
-        """Get docker compose file path."""
+    def get_docker_options(self, instance: str, model_id: str | None) -> DockerOptions:
+        """Return the resolved DockerOptions for this instance/model."""
         info = self.get_instance_installed_info(instance)
         if not model_id:
             raise HTTPException(400, "Docker is not bound with this object")
@@ -420,7 +420,7 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
         if not model_installed:
             raise HTTPException(status_code=400, detail="Model not installed")
 
-        return self.docker_service.get_docker_compose_file_path(model_installed.docker_options.name)
+        return model_installed.docker_options
 
     def _add_custom_model(self, instance: str, model: CustomModel) -> None:
         parsed = try_parse_pydantic(SrvCustomCustomModel, model.data)
@@ -623,7 +623,7 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
                 image = DockerImage(name=docker_options.image, size=model.size)
                 await self._download_image_or_set_progress(stream, image)
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
-                docker_exposed_port, _ = await self.docker_service.install_and_run_docker(docker_options)
+                docker_exposed_port, _, _ = await self.docker_service.install_and_run_docker(docker_options)
                 container_host = self.docker_service.get_container_host(subnet, docker_options.name)
                 container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
                 info.models[model_id] = model_info = ModelInstalledInfo(

@@ -607,7 +607,7 @@ async def test_install_model_registers_endpoint_and_returns_ok(svc: CoquiService
     installed.parsed_options = CoquiOptions(hardware=False)
     svc.instances_info["default"].installed = installed
     model_id = next(iter(_const.models))
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(5002, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(5002, True, False))
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
     deps["docker_service"].get_container_host.return_value = "localhost"
@@ -628,7 +628,7 @@ async def test_install_model_uses_alias_as_registered_name(svc: CoquiService, de
     installed.parsed_options = CoquiOptions(hardware=False)
     svc.instances_info["default"].installed = installed
     model_id = next(iter(_const.models))
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(5002, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(5002, True, False))
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
     deps["docker_service"].get_container_host.return_value = "localhost"
@@ -708,7 +708,7 @@ async def test_install_model_registration_failure_rolls_back_model(svc: CoquiSer
     installed.parsed_options = CoquiOptions(hardware=False)
     svc.instances_info["default"].installed = installed
     model_id = next(iter(_const.models))
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(5002, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(5002, True, False))
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
     deps["docker_service"].get_container_host.return_value = "localhost"
@@ -903,7 +903,7 @@ async def test_install_model_registration_failure_skips_rollback_when_already_re
     installed.parsed_options = CoquiOptions(hardware=False)
     svc.instances_info["default"].installed = installed
     model_id = next(iter(_const.models))
-    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(5002, True))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(5002, True, False))
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
     deps["docker_service"].get_container_host.return_value = "localhost"

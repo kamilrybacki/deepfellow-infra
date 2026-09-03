@@ -560,7 +560,7 @@ async def test_install_user_model_calls_build_image(svc: McpService, tmp_path: P
         svc._add_custom_model("default", _make_user_model())  # pyright: ignore[reportPrivateUsage]
 
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
-    svc.docker_service.install_and_run_docker = AsyncMock(return_value=(8000, True))  # type: ignore[method-assign]
+    svc.docker_service.install_and_run_docker = AsyncMock(return_value=(8000, True, False))  # type: ignore[method-assign]
     svc.docker_service.is_docker_compose_healthy = AsyncMock(return_value=True)  # type: ignore[method-assign]
     svc.service_provider.save_service_config = AsyncMock()  # type: ignore[method-assign]
 
@@ -582,7 +582,7 @@ async def test_install_user_model_populates_size_from_built_image(svc: McpServic
 
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     svc.instances_info["default"].config.custom = [_make_user_model()]
-    svc.docker_service.install_and_run_docker = AsyncMock(return_value=(8000, True))  # type: ignore[method-assign]
+    svc.docker_service.install_and_run_docker = AsyncMock(return_value=(8000, True, False))  # type: ignore[method-assign]
     svc.docker_service.get_local_docker_image_size = AsyncMock(return_value=512 * 1024**2)  # type: ignore[method-assign]
     svc.service_provider.save_service_config = AsyncMock()  # type: ignore[method-assign]
 
@@ -1103,7 +1103,7 @@ async def test_install_model_auto_sets_prefix(svc: McpService, tmp_path: Path, d
         svc._add_custom_model("default", _make_user_model(model_id="my-server"))  # pyright: ignore[reportPrivateUsage]
 
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
-    svc.docker_service.install_and_run_docker = AsyncMock(return_value=(8000, True))  # type: ignore[method-assign]
+    svc.docker_service.install_and_run_docker = AsyncMock(return_value=(8000, True, False))  # type: ignore[method-assign]
 
     with patch.object(svc, "_get_working_dir", return_value=tmp_path):
         promise = await svc._install_model("default", "my-server", InstallModelIn(stream=False, spec={}))  # pyright: ignore[reportPrivateUsage]

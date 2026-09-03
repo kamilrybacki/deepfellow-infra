@@ -1060,12 +1060,20 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         return await Utils.read_file(docker_compose_file_path)
 
     async def restart_docker(self, instance: str, model_id: str | None) -> None:
-        """Get docker compose file."""
-        docker_compose_file_path = self.get_docker_compose_file_path(instance, model_id)
-        await self.docker_service.restart_docker_compose(docker_compose_file_path)
+        """Restart the instance/model's docker-backed service, resolving its DockerOptions first.
 
-    def get_docker_compose_file_path(self, instance: str, model_id: str | None) -> Path:  # noqa: ARG002
+        Handles the no-compose-file case (e.g. an adopted container) via DockerService.restart_docker_compose.
+        """
+        options = self.get_docker_options(instance, model_id)
+        await self.docker_service.restart_docker_compose(options)
+
+    def get_docker_compose_file_path(self, instance: str, model_id: str | None) -> Path:
         """Get docker compose file path."""
+        options = self.get_docker_options(instance, model_id)
+        return self.docker_service.get_docker_compose_file_path(options.name)
+
+    def get_docker_options(self, instance: str, model_id: str | None) -> DockerOptions:  # noqa: ARG002
+        """Return the resolved DockerOptions for this instance/model."""
         if not self.is_installed(instance):
             raise HTTPException(400, "Instance not installed")
         raise HTTPException(400, "Docker is not bound with this object")
@@ -1137,6 +1145,21 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             await self.docker_service.stop_docker(docker_options)
         except Exception:
             logger.exception("Error during stopping docker compose %s", docker_options.name)
+
+    async def _rollback_failed_install_docker(self, docker_options: DockerOptions, *, adopted: bool) -> None:
+        """Undo `install_and_run_docker` after a later step of the same install attempt fails.
+
+        Skips touching the container when `adopted` is True: an adopted container (DFINFRA-281) pre-dates
+        this install attempt — it wasn't created by it — so a failed install must leave it exactly as it
+        found it instead of tearing it down. Only a container this attempt itself started gets stopped.
+        """
+        if adopted:
+            logger.info(
+                "Not stopping %r on install rollback: it was adopted from a pre-existing container, not created by this install attempt",
+                docker_options.name,
+            )
+            return
+        await self._stop_docker(docker_options)
 
     async def _stop_dockers_parallel(self, docker_options_list: list[DockerOptions]) -> None:
         """Stop docker and log error if it occurs."""

@@ -825,8 +825,8 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
             else:
                 del self.instances_info[instance]
 
-    def get_docker_compose_file_path(self, instance: str, model_id: str | None) -> Path:
-        """Get docker compose file path."""
+    def get_docker_options(self, instance: str, model_id: str | None) -> DockerOptions:
+        """Return the resolved DockerOptions for this instance/model."""
         info = self.get_instance_installed_info(instance)
         if not model_id:
             raise HTTPException(400, "Docker is not bound with this object")
@@ -837,7 +837,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         if model_installed.docker_options is None:
             raise HTTPException(400, "Docker is not bound with this model")
-        return self.docker_service.get_docker_compose_file_path(model_installed.docker_options.name)
+        return model_installed.docker_options
 
     def _get_dockerfile_dir(self, instance: str, name: str) -> Path:
         return self.get_working_dir() / "models" / instance / name
@@ -1929,7 +1929,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
                 docker_options_edited = deepcopy(docker_options)
                 docker_options_edited.env_vars = docker_options_edited.env_vars | parsed_model_options.envs
-                docker_exposed_port, _ = await self.docker_service.install_and_run_docker(docker_options_edited)
+                docker_exposed_port, _, _ = await self.docker_service.install_and_run_docker(docker_options_edited)
                 container_host = self.docker_service.get_container_host(subnet, docker_options_edited.name)
                 container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options_edited.image_port)
                 info.models[model_id] = model_info = ModelInstalledInfo(
