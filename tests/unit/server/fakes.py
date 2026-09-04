@@ -53,7 +53,7 @@ class FakeService(BaseService):
     def get_custom_model_spec(self) -> None:
         return None
 
-    def get_instance_install_progress(self, instance: str) -> PromiseWithProgress[InstallServiceOut, StreamChunk]:
+    async def get_instance_install_progress(self, instance: str) -> PromiseWithProgress[InstallServiceOut, StreamChunk]:
         return MagicMock()
 
     async def get_model_install_progress(self, instance: str, model: str) -> PromiseWithProgress[InstallModelOut, StreamChunk]:

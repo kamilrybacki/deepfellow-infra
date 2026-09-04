@@ -437,7 +437,7 @@ async def test_get_model_install_progress(services_manager: ServicesManager):
 async def test_get_service_install_progress(services_manager: ServicesManager):
     svc = FakeService("ollama")
     progress = MagicMock()
-    svc.get_instance_install_progress = MagicMock(return_value=progress)
+    svc.get_instance_install_progress = AsyncMock(return_value=progress)
     services_manager.register_service(svc)
 
     result = await services_manager.get_service_install_progress("ollama")

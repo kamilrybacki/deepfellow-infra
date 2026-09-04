@@ -173,7 +173,7 @@ class ServicesManager:
     async def get_service_install_progress(self, service_id: str) -> PromiseWithProgress[InstallServiceOut, StreamChunk]:
         """Get modelinstall progress."""
         service_type, instance = self.split_service_type_and_instance(service_id)
-        return self._get_service(service_type).get_instance_install_progress(instance)
+        return await self._get_service(service_type).get_instance_install_progress(instance)
 
     async def install_model_in_service(
         self,
