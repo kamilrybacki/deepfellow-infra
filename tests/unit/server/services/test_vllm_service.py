@@ -1194,6 +1194,74 @@ def test_parse_kv_cache_max_len_suggestion(raw: str, expected: int | None) -> No
     assert VllmService._parse_kv_cache_max_len_suggestion(raw) == expected  # pyright: ignore[reportPrivateUsage]
 
 
+def test_check_prefix_collision_skips_models_without_default_prefix(svc: VllmService) -> None:
+    """`VllmModel` has no `default_prefix` field (DFINFRA-309) - unlike MCP/Custom models, whose
+    runtime model type is always addressed by a prefix. The collision scan over every catalog model
+    of the instance must not crash reading `default_prefix` off one that was never installed."""
+    installed = _make_installed_info()
+    svc.instances_info["default"].installed = installed
+    assert len(svc.models["default"]) > 1
+
+    svc._check_prefix_collision("default", "some-new-prefix", exclude_model_id=None)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_edit_model_install_options_without_prefix_does_not_crash(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """DFINFRA-309: editing a vLLM catalog model's install options without an explicit `prefix` in the
+    spec used to unconditionally read `model.default_prefix`, which `VllmModel` doesn't define, and
+    crashed with a 500 AttributeError before any uninstall/reinstall was attempted."""
+    _setup_install_mocks(svc, deps)
+    deps["service_provider"].save_service_config = AsyncMock()
+    model_id = next(iter(svc.models["default"]))
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        was_installed, promise = await svc.edit_model_install_options(
+            "default", model_id, InstallModelIn(spec={"gpu_memory_utilization": 0.6})
+        )
+        result = await promise.wait()
+
+    assert was_installed is False
+    assert result.status == "OK"
+
+
+@pytest.mark.asyncio
+async def test_edit_model_on_installed_custom_model_does_not_crash(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """DFINFRA-309: `VllmModel` (the runtime type behind both catalog and custom vLLM models) has no
+    `default_prefix` field. Editing an installed custom model used to unconditionally read
+    `updated_model.default_prefix` while computing the reinstall prefix, crashing before the
+    definition change could actually be applied."""
+    _setup_install_mocks(svc, deps)
+    deps["service_provider"].save_service_config = AsyncMock()
+    deps["service_provider"].dismiss_warnings_matching = AsyncMock()
+    deps["service_provider"].dismiss_warnings_matching_any = AsyncMock()
+    deps["docker_service"].uninstall_docker = AsyncMock()
+    custom_data = {"id": "my-model", "hf_id": "google/gemma-3-270m-it", "size": "1GB"}
+    custom = CustomModel(id="c-1", data=custom_data)
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    svc.instances_info["default"].config.custom = [custom]
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+        patch("server.services.vllm_service.validate_model_compatibility", new=AsyncMock(return_value=None)),
+    ):
+        install_promise = await svc.install_model("default", "my-model", InstallModelIn(spec={}))
+        await install_promise.wait()
+
+        promise = await svc.edit_model("default", "c-1", AddCustomModelIn(spec={**custom_data, "revision": "quantized-awq"}))
+        assert promise is not None
+        result = await promise.wait()
+
+    assert result.status == "OK"
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
