@@ -991,6 +991,19 @@ def test_create_doc_chunker_model_gpu_image(deps: dict[str, Any]) -> None:
     assert "gpu" in docker_opts.image
 
 
+def test_create_doc_chunker_model_shares_one_gateway_address(svc: CustomService) -> None:
+    """Image description and transcription talk to the same gateway, so the form asks for it once."""
+    model = create_doc_chunker_model(svc, "172.20.0.0/16")
+
+    docker_opts = model.options(  # pyright: ignore[reportCallIssue]
+        {"hardware": "CPU", "infra_api_url": "http://infra:8086", "infra_api_key": "secret"}
+    )
+
+    assert docker_opts.env_vars is not None
+    assert docker_opts.env_vars["INFRA_API_URL"] == "http://infra:8086"
+    assert docker_opts.env_vars["INFRA_API_KEY"] == "secret"
+
+
 def test_create_doc_chunker_model_falls_back_to_default_version(svc: CustomService) -> None:
     model = create_doc_chunker_model(svc, "172.20.0.0/16")
 
