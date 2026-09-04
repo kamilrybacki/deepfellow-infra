@@ -1098,6 +1098,9 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         `edit_model_install_options` can move a model's install-time prefix independently of its
         `default_prefix`, so the two can disagree; the effective prefix is whichever one actually
         reflects what a model is doing right now (serving traffic on it, or reserving it unstalled).
+
+        Not every service's model type carries `default_prefix` - it's only meaningful for services
+        (MCP, Custom) whose models are inherently addressed by a prefix, so it's read via `getattr`.
         """
         # Looked up directly rather than via `get_instance_info` (which 404s): this can run for an
         # instance that isn't registered in `instances_info` yet, e.g. while adding its first model.
@@ -1106,7 +1109,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         for mid, m in self.models.get(instance, {}).items():
             if mid == exclude_model_id:
                 continue
-            effective_prefix = installed_models[mid].prefix if mid in installed_models else m.default_prefix
+            effective_prefix = installed_models[mid].prefix if mid in installed_models else getattr(m, "default_prefix", None)
             if effective_prefix == prefix:
                 raise HTTPException(400, f"Prefix '{prefix}' is already in use by model '{mid}'.")
 
@@ -1171,7 +1174,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             # cleared; `_update_custom_model` still falls back to `normalize_name(id)` in that case and
             # writes that as the model's new `default_prefix`, which the raw request body never reflects.
             updated_model = self.models.get(instance, {}).get(model_id)
-            new_default_prefix = updated_model.default_prefix if updated_model else None
+            new_default_prefix = getattr(updated_model, "default_prefix", None)
             reinstall_options = install_options
             if (
                 install_options.spec is not None
@@ -1210,7 +1213,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         which case it was, so it can report whether this was actually a reinstall.
         """
         model = self.models.get(instance, {}).get(model_id)
-        new_prefix = (new_options.spec or {}).get("prefix") or (model.default_prefix if model else None)
+        new_prefix = (new_options.spec or {}).get("prefix") or getattr(model, "default_prefix", None)
         if new_prefix is not None:
             # Checked upfront, before any uninstall, so a doomed edit doesn't disrupt the running
             # model for nothing - mirrors `edit_model`'s id-immutability check above.
