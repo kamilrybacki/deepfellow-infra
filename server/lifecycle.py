@@ -138,6 +138,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     await services_manager.drain_warning_tasks()
     if config.is_stop_containers_on_shutdown_enabled():
         await services_manager.stop_all_services()
+    await tracer.shutdown()
 
 
 def check_subnet(subnet: str) -> None:

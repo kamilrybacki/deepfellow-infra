@@ -1946,6 +1946,47 @@ async def test_healthcheck_model_model_not_installed_raises_400(svc: McpService)
 
 
 @pytest.mark.asyncio
+async def test_healthcheck_model_records_invalid_request_outcome_metric_when_model_unknown(svc: McpService) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    fake_instruments = MagicMock()
+
+    with mock.patch("server.services.mcp_service.tracer.mcp_instruments", return_value=fake_instruments), pytest.raises(HTTPException):
+        await svc.healthcheck_model("default", "nonexistent")
+
+    assert fake_instruments.healthcheck_count.add.call_count == 1
+    # A 4xx from bad input is not a genuine operational failure — recording its ~0ms duration would
+    # skew p50/p95 and mask real MCP server slowness, so it's excluded from the duration histogram.
+    assert fake_instruments.healthcheck_duration_ms.record.call_count == 0
+    attrs = fake_instruments.healthcheck_count.add.call_args[0][1]
+    assert attrs["mcp.outcome"] == "invalid_request"
+
+
+@pytest.mark.asyncio
+async def test_healthcheck_model_instance_not_installed_raises_400(svc: McpService) -> None:
+    svc.instances_info["default"].installed = None
+
+    with pytest.raises(HTTPException) as exc_info:
+        await svc.healthcheck_model("default", "open-websearch")
+
+    assert exc_info.value.status_code == 400
+    assert "not installed" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_healthcheck_model_records_invalid_request_outcome_metric_when_instance_not_installed(svc: McpService) -> None:
+    svc.instances_info["default"].installed = None
+    fake_instruments = MagicMock()
+
+    with mock.patch("server.services.mcp_service.tracer.mcp_instruments", return_value=fake_instruments), pytest.raises(HTTPException):
+        await svc.healthcheck_model("default", "open-websearch")
+
+    assert fake_instruments.healthcheck_count.add.call_count == 1
+    assert fake_instruments.healthcheck_duration_ms.record.call_count == 0
+    attrs = fake_instruments.healthcheck_count.add.call_args[0][1]
+    assert attrs["mcp.outcome"] == "invalid_request"
+
+
+@pytest.mark.asyncio
 async def test_healthcheck_model_model_not_in_registry_raises_400(svc: McpService) -> None:
     installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     installed.models["open-websearch"] = _make_installed_model_info()
@@ -1997,6 +2038,63 @@ async def test_healthcheck_model_proxy_streamable_http(mock_fetch: AsyncMock, sv
 
 @mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
 @pytest.mark.asyncio
+async def test_healthcheck_model_records_otel_span_and_metrics_when_enabled(mock_fetch: AsyncMock, svc: McpService) -> None:
+    installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    installed.models["open-websearch"] = _make_installed_model_info()
+    svc.instances_info["default"].installed = installed
+    srv_model = svc.models["default"]["open-websearch"]
+    srv_model.kind = "proxy"
+    srv_model.proxy_transport = "streamable_http"
+    mock_fetch.return_value = McpHealthCheckResult(healthy=True, transport="streamable_http", tools=[])
+
+    fake_span = MagicMock()
+    fake_instruments = MagicMock()
+
+    with (
+        mock.patch("server.services.mcp_service.tracer.span") as mock_span,
+        mock.patch("server.services.mcp_service.tracer.mcp_instruments", return_value=fake_instruments),
+    ):
+        mock_span.return_value.__enter__.return_value = fake_span
+        result = await svc.healthcheck_model("default", "open-websearch")
+
+    assert result.healthy is True
+    assert fake_instruments.healthcheck_count.add.call_count == 1
+    assert fake_instruments.healthcheck_duration_ms.record.call_count == 1
+    attrs = fake_instruments.healthcheck_count.add.call_args[0][1]
+    assert attrs["mcp.outcome"] == "healthy"
+    assert attrs["mcp.instance"] == "default"
+    assert attrs["mcp.model_id"] == "open-websearch"
+    duration_value, duration_attrs = fake_instruments.healthcheck_duration_ms.record.call_args[0]
+    assert duration_value >= 0
+    assert duration_attrs == attrs
+    span_attrs = {c[0][0]: c[0][1] for c in fake_span.set_attribute.call_args_list}
+    assert span_attrs["mcp.outcome"] == "healthy"
+    assert span_attrs["mcp.transport"] == "streamable_http"
+    assert span_attrs["mcp.tool_count"] == 0
+
+
+@mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
+@pytest.mark.asyncio
+async def test_healthcheck_model_records_unhealthy_outcome_metric(mock_fetch: AsyncMock, svc: McpService) -> None:
+    installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    installed.models["open-websearch"] = _make_installed_model_info()
+    svc.instances_info["default"].installed = installed
+    srv_model = svc.models["default"]["open-websearch"]
+    srv_model.kind = "proxy"
+    srv_model.proxy_transport = "streamable_http"
+    mock_fetch.return_value = McpHealthCheckResult(healthy=False, error="refused")
+    fake_instruments = MagicMock()
+
+    with mock.patch("server.services.mcp_service.tracer.mcp_instruments", return_value=fake_instruments):
+        result = await svc.healthcheck_model("default", "open-websearch")
+
+    assert result.healthy is False
+    attrs = fake_instruments.healthcheck_count.add.call_args[0][1]
+    assert attrs["mcp.outcome"] == "unhealthy"
+
+
+@mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
+@pytest.mark.asyncio
 async def test_healthcheck_model_proxy_401_triggers_auto_detect_oauth(mock_fetch: AsyncMock, svc: McpService) -> None:
     installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     installed.models["open-websearch"] = _make_installed_model_info()
@@ -2006,11 +2104,17 @@ async def test_healthcheck_model_proxy_401_triggers_auto_detect_oauth(mock_fetch
     srv_model.proxy_transport = "streamable_http"
     mock_fetch.return_value = McpHealthCheckResult(healthy=False, requires_oauth=True, error="401")
 
-    with patch.object(svc, "_auto_detect_oauth", new=AsyncMock()) as mock_detect:
+    fake_instruments = MagicMock()
+    with (
+        patch.object(svc, "_auto_detect_oauth", new=AsyncMock()) as mock_detect,
+        mock.patch("server.services.mcp_service.tracer.mcp_instruments", return_value=fake_instruments),
+    ):
         result = await svc.healthcheck_model("default", "open-websearch")
 
     assert result.requires_oauth is True
     mock_detect.assert_awaited_once_with("default", "open-websearch")
+    attrs = fake_instruments.healthcheck_count.add.call_args[0][1]
+    assert attrs["mcp.outcome"] == "oauth_required"
 
 
 @mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
@@ -3322,6 +3426,90 @@ async def test_refresh_oauth_token_success_persists_new_tokens(svc: McpService) 
     assert result.refresh_token == "new-refresh"
     assert result.token_expires_at is not None
     assert result.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_oauth_token_success_records_otel_metric_when_enabled(svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={"enabled": True, "client_id": "client-1", "refresh_token": "rtok", "token_endpoint": "http://as.example/token"}
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    token = TokenResponse(access_token="new-access", refresh_token="new-refresh", expires_in=3600)
+    fake_instruments = MagicMock()
+
+    with (
+        patch("server.services.mcp_service.refresh_access_token", new=AsyncMock(return_value=token)),
+        patch.object(svc, "_save", new=AsyncMock()),
+        patch("server.services.mcp_service.tracer.mcp_instruments", return_value=fake_instruments),
+    ):
+        result = await svc._refresh_oauth_token("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    assert result is not None
+    assert fake_instruments.oauth_refresh_count.add.call_count == 1
+    attrs = fake_instruments.oauth_refresh_count.add.call_args[0][1]
+    assert attrs["mcp.outcome"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_refresh_oauth_token_error_records_otel_metric_when_enabled(svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={"enabled": True, "client_id": "client-1", "refresh_token": "rtok", "token_endpoint": "http://as.example/token"}
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    fake_instruments = MagicMock()
+
+    with (
+        patch("server.services.mcp_service.refresh_access_token", new=AsyncMock(side_effect=McpOAuthError("invalid_grant"))),
+        patch.object(svc, "_save", new=AsyncMock()),
+        patch("server.services.mcp_service.tracer.mcp_instruments", return_value=fake_instruments),
+    ):
+        result = await svc._refresh_oauth_token("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    assert result is None
+    assert fake_instruments.oauth_refresh_count.add.call_count == 1
+    attrs = fake_instruments.oauth_refresh_count.add.call_args[0][1]
+    assert attrs["mcp.outcome"] == "failure"
+
+
+@pytest.mark.asyncio
+async def test_refresh_oauth_token_success_sets_outcome_span_attribute(svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={"enabled": True, "client_id": "client-1", "refresh_token": "rtok", "token_endpoint": "http://as.example/token"}
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    token = TokenResponse(access_token="new-access", refresh_token="new-refresh", expires_in=3600)
+    fake_span = MagicMock()
+
+    with (
+        patch("server.services.mcp_service.refresh_access_token", new=AsyncMock(return_value=token)),
+        patch.object(svc, "_save", new=AsyncMock()),
+        mock.patch("server.services.mcp_service.tracer.span") as mock_span,
+    ):
+        mock_span.return_value.__enter__.return_value = fake_span
+        result = await svc._refresh_oauth_token("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    assert result is not None
+    assert fake_span.set_attribute.call_args == call("mcp.outcome", "success")
+
+
+@pytest.mark.asyncio
+async def test_refresh_oauth_token_error_sets_outcome_span_attribute(svc: McpService) -> None:
+    custom = _make_proxy_custom(
+        oauth={"enabled": True, "client_id": "client-1", "refresh_token": "rtok", "token_endpoint": "http://as.example/token"}
+    )
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+    fake_span = MagicMock()
+
+    with (
+        patch("server.services.mcp_service.refresh_access_token", new=AsyncMock(side_effect=McpOAuthError("invalid_grant"))),
+        patch.object(svc, "_save", new=AsyncMock()),
+        mock.patch("server.services.mcp_service.tracer.span") as mock_span,
+    ):
+        mock_span.return_value.__enter__.return_value = fake_span
+        result = await svc._refresh_oauth_token("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
+
+    assert result is None
+    assert fake_span.set_attribute.call_args == call("mcp.outcome", "failure")
 
 
 @pytest.mark.asyncio
