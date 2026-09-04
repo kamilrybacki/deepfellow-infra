@@ -1546,6 +1546,76 @@ async def test_add_custom_model_preserves_existing_size(custom_svc: _Base2ImplWi
 
 
 @pytest.mark.asyncio
+async def test_add_custom_model_invokes_validate_hook_before_persisting(custom_svc: _Base2ImplWithCustom) -> None:
+    # `_validate_custom_model` runs before `add_custom_model` fills in "size", so capture a snapshot
+    # of the spec at call time rather than asserting on the (later-mutated) same dict object.
+    seen: list[dict[str, Any]] = []
+
+    async def _capture(spec: dict[str, Any], instance: str = "") -> None:
+        assert instance == "default"
+        seen.append(dict(spec))
+
+    with patch.object(custom_svc, "_validate_custom_model", new=AsyncMock(side_effect=_capture)):
+        model_id = await custom_svc.add_custom_model("default", AddCustomModelIn(spec={"name": "test"}))
+
+    assert seen == [{"name": "test"}]
+    assert model_id in custom_svc._custom_store  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_add_custom_model_propagates_validate_hook_rejection_without_persisting(custom_svc: _Base2ImplWithCustom) -> None:
+    with (
+        patch.object(custom_svc, "_validate_custom_model", new=AsyncMock(side_effect=HTTPException(400, "incompatible"))),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await custom_svc.add_custom_model("default", AddCustomModelIn(spec={"name": "test"}))
+
+    assert exc_info.value.status_code == 400
+    assert custom_svc._custom_store == {}  # pyright: ignore[reportPrivateUsage]
+    assert custom_svc.instances_info["default"].config.custom is None
+
+
+@pytest.mark.asyncio
+async def test_update_custom_model_invokes_validate_hook_when_serving_fields_changed(custom_svc: _Base2ImplWithCustom) -> None:
+    model_id = await custom_svc.add_custom_model("default", AddCustomModelIn(spec={"hf_id": "org/model"}))
+    seen: list[dict[str, Any]] = []
+
+    async def _capture(spec: dict[str, Any], instance: str = "") -> None:
+        assert instance == "default"
+        seen.append(dict(spec))
+
+    with patch.object(custom_svc, "_validate_custom_model", new=AsyncMock(side_effect=_capture)):
+        await custom_svc.update_custom_model("default", model_id, AddCustomModelIn(spec={"hf_id": "org/other-model"}))
+
+    assert seen == [{"hf_id": "org/other-model"}]
+
+
+@pytest.mark.asyncio
+async def test_update_custom_model_skips_validate_hook_when_serving_fields_unchanged(custom_svc: _Base2ImplWithCustom) -> None:
+    model_id = await custom_svc.add_custom_model("default", AddCustomModelIn(spec={"hf_id": "org/model", "size": "1 GB"}))
+    new_spec = {"hf_id": "org/model", "size": "2 GB"}
+
+    with patch.object(custom_svc, "_validate_custom_model", new=AsyncMock()) as mock_validate:
+        await custom_svc.update_custom_model("default", model_id, AddCustomModelIn(spec=new_spec))
+
+    mock_validate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_custom_model_propagates_validate_hook_rejection(custom_svc: _Base2ImplWithCustom) -> None:
+    model_id = await custom_svc.add_custom_model("default", AddCustomModelIn(spec={"hf_id": "org/model"}))
+
+    with (
+        patch.object(custom_svc, "_validate_custom_model", new=AsyncMock(side_effect=HTTPException(400, "incompatible"))),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await custom_svc.update_custom_model("default", model_id, AddCustomModelIn(spec={"hf_id": "org/other-model"}))
+
+    assert exc_info.value.status_code == 400
+    assert custom_svc._custom_store[model_id].data == {"hf_id": "org/model", "size": "unknown"}  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
 async def test_remove_custom_model_base_raises_400(base2_svc: _Base2Impl) -> None:
     base2_svc.instances_info["default"].config.custom = [CustomModel(id="cm1", data={})]
 

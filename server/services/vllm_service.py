@@ -18,7 +18,7 @@ import aiohttp
 from fastapi import HTTPException
 from pydantic import BaseModel
 
-from scripts.get_huggingface_models import fetch_registry_entries
+from scripts.get_huggingface_models import ModelIncompatibleError, fetch_registry_entries, validate_model_compatibility
 from server.applicationcontext import get_base_url
 from server.config import get_main_dir
 from server.docker import (
@@ -62,6 +62,7 @@ from server.utils.core import (
     StreamChunk,
     StreamChunkProgress,
     SuccessDownloadPacket,
+    Utils,
     convert_size_to_bytes,
     normalize_name,
     try_parse_pydantic,
@@ -71,7 +72,7 @@ from server.utils.files import get_model_dir_context_window
 from server.utils.hardware import HardwarePartInfo
 from server.utils.loading import Progress
 from server.utils.registry_client import image_without_registry_prefix, registry_for
-from server.utils.size_fetcher import fetch_huggingface_model_size
+from server.utils.size_fetcher import fetch_huggingface_model_size, fmt_size, sum_siblings_size_bytes
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -83,6 +84,19 @@ _VLLM_FETCH_PLAN: list[tuple[int, int, int, str, bool]] = [
     (10, 0, 10, "reranker", False),
     (10, 0, 10, "embedding", False),
 ]
+
+
+def _is_truthy_flag(value: Any) -> bool:  # noqa: ANN401
+    """Interpret a raw (pre-pydantic) custom-model spec value as a bool checkbox field.
+
+    Spec values arrive as whatever JSON the caller sent - typically a real `bool`, but a form-style
+    submission could send a string. Mirrors Pydantic's own string-to-bool coercion (used when the
+    spec is later parsed as `VllmCustomModel`) so a direct API caller isn't seen differently by the
+    two: "false"/"no"/"off"/"0" (case-insensitive) or empty count as unset/off; anything else is on.
+    """
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "false", "no", "off", "0")
+    return bool(value)
 
 
 class VllmModel(BaseModel):
@@ -106,6 +120,7 @@ class VllmCustomModel(BaseModel):
     revision: str | None = None
     size: str
     model_type: Literal["llm", "reranker", "embedding"] = "llm"
+    skip_validation: bool = False
 
 
 type ImageTypes = Literal["cpu", "gpu"]
@@ -416,6 +431,13 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     default="llm",
                     required=False,
                 ),
+                CustomModelField(
+                    type="bool",
+                    name="skip_validation",
+                    description="Skip the HuggingFace compatibility check (use only if it wrongly rejects a repo that does work)",
+                    default="false",
+                    required=False,
+                ),
             ]
         )
 
@@ -425,6 +447,41 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         except Exception:
             logger.debug("Couldn't resolve size for a custom model id = %s, revision = %s", spec["hf_id"], spec.get("revision"))
             return None
+
+    async def _validate_custom_model(self, spec: dict[str, Any], instance: str = "") -> None:  # noqa: ARG002
+        """Validate hf_id compatibility, opportunistically filling in `size` from the same fetch.
+
+        `_resolve_custom_model_size` would otherwise issue a second, near-identical HuggingFace
+        request for the same repo right after this one - filling `size` here whenever the metadata
+        was already fetched successfully lets `add_custom_model`'s `if not spec.get("size")` guard
+        skip that redundant call. This ordering (validate, then resolve size only if still unset) is
+        load-bearing for that optimization to take effect.
+
+        The heuristics `validate_model_compatibility` relies on (GGUF name matching, architecture
+        detection) are tuned for filtering a large curated catalog, where an occasional false
+        positive silently drops one candidate among hundreds - here they gate a single explicit user
+        action instead, so `spec["skip_validation"]` lets a user bypass the check for a repo they've
+        confirmed works despite being misdetected.
+
+        Sends the configured HuggingFace token, if any, so a gated repo (e.g. Llama, Gemma) that
+        `add_custom_model` can already download validates the same way it downloads, instead of
+        being wrongly rejected as missing/incompatible when accessed anonymously.
+        """
+        if _is_truthy_flag(spec.get("skip_validation")):
+            return
+        hf_id = spec.get("hf_id")
+        if not hf_id:
+            return
+        headers = Utils.create_bearer_header(self.get_hugging_face_token())
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), headers=headers) as session:
+            try:
+                data = await validate_model_compatibility(session, hf_id, spec.get("revision"), spec.get("model_type") or "llm")
+            except ModelIncompatibleError as exc:
+                raise HTTPException(400, str(exc)) from exc
+        if data is not None and not spec.get("size"):
+            total = sum_siblings_size_bytes(data.get("siblings", []))
+            if total:
+                spec["size"] = fmt_size(total)
 
     def get_installed_info(self, instance: str) -> bool | InstallServiceProgress | ServiceOptions:
         """Get service installed info."""

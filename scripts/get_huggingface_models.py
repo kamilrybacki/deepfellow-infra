@@ -10,17 +10,26 @@ Outputs a vllm-min.json compatible JSON to stdout.
 import argparse
 import asyncio
 import json
+import logging
 import re
 import sys
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import aiohttp
 
 from scripts.utils.hf_common import get_json_with_retry, is_embedding, is_gguf
 
 # ruff: noqa: T201
+
+# This module runs both as an offline CLI script and, since `validate_model_compatibility` was
+# added, imported into the running server - use the server's logger name so warnings raised from
+# that path are picked up by its configured handlers instead of falling through to
+# `logging.lastResort` unformatted. Standalone CLI runs are unaffected: neither name has a handler
+# configured outside the server, so both fall back to `lastResort` there too.
+logger = logging.getLogger("uvicorn.error")
 
 HF_API = "https://huggingface.co/api"
 LLM_TAGS = ["text-generation", "text2text-generation", "image-text-to-text"]
@@ -118,24 +127,105 @@ def is_supported_cross_encoder(architectures: list[str]) -> bool:
     return any(a.endswith("ForSequenceClassification") for a in architectures)
 
 
-async def has_chat_template(session: aiohttp.ClientSession, model_id: str, siblings: list[dict[str, Any]]) -> bool:
+async def has_chat_template(
+    session: aiohttp.ClientSession,
+    model_id: str,
+    siblings: list[dict[str, Any]],
+    revision: str | None = None,
+    max_retries: int = 8,
+    strict: bool = False,
+) -> bool:
     """Return True if the model ships a chat template vLLM can use for chat completions.
 
     As of transformers v4.44, vLLM no longer falls back to a generic template, so serving a
     model whose tokenizer defines none raises a 400 on every chat request. Newer repos carry a
     standalone `chat_template.jinja` file; older ones embed a `chat_template` key in
     `tokenizer_config.json`. Base/pretrain models typically have neither.
+
+    By default, a failed fetch of `tokenizer_config.json` (network issue, HF outage, exhausted
+    rate-limit retries) is treated the same as "no chat template" - acceptable for the catalog
+    crawler, which just drops one candidate among hundreds. Pass `strict=True` to instead re-raise
+    `aiohttp.ClientError`/`TimeoutError` so a caller validating a single user-initiated add (where
+    that same fetch failure must NOT read as "confirmed incompatible") can tell the two apart.
     """
     filenames = {f.get("rfilename", "") for f in siblings}
     if "chat_template.jinja" in filenames:
         return True
     if "tokenizer_config.json" not in filenames:
         return False
+    ref = quote(revision, safe="") if revision else "main"
     try:
-        tokenizer_config = await get_json_with_retry(session, f"https://huggingface.co/{model_id}/raw/main/tokenizer_config.json", {})
+        tokenizer_config = await get_json_with_retry(
+            session, f"https://huggingface.co/{model_id}/raw/{ref}/tokenizer_config.json", {}, max_retries=max_retries
+        )
         return bool(tokenizer_config.get("chat_template"))
-    except Exception:
+    except (aiohttp.ClientError, TimeoutError):
+        if strict:
+            raise
         return False
+
+
+class ModelIncompatibleError(Exception):
+    """Raised when a HuggingFace repo is structurally incompatible with the engine's serving mode."""
+
+
+async def validate_model_compatibility(
+    session: aiohttp.ClientSession, hf_id: str, revision: str | None, model_type: str, max_retries: int = 3
+) -> dict[str, Any] | None:
+    """Raise `ModelIncompatibleError` with a clear reason if `hf_id` can't be served, given `model_type`.
+
+    Reuses the same heuristics the catalog refresh already applies when building the curated model
+    list (`is_gguf`, `has_chat_template`, `is_supported_cross_encoder`), so adding a custom model by
+    hf_id fails fast with a clear message instead of only surfacing as an opaque container-start
+    error. `max_retries` defaults low (unlike the catalog crawler's default of 8) because this runs
+    on an interactive add-model request rather than an offline batch job.
+
+    Returns the fetched HuggingFace metadata (siblings/tags/config) on success, so a caller that also
+    needs it (e.g. to compute the model's size) can reuse it instead of issuing a second identical
+    request. Returns `None` when either HTTP fetch failed transiently (network issue, HF outage,
+    exhausted rate-limit retries) - that's not treated as incompatibility, so a temporary HF hiccup
+    doesn't block a valid add; the chat-template check (`has_chat_template(..., strict=True)`) is
+    included in that leniency for the same reason. A repo that doesn't exist or requires auth
+    (404/401/403) is a permanent, user-fixable problem and raises `ModelIncompatibleError` instead.
+    """
+    url = f"{HF_API}/models/{hf_id}" + (f"/revision/{quote(revision, safe='')}" if revision else "")
+    try:
+        data = await get_json_with_retry(session, url, {"blobs": "true"}, max_retries=max_retries)
+    except aiohttp.ClientResponseError as exc:
+        if exc.status in (401, 403, 404):
+            msg = f"{hf_id} could not be found on HuggingFace (or requires authentication); check the repo id and revision."
+            raise ModelIncompatibleError(msg) from exc
+        logger.warning("Transient HuggingFace error validating %s: %s", hf_id, exc)
+        return None
+    except (aiohttp.ClientError, TimeoutError) as exc:
+        logger.warning("Couldn't reach HuggingFace to validate %s: %s", hf_id, exc)
+        return None
+
+    if is_gguf(data):
+        msg = f"{hf_id} is a GGUF (quantized) repo, which this engine can't serve directly."
+        raise ModelIncompatibleError(msg)
+
+    if model_type == "llm":
+        siblings = data.get("siblings", [])
+        try:
+            template_ok = await has_chat_template(session, hf_id, siblings, revision=revision, max_retries=max_retries, strict=True)
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            logger.warning("Couldn't verify chat template for %s: %s", hf_id, exc)
+            return None
+        if not template_ok:
+            msg = f"{hf_id} doesn't ship a chat template, so it can't be served for chat completions."
+            raise ModelIncompatibleError(msg)
+    elif model_type == "reranker":
+        architectures = data.get("config", {}).get("architectures") or []
+        if not is_supported_cross_encoder(architectures):
+            found = ", ".join(architectures) or "unknown"
+            msg = (
+                f"{hf_id}'s architecture ({found}) isn't a supported cross-encoder; "
+                "the rerank/score task only serves ForSequenceClassification models."
+            )
+            raise ModelIncompatibleError(msg)
+
+    return data
 
 
 async def fetch_popular_models(session: aiohttp.ClientSession, tag: str, sort: str, limit: int) -> list[dict[str, Any]]:
