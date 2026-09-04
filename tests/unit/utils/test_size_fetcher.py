@@ -18,6 +18,7 @@ from server.utils.size_fetcher import (
     fetch_huggingface_model_size,
     fetch_ollama_ref_bytes,
     fmt_size,
+    sum_siblings_size_bytes,
 )
 
 
@@ -36,6 +37,19 @@ from server.utils.size_fetcher import (
 )
 def test_fmt_size(n: int, expected: str) -> None:
     assert fmt_size(n) == expected
+
+
+@pytest.mark.parametrize(
+    ("siblings", "expected"),
+    [
+        ([], None),
+        ([{"rfilename": "README.md"}], None),
+        ([{"rfilename": "model.safetensors", "size": 0}], None),
+        ([{"rfilename": "model.safetensors", "size": 100}, {"rfilename": "config.json", "size": 50}], 150),
+    ],
+)
+def test_sum_siblings_size_bytes(siblings: list[dict[str, Any]], expected: int | None) -> None:
+    assert sum_siblings_size_bytes(siblings) == expected
 
 
 @pytest.mark.parametrize(

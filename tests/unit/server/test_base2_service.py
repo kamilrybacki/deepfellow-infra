@@ -6,7 +6,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from server.models.models import InstallModelIn
-from server.services.base2_service import Instance, InstanceConfig, ModelConfig
+from server.services.base2_service import (
+    Instance,
+    InstanceConfig,
+    ModelConfig,
+    _custom_model_serving_fields_changed,  # pyright: ignore[reportPrivateUsage]
+)
 from server.services.llamacpp_service import InstalledInfo, LLamacppService
 from server.utils.hardware import CpuInfo, NvidiaGpuInfo
 
@@ -70,3 +75,41 @@ def test_get_persisted_model_definition_returns_definition_when_persisted():
     config = InstanceConfig(models=[ModelConfig(model_id="some-model", options=InstallModelIn(), definition=definition)])
     svc = _make_base2_service({"default": Instance(None, None, {}, config)})
     assert svc._get_persisted_model_definition("default", "some-model") == definition  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ({"hf_id": "org/model"}, {"hf_id": "org/model", "id": "renamed"}),
+        ({"hf_id": "org/model"}, {"hf_id": "org/model", "size": "4 GB"}),
+        ({"hf_id": "org/model", "size": "4 GB"}, {"hf_id": "org/model"}),
+        ({"hf_id": "org/model"}, {"hf_id": "org/model"}),
+    ],
+)
+def test_custom_model_serving_fields_changed_ignores_id_and_size(old: dict[str, object], new: dict[str, object]) -> None:
+    assert _custom_model_serving_fields_changed(old, new) is False
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ({"hf_id": "org/model"}, {"hf_id": "org/model", "skip_validation": False}),
+        ({"hf_id": "org/model", "skip_validation": False}, {"hf_id": "org/model"}),
+        ({"hf_id": "org/model"}, {"hf_id": "org/model", "revision": ""}),
+        ({"hf_id": "org/model", "revision": ""}, {"hf_id": "org/model"}),
+    ],
+)
+def test_custom_model_serving_fields_changed_ignores_absent_vs_falsy(old: dict[str, object], new: dict[str, object]) -> None:
+    assert _custom_model_serving_fields_changed(old, new) is False
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ({"hf_id": "org/model"}, {"hf_id": "org/other-model"}),
+        ({"hf_id": "org/model"}, {"hf_id": "org/model", "revision": "v2"}),
+        ({"hf_id": "org/model", "model_type": "llm"}, {"hf_id": "org/model", "model_type": "reranker"}),
+    ],
+)
+def test_custom_model_serving_fields_changed_detects_change(old: dict[str, object], new: dict[str, object]) -> None:
+    assert _custom_model_serving_fields_changed(old, new) is True

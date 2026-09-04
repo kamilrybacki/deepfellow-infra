@@ -64,6 +64,27 @@ class CustomModel(BaseModel):
     data: CustomModelDefiniton
 
 
+_CUSTOM_MODEL_NON_SERVING_FIELDS = {"id", "size"}
+
+
+def _custom_model_serving_fields_changed(old: dict[str, Any], new: dict[str, Any]) -> bool:
+    """Return True if any field affecting whether the repo can be served differs between specs.
+
+    `id` (display name) and `size` are cosmetic/derived and don't affect serviceability, so an
+    update that only touches those shouldn't force re-validation of a model that already passed
+    it - which would otherwise be able to permanently strand a model added before validation
+    existed, or during a transient HuggingFace outage.
+
+    Values are compared with falsy values normalized to `None` first, so a field missing from an
+    older spec (e.g. `revision`, or `skip_validation` on a model added before that field existed)
+    doesn't register as "changed" just because the current caller submits it explicitly as `""` or
+    `False` - which would otherwise defeat the point of this check for exactly the legacy models it
+    exists to protect.
+    """
+    keys = (set(old) | set(new)) - _CUSTOM_MODEL_NON_SERVING_FIELDS
+    return any((old.get(k) or None) != (new.get(k) or None) for k in keys)
+
+
 class InstanceConfig(BaseModel):
     options: InstallServiceIn | None = None
     models: list[ModelConfig] | None = None
@@ -731,9 +752,18 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
                     return custom.data
         return None
 
+    async def _validate_custom_model(self, spec: dict[str, Any], instance: str = "") -> None:
+        """Raise `HTTPException(400, ...)` if the custom model spec can't be served; no-op by default.
+
+        Runs before `_resolve_custom_model_size`, so an override may also fill in derived fields
+        (e.g. `size`) it already fetched, sparing a redundant lookup - callers must not reorder the
+        two.
+        """
+
     async def add_custom_model(self, instance: str, options: AddCustomModelIn) -> CustomModelId:
         """Add custom model."""
         spec = dict(options.spec)
+        await self._validate_custom_model(spec, instance)
         if not spec.get("size"):
             resolved = await self._resolve_custom_model_size(spec, instance)
             spec["size"] = resolved if resolved else "unknown"
@@ -773,6 +803,8 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         if model is None:
             raise HTTPException(404, f"Custom model {custom_model_id} not found.")
         new_data: dict[str, Any] = dict(options.spec)
+        if _custom_model_serving_fields_changed(model.data, new_data):
+            await self._validate_custom_model(new_data, instance)
         if not new_data.get("size"):
             resolved = await self._resolve_custom_model_size(new_data, instance)
             new_data["size"] = resolved or model.data.get("size") or "unknown"

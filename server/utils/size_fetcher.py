@@ -5,6 +5,7 @@
 
 import logging
 import re
+from typing import Any
 from urllib.parse import quote
 
 import aiohttp
@@ -37,6 +38,12 @@ async def _fetch_file_size_bytes(url: str) -> int | None:
         return int(content_length) if content_length else None
 
 
+def sum_siblings_size_bytes(siblings: list[dict[str, Any]]) -> int | None:
+    """Return total byte size from a HuggingFace model's `siblings` list, or None if none report a size."""
+    total = sum(f.get("size", 0) for f in siblings if f.get("size"))
+    return total if total else None
+
+
 async def _fetch_hf_size_bytes(hf_id: str, revision: str | None = None) -> int | None:
     url = f"{HF_API}/models/{hf_id}/revision/{quote(revision, safe='')}" if revision else f"{HF_API}/models/{hf_id}"
     async with (
@@ -50,8 +57,7 @@ async def _fetch_hf_size_bytes(hf_id: str, revision: str | None = None) -> int |
     ):
         resp.raise_for_status()
         data = await resp.json()
-    total = sum(f.get("size", 0) for f in data.get("siblings", []) if f.get("size"))
-    return total if total else None
+    return sum_siblings_size_bytes(data.get("siblings", []))
 
 
 def _parse_ollama_tag_size(html: str, tag: str) -> str | None:

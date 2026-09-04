@@ -14,6 +14,7 @@ import pytest
 from scripts.get_huggingface_models import (
     EMBEDDING_TAGS,
     RERANKER_TAGS,
+    ModelIncompatibleError,
     collect_embedding_models,
     collect_llm_models,
     collect_reranker_models,
@@ -32,6 +33,7 @@ from scripts.get_huggingface_models import (
     is_reranking_cross_encoder,
     is_supported_cross_encoder,
     main,
+    validate_model_compatibility,
 )
 
 
@@ -184,6 +186,42 @@ async def test_has_chat_template_false_when_tokenizer_config_lacks_key() -> None
 
 
 @pytest.mark.asyncio
+async def test_has_chat_template_fetches_pinned_revision_when_given() -> None:
+    session = _make_mock_session({"chat_template": "..."})
+    siblings = [{"rfilename": "tokenizer_config.json"}]
+
+    await has_chat_template(session, "org/model", siblings, revision="v2")
+
+    url = session.get.call_args.args[0]
+    assert url == "https://huggingface.co/org/model/raw/v2/tokenizer_config.json"
+
+
+@pytest.mark.asyncio
+async def test_has_chat_template_fetches_main_when_no_revision_given() -> None:
+    session = _make_mock_session({"chat_template": "..."})
+    siblings = [{"rfilename": "tokenizer_config.json"}]
+
+    await has_chat_template(session, "org/model", siblings)
+
+    url = session.get.call_args.args[0]
+    assert url == "https://huggingface.co/org/model/raw/main/tokenizer_config.json"
+
+
+@pytest.mark.asyncio
+async def test_has_chat_template_strict_reraises_on_fetch_error() -> None:
+    mock_resp = AsyncMock()
+    mock_resp.raise_for_status = MagicMock(side_effect=aiohttp.ClientResponseError(MagicMock(), (), status=503))
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+    session = MagicMock()
+    session.get = MagicMock(return_value=mock_resp)
+    siblings = [{"rfilename": "tokenizer_config.json"}]
+
+    with pytest.raises(aiohttp.ClientResponseError):
+        await has_chat_template(session, "org/model", siblings, max_retries=1, strict=True)
+
+
+@pytest.mark.asyncio
 async def test_has_chat_template_false_on_fetch_error() -> None:
     mock_resp = AsyncMock()
     mock_resp.raise_for_status = MagicMock(side_effect=aiohttp.ClientResponseError(MagicMock(), (), status=404))
@@ -222,6 +260,141 @@ def _make_mock_session(json_data: object) -> MagicMock:
     mock_session = MagicMock()
     mock_session.get = MagicMock(return_value=mock_resp)
     return mock_session
+
+
+@pytest.mark.asyncio
+async def test_validate_model_compatibility_raises_for_gguf_repo() -> None:
+    session = _make_mock_session({"id": "org/model-GGUF", "tags": ["gguf"], "siblings": []})
+
+    with pytest.raises(ModelIncompatibleError, match="GGUF"):
+        await validate_model_compatibility(session, "org/model-GGUF", None, "llm")
+
+
+@pytest.mark.asyncio
+async def test_validate_model_compatibility_raises_for_llm_without_chat_template() -> None:
+    session = _make_mock_session({"id": "org/base-model", "tags": [], "siblings": [{"rfilename": "config.json"}]})
+
+    with pytest.raises(ModelIncompatibleError, match="chat template"):
+        await validate_model_compatibility(session, "org/base-model", None, "llm")
+
+
+@pytest.mark.asyncio
+async def test_validate_model_compatibility_passes_for_llm_with_chat_template() -> None:
+    data = {"id": "org/chat-model", "tags": [], "siblings": [{"rfilename": "chat_template.jinja"}]}
+    session = _make_mock_session(data)
+
+    result = await validate_model_compatibility(session, "org/chat-model", None, "llm")
+
+    assert result == data
+
+
+@pytest.mark.asyncio
+async def test_validate_model_compatibility_raises_for_unsupported_reranker_architecture() -> None:
+    session = _make_mock_session(
+        {"id": "org/generative-reranker", "tags": [], "siblings": [], "config": {"architectures": ["Qwen3ForCausalLM"]}}
+    )
+
+    with pytest.raises(ModelIncompatibleError, match="cross-encoder"):
+        await validate_model_compatibility(session, "org/generative-reranker", None, "reranker")
+
+
+@pytest.mark.asyncio
+async def test_validate_model_compatibility_passes_for_supported_reranker() -> None:
+    session = _make_mock_session(
+        {
+            "id": "org/cross-encoder-reranker",
+            "tags": [],
+            "siblings": [],
+            "config": {"architectures": ["XLMRobertaForSequenceClassification"]},
+        }
+    )
+
+    await validate_model_compatibility(session, "org/cross-encoder-reranker", None, "reranker")
+
+
+@pytest.mark.asyncio
+async def test_validate_model_compatibility_skips_check_for_embedding_model_type() -> None:
+    session = _make_mock_session({"id": "org/embedding-model", "tags": [], "siblings": []})
+
+    await validate_model_compatibility(session, "org/embedding-model", None, "embedding")
+
+
+@pytest.mark.asyncio
+async def test_validate_model_compatibility_returns_none_on_transient_fetch_error() -> None:
+    mock_resp = AsyncMock()
+    mock_resp.raise_for_status = MagicMock(side_effect=aiohttp.ClientResponseError(MagicMock(), (), status=503))
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+    session = MagicMock()
+    session.get = MagicMock(return_value=mock_resp)
+
+    result = await validate_model_compatibility(session, "org/missing-model", None, "llm", max_retries=1)
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_validate_model_compatibility_returns_none_on_transient_chat_template_fetch_error() -> None:
+    metadata_resp = AsyncMock()
+    metadata_resp.raise_for_status = MagicMock()
+    metadata_resp.json = AsyncMock(return_value={"id": "org/model", "tags": [], "siblings": [{"rfilename": "tokenizer_config.json"}]})
+    metadata_resp.__aenter__ = AsyncMock(return_value=metadata_resp)
+    metadata_resp.__aexit__ = AsyncMock(return_value=False)
+
+    template_resp = AsyncMock()
+    template_resp.raise_for_status = MagicMock(side_effect=aiohttp.ClientResponseError(MagicMock(), (), status=503))
+    template_resp.__aenter__ = AsyncMock(return_value=template_resp)
+    template_resp.__aexit__ = AsyncMock(return_value=False)
+
+    session = MagicMock()
+    session.get = MagicMock(side_effect=[metadata_resp, template_resp])
+
+    result = await validate_model_compatibility(session, "org/model", None, "llm", max_retries=1)
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_validate_model_compatibility_builds_revision_pinned_url() -> None:
+    session = _make_mock_session({"id": "org/model", "tags": [], "siblings": [{"rfilename": "chat_template.jinja"}]})
+
+    await validate_model_compatibility(session, "org/model", "v2", "llm")
+
+    url = session.get.call_args.args[0]
+    assert url == "https://huggingface.co/api/models/org/model/revision/v2"
+
+
+@pytest.mark.asyncio
+async def test_validate_model_compatibility_returns_none_on_connection_error() -> None:
+    session = MagicMock()
+    session.get = MagicMock(side_effect=aiohttp.ClientConnectionError("boom"))
+
+    result = await validate_model_compatibility(session, "org/missing-model", None, "llm", max_retries=1)
+
+    assert result is None
+
+
+@pytest.mark.parametrize("status", [404, 401, 403])
+@pytest.mark.asyncio
+async def test_validate_model_compatibility_raises_for_permanent_fetch_error(status: int) -> None:
+    mock_resp = AsyncMock()
+    mock_resp.raise_for_status = MagicMock(side_effect=aiohttp.ClientResponseError(MagicMock(), (), status=status))
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+    session = MagicMock()
+    session.get = MagicMock(return_value=mock_resp)
+
+    with pytest.raises(ModelIncompatibleError, match="could not be found"):
+        await validate_model_compatibility(session, "org/missing-model", None, "llm", max_retries=1)
+
+
+@pytest.mark.asyncio
+async def test_validate_model_compatibility_propagates_unexpected_errors() -> None:
+    session = MagicMock()
+    session.get = MagicMock(side_effect=ValueError("not a network failure"))
+
+    with pytest.raises(ValueError, match="not a network failure"):
+        await validate_model_compatibility(session, "org/model", None, "llm")
 
 
 @pytest.mark.asyncio

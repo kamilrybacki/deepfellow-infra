@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Adding a custom vLLM model by HuggingFace id now checks upfront whether the repo can actually be served (GGUF/quantized repos, LLM repos without a usable chat template, and reranker repos with an unsupported architecture), returning a clear error immediately instead of only failing later when the model's container tries to start.
 - vLLM, llama.cpp, and SGLang catalogs can now be refreshed at runtime instead of only via the offline `just get-vllm-models`/`just get-llamacpp-models`/`just get-sglang-models` release recipes: an admin can trigger `POST /admin/services/{service_id}/catalog/refresh` (or the model list's "Refresh catalog" WebUI action) to re-crawl HuggingFace for the current top trending/downloaded/liked models and reload the service's default model list, without a redeploy. Runtime refresh is only available when `static/` is writable; it shares a single in-flight HuggingFace rate-limit budget across all three services, and refuses to write a catalog that shrank suspiciously compared to the one it would replace.
 
 ### Fixed
