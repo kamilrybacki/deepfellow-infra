@@ -107,7 +107,7 @@ class BaseService(ABC):
         return None
 
     @abstractmethod
-    def get_instance_install_progress(self, instance: str) -> PromiseWithProgress[InstallServiceOut, StreamChunk]:
+    async def get_instance_install_progress(self, instance: str) -> PromiseWithProgress[InstallServiceOut, StreamChunk]:
         """Return actually installing instance."""
 
     @abstractmethod

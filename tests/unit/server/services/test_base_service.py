@@ -65,7 +65,7 @@ class _BaseImpl(BaseService):
     def get_custom_model_spec(self) -> CustomModelSpecification | None:
         return None
 
-    def get_instance_install_progress(self, instance: str) -> Any:
+    async def get_instance_install_progress(self, instance: str) -> Any:
         raise NotImplementedError
 
     def get_model_install_progress(self, instance: str, model: str) -> Any:
@@ -607,7 +607,8 @@ async def test_installing_instance_init_creates_task() -> None:
     promise: PromiseWithProgress[InstallServiceOut, StreamChunk] = PromiseWithProgress(value=value)
     promise.progress.close()
 
-    installing = InstallingInstance(promise=promise)
+    installing = InstallingInstance(30)
+    installing.resolve(promise)
 
     assert installing.promise is promise
     assert installing.task is not None
@@ -640,10 +641,25 @@ async def test_installing_instance_stores_last_chunk_from_progress() -> None:
     promise.progress.emit(chunk)
     promise.progress.close()
 
-    installing = InstallingInstance(promise=promise)
+    installing = InstallingInstance(30)
+    installing.resolve(promise)
     await asyncio.sleep(0)
 
     assert installing.last_chunk == chunk
+
+
+@pytest.mark.asyncio
+async def test_installing_instance_wait_ready_raises_if_ready_without_promise_or_error() -> None:
+    """Defensive invariant: `resolve()`/`reject()` are the only way to set `_ready`, and one of them
+    always sets `promise` or `_error` first - so a `wait_ready()` call reaching neither branch would
+    mean that invariant was violated. Simulates that directly (bypassing the public API) since it
+    can't otherwise happen, to prove the check actually raises instead of just documenting the
+    invariant."""
+    installing = InstallingInstance(30)
+    installing._ready.set()  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(RuntimeError, match="resolve\\(\\)/reject\\(\\) were never called"):
+        await installing.wait_ready()
 
 
 def test_get_instance_info_raises_404_for_missing(base2_svc: _Base2Impl) -> None:
@@ -998,21 +1014,24 @@ async def test_download_image_progress_cleared_on_cancel(base2_svc: _Base2Impl) 
     assert image.name not in base2_svc.images_download_progress
 
 
-def test_get_instance_install_progress_raises_when_not_installing(base2_svc: _Base2Impl) -> None:
+@pytest.mark.asyncio
+async def test_get_instance_install_progress_raises_when_not_installing(base2_svc: _Base2Impl) -> None:
     with pytest.raises(HTTPException) as exc_info:
-        base2_svc.get_instance_install_progress("default")
+        await base2_svc.get_instance_install_progress("default")
 
     assert exc_info.value.status_code == 404
 
 
-def test_get_instance_install_progress_returns_promise(base2_svc: _Base2Impl) -> None:
+@pytest.mark.asyncio
+async def test_get_instance_install_progress_returns_promise(base2_svc: _Base2Impl) -> None:
     mock_promise = MagicMock()
     mock_installing = MagicMock()
-    mock_installing.promise = mock_promise
+    mock_installing.wait_ready = AsyncMock(return_value=mock_promise)
+    mock_installing.timeout_seconds = 30
 
     base2_svc.instances_info["default"].installing = mock_installing
 
-    assert base2_svc.get_instance_install_progress("default") is mock_promise
+    assert await base2_svc.get_instance_install_progress("default") is mock_promise
 
 
 @pytest.mark.asyncio
@@ -1480,6 +1499,213 @@ async def test_install_instance_happy_path(base2_svc: _Base2Impl, base2_deps: di
 
     assert base2_svc.instances_info["default"].installed is installed_value
     assert base2_svc.instances_info["default"].installing is None
+
+
+@pytest.mark.asyncio
+async def test_install_instance_rejects_concurrent_call_during_slow_setup(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """A second install must be rejected while `_install_instance` is still doing its (slow) setup work.
+
+    Regression test for the race where `installing` was reset to `None` for the whole duration of
+    `await self._install_instance(...)`, letting a concurrent call slip past the guard and start a
+    second, clobbering install.
+    """
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    entered_setup = asyncio.Event()
+    release_setup = asyncio.Event()
+
+    async def slow_install_instance(_instance: str, _options: InstallServiceIn) -> Any:
+        entered_setup.set()
+        await release_setup.wait()
+        return PromiseWithProgress(value={})
+
+    with patch.object(base2_svc, "_install_instance", new=slow_install_instance):
+        task = asyncio.create_task(base2_svc.install_instance("default", InstallServiceIn(spec={})))
+        await entered_setup.wait()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await base2_svc.install_instance("default", InstallServiceIn(spec={}))
+        assert exc_info.value.status_code == 400
+
+        release_setup.set()
+        result_promise = await task
+        await result_promise.wait()
+
+
+@pytest.mark.asyncio
+async def test_install_instance_clears_reservation_when_setup_fails(base2_svc: _Base2Impl) -> None:
+    """A failure in `_install_instance` itself (before any promise exists) must not leave `installing`
+    stuck permanently truthy - otherwise every later install attempt would be rejected forever."""
+
+    async def failing_install_instance(_instance: str, _options: InstallServiceIn) -> Any:
+        raise RuntimeError("setup failed")
+
+    with patch.object(base2_svc, "_install_instance", new=failing_install_instance), pytest.raises(RuntimeError):
+        await base2_svc.install_instance("default", InstallServiceIn(spec={}))
+
+    assert base2_svc.instances_info["default"].installing is None
+
+
+@pytest.mark.asyncio
+async def test_get_instance_install_progress_waits_for_slow_setup_instead_of_404ing(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any]
+) -> None:
+    """The progress endpoint must not report "not installing" while `_install_instance` is mid-setup."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    entered_setup = asyncio.Event()
+    release_setup = asyncio.Event()
+    real_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value={})
+
+    async def slow_install_instance(_instance: str, _options: InstallServiceIn) -> Any:
+        entered_setup.set()
+        await release_setup.wait()
+        return real_promise
+
+    with patch.object(base2_svc, "_install_instance", new=slow_install_instance):
+        task = asyncio.create_task(base2_svc.install_instance("default", InstallServiceIn(spec={})))
+        await entered_setup.wait()
+
+        progress_task = asyncio.create_task(base2_svc.get_instance_install_progress("default"))
+        await asyncio.sleep(0)
+        assert not progress_task.done()
+
+        release_setup.set()
+        next_promise = await task
+        returned = await progress_task
+        await next_promise.wait()
+
+    assert returned is next_promise
+
+
+@pytest.mark.asyncio
+async def test_get_instance_install_progress_times_out_on_hung_setup(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """A genuinely hung `_install_instance` must not leave every poller waiting forever."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    entered_setup = asyncio.Event()
+    release_setup = asyncio.Event()
+
+    async def hung_install_instance(_instance: str, _options: InstallServiceIn) -> Any:
+        entered_setup.set()
+        await release_setup.wait()
+        return PromiseWithProgress(value={})
+
+    with (
+        patch.object(base2_svc, "_install_instance", new=hung_install_instance),
+        patch("server.services.base2_service._INSTANCE_INSTALL_STATUS_WAIT_TIMEOUT_SECONDS", 0.01),
+    ):
+        task = asyncio.create_task(base2_svc.install_instance("default", InstallServiceIn(spec={})))
+        await entered_setup.wait()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await base2_svc.get_instance_install_progress("default")
+        assert exc_info.value.status_code == 504
+
+        release_setup.set()
+        next_promise = await task
+        await next_promise.wait()
+
+
+@pytest.mark.asyncio
+async def test_install_instance_reservation_converts_cancelled_error_for_other_waiters(base2_svc: _Base2Impl) -> None:
+    """A concurrent reader waiting on the reservation must see a clean `HTTPException`, not a raw
+    `CancelledError` that actually belongs to a completely different task.
+
+    `_install_instance` must actually suspend before failing, otherwise it (and the exception
+    handling that clears `installing`) runs to completion in one scheduling turn, before a
+    concurrent reader ever gets a chance to attach its own waiter to the reservation.
+    """
+    entered_setup = asyncio.Event()
+    release_setup = asyncio.Event()
+
+    async def cancelled_install_instance(_instance: str, _options: InstallServiceIn) -> Any:
+        entered_setup.set()
+        await release_setup.wait()
+        raise asyncio.CancelledError
+
+    with patch.object(base2_svc, "_install_instance", new=cancelled_install_instance):
+        task = asyncio.create_task(base2_svc.install_instance("default", InstallServiceIn(spec={})))
+        await entered_setup.wait()
+
+        progress_task = asyncio.create_task(base2_svc.get_instance_install_progress("default"))
+        await asyncio.sleep(0)
+        assert not progress_task.done()
+
+        release_setup.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        with pytest.raises(HTTPException) as exc_info:
+            await progress_task
+
+    assert exc_info.value.status_code == 409
+    assert base2_svc.instances_info["default"].installing is None
+
+
+@pytest.mark.asyncio
+async def test_update_instance_rejects_concurrent_call_during_slow_setup(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """Same race as install_instance, but for update_instance's re-install of an already-installed instance."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_svc.instances_info["default"].installed = object()
+    entered_setup = asyncio.Event()
+    release_setup = asyncio.Event()
+
+    async def slow_install_instance(_instance: str, _options: InstallServiceIn) -> Any:
+        entered_setup.set()
+        await release_setup.wait()
+        return PromiseWithProgress(value={})
+
+    with (
+        patch.object(base2_svc, "_uninstall_instance", new=AsyncMock()),
+        patch.object(base2_svc, "_install_instance", new=slow_install_instance),
+    ):
+        task = asyncio.create_task(base2_svc.update_instance("default", InstallServiceIn(spec={})))
+        await entered_setup.wait()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await base2_svc.update_instance("default", InstallServiceIn(spec={}))
+        assert exc_info.value.status_code == 400
+
+        release_setup.set()
+        result_promise = await task
+        await result_promise.wait()
+
+
+@pytest.mark.asyncio
+async def test_update_instance_progress_wait_covers_the_uninstall_step_too(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """update_instance's pre-promise phase includes a real uninstall, which can run longer than
+    install_instance's (setup-only) window - the progress read must be bounded by update_instance's
+    own, wider timeout, not install_instance's."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_svc.instances_info["default"].installed = object()
+    entered_uninstall = asyncio.Event()
+    release_uninstall = asyncio.Event()
+
+    async def slow_uninstall(_instance: str, _options: UninstallServiceIn) -> None:
+        entered_uninstall.set()
+        await release_uninstall.wait()
+
+    with (
+        patch.object(base2_svc, "_uninstall_instance", new=slow_uninstall),
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(return_value=PromiseWithProgress(value={}))),
+        patch("server.services.base2_service._INSTANCE_INSTALL_STATUS_WAIT_TIMEOUT_SECONDS", 0.01),
+        patch("server.services.base2_service._INSTANCE_UPDATE_STATUS_WAIT_TIMEOUT_SECONDS", 1.0),
+    ):
+        task = asyncio.create_task(base2_svc.update_instance("default", InstallServiceIn(spec={})))
+        await entered_uninstall.wait()
+
+        # The uninstall alone already runs well past install_instance's (much shorter) setup
+        # timeout, but must not trip update_instance's own, wider budget.
+        await asyncio.sleep(0.05)
+        progress_task = asyncio.create_task(base2_svc.get_instance_install_progress("default"))
+        await asyncio.sleep(0.05)
+        assert not progress_task.done()
+
+        release_uninstall.set()
+        next_promise = await task
+        returned = await progress_task
+        await next_promise.wait()
+
+    assert returned is next_promise
 
 
 @pytest.mark.asyncio
