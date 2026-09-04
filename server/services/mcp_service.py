@@ -80,6 +80,7 @@ from server.utils.mcp_oauth import (
 )
 from server.utils.registry_client import image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fmt_size
+from server.utils.tracing import tracer
 
 
 class McpUserVariant(StrEnum):
@@ -1374,45 +1375,80 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
 
     async def healthcheck_model(self, instance: str, model_id: str) -> McpHealthCheckResult:  # noqa: C901
         """Probe an installed MCP server: check liveness, detect transport, and fetch tool list."""
-        info = self.get_instance_installed_info(instance)
-        if model_id not in info.models:
-            raise HTTPException(status_code=400, detail="Model is not installed")
-        model_info = info.models[model_id]
-        model = (self.models.get(instance) or {}).get(model_id)
-        if model is None:
-            raise HTTPException(status_code=400, detail="Model not found in registry")
+        start_time = time.monotonic()
+        base_attrs = {"mcp.instance": instance, "mcp.model_id": model_id}
+        outcome = "error"
+        with tracer.span("mcp.healthcheck", **base_attrs) as span:
+            try:
+                try:
+                    info = self.get_instance_installed_info(instance)
+                except HTTPException:
+                    # Instance missing/not installed (404/400) is bad input, not an operational
+                    # failure — same reasoning as the invalid_request cases below: keep it out of
+                    # "error" so it doesn't skew error-rate/latency alerting for genuine MCP server
+                    # problems (e.g. an admin uninstalling the model mid-retry-loop is a benign race).
+                    outcome = "invalid_request"
+                    raise
+                if model_id not in info.models:
+                    # Bad input (unknown model), not an operational failure — keep it out of "error"
+                    # so it doesn't pollute error-rate/latency alerting for genuine MCP server problems.
+                    outcome = "invalid_request"
+                    raise HTTPException(status_code=400, detail="Model is not installed")
+                model_info = info.models[model_id]
+                model = (self.models.get(instance) or {}).get(model_id)
+                if model is None:
+                    outcome = "invalid_request"
+                    raise HTTPException(status_code=400, detail="Model not found in registry")
 
-        base_url = model_info.base_url
-        headers = model_info.headers or {}
-        transport = model.proxy_transport  # "streamable_http" | "sse"
+                base_url = model_info.base_url
+                headers = model_info.headers or {}
+                transport = model.proxy_transport  # "streamable_http" | "sse"
 
-        if model.kind == "proxy":
-            if model.oauth and model.oauth.enabled and has_valid_access_token(model.oauth):
-                headers = {**headers, "Authorization": f"Bearer {model.oauth.access_token}"}
-            # proxy_url is already the full endpoint URL (may end with /mcp or /sse)
-            if transport == "sse":
-                result = await _fetch_tools_from_sse_endpoint(base_url, headers)
-            else:
-                result = await _fetch_tools_from_mcp_endpoint(base_url, headers)
-            if result.requires_oauth and not (model.oauth and model.oauth.enabled):
-                await self._auto_detect_oauth(instance, model_id)
-        else:
-            # Docker / user model — base_url is http://host:port, transport path appended separately
-            if transport == "sse":
-                result = await _fetch_tools_from_sse_endpoint(f"{base_url}/sse", headers)
-                if not result.healthy:
-                    fallback = await _fetch_tools_from_mcp_endpoint(f"{base_url}/mcp", headers)
-                    result = fallback if fallback.healthy else result
-            else:
-                result = await _fetch_tools_from_mcp_endpoint(f"{base_url}/mcp", headers)
-                if not result.healthy:
-                    fallback = await _fetch_tools_from_sse_endpoint(f"{base_url}/sse", headers)
-                    result = fallback if fallback.healthy else result
+                if model.kind == "proxy":
+                    if model.oauth and model.oauth.enabled and has_valid_access_token(model.oauth):
+                        headers = {**headers, "Authorization": f"Bearer {model.oauth.access_token}"}
+                    # proxy_url is already the full endpoint URL (may end with /mcp or /sse)
+                    if transport == "sse":
+                        result = await _fetch_tools_from_sse_endpoint(base_url, headers)
+                    else:
+                        result = await _fetch_tools_from_mcp_endpoint(base_url, headers)
+                    if result.requires_oauth and not (model.oauth and model.oauth.enabled):
+                        await self._auto_detect_oauth(instance, model_id)
+                else:
+                    # Docker / user model — base_url is http://host:port, transport path appended separately
+                    if transport == "sse":
+                        result = await _fetch_tools_from_sse_endpoint(f"{base_url}/sse", headers)
+                        if not result.healthy:
+                            fallback = await _fetch_tools_from_mcp_endpoint(f"{base_url}/mcp", headers)
+                            result = fallback if fallback.healthy else result
+                    else:
+                        result = await _fetch_tools_from_mcp_endpoint(f"{base_url}/mcp", headers)
+                        if not result.healthy:
+                            fallback = await _fetch_tools_from_sse_endpoint(f"{base_url}/sse", headers)
+                            result = fallback if fallback.healthy else result
 
-        if result.healthy:
-            self._apply_healthcheck_result(model, model_info.prefix, result)
+                if result.healthy:
+                    self._apply_healthcheck_result(model, model_info.prefix, result)
 
-        return result
+                outcome = "healthy" if result.healthy else ("oauth_required" if result.requires_oauth else "unhealthy")
+                if span is not None:
+                    span.set_attribute("mcp.transport", result.transport or "<unknown>")
+                    span.set_attribute("mcp.tool_count", len(result.tools))
+
+                return result
+            finally:
+                # In a `finally`, not just the success path — an attempt that raised (e.g. the
+                # `HTTPException`s above) is still an attempt and should show up in the metric,
+                # not silently vanish from it. `outcome` stays "error" for any of those cases.
+                if span is not None:
+                    span.set_attribute("mcp.outcome", outcome)
+                attrs = {**base_attrs, "mcp.outcome": outcome}
+                if instruments := tracer.mcp_instruments():
+                    instruments.healthcheck_count.add(1, attrs)
+                    # `invalid_request` is bad input rejected before any probe ran — its ~0ms
+                    # duration would skew p50/p95 and mask genuinely slow MCP servers.
+                    if outcome != "invalid_request":
+                        instruments.healthcheck_duration_ms.record((time.monotonic() - start_time) * 1000, attrs)
 
     def check_envs(self, required_envs: list[str] | None, envs: dict[str, str]) -> None:
         """Check enviromental variables."""
@@ -1477,7 +1513,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
             self._oauth_refresh_locks[key] = asyncio.Lock()
         return self._oauth_refresh_locks[key]
 
-    async def _refresh_oauth_token(self, instance: str, model_id: str) -> McpOAuthConfig | None:
+    async def _refresh_oauth_token(self, instance: str, model_id: str) -> McpOAuthConfig | None:  # noqa: C901
         """Refresh the access token for a proxy model's OAuth config, persisting the result."""
         async with self._get_oauth_lock(instance, model_id):
             model = (self.models.get(instance) or {}).get(model_id)
@@ -1487,18 +1523,31 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                 return model.oauth  # a concurrent caller already refreshed it while we waited for the lock
             if not model.oauth.client_id:
                 return model.oauth
+            attrs = {"mcp.instance": instance, "mcp.model_id": model_id}
             try:
-                token = await refresh_access_token(
-                    model.oauth.token_endpoint,
-                    model.oauth.refresh_token,
-                    model.oauth.client_id,
-                    model.oauth.client_secret,
-                    model.oauth.resource or model.proxy_url or "",
-                )
+                with tracer.span("mcp.oauth.refresh", **attrs) as span:
+                    try:
+                        token = await refresh_access_token(
+                            model.oauth.token_endpoint,
+                            model.oauth.refresh_token,
+                            model.oauth.client_id,
+                            model.oauth.client_secret,
+                            model.oauth.resource or model.proxy_url or "",
+                        )
+                    except McpOAuthError:
+                        if span is not None:
+                            span.set_attribute("mcp.outcome", "failure")
+                        raise
+                    if span is not None:
+                        span.set_attribute("mcp.outcome", "success")
             except McpOAuthError as exc:
+                if instruments := tracer.mcp_instruments():
+                    instruments.oauth_refresh_count.add(1, {**attrs, "mcp.outcome": "failure"})
                 model.oauth.last_error = str(exc)
                 await self._persist_proxy_oauth(instance, model_id, model.oauth)
                 return None
+            if instruments := tracer.mcp_instruments():
+                instruments.oauth_refresh_count.add(1, {**attrs, "mcp.outcome": "success"})
             model.oauth.access_token = token.access_token
             if token.refresh_token:
                 model.oauth.refresh_token = token.refresh_token

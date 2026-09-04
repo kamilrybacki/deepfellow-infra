@@ -26,7 +26,7 @@ from server.core.dependencies import (
 from server.dynamic_config import DynamicSettings
 from server.models.config import ConfigEntry, ConfigOut, ConfigRevealOut
 from server.task_manager import TaskManager
-from server.utils.tracing import OtlpLoggingManager
+from server.utils.tracing import OtlpLoggingManager, tracer
 from server.websockets.infra_websocket_server import InfraWebsocketServer
 from server.websockets.parent_infra_group import ParentInfraGroup
 
@@ -153,6 +153,7 @@ async def update_dynamic_config(
             new_settings.otel_logging_enabled != current.otel_logging_enabled
             or new_settings.otel_exporter_otlp_endpoint != current.otel_exporter_otlp_endpoint
         )
+        otel_tracing_disabled = current.otel_tracing_enabled and not new_settings.otel_tracing_enabled
         ancestor_broadcast_needed = (
             new_settings.share_models_downstream != current.share_models_downstream
             or new_settings.infra_api_key.get_secret_value() != current.infra_api_key.get_secret_value()
@@ -173,6 +174,11 @@ async def update_dynamic_config(
                 await parent_infra.reconfigure(config, task_manager)
             if otel_logging_changed:
                 otlp_logging.reconfigure(config)
+            if otel_tracing_disabled:
+                # Endpoint changes are already picked up lazily by tracer._get_tracer()/
+                # _get_mcp_instruments(); only a disable transition needs an explicit stop, since
+                # nothing calls those getters again to shut down the now-unreferenced providers.
+                await tracer.shutdown()
             if ancestor_broadcast_needed:
                 infra_websocket_server.broadcast_ancestors_to_children()
         except Exception as e:

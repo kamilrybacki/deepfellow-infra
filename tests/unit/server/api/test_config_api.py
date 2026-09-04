@@ -272,6 +272,28 @@ def test_update_config_otel_change_triggers_otlp_reconfigure(
     parent_infra.reconfigure.assert_not_awaited()
 
 
+def test_update_config_otel_tracing_disabled_shuts_down_tracer(client: TestClient, config: MagicMock, auth_header: dict[str, str]) -> None:
+    config.otel_tracing_enabled = True
+    with patch("server.api.config.dynamic_config.persist_settings"), patch("server.api.config.tracer") as mock_tracer:
+        mock_tracer.shutdown = AsyncMock()
+        resp = client.put("/admin/config", json={"otel_tracing_enabled": False}, headers=auth_header)
+
+    assert resp.status_code == 200
+    assert mock_tracer.shutdown.call_count == 1
+
+
+def test_update_config_otel_tracing_still_enabled_does_not_shut_down_tracer(
+    client: TestClient, config: MagicMock, auth_header: dict[str, str]
+) -> None:
+    config.otel_tracing_enabled = True
+    with patch("server.api.config.dynamic_config.persist_settings"), patch("server.api.config.tracer") as mock_tracer:
+        mock_tracer.shutdown = AsyncMock()
+        resp = client.put("/admin/config", json={"otel_exporter_otlp_endpoint": "http://new:4317"}, headers=auth_header)
+
+    assert resp.status_code == 200
+    assert mock_tracer.shutdown.call_count == 0
+
+
 def test_update_config_share_models_downstream_change_broadcasts_ancestors(
     client: TestClient, infra_websocket_server: MagicMock, auth_header: dict[str, str]
 ) -> None:

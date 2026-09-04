@@ -3,21 +3,29 @@
 
 """OpenTelemetry tracing utilities for request and streaming response tracing."""
 
+import asyncio
+import contextlib
 import functools
 import inspect
 import logging
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from typing import Any
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from opentelemetry import trace
 from opentelemetry._logs import set_logger_provider
 from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
+from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.metrics import Counter, Histogram
 from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import Status, StatusCode, TracerProvider  # type: ignore
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -27,6 +35,8 @@ from pydantic import BaseModel
 from server.config import AppSettings
 
 uvicorn_logger = logging.getLogger("uvicorn")
+
+_OTEL_SHUTDOWN_TIMEOUT_MILLIS = 5000
 
 
 class OtlpLoggingManager:
@@ -87,6 +97,19 @@ class FuncArgs:
     model: BaseModel | None = None
 
 
+@dataclass
+class McpInstruments:
+    """OTel metric instruments for MCP operations.
+
+    Attribute values are identifiers/outcomes/sizes only — never tool arguments, tool results, or
+    other MCP payload content.
+    """
+
+    healthcheck_count: Counter
+    healthcheck_duration_ms: Histogram
+    oauth_refresh_count: Counter
+
+
 class InfraTracer:
     service_name: str
     config: AppSettings | None
@@ -98,12 +121,73 @@ class InfraTracer:
         self.tracer = None
         self._tracer_endpoint: str | None = None
         self._provider: TracerProvider | None = None
+        self._meter_provider: MeterProvider | None = None
+        self._meter_endpoint: str | None = None
+        self._mcp_instruments: McpInstruments | None = None
 
     def _get_config(self) -> AppSettings:
         if self.config is None:
             msg = "InfraTracer.config was not set. Ensure lifecycle.py assigns `tracer.config` at startup."
             raise RuntimeError(msg)
         return self.config
+
+    def _shutdown_span_provider(self, provider: TracerProvider) -> None:
+        """Shut down a `TracerProvider` without blocking the caller for up to the default 30s.
+
+        Unlike `MeterProvider.shutdown()`, `TracerProvider.shutdown()`/`BatchSpanProcessor.shutdown()`
+        accept no timeout parameter, so a stuck exporter (e.g. an unreachable OTLP endpoint) would
+        otherwise stall whichever request triggered the rebuild/disable for up to 30s. Run it on a
+        background thread and only wait up to our own bound — if the shutdown is still slow, it
+        keeps finishing on its own thread instead of blocking this one.
+
+        Called from `shutdown()` (already off the event loop thread via `asyncio.to_thread()`), where
+        this bounded wait caps thread-pool growth across repeated enable/disable cycles.
+        """
+        thread = threading.Thread(target=self._run_span_provider_shutdown, args=(provider,), daemon=True)
+        thread.start()
+        thread.join(timeout=_OTEL_SHUTDOWN_TIMEOUT_MILLIS / 1000)
+
+    def _shutdown_span_provider_detached(self, provider: TracerProvider) -> None:
+        """Fire-and-forget variant of `_shutdown_span_provider()` for the sync rebuild path.
+
+        `_get_tracer()` runs synchronously on whatever thread calls it — including the event loop
+        thread, via `span()`/`mcp_instruments()` used by MCP healthchecks and OAuth refresh. Nothing
+        reads this old provider's shutdown result, so unlike `shutdown()` (an explicit, awaited
+        disable/app-shutdown transition), there's no reason to block that thread waiting for it —
+        just let the exporter finish flushing on its own daemon thread.
+        """
+        threading.Thread(target=self._run_span_provider_shutdown, args=(provider,), daemon=True).start()
+
+    def _run_span_provider_shutdown(self, provider: TracerProvider) -> None:
+        """Run `TracerProvider.shutdown()`, logging (not propagating) any exception it raises.
+
+        Both callers above run this as a bare `threading.Thread` target, so an unhandled exception
+        (e.g. an unreachable/broken OTLP collector at final flush) would otherwise only reach the
+        default `threading.excepthook`, which prints to stderr and never reaches our structured
+        logs. Mirrors `_shutdown_meter_provider()`'s try/except so a failed span-provider shutdown
+        is just as visible as a failed meter-provider one.
+        """
+        try:
+            provider.shutdown()
+        except Exception:
+            uvicorn_logger.warning("Failed to shut down OTel span provider", exc_info=True)
+
+    def _shutdown_meter_provider(self, provider: MeterProvider) -> None:
+        """Shut down a `MeterProvider`, swallowing any exception it raises.
+
+        Unlike `TracerProvider.shutdown()` (run via a bare `threading.Thread`, whose exceptions
+        never propagate to the caller), `MeterProvider.shutdown()` is invoked here via
+        `asyncio.to_thread()` in `shutdown()`, and `asyncio.to_thread()` *does* propagate the
+        thread's exception back to the awaiter. A slow/unreachable OTLP collector at final flush
+        would then surface as a failure of whatever triggered the shutdown (e.g. `/admin/config`
+        reporting "could not be applied live" even though the config itself applied fine) rather
+        than a telemetry-only problem — so catch and log instead, matching the best-effort
+        telemetry contract followed by `span()`/`mcp_instruments()`.
+        """
+        try:
+            provider.shutdown(timeout_millis=_OTEL_SHUTDOWN_TIMEOUT_MILLIS)
+        except Exception:
+            uvicorn_logger.warning("Failed to shut down OTel meter provider", exc_info=True)
 
     def _get_tracer(self) -> Tracer:
         otlp_endpoint = self._get_config().otel_exporter_otlp_endpoint
@@ -116,7 +200,7 @@ class InfraTracer:
             # Stop the old BatchSpanProcessor's background export thread before discarding its
             # provider — otherwise every endpoint change via /admin/config leaks one more thread.
             if self._provider is not None:
-                self._provider.shutdown()
+                self._shutdown_span_provider_detached(self._provider)
 
             resource = Resource(attributes={"service.name": self.service_name})
             provider = self._provider = TracerProvider(resource=resource)
@@ -126,6 +210,124 @@ class InfraTracer:
             self.tracer = provider.get_tracer(__name__)
             self._tracer_endpoint = otlp_endpoint
         return self.tracer
+
+    def _get_mcp_instruments(self) -> McpInstruments:
+        """Lazily build (and rebuild on endpoint change) the meter and MCP metric instruments.
+
+        Mirrors `_get_tracer()`: a changed `otel_exporter_otlp_endpoint` requires a fresh
+        `MeterProvider`, and instruments created on the old provider would keep exporting nowhere,
+        so they're recreated alongside it rather than reused.
+        """
+        otlp_endpoint = self._get_config().otel_exporter_otlp_endpoint
+        if self._mcp_instruments is None or self._meter_endpoint != otlp_endpoint:
+            if self._meter_provider is not None:
+                # Detached, like `_shutdown_span_provider_detached()`: this runs synchronously on
+                # the request that triggered the rebuild (possibly the event loop thread, via
+                # `mcp_instruments()`), and nothing reads the result, so don't block waiting for a
+                # final flush against a possibly-unreachable old endpoint — let it finish on its own
+                # daemon thread instead.
+                threading.Thread(target=self._shutdown_meter_provider, args=(self._meter_provider,), daemon=True).start()
+
+            resource = Resource(attributes={"service.name": self.service_name})
+            reader = PeriodicExportingMetricReader(OTLPMetricExporter(endpoint=otlp_endpoint, insecure=True))
+            provider = self._meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
+            meter = provider.get_meter(__name__)
+
+            self._mcp_instruments = McpInstruments(
+                healthcheck_count=meter.create_counter("mcp.healthcheck.count", description="MCP server health-check attempts, by outcome"),
+                healthcheck_duration_ms=meter.create_histogram(
+                    "mcp.healthcheck.duration", unit="ms", description="MCP server health-check duration"
+                ),
+                oauth_refresh_count=meter.create_counter(
+                    "mcp.oauth.refresh.count", description="MCP OAuth access token refresh attempts, by outcome"
+                ),
+            )
+            self._meter_endpoint = otlp_endpoint
+        return self._mcp_instruments
+
+    async def shutdown(self) -> None:
+        """Stop the tracer's and MCP meter's background export threads.
+
+        Call at app shutdown and whenever `otel_tracing_enabled` is turned off via `/admin/config` —
+        otherwise the `BatchSpanProcessor`/`PeriodicExportingMetricReader` export threads built by
+        `_get_tracer()`/`_get_mcp_instruments()` keep running (and exporting to the OTLP endpoint)
+        even though nothing references them anymore. Resets provider state so a later call rebuilds
+        fresh providers rather than reusing shut-down ones.
+
+        Both provider shutdowns block synchronously for up to `_OTEL_SHUTDOWN_TIMEOUT_MILLIS` against
+        the OTLP endpoint, so they run via `asyncio.to_thread()` — otherwise a slow/unreachable
+        endpoint would stall the event loop (and every other in-flight request) for up to that long.
+        """
+        if self._provider is not None:
+            await asyncio.to_thread(self._shutdown_span_provider, self._provider)
+            self._provider = None
+        self.tracer = None
+        self._tracer_endpoint = None
+
+        if self._meter_provider is not None:
+            await asyncio.to_thread(self._shutdown_meter_provider, self._meter_provider)
+            self._meter_provider = None
+        self._mcp_instruments = None
+        self._meter_endpoint = None
+
+    def mcp_instruments(self) -> McpInstruments | None:
+        """Return the MCP metric instruments, or `None` when disabled or on a build failure.
+
+        Telemetry stays best-effort: a failure building the instruments never breaks callers.
+        """
+        if self.config is None or not self.config.otel_tracing_enabled:
+            return None
+        try:
+            return self._get_mcp_instruments()
+        except Exception:
+            uvicorn_logger.warning("Failed to initialize MCP OTel instruments; continuing without metrics", exc_info=True)
+            return None
+
+    @contextlib.contextmanager
+    def span(self, name: str, **attributes: Any) -> Iterator[Span | None]:
+        """Start a manual span for code outside `trace_request()`.
+
+        Meant for background tasks and internal service calls that aren't FastAPI endpoints. Yields
+        `None` when tracing is disabled (including when `self.config` was never set, e.g. in unit
+        tests that call service methods without going through `lifecycle.py`) or when acquiring the
+        tracer fails, so callers can guard extra `set_attribute` calls with `if span is not None:`.
+        `attributes` should only carry identifiers/outcomes/sizes — never MCP tool arguments, tool
+        results, or other payload content. A raised `HTTPException` with a 4xx status is recorded as
+        `OK`, not `ERROR` — it's an expected client-input rejection, not a span-level failure.
+
+        Uses `start_as_current_span` (not `start_span`) so the span is attached to the current OTel
+        context — otherwise it would never nest under a caller's own `span()`/`trace_request()` span.
+        """
+        if self.config is None or not self.config.otel_tracing_enabled:
+            yield None
+            return
+        try:
+            tracer_obj = self._get_tracer()
+        except Exception:
+            uvicorn_logger.warning("Failed to initialize OTel tracer for span %r; continuing without tracing", name, exc_info=True)
+            yield None
+            return
+        with tracer_obj.start_as_current_span(
+            name, attributes=attributes, record_exception=False, set_status_on_exception=False
+        ) as span_obj:
+            try:
+                yield span_obj
+            except HTTPException as e:
+                # A 4xx is expected client-input rejection, not a span-level failure — recording it
+                # as an OTel error would make routine bad input (e.g. an unknown model id) show up
+                # in span-based error-rate alerting alongside genuine operational failures.
+                if e.status_code < 500:
+                    span_obj.set_status(Status(StatusCode.OK))
+                else:
+                    span_obj.record_exception(e)
+                    span_obj.set_status(Status(StatusCode.ERROR))
+                raise
+            except Exception as e:
+                span_obj.record_exception(e)
+                span_obj.set_status(Status(StatusCode.ERROR))
+                raise
+            else:
+                span_obj.set_status(Status(StatusCode.OK))
 
     def _set_success_attributes(self, span: Span, execution_time: float) -> None:
         """Set success attributes on the span."""

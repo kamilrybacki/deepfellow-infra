@@ -7,12 +7,34 @@ from typing import Any
 from unittest.mock import MagicMock, call, patch
 
 import pytest
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from opentelemetry.trace.status import StatusCode
 from pydantic import BaseModel
 
-from server.utils.tracing import FuncArgs, InfraTracer, OtlpLoggingManager
+from server.utils.tracing import FuncArgs, InfraTracer, McpInstruments, OtlpLoggingManager
+
+
+def _synchronous_daemon_threads() -> Any:
+    """Patch `threading.Thread` in the tracing module to run its target immediately, in-line.
+
+    The detached-shutdown paths (`_shutdown_span_provider_detached()`, and the equivalent in
+    `_get_mcp_instruments()`) fire a daemon thread and deliberately don't join it — nothing waits
+    for the old provider's shutdown to finish. Asserting on it right after `.start()` would
+    otherwise race the real OS thread; this makes the target run synchronously so the assertion is
+    deterministic without changing production behavior (which stays a real background thread).
+    """
+
+    class _ImmediateThread:
+        def __init__(self, target: Any, args: Any = (), kwargs: Any = None, daemon: bool = False) -> None:
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
+
+        def start(self) -> None:
+            self._target(*self._args, **self._kwargs)
+
+    return patch("server.utils.tracing.threading.Thread", side_effect=_ImmediateThread)
 
 
 def _make_config(enabled: bool = True, endpoint: str = "http://localhost:4317") -> MagicMock:
@@ -73,6 +95,14 @@ def _patch_otel_context_managers():
         patch("server.utils.tracing.TracerProvider"),
         patch("server.utils.tracing.OTLPSpanExporter"),
         patch("server.utils.tracing.BatchSpanProcessor"),
+    ]
+
+
+def _patch_otel_metric_context_managers():
+    return [
+        patch("server.utils.tracing.MeterProvider"),
+        patch("server.utils.tracing.OTLPMetricExporter"),
+        patch("server.utils.tracing.PeriodicExportingMetricReader"),
     ]
 
 
@@ -302,7 +332,7 @@ def test_get_tracer_rebuilds_from_new_providers_tracer_when_endpoint_changes() -
     t.config = _make_config(endpoint="http://old:4317")
     patches = _patch_otel_context_managers()
 
-    with patches[0] as mock_provider_cls, patches[1], patches[2]:
+    with patches[0] as mock_provider_cls, patches[1], patches[2], _synchronous_daemon_threads():
         first_provider = MagicMock()
         second_provider = MagicMock()
         mock_provider_cls.side_effect = [first_provider, second_provider]
@@ -658,3 +688,274 @@ async def test_trace_request_preserves_function_signature() -> None:
     wrapped = t.trace_request()(my_handler)
 
     assert wrapped.__name__ == "my_handler"
+
+
+def test_get_mcp_instruments_builds_provider_with_service_name_and_endpoint() -> None:
+    t = InfraTracer("svc")
+    t.config = _make_config(endpoint="http://otel:4317")
+    patches = _patch_otel_metric_context_managers()
+
+    with patches[0] as mock_provider_cls, patches[1] as mock_exporter_cls, patches[2] as mock_reader_cls:
+        instruments = t._get_mcp_instruments()  # pyright: ignore[reportPrivateUsage]
+
+    resource_arg = mock_provider_cls.call_args[1]["resource"]
+    assert resource_arg.attributes["service.name"] == "svc"
+    assert mock_exporter_cls.call_args == call(endpoint="http://otel:4317", insecure=True)
+    assert mock_reader_cls.call_args == call(mock_exporter_cls.return_value)
+    assert isinstance(instruments, McpInstruments)
+
+    meter = mock_provider_cls.return_value.get_meter.return_value
+    counter_names = [c.args[0] for c in meter.create_counter.call_args_list]
+    assert counter_names == ["mcp.healthcheck.count", "mcp.oauth.refresh.count"]
+    histogram_call = meter.create_histogram.call_args
+    assert histogram_call.args[0] == "mcp.healthcheck.duration"
+    assert histogram_call.kwargs["unit"] == "ms"
+
+
+def test_get_mcp_instruments_caches_instruments() -> None:
+    t = InfraTracer("svc")
+    t.config = _make_config()
+    patches = _patch_otel_metric_context_managers()
+
+    with patches[0] as mock_provider_cls, patches[1], patches[2]:
+        first = t._get_mcp_instruments()  # pyright: ignore[reportPrivateUsage]
+        second = t._get_mcp_instruments()  # pyright: ignore[reportPrivateUsage]
+
+    assert first is second
+    assert mock_provider_cls.return_value.get_meter.call_count == 1
+
+
+def test_get_mcp_instruments_rebuilds_and_shuts_down_old_provider_on_endpoint_change() -> None:
+    t = InfraTracer("svc")
+    t.config = _make_config(endpoint="http://old:4317")
+    patches = _patch_otel_metric_context_managers()
+
+    with patches[0] as mock_provider_cls, patches[1], patches[2], _synchronous_daemon_threads():
+        first_provider = MagicMock()
+        second_provider = MagicMock()
+        mock_provider_cls.side_effect = [first_provider, second_provider]
+
+        first = t._get_mcp_instruments()  # pyright: ignore[reportPrivateUsage]
+        t.config.otel_exporter_otlp_endpoint = "http://new:4317"
+        second = t._get_mcp_instruments()  # pyright: ignore[reportPrivateUsage]
+
+    assert first is not second
+    assert first_provider.shutdown.call_count == 1
+    assert first_provider.shutdown.call_args == call(timeout_millis=5000)
+    assert second_provider.shutdown.call_count == 0
+
+
+def test_mcp_instruments_rebuild_skipped_while_disabled_even_if_endpoint_changed() -> None:
+    t = InfraTracer("svc")
+    t.config = _make_config(enabled=False, endpoint="http://old:4317")
+
+    with patch.object(t, "_get_mcp_instruments") as mock_get:
+        t.config.otel_exporter_otlp_endpoint = "http://new:4317"
+        assert t.mcp_instruments() is None
+
+    mock_get.assert_not_called()
+
+
+def test_mcp_instruments_returns_cached_instruments_after_disable_then_reenable() -> None:
+    t = InfraTracer("svc")
+    t.config = _make_config(enabled=True)
+    patches = _patch_otel_metric_context_managers()
+
+    with patches[0] as mock_provider_cls, patches[1], patches[2]:
+        first = t.mcp_instruments()
+        t.config.otel_tracing_enabled = False
+        assert t.mcp_instruments() is None
+        t.config.otel_tracing_enabled = True
+        second = t.mcp_instruments()
+
+    assert first is second
+    assert mock_provider_cls.return_value.get_meter.call_count == 1
+
+
+def test_mcp_instruments_returns_none_when_config_not_set() -> None:
+    t = InfraTracer("svc")
+
+    assert t.mcp_instruments() is None
+
+
+def test_mcp_instruments_returns_none_when_tracing_disabled() -> None:
+    t = InfraTracer("svc")
+    t.config = _make_config(enabled=False)
+
+    assert t.mcp_instruments() is None
+
+
+def test_mcp_instruments_returns_instruments_when_tracing_enabled() -> None:
+    t = InfraTracer("svc")
+    t.config = _make_config(enabled=True)
+    patches = _patch_otel_metric_context_managers()
+
+    with patches[0], patches[1], patches[2]:
+        result = t.mcp_instruments()
+
+    assert isinstance(result, McpInstruments)
+
+
+def test_span_yields_none_when_config_not_set() -> None:
+    t = InfraTracer("svc")
+
+    with t.span("mcp.op") as span:
+        assert span is None
+
+
+def test_span_yields_none_when_tracing_disabled() -> None:
+    t = _make_tracer_with_config(enabled=False)
+
+    with t.span("mcp.op") as span:
+        assert span is None
+
+
+def test_span_starts_and_ends_span_with_ok_status_when_enabled() -> None:
+    t = _make_tracer_with_config(enabled=True)
+    fake_span = _make_span()
+    fake_tracer = MagicMock()
+    fake_tracer.start_as_current_span.return_value.__enter__.return_value = fake_span
+    t.tracer = fake_tracer
+    t._tracer_endpoint = t.config.otel_exporter_otlp_endpoint  # pyright: ignore[reportPrivateUsage, reportOptionalMemberAccess]
+
+    with t.span("mcp.op", **{"mcp.instance": "default"}) as span:
+        assert span is fake_span
+
+    assert fake_tracer.start_as_current_span.call_args == call(
+        "mcp.op", attributes={"mcp.instance": "default"}, record_exception=False, set_status_on_exception=False
+    )
+    assert fake_tracer.start_as_current_span.return_value.__exit__.call_count == 1
+    status_arg = fake_span.set_status.call_args[0][0]
+    assert status_arg.status_code == StatusCode.OK
+
+
+def test_span_records_exception_and_reraises_when_body_raises() -> None:
+    t = _make_tracer_with_config(enabled=True)
+    fake_span = _make_span()
+    fake_tracer = MagicMock()
+    fake_tracer.start_as_current_span.return_value.__enter__.return_value = fake_span
+    t.tracer = fake_tracer
+    t._tracer_endpoint = t.config.otel_exporter_otlp_endpoint  # pyright: ignore[reportPrivateUsage, reportOptionalMemberAccess]
+
+    with pytest.raises(ValueError, match="boom"), t.span("mcp.op"):
+        raise ValueError("boom")
+
+    assert fake_span.record_exception.call_count == 1
+    status_arg = fake_span.set_status.call_args[0][0]
+    assert status_arg.status_code == StatusCode.ERROR
+
+
+def test_span_records_ok_status_and_no_exception_when_body_raises_client_http_exception() -> None:
+    t = _make_tracer_with_config(enabled=True)
+    fake_span = _make_span()
+    fake_tracer = MagicMock()
+    fake_tracer.start_as_current_span.return_value.__enter__.return_value = fake_span
+    t.tracer = fake_tracer
+    t._tracer_endpoint = t.config.otel_exporter_otlp_endpoint  # pyright: ignore[reportPrivateUsage, reportOptionalMemberAccess]
+
+    with pytest.raises(HTTPException), t.span("mcp.op"):
+        raise HTTPException(status_code=400, detail="bad input")
+
+    assert fake_span.record_exception.call_count == 0
+    status_arg = fake_span.set_status.call_args[0][0]
+    assert status_arg.status_code == StatusCode.OK
+
+
+def test_span_records_error_status_and_exception_when_body_raises_server_http_exception() -> None:
+    t = _make_tracer_with_config(enabled=True)
+    fake_span = _make_span()
+    fake_tracer = MagicMock()
+    fake_tracer.start_as_current_span.return_value.__enter__.return_value = fake_span
+    t.tracer = fake_tracer
+    t._tracer_endpoint = t.config.otel_exporter_otlp_endpoint  # pyright: ignore[reportPrivateUsage, reportOptionalMemberAccess]
+
+    with pytest.raises(HTTPException), t.span("mcp.op"):
+        raise HTTPException(status_code=502, detail="upstream failed")
+
+    assert fake_span.record_exception.call_count == 1
+    status_arg = fake_span.set_status.call_args[0][0]
+    assert status_arg.status_code == StatusCode.ERROR
+
+
+def test_span_yields_none_when_tracer_acquisition_fails() -> None:
+    t = _make_tracer_with_config(enabled=True)
+
+    with patch.object(t, "_get_tracer", side_effect=RuntimeError("boom")), t.span("mcp.op") as span:
+        assert span is None
+
+
+def test_mcp_instruments_returns_none_when_building_fails() -> None:
+    t = InfraTracer("svc")
+    t.config = _make_config(enabled=True)
+
+    with patch.object(t, "_get_mcp_instruments", side_effect=RuntimeError("boom")):
+        assert t.mcp_instruments() is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_stops_tracer_and_meter_providers_and_resets_state() -> None:
+    t = InfraTracer("svc")
+    provider = MagicMock()
+    meter_provider = MagicMock()
+    t._provider = provider  # pyright: ignore[reportPrivateUsage]
+    t._meter_provider = meter_provider  # pyright: ignore[reportPrivateUsage]
+    t.tracer = MagicMock()
+    t._tracer_endpoint = "http://old:4317"  # pyright: ignore[reportPrivateUsage]
+    t._mcp_instruments = MagicMock()  # pyright: ignore[reportPrivateUsage]
+    t._meter_endpoint = "http://old:4317"  # pyright: ignore[reportPrivateUsage]
+
+    await t.shutdown()
+
+    assert provider.shutdown.call_count == 1
+    assert meter_provider.shutdown.call_args == call(timeout_millis=5000)
+    assert t._provider is None  # pyright: ignore[reportPrivateUsage]
+    assert t._meter_provider is None  # pyright: ignore[reportPrivateUsage]
+    assert t.tracer is None
+    assert t._tracer_endpoint is None  # pyright: ignore[reportPrivateUsage]
+    assert t._mcp_instruments is None  # pyright: ignore[reportPrivateUsage]
+    assert t._meter_endpoint is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_swallows_meter_provider_shutdown_error(caplog: pytest.LogCaptureFixture) -> None:
+    """A failed final flush (e.g. an unreachable OTLP collector) must not fail the caller.
+
+    `/admin/config` and `lifecycle.py`'s shutdown phase both call `InfraTracer.shutdown()`
+    directly; if `MeterProvider.shutdown()` raised through it, an admin applying an unrelated
+    config change would get a misleading "could not be applied live" error even though the
+    config itself applied fine.
+    """
+    t = InfraTracer("svc")
+    meter_provider = MagicMock()
+    meter_provider.shutdown.side_effect = RuntimeError("boom")
+    t._meter_provider = meter_provider  # pyright: ignore[reportPrivateUsage]
+
+    with caplog.at_level(logging.WARNING):
+        await t.shutdown()  # must not raise
+
+    assert t._meter_provider is None  # pyright: ignore[reportPrivateUsage]
+    assert "Failed to shut down OTel meter provider" in caplog.text
+
+
+def test_run_span_provider_shutdown_logs_error(caplog: pytest.LogCaptureFixture) -> None:
+    """Mirrors `test_shutdown_swallows_meter_provider_shutdown_error()` for the span-provider side.
+
+    `_run_span_provider_shutdown()` runs as a bare `threading.Thread` target (from both
+    `_shutdown_span_provider()` and `_shutdown_span_provider_detached()`), so an unhandled exception
+    would otherwise only reach `threading.excepthook` and never our structured logs.
+    """
+    t = InfraTracer("svc")
+    provider = MagicMock()
+    provider.shutdown.side_effect = RuntimeError("boom")
+
+    with caplog.at_level(logging.WARNING):
+        t._run_span_provider_shutdown(provider)  # pyright: ignore[reportPrivateUsage]  # must not raise
+
+    assert "Failed to shut down OTel span provider" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_shutdown_noop_when_nothing_built() -> None:
+    t = InfraTracer("svc")
+
+    await t.shutdown()  # must not raise

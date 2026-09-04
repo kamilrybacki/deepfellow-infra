@@ -177,6 +177,19 @@ async def test_lifespan_skips_setup_otlp_logging_when_disabled(app: FastAPI, bas
 
 
 @pytest.mark.asyncio
+async def test_lifespan_shuts_down_tracer_on_exit(app: FastAPI, base_mocks: dict[str, Mock]) -> None:
+    cfg = _make_config()
+    _apply_base_patches(base_mocks, config=cfg)
+
+    with patch("server.lifecycle.tracer") as mock_tracer:
+        mock_tracer.shutdown = AsyncMock()
+        async with lifespan(app):
+            pass
+
+        assert mock_tracer.shutdown.call_count == 1
+
+
+@pytest.mark.asyncio
 async def test_lifespan_calls_check_subnet_when_set(app: FastAPI, base_mocks: dict[str, Mock]) -> None:
     cfg = _make_config(docker_subnet="my-net")
     _apply_base_patches(base_mocks, config=cfg)
