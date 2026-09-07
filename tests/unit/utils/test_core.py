@@ -52,6 +52,27 @@ async def test_run_command_nonzero_exit():
 
 
 @pytest.mark.asyncio
+async def test_run_command_kills_subprocess_on_cancel():
+    captured_proc: asyncio.subprocess.Process | None = None
+    real_create_subprocess_exec = asyncio.create_subprocess_exec
+
+    async def capture_create_subprocess_exec(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+        nonlocal captured_proc
+        captured_proc = await real_create_subprocess_exec(*args, **kwargs)  # type: ignore[arg-type]
+        return captured_proc
+
+    with patch("asyncio.create_subprocess_exec", side_effect=capture_create_subprocess_exec):
+        task = asyncio.create_task(Utils.run_command(["sleep", "5"]))
+        await asyncio.sleep(0.1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert captured_proc is not None
+    assert captured_proc.returncode is not None
+
+
+@pytest.mark.asyncio
 async def test_run_command_for_success_raises_on_nonzero():
     with pytest.raises(RuntimeError):
         await Utils.run_command_for_success(["sh", "-c", "exit 2"])

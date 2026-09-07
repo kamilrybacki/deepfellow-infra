@@ -1961,6 +1961,9 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
             raise
 
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
+            model_info: ModelInstalledInfo | None = None
+            docker_options_edited: DockerOptions | None = None
+            adopted = False
             try:
                 model_dir = self._get_working_dir() / "models"
                 model_dir.mkdir(parents=True, exist_ok=True)
@@ -1978,7 +1981,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
                 docker_options_edited = deepcopy(docker_options)
                 docker_options_edited.env_vars = docker_options_edited.env_vars | parsed_model_options.envs
-                docker_exposed_port, _, _ = await self.docker_service.install_and_run_docker(docker_options_edited)
+                docker_exposed_port, _, adopted = await self.docker_service.install_and_run_docker(docker_options_edited)
                 container_host = self.docker_service.get_container_host(subnet, docker_options_edited.name)
                 container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options_edited.image_port)
                 info.models[model_id] = model_info = ModelInstalledInfo(
@@ -1994,43 +1997,49 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                     headers=parsed_model_options.headers,
                     envs=parsed_model_options.envs,
                 )
-                try:
-                    if model.proxy_transport == "sse":
-                        model_info.registration_id = self.endpoint_registry.register_mcp_sse_endpoint_as_proxy(
-                            url=model_info.prefix,
-                            props=model.model_props,
-                            options=ProxyOptions(
-                                url=model_info.base_url + "/sse",
-                                allowed_request_headers=["accept", "mcp-session-id"],
-                                allowed_response_headers=["accept", "mcp-session-id"],
-                                headers=model.headers | parsed_model_options.headers if model.headers else parsed_model_options.headers,
-                            ),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
-                        )
-                    else:
-                        model_info.registration_id = self.endpoint_registry.register_mcp_endpoint_as_proxy(
-                            url=model_info.prefix,
-                            props=model.model_props,
-                            options=ProxyOptions(
-                                url=model_info.base_url + "/mcp",
-                                allowed_request_headers=["accept", "mcp-session-id"],
-                                allowed_response_headers=["accept", "mcp-session-id"],
-                                headers=model.headers | parsed_model_options.headers if model.headers else parsed_model_options.headers,
-                            ),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
-                        )
-                    self.models_downloaded[model_id] = DownloadedInfo(docker_options.image)
-                    task = asyncio.create_task(self._fetch_tools_background(instance, model_id))
-                    self._background_tasks.add(task)
-                    task.add_done_callback(self._background_tasks.discard)
-                    stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
-                    return InstallModelOut(status="OK", details="Installed")
-                except Exception:
-                    if model_info.registration_id:
+                if model.proxy_transport == "sse":
+                    model_info.registration_id = self.endpoint_registry.register_mcp_sse_endpoint_as_proxy(
+                        url=model_info.prefix,
+                        props=model.model_props,
+                        options=ProxyOptions(
+                            url=model_info.base_url + "/sse",
+                            allowed_request_headers=["accept", "mcp-session-id"],
+                            allowed_response_headers=["accept", "mcp-session-id"],
+                            headers=model.headers | parsed_model_options.headers if model.headers else parsed_model_options.headers,
+                        ),
+                        registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                    )
+                else:
+                    model_info.registration_id = self.endpoint_registry.register_mcp_endpoint_as_proxy(
+                        url=model_info.prefix,
+                        props=model.model_props,
+                        options=ProxyOptions(
+                            url=model_info.base_url + "/mcp",
+                            allowed_request_headers=["accept", "mcp-session-id"],
+                            allowed_response_headers=["accept", "mcp-session-id"],
+                            headers=model.headers | parsed_model_options.headers if model.headers else parsed_model_options.headers,
+                        ),
+                        registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                    )
+                self.models_downloaded[model_id] = DownloadedInfo(docker_options.image)
+                task = asyncio.create_task(self._fetch_tools_background(instance, model_id))
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+                stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
+                return InstallModelOut(status="OK", details="Installed")
+            except BaseException:
+                # Each cleanup step is independently guarded so one raising (e.g. the endpoint unregister) can't
+                # skip the rest - in particular, it must never skip the docker rollback below.
+                if model_info is not None and model_info.registration_id:
+                    try:
                         self.endpoint_registry.unregister_mcp_endpoint(model_info.prefix, model_info.registration_id)
-                    if info.models.get(model_id) is model_info:
-                        info.models.pop(model_id, None)
-                    raise
+                    except Exception:
+                        logger.exception("Error unregistering MCP endpoint for %r during install rollback", model_id)
+                if model_info is not None and info.models.get(model_id) is model_info:
+                    info.models.pop(model_id, None)
+                if docker_options_edited is not None:
+                    await self._rollback_failed_install_docker(docker_options_edited, adopted=adopted)
+                raise
             finally:
                 self._installing.discard(key)
 

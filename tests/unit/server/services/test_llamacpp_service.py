@@ -87,6 +87,7 @@ def _setup_install_mocks(svc: LLamacppService, deps: dict[str, Any]) -> Installe
     deps["docker_service"].get_docker_container_name.return_value = "container"
     deps["docker_service"].get_container_host.return_value = "localhost"
     deps["docker_service"].get_container_port.return_value = 8080
+    deps["docker_service"].stop_docker = AsyncMock()
     return installed
 
 

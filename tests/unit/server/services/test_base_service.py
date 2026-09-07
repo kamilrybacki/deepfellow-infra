@@ -2582,6 +2582,60 @@ async def test_stop_docker_logs_error_on_exception(base2_svc: _Base2Impl, base2_
 
 
 @pytest.mark.asyncio
+async def test_stop_docker_shields_teardown_from_a_second_cancellation(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """A second cancellation of the caller (e.g. a repeated cancel request) must not kill the teardown
+    subprocess mid-flight - it should keep running to completion even though the caller unwinds."""
+    teardown_started = asyncio.Event()
+    teardown_finished = asyncio.Event()
+
+    async def slow_stop_docker(*args: object, **kwargs: object) -> None:
+        teardown_started.set()
+        await asyncio.sleep(0.2)
+        teardown_finished.set()
+
+    base2_deps["docker_service"].stop_docker = AsyncMock(side_effect=slow_stop_docker)
+    docker_options = MagicMock()
+
+    outer_task = asyncio.create_task(base2_svc._stop_docker(docker_options))  # pyright: ignore[reportPrivateUsage]
+    await asyncio.wait_for(teardown_started.wait(), timeout=1)
+
+    outer_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await outer_task
+
+    assert not teardown_finished.is_set()
+    await asyncio.wait_for(teardown_finished.wait(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_stop_docker_logs_failure_via_done_callback_when_shield_swallows_it(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any]
+) -> None:
+    """A real teardown failure that lands concurrently with the caller's own cancellation must still be
+    logged - asyncio.shield alone would otherwise let that exception go unretrieved and silently dropped."""
+    teardown_started = asyncio.Event()
+
+    async def failing_stop_docker(*args: object, **kwargs: object) -> None:
+        teardown_started.set()
+        await asyncio.sleep(0.1)
+        raise RuntimeError("teardown boom")
+
+    base2_deps["docker_service"].stop_docker = AsyncMock(side_effect=failing_stop_docker)
+    docker_options = MagicMock()
+
+    with patch("server.services.base2_service.logger") as mock_logger:
+        outer_task = asyncio.create_task(base2_svc._stop_docker(docker_options))  # pyright: ignore[reportPrivateUsage]
+        await asyncio.wait_for(teardown_started.wait(), timeout=1)
+
+        outer_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await outer_task
+
+        await asyncio.sleep(0.2)  # let the shielded teardown task actually fail and its done-callback run
+        mock_logger.error.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_verify_docker_image_raises_when_warnings_not_ignored(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
     base2_deps["docker_service"].get_image_warnings = AsyncMock(return_value=["w1"])
 

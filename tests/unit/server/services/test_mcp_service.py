@@ -2406,6 +2406,7 @@ async def test_install_model_registration_failure_rolls_back_model_without_unreg
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     model_id = "open-websearch"
     deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True, False))
+    deps["docker_service"].stop_docker = AsyncMock()
     deps["docker_service"].get_container_host.return_value = "172.20.0.2"
     deps["docker_service"].get_container_port.return_value = 3000
     deps["endpoint_registry"].register_mcp_endpoint_as_proxy.side_effect = RuntimeError("registry down")
@@ -2423,6 +2424,7 @@ async def test_install_model_registration_failure_rolls_back_model_without_unreg
     info = svc.get_instance_installed_info("default")
     assert model_id not in info.models
     assert deps["endpoint_registry"].unregister_mcp_endpoint.call_count == 0
+    deps["docker_service"].stop_docker.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -2432,6 +2434,7 @@ async def test_install_model_post_registration_failure_unregisters_and_rolls_bac
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     model_id = "open-websearch"
     deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True, False))
+    deps["docker_service"].stop_docker = AsyncMock()
     deps["docker_service"].get_container_host.return_value = "172.20.0.2"
     deps["docker_service"].get_container_port.return_value = 3000
     deps["endpoint_registry"].register_mcp_endpoint_as_proxy.return_value = "reg-id"
@@ -2452,6 +2455,39 @@ async def test_install_model_post_registration_failure_unregisters_and_rolls_bac
     info = svc.get_instance_installed_info("default")
     assert model_id not in info.models
     assert deps["endpoint_registry"].unregister_mcp_endpoint.call_count == 1
+    deps["docker_service"].stop_docker.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_install_model_unregister_failure_during_rollback_does_not_skip_docker_rollback(
+    svc: McpService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    """If the endpoint unregister step itself raises during rollback, the docker container must still be torn down."""
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    model_id = "open-websearch"
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True, False))
+    deps["docker_service"].stop_docker = AsyncMock()
+    deps["docker_service"].get_container_host.return_value = "172.20.0.2"
+    deps["docker_service"].get_container_port.return_value = 3000
+    deps["endpoint_registry"].register_mcp_endpoint_as_proxy.return_value = "reg-id"
+    deps["endpoint_registry"].unregister_mcp_endpoint.side_effect = RuntimeError("unregister exploded")
+    bad_tasks: MagicMock = MagicMock()
+    bad_tasks.add.side_effect = RuntimeError("add failed")
+
+    with (
+        patch.object(svc, "_verify_docker_image", new=AsyncMock()),
+        patch.object(svc, "_download_image_or_set_progress", new=AsyncMock()),
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),
+        patch("server.services.mcp_service.get_base_url", return_value="http://172.20.0.2:3000"),
+        patch.object(svc, "_background_tasks", bad_tasks),  # pyright: ignore[reportPrivateUsage]
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn())  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError, match="add failed"):
+            await promise.wait()
+
+    info = svc.get_instance_installed_info("default")
+    assert model_id not in info.models
+    deps["docker_service"].stop_docker.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -2461,6 +2497,7 @@ async def test_install_model_registration_failure_skips_rollback_when_already_re
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
     model_id = "open-websearch"
     deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True, False))
+    deps["docker_service"].stop_docker = AsyncMock()
     deps["docker_service"].get_container_host.return_value = "172.20.0.2"
     deps["docker_service"].get_container_port.return_value = 3000
 
@@ -2483,6 +2520,95 @@ async def test_install_model_registration_failure_skips_rollback_when_already_re
 
     info = svc.get_instance_installed_info("default")
     assert model_id not in info.models
+    deps["docker_service"].stop_docker.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_install_model_cancelled_after_docker_start_rolls_back_container(
+    svc: McpService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    """Cancelling after `install_and_run_docker` succeeds (e.g. during registration) must tear the container back down."""
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    model_id = "open-websearch"
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True, False))
+    deps["docker_service"].stop_docker = AsyncMock()
+    deps["docker_service"].get_container_host.return_value = "172.20.0.2"
+    deps["docker_service"].get_container_port.return_value = 3000
+    deps["endpoint_registry"].register_mcp_endpoint_as_proxy.side_effect = asyncio.CancelledError()
+
+    with (
+        patch.object(svc, "_verify_docker_image", new=AsyncMock()),
+        patch.object(svc, "_download_image_or_set_progress", new=AsyncMock()),
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),
+        patch("server.services.mcp_service.get_base_url", return_value="http://172.20.0.2:3000"),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn())  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(asyncio.CancelledError):
+            await promise.wait()
+
+    info = svc.get_instance_installed_info("default")
+    assert model_id not in info.models
+    deps["docker_service"].stop_docker.assert_called_once()
+    assert deps["endpoint_registry"].unregister_mcp_endpoint.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_install_model_promise_cancel_while_docker_starting_rolls_back_container(
+    svc: McpService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    """Same as above but with a genuine `promise.cancel()` (real task cancellation at a real await point,
+    like `cancel_model_install()` performs) instead of a synchronously-raised CancelledError."""
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    model_id = "open-websearch"
+    deps["docker_service"].stop_docker = AsyncMock()
+    docker_up_started = asyncio.Event()
+
+    async def hang_after_docker_up_starts(*args: object, **kwargs: object) -> tuple[int, bool, bool]:
+        docker_up_started.set()
+        await asyncio.Event().wait()  # only a real task cancellation ends this
+        raise AssertionError("unreachable")
+
+    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=hang_after_docker_up_starts)
+
+    with (
+        patch.object(svc, "_verify_docker_image", new=AsyncMock()),
+        patch.object(svc, "_download_image_or_set_progress", new=AsyncMock()),
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn())  # pyright: ignore[reportPrivateUsage]
+        await asyncio.wait_for(docker_up_started.wait(), timeout=1)
+
+        promise.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await promise.task
+
+    info = svc.get_instance_installed_info("default")
+    assert model_id not in info.models
+    deps["docker_service"].stop_docker.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_install_model_failure_before_docker_start_skips_rollback(svc: McpService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """A failure before `install_and_run_docker` is even called has nothing to roll back yet."""
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    model_id = "open-websearch"
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True, False))
+    deps["docker_service"].stop_docker = AsyncMock()
+
+    with (
+        patch.object(svc, "_verify_docker_image", new=AsyncMock()),
+        patch.object(svc, "_download_image_or_set_progress", new=AsyncMock(side_effect=RuntimeError("download failed"))),
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn())  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RuntimeError):
+            await promise.wait()
+
+    info = svc.get_instance_installed_info("default")
+    assert model_id not in info.models
+    deps["docker_service"].install_and_run_docker.assert_not_called()
+    deps["docker_service"].stop_docker.assert_not_called()
+    assert deps["endpoint_registry"].unregister_mcp_endpoint.call_count == 0
 
 
 def _make_proxy_custom(

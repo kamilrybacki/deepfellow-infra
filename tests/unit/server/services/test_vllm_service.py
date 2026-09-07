@@ -2587,6 +2587,7 @@ async def test_install_model_releases_gpu_on_cancelled_error(svc: VllmService, d
     deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=asyncio.CancelledError())
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "container"
+    deps["docker_service"].stop_docker = AsyncMock()
 
     model_id = "cancel-model"
     svc2.models["default"][model_id] = VllmModel(hf_id=model_id, size="1GB", gpu_memory_utilization=0.5)
@@ -2840,6 +2841,7 @@ async def test_install_model_registration_failure_skips_rollback_when_already_re
     svc: VllmService, deps: dict[str, Any], tmp_path: Path
 ) -> None:
     installed = _setup_install_mocks(svc, deps)
+    deps["docker_service"].stop_docker = AsyncMock()
     model_id = next(iter(svc.models["default"]))
 
     def side_effect(*args: object, **kwargs: object) -> None:
