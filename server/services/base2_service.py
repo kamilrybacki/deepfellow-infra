@@ -10,6 +10,7 @@ import time
 import uuid
 from abc import abstractmethod
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generic, Protocol, TypeVar, cast
@@ -1464,10 +1465,20 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
 
     async def _stop_docker(self, docker_options: DockerOptions) -> None:
         """Stop docker and log error if it occurs."""
-        try:
-            await self.docker_service.stop_docker(docker_options)
-        except Exception:
-            logger.exception("Error during stopping docker compose %s", docker_options.name)
+        task: asyncio.Task[None] = asyncio.ensure_future(self.docker_service.stop_docker(docker_options))
+
+        def _log_if_failed(finished: "asyncio.Task[None]") -> None:
+            if not finished.cancelled() and (exc := finished.exception()) is not None:
+                logger.error("Error during stopping docker compose %s", docker_options.name, exc_info=exc)
+
+        # Logging happens in the done-callback above, not in an except block here: asyncio.shield
+        # discards a real teardown failure that lands concurrently with the caller itself being
+        # cancelled a second time, which would otherwise silently drop that failure. Shielded so a
+        # second cancellation of the caller can't kill this teardown's own subprocess mid-`docker
+        # compose down`, which would leave the container half-removed.
+        task.add_done_callback(_log_if_failed)
+        with suppress(Exception):  # already logged by the done-callback above
+            await asyncio.shield(task)
 
     async def _rollback_failed_install_docker(self, docker_options: DockerOptions, *, adopted: bool) -> None:
         """Undo `install_and_run_docker` after a later step of the same install attempt fails.

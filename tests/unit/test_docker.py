@@ -1285,6 +1285,74 @@ async def test_install_and_run_docker_adoption_in_subnet_mode_returns_minus_one(
 
 
 @pytest.mark.asyncio
+async def test_install_and_run_docker_cancel_kills_up_subprocess_and_rollback_tears_down(
+    docker_service: DockerService, tmp_path: Path
+) -> None:
+    """End-to-end kill-on-cancel proof against a real subprocess (no docker daemon required).
+
+    Cancels `install_and_run_docker` while a fake `docker compose up -d --wait` is genuinely mid-run (proven by
+    it having written its pidfile before sleeping), then asserts the real subprocess was killed - and that the
+    existing rollback path's `docker compose down --remove-orphans` (stop_docker_compose) actually tears down
+    a real subprocess too, rather than racing an orphaned still-running `up`.
+    """
+    compose_file = tmp_path / "compose.yaml"
+    pid_file = tmp_path / "up.pid"
+    down_log = tmp_path / "down.log"
+    fake_compose = tmp_path / "fake-docker-compose.sh"
+    fake_compose.write_text(
+        f"""#!/bin/sh
+case " $* " in
+  *' up '*)
+    echo $$ > {pid_file}
+    sleep 30
+    ;;
+  *' down '*)
+    echo down >> {down_log}
+    ;;
+esac
+"""
+    )
+    fake_compose.chmod(0o755)
+    docker_service.docker_compose_cmd = str(fake_compose)
+
+    options = _opts()
+    docker_service.port_service.is_port_available.return_value = True  # pyright: ignore[reportAttributeAccessIssue]
+
+    real_create_subprocess_exec = asyncio.create_subprocess_exec
+    captured_procs: list[asyncio.subprocess.Process] = []
+
+    async def capture_create_subprocess_exec(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+        proc = await real_create_subprocess_exec(*args, **kwargs)  # type: ignore[arg-type]
+        captured_procs.append(proc)
+        return proc
+
+    with (
+        patch.object(docker_service, "get_docker_compose_file_path", return_value=compose_file),
+        patch.object(docker_service, "is_docker_compose_running", new_callable=AsyncMock, return_value=False),
+        patch.object(docker_service, "has_docker_compose_difference", new_callable=AsyncMock, return_value=(False, 18080)),
+        patch("asyncio.create_subprocess_exec", side_effect=capture_create_subprocess_exec),
+    ):
+        task = asyncio.create_task(docker_service.install_and_run_docker(options))
+        for _ in range(100):
+            if pid_file.exists():
+                break
+            await asyncio.sleep(0.05)
+        else:
+            pytest.fail("fake docker compose up never started")
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert len(captured_procs) == 1
+    assert captured_procs[0].returncode is not None  # killed, not left running
+
+    await docker_service.stop_docker_compose(compose_file)
+    assert down_log.exists()
+    assert down_log.read_text().strip() == "down"
+
+
+@pytest.mark.asyncio
 async def test_uninstall_docker_runs_down_and_removes_file(docker_service: DockerService, tmp_path: Path) -> None:
     options = _opts()
     compose_file = tmp_path / "mymodel.yaml"
