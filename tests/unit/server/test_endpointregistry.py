@@ -2074,6 +2074,18 @@ def test_register_proxy_custom_uses_configured_standard_proxy_timeout():
     assert registered_options.read_timeout_seconds == 1800
 
 
+def test_register_proxy_custom_forwards_full_path():
+    reg = make_registry()
+
+    with patch.object(reg, "register_custom_endpoint_as_proxy") as mock_register:
+        reg._register_proxy(  # pyright: ignore[reportPrivateUsage]
+            "custom/url", "custom", make_props(), "http://example.com/", "key", RegistrationOptions(origin="http://example.com/")
+        )
+
+    registered_options = mock_register.call_args.kwargs["options"]
+    assert registered_options.forward_full_path is True
+
+
 def test_register_proxy_mcp_registers_mcp_endpoint():
     reg = make_registry()
 
@@ -3026,6 +3038,36 @@ async def test_register_custom_endpoint_as_proxy_callback_invokes_make_http_requ
 
     assert result is mock_streaming
     assert mock_call.call_args.kwargs["timeout"] == aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=expected_sock_read)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("forward_full_path", "expected_url"),
+    [
+        pytest.param(False, "http://example.com/custom/sub/path", id="strips-prefix-for-local-container"),
+        pytest.param(True, "http://example.com/custom/my-svc/sub/path", id="forwards-full-path-for-mesh"),
+    ],
+)
+async def test_register_custom_endpoint_as_proxy_callback_forward_full_path(forward_full_path: bool, expected_url: str) -> None:
+    reg = make_registry()
+    opts = ProxyOptions(url="http://example.com/custom", forward_full_path=forward_full_path)
+    reg.register_custom_endpoint_as_proxy("my-svc", make_props(), opts, None)
+    ep = reg.custom_endpoints.get_model("my-svc")
+    mock_http_response = MagicMock()
+    mock_streaming = MagicMock(spec=StreamingResponse)
+    mock_http_response.as_streaming_response.return_value = mock_streaming
+    request = MagicMock()
+    request.headers = {"content-type": "application/json"}
+    request.method = "POST"
+    request.path_params = {"full_path": "my-svc/sub/path"}
+    request.url.query = ""
+    request.stream.return_value = AsyncMock()
+
+    with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response) as mock_call:
+        result = await ep.endpoint.on_request(request)  # pyright: ignore[reportOptionalMemberAccess]
+
+    assert result is mock_streaming
+    assert mock_call.call_args.kwargs["url"] == expected_url
 
 
 @pytest.mark.asyncio

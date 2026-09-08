@@ -593,6 +593,10 @@ class ProxyOptions:
     # register_custom_endpoint_as_proxy; ignored by every other proxy path. This is deliberate —
     # the longer timeout is meant for doc-chunker and other custom services only.
     read_timeout_seconds: int = 300
+    # Custom-endpoint proxy only. True forwards the full path (prefix included) — for proxying to
+    # another DF-Infra node's /custom/{full_path}. False (default) strips the prefix — for
+    # proxying straight to a backing container, which doesn't know about it.
+    forward_full_path: bool = False
 
     async def get_request_headers(self, request: Request | None) -> dict[str, str]:
         """Get request headers, merging in freshly-computed dynamic headers (e.g. a live OAuth token) last."""
@@ -993,7 +997,10 @@ class EndpointRegistry:
         async def on_request(request: Request) -> StreamingResponse:
             headers = await options.get_request_headers(request)
             headers["content-type"] = request.headers.get("content-type") or "application/octet-stream"
-            _, _, sub_path = request.path_params["full_path"].partition("/")
+            if options.forward_full_path:
+                sub_path = request.path_params["full_path"]
+            else:
+                _, _, sub_path = request.path_params["full_path"].partition("/")
             full_url = Utils.join_url(options.url, sub_path) if sub_path else options.url
             if request.url.query:
                 full_url = f"{full_url}?{request.url.query}"
@@ -1299,6 +1306,7 @@ class EndpointRegistry:
                     url=urljoin(url, "custom"),
                     headers={"Authorization": f"Bearer {api_key}"},
                     read_timeout_seconds=self.config.standard_proxy_timeout_seconds,
+                    forward_full_path=True,
                 ),
                 registration_options=registration_options,
             )
