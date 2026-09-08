@@ -1427,6 +1427,45 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                             fallback = await _fetch_tools_from_sse_endpoint(f"{base_url}/sse", headers)
                             result = fallback if fallback.healthy else result
 
+                    if result.healthy and not result.error and result.transport and result.transport != transport:
+                        # The live proxy registered at install time still targets `transport`, but only
+                        # the other one actually answers — re-register it so real traffic (not just this
+                        # probe) stops hitting the broken endpoint. `healthy=True` alone isn't enough to
+                        # act on: it only means the transport connected and `initialize` completed, while
+                        # a later step (waiting for the SSE endpoint event, the MCP response, or
+                        # tools/list itself) can still time out or error — reported as `healthy=True`
+                        # with `error` set and no tools. Re-registering on that would permanently point
+                        # the live proxy at a transport that never actually returned tools either, so
+                        # `error` must be unset too for this to count as a real, complete success.
+                        merged_headers = model.headers | headers if model.headers else headers
+                        try:
+                            new_registration_id = self._register_docker_mcp_proxy(model, model_info, result.transport, merged_headers)
+                        except Exception:
+                            logger.exception(
+                                "Failed to register MCP proxy for prefix %s on transport %s; keeping the existing registration %s",
+                                model_info.prefix,
+                                result.transport,
+                                model_info.registration_id,
+                            )
+                            raise
+                        old_registration_id = model_info.registration_id
+                        # Update bookkeeping before unregistering the old entry: `unregister_mcp_endpoint`
+                        # can still raise after removing it (e.g. the parent-infra notification fails), and
+                        # we'd rather keep pointing at the new, working registration than leave `model_info`
+                        # referencing an id that's already gone from the registry.
+                        model_info.registration_id = new_registration_id
+                        model.proxy_transport = result.transport
+                        try:
+                            self.endpoint_registry.unregister_mcp_endpoint(model_info.prefix, old_registration_id)
+                        except Exception:
+                            logger.exception(
+                                "Failed to unregister stale MCP proxy registration %s for prefix %s"
+                                " after re-registering it on transport %s",
+                                old_registration_id,
+                                model_info.prefix,
+                                result.transport,
+                            )
+
                 if result.healthy:
                     self._apply_healthcheck_result(model, model_info.prefix, result)
 
@@ -1505,6 +1544,35 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
             )
         return self.endpoint_registry.register_mcp_endpoint_as_proxy(
             url=parsed_options.prefix, props=model.model_props, options=proxy_options, registration_options=registration_options
+        )
+
+    def _register_docker_mcp_proxy(
+        self, model: SrvMcpModel, model_info: ModelInstalledInfo, transport: str, headers: dict[str, str]
+    ) -> RegistrationId:
+        """Register (or re-register) the live MCP proxy for a docker-installed model at the given transport."""
+        registration_options = RegistrationOptions(origin="local", owned_by=self.get_type())
+        if transport == "sse":
+            return self.endpoint_registry.register_mcp_sse_endpoint_as_proxy(
+                url=model_info.prefix,
+                props=model.model_props,
+                options=ProxyOptions(
+                    url=model_info.base_url + "/sse",
+                    allowed_request_headers=["accept", "mcp-session-id"],
+                    allowed_response_headers=["accept", "mcp-session-id"],
+                    headers=headers,
+                ),
+                registration_options=registration_options,
+            )
+        return self.endpoint_registry.register_mcp_endpoint_as_proxy(
+            url=model_info.prefix,
+            props=model.model_props,
+            options=ProxyOptions(
+                url=model_info.base_url + "/mcp",
+                allowed_request_headers=["accept", "mcp-session-id"],
+                allowed_response_headers=["accept", "mcp-session-id"],
+                headers=headers,
+            ),
+            registration_options=registration_options,
         )
 
     def _get_oauth_lock(self, instance: str, model_id: str) -> asyncio.Lock:
@@ -1997,30 +2065,8 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                     headers=parsed_model_options.headers,
                     envs=parsed_model_options.envs,
                 )
-                if model.proxy_transport == "sse":
-                    model_info.registration_id = self.endpoint_registry.register_mcp_sse_endpoint_as_proxy(
-                        url=model_info.prefix,
-                        props=model.model_props,
-                        options=ProxyOptions(
-                            url=model_info.base_url + "/sse",
-                            allowed_request_headers=["accept", "mcp-session-id"],
-                            allowed_response_headers=["accept", "mcp-session-id"],
-                            headers=model.headers | parsed_model_options.headers if model.headers else parsed_model_options.headers,
-                        ),
-                        registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
-                    )
-                else:
-                    model_info.registration_id = self.endpoint_registry.register_mcp_endpoint_as_proxy(
-                        url=model_info.prefix,
-                        props=model.model_props,
-                        options=ProxyOptions(
-                            url=model_info.base_url + "/mcp",
-                            allowed_request_headers=["accept", "mcp-session-id"],
-                            allowed_response_headers=["accept", "mcp-session-id"],
-                            headers=model.headers | parsed_model_options.headers if model.headers else parsed_model_options.headers,
-                        ),
-                        registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
-                    )
+                merged_headers = model.headers | parsed_model_options.headers if model.headers else parsed_model_options.headers
+                model_info.registration_id = self._register_docker_mcp_proxy(model, model_info, model.proxy_transport, merged_headers)
                 self.models_downloaded[model_id] = DownloadedInfo(docker_options.image)
                 task = asyncio.create_task(self._fetch_tools_background(instance, model_id))
                 self._background_tasks.add(task)

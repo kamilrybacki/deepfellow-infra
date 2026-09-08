@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -1931,6 +1932,7 @@ def _make_installed_model_info(base_url: str = "http://172.20.0.2:3000", prefix:
     info.base_url = base_url
     info.headers = {}
     info.prefix = prefix
+    info.registration_id = "existing-reg-id"
     return info
 
 
@@ -2255,6 +2257,203 @@ async def test_healthcheck_model_docker_streamable_http_unhealthy_fallback_healt
 
     assert mock_sse.call_count == 1
     assert result.transport == "sse"
+
+
+@mock.patch("server.services.mcp_service._fetch_tools_from_sse_endpoint")
+@mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
+@pytest.mark.asyncio
+async def test_healthcheck_model_docker_transport_mismatch_reregisters_live_proxy(
+    mock_mcp: AsyncMock, mock_sse: AsyncMock, svc: McpService
+) -> None:
+    """If only the non-registered transport actually works, the live proxy must be re-registered at it."""
+    model_info = _make_installed_model_info()
+    installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    installed.models["open-websearch"] = model_info
+    svc.instances_info["default"].installed = installed
+    srv_model = svc.models["default"]["open-websearch"]
+    srv_model.kind = "custom"
+    srv_model.proxy_transport = "streamable_http"
+    mock_mcp.return_value = McpHealthCheckResult(healthy=False, error="mcp failed")
+    mock_sse.return_value = McpHealthCheckResult(healthy=True, transport="sse", tools=[])
+    svc.endpoint_registry.register_mcp_sse_endpoint_as_proxy.return_value = "new-sse-reg-id"  # pyright: ignore[reportAttributeAccessIssue]
+
+    await svc.healthcheck_model("default", "open-websearch")
+
+    svc.endpoint_registry.register_mcp_sse_endpoint_as_proxy.assert_called_once()  # pyright: ignore[reportAttributeAccessIssue]
+    svc.endpoint_registry.register_mcp_endpoint_as_proxy.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+    svc.endpoint_registry.unregister_mcp_endpoint.assert_called_once_with(  # pyright: ignore[reportAttributeAccessIssue]
+        model_info.prefix, "existing-reg-id"
+    )
+    assert model_info.registration_id == "new-sse-reg-id"
+    assert srv_model.proxy_transport == "sse"
+
+
+@mock.patch("server.services.mcp_service._fetch_tools_from_sse_endpoint")
+@mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
+@pytest.mark.asyncio
+async def test_healthcheck_model_docker_transport_match_does_not_reregister(
+    mock_mcp: AsyncMock, mock_sse: AsyncMock, svc: McpService
+) -> None:
+    """If the registered transport already works, the live proxy must not be touched."""
+    model_info = _make_installed_model_info()
+    installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    installed.models["open-websearch"] = model_info
+    svc.instances_info["default"].installed = installed
+    srv_model = svc.models["default"]["open-websearch"]
+    srv_model.kind = "custom"
+    srv_model.proxy_transport = "streamable_http"
+    mock_mcp.return_value = McpHealthCheckResult(healthy=True, transport="streamable_http", tools=[])
+
+    await svc.healthcheck_model("default", "open-websearch")
+
+    svc.endpoint_registry.register_mcp_sse_endpoint_as_proxy.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+    svc.endpoint_registry.register_mcp_endpoint_as_proxy.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+    svc.endpoint_registry.unregister_mcp_endpoint.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+    assert model_info.registration_id == "existing-reg-id"
+    assert srv_model.proxy_transport == "streamable_http"
+
+
+@mock.patch("server.services.mcp_service._fetch_tools_from_sse_endpoint")
+@mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
+@pytest.mark.asyncio
+async def test_healthcheck_model_docker_transport_mismatch_with_error_does_not_reregister(
+    mock_mcp: AsyncMock, mock_sse: AsyncMock, svc: McpService
+) -> None:
+    """A `healthy=True` fallback result that only got partway through the handshake (`error` set,
+    e.g. a timeout waiting for tools/list) must not be treated as proof the other transport works
+    — re-registering on it would permanently point real traffic at a transport that never actually
+    returned tools either, reproducing the same bug this re-registration logic exists to fix."""
+    model_info = _make_installed_model_info()
+    installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    installed.models["open-websearch"] = model_info
+    svc.instances_info["default"].installed = installed
+    srv_model = svc.models["default"]["open-websearch"]
+    srv_model.kind = "custom"
+    srv_model.proxy_transport = "streamable_http"
+    mock_mcp.return_value = McpHealthCheckResult(healthy=False, error="mcp failed")
+    mock_sse.return_value = McpHealthCheckResult(healthy=True, transport="sse", error="Timeout waiting for MCP response")
+
+    result = await svc.healthcheck_model("default", "open-websearch")
+
+    assert result.healthy is True
+    svc.endpoint_registry.register_mcp_sse_endpoint_as_proxy.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+    svc.endpoint_registry.register_mcp_endpoint_as_proxy.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+    svc.endpoint_registry.unregister_mcp_endpoint.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+    assert model_info.registration_id == "existing-reg-id"
+    assert srv_model.proxy_transport == "streamable_http"
+
+
+@mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
+@mock.patch("server.services.mcp_service._fetch_tools_from_sse_endpoint")
+@pytest.mark.asyncio
+async def test_healthcheck_model_docker_transport_mismatch_reregisters_live_proxy_reverse_direction(
+    mock_sse: AsyncMock, mock_mcp: AsyncMock, svc: McpService
+) -> None:
+    """Mirror of the streamable_http->sse case: registered `sse`, only `streamable_http` actually works."""
+    model_info = _make_installed_model_info()
+    installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    installed.models["open-websearch"] = model_info
+    svc.instances_info["default"].installed = installed
+    srv_model = svc.models["default"]["open-websearch"]
+    srv_model.kind = "custom"
+    srv_model.proxy_transport = "sse"
+    mock_sse.return_value = McpHealthCheckResult(healthy=False, error="sse failed")
+    mock_mcp.return_value = McpHealthCheckResult(healthy=True, transport="streamable_http", tools=[])
+    svc.endpoint_registry.register_mcp_endpoint_as_proxy.return_value = "new-mcp-reg-id"  # pyright: ignore[reportAttributeAccessIssue]
+
+    await svc.healthcheck_model("default", "open-websearch")
+
+    svc.endpoint_registry.register_mcp_endpoint_as_proxy.assert_called_once()  # pyright: ignore[reportAttributeAccessIssue]
+    svc.endpoint_registry.register_mcp_sse_endpoint_as_proxy.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+    svc.endpoint_registry.unregister_mcp_endpoint.assert_called_once_with(  # pyright: ignore[reportAttributeAccessIssue]
+        model_info.prefix, "existing-reg-id"
+    )
+    assert model_info.registration_id == "new-mcp-reg-id"
+    assert srv_model.proxy_transport == "streamable_http"
+
+
+@mock.patch("server.services.mcp_service._fetch_tools_from_sse_endpoint")
+@mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
+@pytest.mark.asyncio
+async def test_healthcheck_model_docker_transport_mismatch_reregisters_with_merged_headers(
+    mock_mcp: AsyncMock, mock_sse: AsyncMock, svc: McpService
+) -> None:
+    """The re-registered proxy must carry the model's static headers merged with the install-time ones."""
+    model_info = _make_installed_model_info()
+    model_info.headers = {"X-Install-Header": "install-value"}
+    installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    installed.models["open-websearch"] = model_info
+    svc.instances_info["default"].installed = installed
+    srv_model = svc.models["default"]["open-websearch"]
+    srv_model.kind = "custom"
+    srv_model.proxy_transport = "streamable_http"
+    srv_model.headers = {"X-Static-Header": "static-value"}
+    mock_mcp.return_value = McpHealthCheckResult(healthy=False, error="mcp failed")
+    mock_sse.return_value = McpHealthCheckResult(healthy=True, transport="sse", tools=[])
+    svc.endpoint_registry.register_mcp_sse_endpoint_as_proxy.return_value = "new-sse-reg-id"  # pyright: ignore[reportAttributeAccessIssue]
+
+    await svc.healthcheck_model("default", "open-websearch")
+
+    _, kwargs = svc.endpoint_registry.register_mcp_sse_endpoint_as_proxy.call_args  # pyright: ignore[reportAttributeAccessIssue]
+    assert kwargs["options"].headers == {
+        "X-Static-Header": "static-value",
+        "X-Install-Header": "install-value",
+    }
+
+
+@mock.patch("server.services.mcp_service._fetch_tools_from_sse_endpoint")
+@mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
+@pytest.mark.asyncio
+async def test_healthcheck_model_docker_transport_mismatch_unregister_failure_is_logged_not_raised(
+    mock_mcp: AsyncMock, mock_sse: AsyncMock, svc: McpService, caplog: pytest.LogCaptureFixture
+) -> None:
+    """If unregistering the stale proxy fails, the failure is logged and bookkeeping still moves to the new registration."""
+    model_info = _make_installed_model_info()
+    installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    installed.models["open-websearch"] = model_info
+    svc.instances_info["default"].installed = installed
+    srv_model = svc.models["default"]["open-websearch"]
+    srv_model.kind = "custom"
+    srv_model.proxy_transport = "streamable_http"
+    mock_mcp.return_value = McpHealthCheckResult(healthy=False, error="mcp failed")
+    mock_sse.return_value = McpHealthCheckResult(healthy=True, transport="sse", tools=[])
+    svc.endpoint_registry.register_mcp_sse_endpoint_as_proxy.return_value = "new-sse-reg-id"  # pyright: ignore[reportAttributeAccessIssue]
+    svc.endpoint_registry.unregister_mcp_endpoint.side_effect = RuntimeError("registry notification failed")  # pyright: ignore[reportAttributeAccessIssue]
+
+    with caplog.at_level(logging.ERROR, logger="uvicorn.error"):
+        result = await svc.healthcheck_model("default", "open-websearch")
+
+    assert result.healthy is True
+    assert model_info.registration_id == "new-sse-reg-id"
+    assert srv_model.proxy_transport == "sse"
+    assert any("Failed to unregister stale MCP proxy registration" in record.message for record in caplog.records)
+
+
+@mock.patch("server.services.mcp_service._fetch_tools_from_sse_endpoint")
+@mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
+@pytest.mark.asyncio
+async def test_healthcheck_model_docker_transport_mismatch_register_failure_is_logged_and_raised(
+    mock_mcp: AsyncMock, mock_sse: AsyncMock, svc: McpService, caplog: pytest.LogCaptureFixture
+) -> None:
+    """If registering the new proxy fails, the failure is logged, the exception propagates, and the old registration is untouched."""
+    model_info = _make_installed_model_info()
+    installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    installed.models["open-websearch"] = model_info
+    svc.instances_info["default"].installed = installed
+    srv_model = svc.models["default"]["open-websearch"]
+    srv_model.kind = "custom"
+    srv_model.proxy_transport = "streamable_http"
+    mock_mcp.return_value = McpHealthCheckResult(healthy=False, error="mcp failed")
+    mock_sse.return_value = McpHealthCheckResult(healthy=True, transport="sse", tools=[])
+    svc.endpoint_registry.register_mcp_sse_endpoint_as_proxy.side_effect = RuntimeError("registry rejected registration")  # pyright: ignore[reportAttributeAccessIssue]
+
+    with caplog.at_level(logging.ERROR, logger="uvicorn.error"), pytest.raises(RuntimeError, match="registry rejected registration"):
+        await svc.healthcheck_model("default", "open-websearch")
+
+    svc.endpoint_registry.unregister_mcp_endpoint.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+    assert model_info.registration_id == "existing-reg-id"
+    assert srv_model.proxy_transport == "streamable_http"
+    assert any("Failed to register MCP proxy for prefix" in record.message for record in caplog.records)
 
 
 @mock.patch("server.services.mcp_service._fetch_tools_from_sse_endpoint")
