@@ -196,7 +196,7 @@ class InstallingModel:
         return self.chained_promise
 
 
-class InstallingInstance:
+class InstallingInstance(Generic[InstalledInfoType]):  # noqa: UP046
     """Tracks one service-instance install/update.
 
     Reserved synchronously as soon as `install_instance()`/`update_instance()` decide to proceed,
@@ -205,24 +205,38 @@ class InstallingInstance:
     for the whole duration instead of a false "not installing" while `_install_instance()` is still
     doing its (potentially slow) pre-promise setup work.
 
-    `timeout_seconds` bounds how long a progress reader waits on `wait_ready()` before giving up -
-    it's set by whichever caller (`install_instance()`/`update_instance()`) created the reservation,
-    since they don't do the same amount of pre-promise work (see the two `_INSTANCE_*_STATUS_WAIT_TIMEOUT_SECONDS`
-    constants below).
+    `timeout_seconds` bounds how long a progress reader waits on `wait_ready()`/`wait_chained()` before
+    giving up - it's set by whichever caller (`install_instance()`/`update_instance()`) created the
+    reservation, since they don't do the same amount of pre-promise work (see the two
+    `_INSTANCE_*_STATUS_WAIT_TIMEOUT_SECONDS` constants below).
     """
 
     last_chunk: StreamChunk | None = None
 
     def __init__(self, timeout_seconds: float) -> None:
-        self.promise: PromiseWithProgress[InstallServiceOut, StreamChunk] | None = None
+        self.promise: PromiseWithProgress[InstalledInfoType, StreamChunk] | None = None
+        self.chained_promise: PromiseWithProgress[InstallServiceOut, StreamChunk] | None = None
         self.task: asyncio.Task[None] | None = None
         self.timeout_seconds = timeout_seconds
         self._ready = asyncio.Event()
         self._error: BaseException | None = None
 
-    def resolve(self, promise: PromiseWithProgress[InstallServiceOut, StreamChunk]) -> None:
-        """Attach the real install promise once it exists, unblocking any concurrent waiters."""
+    def resolve(
+        self,
+        promise: PromiseWithProgress[InstalledInfoType, StreamChunk],
+        on_success: Callable[[InstalledInfoType], Awaitable[InstallServiceOut]],
+        on_error: Callable[[Exception], None],
+    ) -> PromiseWithProgress[InstallServiceOut, StreamChunk]:
+        """Attach the real install promise once it exists, unblocking any concurrent waiters.
+
+        Chains the one-time post-install bookkeeping (`on_success`/`on_error`) onto the real promise
+        exactly once here, rather than letting the caller chain its own copy first and hand this only
+        the already-chained result - `wait_ready()` needs the real, unchained promise (the one whose
+        `.cancel()` actually reaches `_install_instance()`'s work), while `wait_chained()` needs the
+        bookkeeping-wrapped one, and only resolving from the real promise lets both stay available.
+        """
         self.promise = promise
+        self.chained_promise = promise.next(on_success, on_error)
 
         async def the_func() -> None:
             async for chunk in promise.progress.as_generator():
@@ -230,6 +244,7 @@ class InstallingInstance:
 
         self.task = asyncio.create_task(the_func())
         self._ready.set()
+        return self.chained_promise
 
     def reject(self, error: BaseException) -> None:
         """Unblock any concurrent waiters with a failure - no promise will ever exist for this reservation.
@@ -245,7 +260,7 @@ class InstallingInstance:
         self._error = error
         self._ready.set()
 
-    async def wait_ready(self) -> PromiseWithProgress[InstallServiceOut, StreamChunk]:
+    async def wait_ready(self) -> PromiseWithProgress[InstalledInfoType, StreamChunk]:
         """Wait until the real install promise is available, then return it.
 
         Re-raises the original failure if the reservation was rejected instead of resolved, so a
@@ -258,11 +273,20 @@ class InstallingInstance:
             raise RuntimeError("InstallingInstance became ready without a promise or an error - resolve()/reject() were never called")
         return self.promise
 
+    async def wait_chained(self) -> PromiseWithProgress[InstallServiceOut, StreamChunk]:
+        """Wait until the reservation resolves, then return the single shared post-install-bookkeeping promise."""
+        await self._ready.wait()
+        if self._error is not None:
+            raise self._error
+        if self.chained_promise is None:
+            raise RuntimeError("InstallingInstance became ready without a promise or an error - resolve()/reject() were never called")
+        return self.chained_promise
+
 
 @dataclass
 class Instance[InstalledInfoType]:
     installed: InstalledInfoType | None
-    installing: InstallingInstance | None
+    installing: InstallingInstance[InstalledInfoType] | None
     installing_model_progress: dict[str, InstallingModel]
     config: InstanceConfig
 
@@ -647,7 +671,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             raise HTTPException(404, "This service is not installing now.")
 
         try:
-            return await asyncio.wait_for(installing.wait_ready(), timeout=installing.timeout_seconds)
+            return await asyncio.wait_for(installing.wait_chained(), timeout=installing.timeout_seconds)
         except TimeoutError:
             raise HTTPException(504, f"Service {self.get_id(instance)} is still preparing to install; try again shortly.") from None
 
@@ -861,7 +885,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         # Reserve the slot synchronously (no `await` before this point) so a concurrent call can
         # never observe "not installing" once this one has started, no matter how long the
         # service's own `_install_instance()` takes to actually produce the real promise.
-        reservation = InstallingInstance(_INSTANCE_INSTALL_STATUS_WAIT_TIMEOUT_SECONDS)
+        reservation: InstallingInstance[InstalledInfoType] = InstallingInstance(_INSTANCE_INSTALL_STATUS_WAIT_TIMEOUT_SECONDS)
         self.instances_info[instance] = Instance(None, reservation, {}, instance_config or InstanceConfig())
 
         async def func(data: InstalledInfoType) -> InstallServiceOut:
@@ -888,9 +912,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             reservation.reject(e)
             raise
 
-        next_promise = promise.next(func, on_error)
-        reservation.resolve(next_promise)
-        return next_promise
+        return reservation.resolve(promise, func, on_error)
 
     async def update_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstallServiceOut, StreamChunk]:
         """Update an installed service by re-applying the install flow with new options.
@@ -910,7 +932,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         # Reserve the slot synchronously (no `await` before this point) so a concurrent call can
         # never observe "not installing" once this one has started, no matter how long validation,
         # the uninstall, or the service's own `_install_instance()` take to run.
-        reservation = InstallingInstance(_INSTANCE_UPDATE_STATUS_WAIT_TIMEOUT_SECONDS)
+        reservation: InstallingInstance[InstalledInfoType] = InstallingInstance(_INSTANCE_UPDATE_STATUS_WAIT_TIMEOUT_SECONDS)
         info.installing = reservation
 
         async def func(data: InstalledInfoType) -> InstallServiceOut:
@@ -940,9 +962,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             reservation.reject(e)
             raise
 
-        next_promise = promise.next(func, on_error)
-        reservation.resolve(next_promise)
-        return next_promise
+        return reservation.resolve(promise, func, on_error)
 
     async def _validate_update_options(self, options: InstallServiceIn) -> None:
         """Validate new options before update_instance tears down the existing installation.
