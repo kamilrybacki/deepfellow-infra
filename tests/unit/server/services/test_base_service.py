@@ -607,8 +607,11 @@ async def test_installing_instance_init_creates_task() -> None:
     promise: PromiseWithProgress[InstallServiceOut, StreamChunk] = PromiseWithProgress(value=value)
     promise.progress.close()
 
+    async def on_success(data: InstallServiceOut) -> InstallServiceOut:
+        return data
+
     installing = InstallingInstance(30)
-    installing.resolve(promise)
+    installing.resolve(promise, on_success, lambda _e: None)
 
     assert installing.promise is promise
     assert installing.task is not None
@@ -641,8 +644,11 @@ async def test_installing_instance_stores_last_chunk_from_progress() -> None:
     promise.progress.emit(chunk)
     promise.progress.close()
 
+    async def on_success(data: InstallServiceOut) -> InstallServiceOut:
+        return data
+
     installing = InstallingInstance(30)
-    installing.resolve(promise)
+    installing.resolve(promise, on_success, lambda _e: None)
     await asyncio.sleep(0)
 
     assert installing.last_chunk == chunk
@@ -659,6 +665,44 @@ async def test_installing_instance_wait_ready_raises_if_ready_without_promise_or
     installing._ready.set()  # pyright: ignore[reportPrivateUsage]
 
     with pytest.raises(RuntimeError, match="resolve\\(\\)/reject\\(\\) were never called"):
+        await installing.wait_ready()
+
+
+@pytest.mark.asyncio
+async def test_installing_instance_wait_chained_raises_if_ready_without_chained_promise() -> None:
+    """Same defensive invariant as `wait_ready()`, for `wait_chained()`'s own `chained_promise` check."""
+    installing = InstallingInstance(30)
+    installing._ready.set()  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(RuntimeError, match="resolve\\(\\)/reject\\(\\) were never called"):
+        await installing.wait_chained()
+
+
+@pytest.mark.asyncio
+async def test_installing_instance_wait_ready_returns_real_promise_after_resolve() -> None:
+    """`wait_ready()` must return the real, unchained promise - the one whose `.cancel()` would
+    actually reach `_install_instance()`'s work - not the bookkeeping-wrapped `chained_promise`."""
+    value = InstallServiceOut(status="OK")
+    promise: PromiseWithProgress[InstallServiceOut, StreamChunk] = PromiseWithProgress(value=value)
+    promise.progress.close()
+
+    async def on_success(data: InstallServiceOut) -> InstallServiceOut:
+        return data
+
+    installing = InstallingInstance(30)
+    installing.resolve(promise, on_success, lambda _e: None)
+
+    assert await installing.wait_ready() is promise
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_installing_instance_wait_ready_reraises_rejected_error() -> None:
+    """A concurrent caller of `wait_ready()` must learn the real rejection outcome, not hang forever."""
+    installing = InstallingInstance(30)
+    installing.reject(RuntimeError("setup blew up"))
+
+    with pytest.raises(RuntimeError, match="setup blew up"):
         await installing.wait_ready()
 
 
@@ -1026,7 +1070,7 @@ async def test_get_instance_install_progress_raises_when_not_installing(base2_sv
 async def test_get_instance_install_progress_returns_promise(base2_svc: _Base2Impl) -> None:
     mock_promise = MagicMock()
     mock_installing = MagicMock()
-    mock_installing.wait_ready = AsyncMock(return_value=mock_promise)
+    mock_installing.wait_chained = AsyncMock(return_value=mock_promise)
     mock_installing.timeout_seconds = 30
 
     base2_svc.instances_info["default"].installing = mock_installing
