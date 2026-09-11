@@ -20,6 +20,7 @@ from server.core.dependencies import (
     get_config,
     get_config_lock,
     get_infra_websocket_server,
+    get_model_downloader,
     get_otlp_logging,
     get_parent_infra,
     get_task_manager,
@@ -91,6 +92,11 @@ def infra_websocket_server() -> MagicMock:
 
 
 @pytest.fixture
+def model_downloader() -> MagicMock:
+    return MagicMock()
+
+
+@pytest.fixture
 def client(
     config: MagicMock,
     parent_infra: MagicMock,
@@ -98,6 +104,7 @@ def client(
     config_lock: asyncio.Lock,
     otlp_logging: MagicMock,
     infra_websocket_server: MagicMock,
+    model_downloader: MagicMock,
 ) -> Generator[TestClient]:
     app = FastAPI()
     app.include_router(router)
@@ -108,6 +115,7 @@ def client(
     app.dependency_overrides[get_config_lock] = lambda: config_lock
     app.dependency_overrides[get_otlp_logging] = lambda: otlp_logging
     app.dependency_overrides[get_infra_websocket_server] = lambda: infra_websocket_server
+    app.dependency_overrides[get_model_downloader] = lambda: model_downloader
     with TestClient(app) as c:
         yield c
 
@@ -325,7 +333,11 @@ def test_update_config_name_change_broadcasts_ancestors(
 
 
 def test_update_config_no_relevant_change_skips_reconfigure(
-    client: TestClient, parent_infra: MagicMock, otlp_logging: MagicMock, auth_header: dict[str, str]
+    client: TestClient,
+    parent_infra: MagicMock,
+    otlp_logging: MagicMock,
+    model_downloader: MagicMock,
+    auth_header: dict[str, str],
 ) -> None:
     with patch("server.api.config.dynamic_config.persist_settings"):
         resp = client.put("/admin/config", json={"metrics_username": "newname"}, headers=auth_header)
@@ -333,6 +345,37 @@ def test_update_config_no_relevant_change_skips_reconfigure(
     assert resp.status_code == 200
     parent_infra.reconfigure.assert_not_awaited()
     assert otlp_logging.reconfigure.call_count == 0
+    assert model_downloader.create_downloaders.call_count == 0
+
+
+def test_update_config_civitai_token_change_refreshes_downloaders(
+    client: TestClient, config: MagicMock, model_downloader: MagicMock, auth_header: dict[str, str]
+) -> None:
+    with patch("server.api.config.dynamic_config.persist_settings"):
+        resp = client.put("/admin/config", json={"civitai_token": "new-civitai-token"}, headers=auth_header)
+
+    assert resp.status_code == 200
+    model_downloader.create_downloaders.assert_called_once_with(config)
+
+
+def test_update_config_hugging_face_token_change_refreshes_downloaders(
+    client: TestClient, config: MagicMock, model_downloader: MagicMock, auth_header: dict[str, str]
+) -> None:
+    with patch("server.api.config.dynamic_config.persist_settings"):
+        resp = client.put("/admin/config", json={"hugging_face_token": "new-hf-token"}, headers=auth_header)
+
+    assert resp.status_code == 200
+    model_downloader.create_downloaders.assert_called_once_with(config)
+
+
+def test_update_config_adapter_registry_change_refreshes_downloaders(
+    client: TestClient, config: MagicMock, model_downloader: MagicMock, auth_header: dict[str, str]
+) -> None:
+    with patch("server.api.config.dynamic_config.persist_settings"):
+        resp = client.put("/admin/config", json={"adapter_registry_url": "http://new-registry"}, headers=auth_header)
+
+    assert resp.status_code == 200
+    model_downloader.create_downloaders.assert_called_once_with(config)
 
 
 def test_update_config_reconfigure_failure_returns_502(
@@ -394,6 +437,7 @@ async def test_update_config_serializes_concurrent_writes(
     app.dependency_overrides[get_config_lock] = lambda: shared_lock
     app.dependency_overrides[get_otlp_logging] = lambda: MagicMock()
     app.dependency_overrides[get_infra_websocket_server] = lambda: MagicMock()
+    app.dependency_overrides[get_model_downloader] = lambda: MagicMock()
 
     def record_persist(_config: object, _settings: object) -> None:
         nonlocal persist_count

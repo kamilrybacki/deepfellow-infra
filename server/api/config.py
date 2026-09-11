@@ -19,6 +19,7 @@ from server.core.dependencies import (
     get_config,
     get_config_lock,
     get_infra_websocket_server,
+    get_model_downloader,
     get_otlp_logging,
     get_parent_infra,
     get_task_manager,
@@ -26,6 +27,7 @@ from server.core.dependencies import (
 from server.dynamic_config import DynamicSettings
 from server.models.config import ConfigEntry, ConfigOut, ConfigRevealOut
 from server.task_manager import TaskManager
+from server.utils.model_downloader import ModelDownloader
 from server.utils.tracing import OtlpLoggingManager, tracer
 from server.websockets.infra_websocket_server import InfraWebsocketServer
 from server.websockets.parent_infra_group import ParentInfraGroup
@@ -118,6 +120,7 @@ async def update_dynamic_config(
     config_lock: Annotated[asyncio.Lock, Depends(get_config_lock)],
     otlp_logging: Annotated[OtlpLoggingManager, Depends(get_otlp_logging)],
     infra_websocket_server: Annotated[InfraWebsocketServer, Depends(get_infra_websocket_server)],
+    model_downloader: Annotated[ModelDownloader, Depends(get_model_downloader)],
     auth: Annotated[str, Depends(auth_admin)],
 ) -> ConfigOut:
     """Apply a partial update to the dynamic settings backed by `config.json`.
@@ -126,7 +129,7 @@ async def update_dynamic_config(
     (`docker_subnet`, `storage_dir`, `storage_services_dir`, `container_name_prefix`,
     `compose_prefix`, `infra_admin_api_key`) are immutable at runtime. Validated, persisted
     atomically, applied in-memory, and any required side effects (mesh reconnect, OTEL
-    reconfigure) are triggered — all without a process restart.
+    reconfigure, model downloader token refresh) are triggered — all without a process restart.
 
     `config.json` has exactly one writer (this handler); the lock serializes read-merge-write-apply
     cycles so two concurrent PUTs can't each read the same snapshot and clobber each other's change.
@@ -160,6 +163,12 @@ async def update_dynamic_config(
             or new_settings.name != current.name
             or new_settings.infra_url != current.infra_url
         )
+        downloaders_changed = (
+            new_settings.hugging_face_token.get_secret_value() != current.hugging_face_token.get_secret_value()
+            or new_settings.civitai_token.get_secret_value() != current.civitai_token.get_secret_value()
+            or new_settings.adapter_registry_url != current.adapter_registry_url
+            or new_settings.adapter_registry_secret.get_secret_value() != current.adapter_registry_secret.get_secret_value()
+        )
 
         # Persist before mutating in-memory state: the file is the source of truth.
         try:
@@ -181,6 +190,8 @@ async def update_dynamic_config(
                 await tracer.shutdown()
             if ancestor_broadcast_needed:
                 infra_websocket_server.broadcast_ancestors_to_children()
+            if downloaders_changed:
+                model_downloader.create_downloaders(config)
         except Exception as e:
             logger.exception("Config saved, but applying it live failed")
             raise HTTPException(

@@ -20,6 +20,7 @@ from server.core.dependencies import (
     get_hardware,
     get_infra_websocket_server,
     get_metrics_service,
+    get_model_downloader,
     get_otlp_logging,
     get_parent_infra,
     get_service_provider,
@@ -76,6 +77,7 @@ def test_get_dependency_raises_runtime_error_when_missing() -> None:
         ("task_manager", get_task_manager),
         ("config_lock", get_config_lock),
         ("otlp_logging", get_otlp_logging),
+        ("model_downloader", get_model_downloader),
     ],
 )
 def test_getter_returns_state_value(state_key: str, getter: object) -> None:
