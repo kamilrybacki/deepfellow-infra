@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [0.33.0] - 2026-09-11
 
 ### Added
 - MCP server health checks and OAuth token refresh now emit OpenTelemetry metrics (`mcp.healthcheck.count`, `mcp.healthcheck.duration` in ms, `mcp.oauth.refresh.count`) and spans, for observability into MCP integration failures. Enabled by the existing `otel_tracing_enabled` flag — no separate metrics flag.
