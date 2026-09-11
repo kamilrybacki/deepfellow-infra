@@ -1703,7 +1703,7 @@
         {
             "name": "laguna-xs-2.1:mxfp8",
             "size": "40GB",
-            "hash": "5a09682a78a6",
+            "hash": "44251b31234b",
             "context": 262144
         },
         {
@@ -3381,7 +3381,7 @@
         {
             "name": "qwen3.5:0.8b-mlx",
             "size": "1.2GB",
-            "hash": "6a48dd9c06e3",
+            "hash": "12f40a7f8473",
             "context": 262144
         },
         {
@@ -3411,7 +3411,7 @@
         {
             "name": "qwen3.5:2b-mlx",
             "size": "3.1GB",
-            "hash": "3a4a00dbfb1d",
+            "hash": "9dd89c688f18",
             "context": 262144
         },
         {
