@@ -16,6 +16,7 @@ from server.serviceprovider import ServiceProvider
 from server.services_manager import ServicesManager
 from server.task_manager import TaskManager
 from server.utils.hardware import Hardware
+from server.utils.model_downloader import ModelDownloader
 from server.utils.tracing import OtlpLoggingManager
 from server.websockets.infra_websocket_server import InfraWebsocketServer
 from server.websockets.parent_infra_group import ParentInfraGroup
@@ -86,6 +87,11 @@ def get_task_manager(request: Request) -> TaskManager:
 def get_otlp_logging(request: Request) -> OtlpLoggingManager:
     """Get OtlpLoggingManager instance from application state."""
     return get_dependency(request, "otlp_logging")
+
+
+def get_model_downloader(request: Request) -> ModelDownloader:
+    """Get ModelDownloader instance from application state."""
+    return get_dependency(request, "model_downloader")
 
 
 def auth_server(
