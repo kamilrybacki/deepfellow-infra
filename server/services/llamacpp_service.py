@@ -107,15 +107,15 @@ def _read_models() -> dict[str, LlamacppModel]:
 
 
 _const = LlamacppConst(
-    # b10290: latest published image build as of 2026-08-06. Known-risk: CVE-2026-2069 (GBNF
+    # b10902: latest published image build as of 2026-09-11. Known-risk: CVE-2026-2069 (GBNF
     # grammar stack overflow, fix PR ggml-org/llama.cpp#18993 unmerged) and an unpatched GGUF
     # `general.alignment` integer overflow (fix PR #24997 unmerged) are both still open upstream
-    # and were already present in the previous b10068 pin — this bump does not introduce or
+    # and were already present in the previous b10290 pin — this bump does not introduce or
     # resolve them. See DFINFRA-168.
     images={
-        "gpu": DockerImage(name="ghcr.io/ggml-org/llama.cpp:server-cuda12-b10290", size="2.6 GB"),
-        "vulkan": DockerImage(name="ghcr.io/ggml-org/llama.cpp:server-vulkan-b10290", size="0.3 GB"),
-        "cpu": DockerImage(name="ghcr.io/ggml-org/llama.cpp:server-b10290", size="0.3 GB"),
+        "gpu": DockerImage(name="ghcr.io/ggml-org/llama.cpp:server-cuda12-b10902", size="2.6 GB"),
+        "vulkan": DockerImage(name="ghcr.io/ggml-org/llama.cpp:server-vulkan-b10902", size="0.3 GB"),
+        "cpu": DockerImage(name="ghcr.io/ggml-org/llama.cpp:server-b10902", size="0.3 GB"),
     },
     model_type="llm",
     models=_read_models(),
