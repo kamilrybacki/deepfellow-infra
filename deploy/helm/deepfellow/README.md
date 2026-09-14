@@ -118,6 +118,17 @@ seeds `type=None` in Infra and collides with custom-model install — Gate A fin
 - Secrets for the credentials you reference (or use `source: value` / `generate`)
 - Model weights reachable as GGUF URLs (downloaded by an initContainer per native backend)
 
+### Storage for stateful components
+
+MongoDB, the vector DBs, and FalkorDB store data on a PVC. Give the stateful components a
+StorageClass that meets the engine's requirements — in particular **MongoDB (WiredTiger) does not
+support NFS** (file operations fail with `Operation not permitted`), so back `server.mongo` and
+`workspace.mongo` with block or node-local storage (e.g. a `local-path` class), not an NFS class.
+The embedded MongoDB runs as its own non-root user and relies on `fsGroup`, so the StorageClass
+must honor `fsGroup` for volume ownership. Set `*.storage.storageClass` per component, and use
+`*.nodeSelector` / `*.tolerations` / `*.affinity` (including on `server.mongo` and
+`workspace.mongo`) to pin data pods when using node-local storage.
+
 ## Installing
 
 ```console

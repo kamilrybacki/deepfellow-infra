@@ -235,6 +235,13 @@ server:
     external:
       # -- External MongoDB URI (`DF_MONGO_URL`) as a Secret ref (external mode).
       uriSecret: { name: "", key: "uri" }
+    # -- Resource requests/limits for the embedded MongoDB.
+    resources: {}
+    # -- Pod placement for the embedded MongoDB. MongoDB/WiredTiger does not support NFS; use a
+    # storageClass backed by block/local storage and, if needed, pin here.
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
   vectorDb:
     # -- Enable RAG / vector store (`DF_VECTOR_DATABASE__PROVIDER__ACTIVE`).
     active: false
@@ -382,6 +389,12 @@ workspace:
         value: ""
         generate: { retain: true }
     storage: { size: 4Gi, storageClass: "" }
+    # -- Resource requests/limits for the Workspace MongoDB.
+    resources: {}
+    # -- Pod placement for the Workspace MongoDB (same NFS caveat as server.mongo).
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
   resources: {}
   nodeSelector: {}
   tolerations: []

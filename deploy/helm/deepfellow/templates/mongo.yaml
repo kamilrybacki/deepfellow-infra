@@ -64,8 +64,12 @@ spec:
     spec:
       {{- include "deepfellow.imagePullSecrets" . | nindent 6 }}
       securityContext:
-        # mongo's official image manages its own runtime user; fsGroup fixes volume ownership.
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
         fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: mongo
           image: {{ include "deepfellow.image" (dict "context" . "image" $m.image) }}
@@ -115,6 +119,18 @@ spec:
           configMap:
             name: {{ $fullname }}-init
             defaultMode: 0755
+      {{- with $m.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $m.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $m.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
   volumeClaimTemplates:
     - metadata:
         name: data
