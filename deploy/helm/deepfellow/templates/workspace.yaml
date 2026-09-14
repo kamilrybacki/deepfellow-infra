@@ -1,0 +1,226 @@
+{{- if .Values.workspace.enabled }}
+{{- $w := .Values.workspace }}
+{{- $fullname := include "deepfellow.componentName" (dict "context" . "component" "workspace") }}
+{{- $secretName := include "deepfellow.credSecretName" (dict "context" . "component" "workspace") }}
+{{- $selector := include "deepfellow.selectorLabels" (dict "context" . "component" "workspace") }}
+{{- $appMongo := include "deepfellow.componentName" (dict "context" . "component" "workspace-mongo") }}
+{{- $appMongoSecret := include "deepfellow.credSecretName" (dict "context" . "component" "workspace-mongo") }}
+{{- $appMongoSel := include "deepfellow.selectorLabels" (dict "context" . "component" "workspace-mongo") }}
+{{- $serverFullname := include "deepfellow.componentName" (dict "context" . "component" "server") }}
+{{- $stateSecret := include "deepfellow.provisioning.stateSecretName" . }}
+{{/* --- workspace-owned credentials --- */}}
+{{- $sec := include "deepfellow.chartSecret" (dict "context" . "secretName" $secretName "creds" (dict "betterAuthSecret" $w.auth.betterAuthSecret "bootstrapAdminPassword" $w.auth.bootstrapAdmin.password)) }}
+{{- with $sec }}
+{{ . }}
+---
+{{- end }}
+{{/* --- workspace app-mongo credentials --- */}}
+{{- $amSec := include "deepfellow.chartSecret" (dict "context" . "secretName" $appMongoSecret "creds" (dict "rootPassword" $w.mongo.auth.rootPassword)) }}
+{{- with $amSec }}
+{{ . }}
+---
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $appMongo }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: workspace-mongo
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: mongo
+      port: 27017
+      targetPort: mongo
+  selector:
+    {{- $appMongoSel | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $appMongo }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: workspace-mongo
+spec:
+  serviceName: {{ $appMongo }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- $appMongoSel | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- $appMongoSel | nindent 8 }}
+    spec:
+      {{- include "deepfellow.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: mongo
+          image: {{ include "deepfellow.image" (dict "context" . "image" $w.mongo.image) }}
+          imagePullPolicy: {{ $w.mongo.image.pullPolicy }}
+          command: ["mongod", "--replSet", {{ $w.mongo.replSetName | quote }}, "--bind_ip_all"]
+          ports:
+            - name: mongo
+              containerPort: 27017
+          env:
+            - name: MONGO_INITDB_ROOT_USERNAME
+              value: {{ $w.mongo.auth.rootUsername | quote }}
+            {{- include "deepfellow.credEnv" (dict "name" "MONGO_INITDB_ROOT_PASSWORD" "cred" $w.mongo.auth.rootPassword "secretName" $appMongoSecret "required" true) | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with $w.mongo.storage.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $w.mongo.storage.size }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $appMongo }}-rs-init
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: workspace-mongo
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "1"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels:
+        {{- $appMongoSel | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      {{- include "deepfellow.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: rs-init
+          image: {{ include "deepfellow.image" (dict "context" . "image" $w.mongo.image) }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              host="{{ $appMongo }}-0.{{ $appMongo }}"
+              until mongosh --host "$host" -u "$MONGO_ROOT_USER" -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --eval 'db.runCommand("ping")' >/dev/null 2>&1; do
+                echo "waiting for mongo..."; sleep 3
+              done
+              mongosh --host "$host" -u "$MONGO_ROOT_USER" -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --eval '
+                try { rs.status() } catch (e) { rs.initiate({_id: "{{ $w.mongo.replSetName }}", members: [{_id: 0, host: "'"$host"':27017"}]}) }'
+          env:
+            - name: MONGO_ROOT_USER
+              value: {{ $w.mongo.auth.rootUsername | quote }}
+            {{- include "deepfellow.credEnv" (dict "name" "MONGO_ROOT_PASSWORD" "cred" $w.mongo.auth.rootPassword "secretName" $appMongoSecret "required" true) | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: workspace
+spec:
+  type: {{ $w.service.type }}
+  ports:
+    - name: http
+      port: {{ $w.service.port }}
+      targetPort: http
+  selector:
+    {{- $selector | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: workspace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- $selector | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- $selector | nindent 8 }}
+    spec:
+      {{- include "deepfellow.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "deepfellow.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: workspace
+          image: {{ include "deepfellow.image" (dict "context" . "image" $w.image) }}
+          imagePullPolicy: {{ $w.image.pullPolicy }}
+          securityContext:
+            {{- include "deepfellow.containerSecurityContext" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: DF_SERVER_URL
+              value: {{ printf "http://%s:%v" $serverFullname .Values.server.service.port | quote }}
+            - name: DF_SERVER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $stateSecret }}
+                  key: project-api-key
+            - name: DF_SERVER_ORGANIZATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $stateSecret }}
+                  key: organization-id
+            - name: DF_SERVER_PROJECT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $stateSecret }}
+                  key: project-id
+            {{- include "deepfellow.credEnv" (dict "name" "BETTER_AUTH_SECRET" "cred" $w.auth.betterAuthSecret "secretName" $secretName "required" true) | nindent 12 }}
+            - name: BOOTSTRAP_ADMIN_EMAIL
+              value: {{ $w.auth.bootstrapAdmin.email | quote }}
+            {{- include "deepfellow.credEnv" (dict "name" "BOOTSTRAP_ADMIN_PASSWORD" "cred" $w.auth.bootstrapAdmin.password "secretName" $secretName "required" true) | nindent 12 }}
+            - name: MONGO_URL
+              value: {{ printf "mongodb://%s-0.%s:27017/?replicaSet=%s" $appMongo $appMongo $w.mongo.replSetName | quote }}
+            {{- with $w.sessionTitleModel }}
+            - name: DF_SESSION_TITLE_MODEL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with $w.smallModel }}
+            - name: DF_SMALL_MODEL
+              value: {{ . | quote }}
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          {{- with $w.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with $w.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $w.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $w.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

@@ -13,6 +13,8 @@ server:
     auth:
       rootPassword: { source: existingSecret, existingSecret: { name: df-secrets } }
       password: { source: existingSecret, existingSecret: { name: df-secrets } }
+provisioning:
+  stateSecret: { name: df-provstate }
 workspace:
   image: { allowMutableTag: true }
   auth:

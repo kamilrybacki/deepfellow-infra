@@ -1,0 +1,190 @@
+{{- range $name, $bRaw := .Values.modelBackends }}
+{{- if include "deepfellow.backendEnabled" (dict "b" $bRaw) }}
+{{- $b := mergeOverwrite (include "deepfellow.modelBackendDefaults" $ | fromYaml) (deepCopy $bRaw) }}
+{{- $fullname := include "deepfellow.componentName" (dict "context" $ "component" (printf "mb-%s" $name)) }}
+{{- $component := printf "mb-%s" $name }}
+{{- $selector := include "deepfellow.selectorLabels" (dict "context" $ "component" $component) }}
+{{- $secretName := include "deepfellow.credSecretName" (dict "context" $ "component" $component) }}
+{{- $port := int $b.service.port }}
+{{- $medium := $b.storage.medium }}
+{{- $size := $b.storage.size }}
+{{- $storageClass := $b.storage.storageClass }}
+{{- $hfToken := dig "gguf" "hfToken" (dict "source" "none" "existingSecret" (dict "name" "" "key" "hf-token") "value" "") $b }}
+{{- $sec := include "deepfellow.chartSecret" (dict "context" $ "secretName" $secretName "creds" (dict "hfToken" $hfToken)) }}
+{{- with $sec }}
+{{ . }}
+---
+{{- end }}
+{{- if and (ne $medium "Memory") (not (dig "storage" "existingClaim" "" $b)) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "deepfellow.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- with $storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $size }}
+---
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "deepfellow.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ $port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- $selector | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "deepfellow.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- $selector | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- $selector | nindent 8 }}
+    spec:
+      {{- include "deepfellow.imagePullSecrets" $ | nindent 6 }}
+      securityContext:
+        {{- include "deepfellow.podSecurityContext" $ | nindent 8 }}
+      initContainers:
+        - name: fetch-gguf
+          image: {{ dig "gguf" "downloadImage" "curlimages/curl:8.11.1" $b }}
+          securityContext:
+            {{- include "deepfellow.containerSecurityContext" $ | nindent 12 }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              target="/models/model.gguf"
+              if [ -f "$target" ]; then echo "weights present, skipping"; exit 0; fi
+              if [ -n "${HF_TOKEN:-}" ]; then
+                umask 077
+                printf 'header = "Authorization: Bearer %s"\n' "$HF_TOKEN" > /tmp/curlrc
+                curl -fSL --config /tmp/curlrc -o "$target" "$GGUF_URL"
+                rm -f /tmp/curlrc
+              else
+                curl -fSL -o "$target" "$GGUF_URL"
+              fi
+          env:
+            - name: GGUF_URL
+              value: {{ $b.gguf.url | quote }}
+            {{- include "deepfellow.credEnv" (dict "name" "HF_TOKEN" "cred" $hfToken "secretName" $secretName) | nindent 12 }}
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      containers:
+        - name: llama-cpp
+          image: {{ include "deepfellow.image" (dict "context" $ "image" $b.image) }}
+          imagePullPolicy: {{ $b.image.pullPolicy }}
+          securityContext:
+            {{- include "deepfellow.containerSecurityContext" $ | nindent 12 }}
+          args:
+            - --model
+            - /models/model.gguf
+            - --host
+            - 0.0.0.0
+            - --port
+            - {{ $port | quote }}
+            - --parallel
+            - {{ $b.parallel | quote }}
+            - --threads
+            - {{ $b.threads | quote }}
+            - --ctx-size
+            - {{ $b.ctxSize | quote }}
+            {{- if $b.gpu.enabled }}
+            - --n-gpu-layers
+            - "999"
+            {{- end }}
+            {{- range $b.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ $port }}
+              protocol: TCP
+          volumeMounts:
+            - name: models
+              mountPath: /models
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          {{- if $b.gpu.enabled }}
+          resources:
+            {{- $res := dig "resources" (dict) $b }}
+            {{- if $res }}
+            {{- toYaml $res | nindent 12 }}
+            {{- else }}
+            limits:
+              nvidia.com/gpu: {{ $b.gpu.count }}
+            {{- end }}
+          {{- else }}
+          {{- with (dig "resources" (dict) $b) }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- end }}
+      volumes:
+        - name: models
+          {{- if eq $medium "Memory" }}
+          emptyDir:
+            medium: Memory
+          {{- else }}
+          persistentVolumeClaim:
+            claimName: {{ dig "storage" "existingClaim" $fullname $b }}
+          {{- end }}
+      {{- with (dig "nodeSelector" (dict) $b) }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (dig "tolerations" (list) $b) }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (dig "affinity" (dict) $b) }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+{{- end }}
+{{- end }}

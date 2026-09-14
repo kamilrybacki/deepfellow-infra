@@ -1,0 +1,130 @@
+{{- if eq .Values.server.mongo.mode "embedded" }}
+{{- $fullname := include "deepfellow.componentName" (dict "context" . "component" "mongo") }}
+{{- $secretName := include "deepfellow.credSecretName" (dict "context" . "component" "mongo") }}
+{{- $selector := include "deepfellow.selectorLabels" (dict "context" . "component" "mongo") }}
+{{- $m := .Values.server.mongo }}
+{{- $sec := include "deepfellow.chartSecret" (dict "context" . "secretName" $secretName "creds" (dict "rootPassword" $m.auth.rootPassword "password" $m.auth.password)) }}
+{{- with $sec }}
+{{ . }}
+---
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-init
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mongo
+data:
+  init-mongo.sh: |
+    #!/bin/bash
+    mongosh -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin <<EOF
+    db = db.getSiblingDB("admin");
+    db.createUser({
+      user: "$DF_MONGO_USER",
+      pwd: "$DF_MONGO_PASSWORD",
+      roles: [{ role: "readWrite", db: "$DF_MONGO_DB" }],
+    });
+    EOF
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mongo
+spec:
+  type: ClusterIP
+  ports:
+    - name: mongo
+      port: 27017
+      targetPort: mongo
+      protocol: TCP
+  selector:
+    {{- $selector | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mongo
+spec:
+  serviceName: {{ $fullname }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- $selector | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- $selector | nindent 8 }}
+    spec:
+      {{- include "deepfellow.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        # mongo's official image manages its own runtime user; fsGroup fixes volume ownership.
+        fsGroup: 999
+      containers:
+        - name: mongo
+          image: {{ include "deepfellow.image" (dict "context" . "image" $m.image) }}
+          imagePullPolicy: {{ $m.image.pullPolicy }}
+          securityContext:
+            {{- include "deepfellow.containerSecurityContext" . | nindent 12 }}
+          ports:
+            - name: mongo
+              containerPort: 27017
+              protocol: TCP
+          env:
+            - name: MONGO_INITDB_ROOT_USERNAME
+              value: {{ $m.auth.rootUsername | quote }}
+            {{- include "deepfellow.credEnv" (dict "name" "MONGO_INITDB_ROOT_PASSWORD" "cred" $m.auth.rootPassword "secretName" $secretName "required" true) | nindent 12 }}
+            - name: DF_MONGO_USER
+              value: {{ $m.auth.username | quote }}
+            {{- include "deepfellow.credEnv" (dict "name" "DF_MONGO_PASSWORD" "cred" $m.auth.password "secretName" $secretName "required" true) | nindent 12 }}
+            - name: DF_MONGO_DB
+              value: {{ $m.auth.database | quote }}
+            - name: GLIBC_TUNABLES
+              value: "glibc.cpu.hwcaps=-SHSTK"
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+          livenessProbe:
+            exec:
+              command: ["mongosh", "--eval", "db.runCommand('ping')"]
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 5
+          readinessProbe:
+            exec:
+              command: ["mongosh", "--eval", "db.runCommand('ping')"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 5
+          {{- with $m.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: init
+          configMap:
+            name: {{ $fullname }}-init
+            defaultMode: 0755
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- with $m.storage.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $m.storage.size }}
+{{- end }}

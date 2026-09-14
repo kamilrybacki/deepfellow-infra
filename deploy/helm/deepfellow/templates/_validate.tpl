@@ -124,10 +124,11 @@ Each failed check aborts rendering with a clear, path-prefixed message.
 
 {{/* ---------- Native + external backends ---------- */}}
 {{- $nativeEnabled := 0 -}}
-{{- range $name, $b := .Values.modelBackends -}}
-{{- if include "deepfellow.backendEnabled" (dict "b" $b) -}}
+{{- range $name, $bRaw := .Values.modelBackends -}}
+{{- if include "deepfellow.backendEnabled" (dict "b" $bRaw) -}}
+{{- $b := mergeOverwrite (include "deepfellow.modelBackendDefaults" $ | fromYaml) (deepCopy $bRaw) -}}
 {{- $nativeEnabled = add1 $nativeEnabled -}}
-{{- if ne (default "llamaCpp" $b.type) "llamaCpp" -}}
+{{- if ne $b.type "llamaCpp" -}}
 {{- fail (printf "modelBackends.%s.type must be llamaCpp." $name) -}}
 {{- end -}}
 {{- if not $b.gguf.url -}}
@@ -194,6 +195,9 @@ Each failed check aborts rendering with a clear, path-prefixed message.
 
 {{/* ---------- Workspace ---------- */}}
 {{- if .Values.workspace.enabled -}}
+{{- if and (not .Values.provisioning.enabled) (not .Values.provisioning.stateSecret.name) -}}
+{{- fail "workspace.enabled=true needs the provisioning state Secret (DF_SERVER_* dfproj identity): enable provisioning.enabled, or set provisioning.stateSecret.name to a Secret you manage. Otherwise the Workspace pod never starts." -}}
+{{- end -}}
 {{- include "deepfellow.validateSecret" (dict "cred" .Values.workspace.auth.betterAuthSecret "path" "workspace.auth.betterAuthSecret" "required" true) -}}
 {{- include "deepfellow.validateSecret" (dict "cred" .Values.workspace.auth.bootstrapAdmin.password "path" "workspace.auth.bootstrapAdmin.password" "required" true) -}}
 {{- include "deepfellow.validateSecret" (dict "cred" .Values.workspace.mongo.auth.rootPassword "path" "workspace.mongo.auth.rootPassword" "required" true) -}}

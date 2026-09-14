@@ -88,6 +88,8 @@ infra:
     storageClass: ""
     # -- Use an existing PVC instead of creating one.
     existingClaim: ""
+    # -- Mount path = `DF_STORAGE_DIR`. VERIFY writability for uid 1000 against the image before deploy.
+    mountPath: /app/storage
   service:
     # -- Infra Service type.
     type: ClusterIP
@@ -213,6 +215,8 @@ server:
       # -- Application user (`DF_MONGO_USER`) and database (`DF_MONGO_DB`).
       username: deepfellow
       database: deepfellow
+      # -- Mongo root username (`MONGO_INITDB_ROOT_USERNAME`).
+      rootUsername: root
       # -- Mongo root password (credential shape; embedded mode).
       rootPassword:
         source: existingSecret
@@ -356,6 +360,8 @@ workspace:
       pullPolicy: IfNotPresent
     replSetName: rs0
     auth:
+      # -- Workspace mongo root username.
+      rootUsername: root
       # -- Workspace mongo root password (credential shape).
       rootPassword:
         source: existingSecret

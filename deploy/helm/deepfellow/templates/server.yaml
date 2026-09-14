@@ -1,0 +1,183 @@
+{{- $fullname := include "deepfellow.componentName" (dict "context" . "component" "server") -}}
+{{- $secretName := include "deepfellow.credSecretName" (dict "context" . "component" "server") -}}
+{{- $selector := include "deepfellow.selectorLabels" (dict "context" . "component" "server") -}}
+{{- $infraFullname := include "deepfellow.componentName" (dict "context" . "component" "infra") -}}
+{{- $infraSecret := include "deepfellow.credSecretName" (dict "context" . "component" "infra") -}}
+{{- $mongoFullname := include "deepfellow.componentName" (dict "context" . "component" "mongo") -}}
+{{- $mongoSecret := include "deepfellow.credSecretName" (dict "context" . "component" "mongo") -}}
+{{- $s := .Values.server -}}
+{{/* --- chart-managed Secret: server-owned credentials (admin password consumed by the Phase-3 provisioning Job; graph/metrics by this Deployment) --- */}}
+{{- $creds := dict "adminPassword" $s.admin.password -}}
+{{- if $s.graph.enabled -}}{{- $creds = merge $creds (dict "graphPassword" $s.graph.password) -}}{{- end -}}
+{{- if $s.metrics.enabled -}}{{- $creds = merge $creds (dict "metricsPassword" $s.metrics.password) -}}{{- end -}}
+{{- $sec := include "deepfellow.chartSecret" (dict "context" . "secretName" $secretName "creds" $creds) -}}
+{{- with $sec }}
+{{ . }}
+---
+{{- end }}
+{{- if not $s.storage.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- with $s.storage.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $s.storage.size }}
+---
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  type: {{ $s.service.type }}
+  ports:
+    - name: http
+      port: {{ $s.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- $selector | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- $selector | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- $selector | nindent 8 }}
+    spec:
+      {{- include "deepfellow.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "deepfellow.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: server
+          image: {{ include "deepfellow.image" (dict "context" . "image" $s.image) }}
+          imagePullPolicy: {{ $s.image.pullPolicy }}
+          securityContext:
+            {{- include "deepfellow.containerSecurityContext" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: DF_LOG_LEVEL
+              value: {{ $s.logLevel | quote }}
+            # --- Infra link (double-underscore keys, per Gate A) ---
+            - name: DF_INFRA__URL
+              value: {{ printf "http://%s:%v" $infraFullname .Values.infra.service.port | quote }}
+            {{- include "deepfellow.credEnv" (dict "name" "DF_INFRA__API_KEY" "cred" .Values.infra.auth.apiKey "secretName" $infraSecret "required" true) | nindent 12 }}
+            # --- Mongo ---
+            {{- if eq $s.mongo.mode "embedded" }}
+            - name: DF_MONGO_URL
+              value: {{ printf "%s:27017" $mongoFullname | quote }}
+            - name: DF_MONGO_USER
+              value: {{ $s.mongo.auth.username | quote }}
+            {{- include "deepfellow.credEnv" (dict "name" "DF_MONGO_PASSWORD" "cred" $s.mongo.auth.password "secretName" $mongoSecret "required" true) | nindent 12 }}
+            - name: DF_MONGO_DB
+              value: {{ $s.mongo.auth.database | quote }}
+            {{- else }}
+            - name: DF_MONGO_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s.mongo.external.uriSecret.name }}
+                  key: {{ $s.mongo.external.uriSecret.key }}
+            {{- end }}
+            # --- Plugins ---
+            {{- with $s.plugins.setup }}
+            - name: DF_PLUGINS_SETUP
+              value: {{ . | quote }}
+            {{- end }}
+            # --- Vector DB ---
+            - name: DF_VECTOR_DATABASE__PROVIDER__ACTIVE
+              value: {{ ternary "1" "0" $s.vectorDb.active | quote }}
+            {{- if $s.vectorDb.active }}
+            - name: DF_VECTOR_DATABASE__PROVIDER__TYPE
+              value: {{ $s.vectorDb.type | quote }}
+            - name: DF_VECTOR_DATABASE__PROVIDER__URL
+              value: {{ (eq $s.vectorDb.type "qdrant") | ternary (default (printf "http://%s:6333" (include "deepfellow.componentName" (dict "context" . "component" "qdrant"))) $s.vectorDb.qdrant.url) (printf "http://%s:19530" (include "deepfellow.componentName" (dict "context" . "component" "milvus"))) | quote }}
+            - name: DF_VECTOR_DATABASE__EMBEDDING__ACTIVE
+              value: "1"
+            - name: DF_VECTOR_DATABASE__EMBEDDING__ENDPOINT
+              value: {{ $s.vectorDb.embedding.endpoint | quote }}
+            - name: DF_VECTOR_DATABASE__EMBEDDING__MODEL
+              value: {{ $s.vectorDb.embedding.model | quote }}
+            - name: DF_VECTOR_DATABASE__EMBEDDING__SIZE
+              value: {{ $s.vectorDb.embedding.size | quote }}
+            {{- end }}
+            # --- Graph ---
+            {{- if $s.graph.enabled }}
+            - name: DF_GRAPH__ENABLED
+              value: "1"
+            - name: DF_GRAPH__HOST
+              value: {{ include "deepfellow.componentName" (dict "context" . "component" "falkordb") | quote }}
+            - name: DF_GRAPH__PORT
+              value: "6379"
+            {{- include "deepfellow.credEnv" (dict "name" "DF_GRAPH__PASSWORD" "cred" $s.graph.password "secretName" $secretName "required" true) | nindent 12 }}
+            {{- end }}
+            # --- Metrics ---
+            {{- if $s.metrics.enabled }}
+            - name: DF_METRICS_USERNAME
+              value: {{ $s.metrics.username | quote }}
+            {{- include "deepfellow.credEnv" (dict "name" "DF_METRICS_PASSWORD" "cred" $s.metrics.password "secretName" $secretName "required" true) | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: storage
+              mountPath: /app/storage
+          livenessProbe:
+            exec:
+              command: ["/app/scripts/healthcheck.py"]
+            initialDelaySeconds: 40
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["/app/scripts/healthcheck.py"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          {{- with $s.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: storage
+          persistentVolumeClaim:
+            claimName: {{ $s.storage.existingClaim | default $fullname }}
+      {{- with $s.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $s.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $s.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

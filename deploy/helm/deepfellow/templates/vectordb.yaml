@@ -1,0 +1,280 @@
+{{- if .Values.server.vectorDb.active }}
+{{- $v := .Values.server.vectorDb }}
+{{- if and (eq $v.type "qdrant") (not $v.qdrant.url) }}
+{{- $fullname := include "deepfellow.componentName" (dict "context" . "component" "qdrant") }}
+{{- $selector := include "deepfellow.selectorLabels" (dict "context" . "component" "qdrant") }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: qdrant
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 6333
+      targetPort: http
+    - name: grpc
+      port: 6334
+      targetPort: grpc
+  selector:
+    {{- $selector | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: qdrant
+spec:
+  serviceName: {{ $fullname }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- $selector | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- $selector | nindent 8 }}
+    spec:
+      {{- include "deepfellow.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "deepfellow.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: qdrant
+          image: {{ include "deepfellow.image" (dict "context" . "image" $v.qdrant.image) }}
+          imagePullPolicy: {{ $v.qdrant.image.pullPolicy }}
+          securityContext:
+            {{- include "deepfellow.containerSecurityContext" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 6333
+            - name: grpc
+              containerPort: 6334
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /qdrant/storage
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- with $v.qdrant.storage.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $v.qdrant.storage.size }}
+{{- end }}
+{{- if eq $v.type "milvus" }}
+{{/*
+Milvus standalone stack (etcd + minio + milvus). MinIO exists ONLY here.
+Rendered as a compact standalone; tune resources/storage via values before production.
+*/}}
+{{- $etcd := include "deepfellow.componentName" (dict "context" . "component" "etcd") }}
+{{- $minio := include "deepfellow.componentName" (dict "context" . "component" "minio") }}
+{{- $milvus := include "deepfellow.componentName" (dict "context" . "component" "milvus") }}
+{{- $etcdSel := include "deepfellow.selectorLabels" (dict "context" . "component" "etcd") }}
+{{- $minioSel := include "deepfellow.selectorLabels" (dict "context" . "component" "minio") }}
+{{- $milvusSel := include "deepfellow.selectorLabels" (dict "context" . "component" "milvus") }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $etcd }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: etcd
+spec:
+  type: ClusterIP
+  ports:
+    - name: client
+      port: 2379
+      targetPort: client
+  selector:
+    {{- $etcdSel | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $etcd }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: etcd
+spec:
+  serviceName: {{ $etcd }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- $etcdSel | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- $etcdSel | nindent 8 }}
+    spec:
+      {{- include "deepfellow.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: etcd
+          image: {{ include "deepfellow.image" (dict "context" . "image" $v.milvus.etcdImage) }}
+          command: ["etcd", "-advertise-client-urls=http://127.0.0.1:2379", "-listen-client-urls", "http://0.0.0.0:2379", "--data-dir", "/etcd"]
+          env:
+            - name: ETCD_AUTO_COMPACTION_MODE
+              value: revision
+            - name: ETCD_AUTO_COMPACTION_RETENTION
+              value: "1000"
+            - name: ETCD_QUOTA_BACKEND_BYTES
+              value: "4294967296"
+          ports:
+            - name: client
+              containerPort: 2379
+          volumeMounts:
+            - name: data
+              mountPath: /etcd
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with $v.milvus.storage.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $v.milvus.storage.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $minio }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: minio
+spec:
+  type: ClusterIP
+  ports:
+    - name: api
+      port: 9000
+      targetPort: api
+  selector:
+    {{- $minioSel | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $minio }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: minio
+spec:
+  serviceName: {{ $minio }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- $minioSel | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- $minioSel | nindent 8 }}
+    spec:
+      {{- include "deepfellow.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: minio
+          image: {{ include "deepfellow.image" (dict "context" . "image" $v.milvus.minioImage) }}
+          command: ["minio", "server", "/minio_data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ACCESS_KEY
+              value: minioadmin
+            - name: MINIO_SECRET_KEY
+              value: minioadmin
+          ports:
+            - name: api
+              containerPort: 9000
+          volumeMounts:
+            - name: data
+              mountPath: /minio_data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with $v.milvus.storage.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $v.milvus.storage.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $milvus }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: milvus
+spec:
+  type: ClusterIP
+  ports:
+    - name: grpc
+      port: 19530
+      targetPort: grpc
+  selector:
+    {{- $milvusSel | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $milvus }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: milvus
+spec:
+  serviceName: {{ $milvus }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- $milvusSel | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- $milvusSel | nindent 8 }}
+    spec:
+      {{- include "deepfellow.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: milvus
+          image: {{ include "deepfellow.image" (dict "context" . "image" $v.milvus.milvusImage) }}
+          args: ["milvus", "run", "standalone"]
+          env:
+            - name: ETCD_ENDPOINTS
+              value: "{{ $etcd }}:2379"
+            - name: MINIO_ADDRESS
+              value: "{{ $minio }}:9000"
+            - name: MQ_TYPE
+              value: woodpecker
+          ports:
+            - name: grpc
+              containerPort: 19530
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/milvus
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with $v.milvus.storage.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $v.milvus.storage.size }}
+{{- end }}
+{{- end }}
