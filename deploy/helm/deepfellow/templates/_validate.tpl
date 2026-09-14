@@ -249,6 +249,7 @@ existingSecret's content is opaque at render — its password must be URL-safe o
 {{- include "deepfellow.validateSecret" (dict "cred" .Values.workspace.auth.bootstrapAdmin.password "path" "workspace.auth.bootstrapAdmin.password" "required" true) -}}
 {{- include "deepfellow.validateSecret" (dict "cred" .Values.workspace.mongo.auth.rootPassword "path" "workspace.mongo.auth.rootPassword" "required" true) -}}
 {{- include "deepfellow.validateUrlSafeValue" (dict "cred" .Values.workspace.mongo.auth.rootPassword "path" "workspace.mongo.auth.rootPassword") -}}
+{{- include "deepfellow.validateSecret" (dict "cred" .Values.workspace.mongo.auth.keyFile "path" "workspace.mongo.auth.keyFile" "required" true) -}}
 {{- end -}}
 
 {{/* ---------- Provisioning gate ---------- */}}

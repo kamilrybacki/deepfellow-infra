@@ -24,3 +24,4 @@ workspace:
   mongo:
     auth:
       rootPassword: { source: existingSecret, existingSecret: { name: df-secrets } }
+      keyFile: { source: existingSecret, existingSecret: { name: df-secrets } }

@@ -196,6 +196,10 @@ spec:
             matchLabels:
               app.kubernetes.io/instance: {{ $inst }}
               app.kubernetes.io/component: workspace
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ $inst }}
+              app.kubernetes.io/component: workspace-mongo
       ports:
         - port: 27017
           protocol: TCP

@@ -129,6 +129,19 @@ must honor `fsGroup` for volume ownership. Set `*.storage.storageClass` per comp
 `*.nodeSelector` / `*.tolerations` / `*.affinity` (including on `server.mongo` and
 `workspace.mongo`) to pin data pods when using node-local storage.
 
+### Workspace MongoDB authentication
+
+The Workspace's MongoDB is a single-node replica set with authentication **enforced** via a
+`--keyFile` (internal auth) plus a root user. Supply the keyFile as `workspace.mongo.auth.keyFile`
+(credential shape; base64-charset content) — an initContainer copies it to the mode the daemon
+requires. If generated it is retained (`resource-policy: keep`) because a changed keyFile would no
+longer match the replica set's own data dir; under GitOps use `source: existingSecret`.
+
+> **Upgrade note.** The root user is created only on a **fresh** data directory. A pre-existing
+> unauthenticated Workspace MongoDB upgraded into this version comes up with auth enforced and no
+> users (reachable only via the localhost exception); this chart is pre-release with no such
+> deployments to migrate, but a populated volume would need the user created manually.
+
 ## Installing
 
 ```console

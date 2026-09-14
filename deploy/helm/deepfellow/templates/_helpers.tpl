@@ -119,6 +119,15 @@ which create_admin rejects — so append one of each class.
 {{- end -}}
 
 {{/*
+Generated value for a MongoDB replica-set keyFile: base64 charset only (randAlphaNum is a strict
+subset), length well within Mongo's 6-1024 limit. No password-complexity suffix — the keyFile is
+never typed by a human and the "!" from genSecretValue is not a valid keyFile character.
+*/}}
+{{- define "deepfellow.genKeyFileValue" -}}
+{{- randAlphaNum 96 -}}
+{{- end -}}
+
+{{/*
 Emit ONE env-var list entry for a credential sub-map, sourcing it from the right Secret.
 Nothing is emitted when source=none (caller decides whether that's allowed).
   {{ include "deepfellow.credEnv" (dict "name" "DF_X" "cred" .Values....x "secretName" $s) }}
@@ -152,6 +161,7 @@ policy-compliant value; fail on upgrade/GitOps where lookup is empty (use existi
 {{- define "deepfellow.chartSecret" -}}
 {{- $ctx := .context -}}
 {{- $secretName := .secretName -}}
+{{- $gen := .generator | default "deepfellow.genSecretValue" -}}
 {{- $data := dict -}}
 {{- $keep := false -}}
 {{- range $label, $c := .creds -}}
@@ -166,7 +176,7 @@ policy-compliant value; fail on upgrade/GitOps where lookup is empty (use existi
 {{- if and $existing (hasKey ($existing.data | default dict) $key) -}}
 {{- $val = (index $existing.data $key | b64dec) -}}
 {{- else if $ctx.Release.IsInstall -}}
-{{- $val = (include "deepfellow.genSecretValue" $ctx) -}}
+{{- $val = (include $gen $ctx) -}}
 {{- else -}}
 {{- fail (printf "generated credential %q not found in Secret %q and this is not a fresh install: GitOps/upgrade must use source=existingSecret." $key $secretName) -}}
 {{- end -}}

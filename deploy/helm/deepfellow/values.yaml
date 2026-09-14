@@ -388,6 +388,16 @@ workspace:
         existingSecret: { name: "", key: "workspace-mongo-root-password" }
         value: ""
         generate: { retain: true }
+      # -- Replica-set internal-auth keyFile (credential shape; base64-charset content). Enforces
+      # authentication on the single-node replica set. If generated it MUST be retained — a changed
+      # keyFile breaks the replica set's own data dir — so `generate` here always sets retain and is
+      # produced from the base64 charset (not the password generator). Defaults to existingSecret
+      # like every other credential (GitOps-safe).
+      keyFile:
+        source: existingSecret
+        existingSecret: { name: "", key: "workspace-mongo-keyfile" }
+        value: ""
+        generate: { retain: true }
     storage: { size: 4Gi, storageClass: "" }
     # -- Resource requests/limits for the Workspace MongoDB.
     resources: {}

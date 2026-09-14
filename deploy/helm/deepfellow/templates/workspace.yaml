@@ -20,6 +20,13 @@
 {{ . }}
 ---
 {{- end }}
+{{/* --- workspace app-mongo replica-set keyFile (own Secret: base64-charset generator) --- */}}
+{{- $appMongoKeySecret := include "deepfellow.credSecretName" (dict "context" . "component" "workspace-mongo-keyfile") }}
+{{- $amKey := include "deepfellow.chartSecret" (dict "context" . "secretName" $appMongoKeySecret "generator" "deepfellow.genKeyFileValue" "creds" (dict "keyfile" $w.mongo.auth.keyFile)) }}
+{{- with $amKey }}
+{{ . }}
+---
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -57,12 +64,43 @@ spec:
     spec:
       {{- include "deepfellow.imagePullSecrets" . | nindent 6 }}
       securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
         fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: copy-keyfile
+          image: {{ include "deepfellow.image" (dict "context" . "image" $w.mongo.image) }}
+          imagePullPolicy: {{ $w.mongo.image.pullPolicy }}
+          securityContext:
+            {{- include "deepfellow.containerSecurityContext" . | nindent 12 }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              cp /etc/mongo-keyfile-src/keyfile /etc/mongo-keyfile/keyfile
+              chmod 400 /etc/mongo-keyfile/keyfile
+          volumeMounts:
+            - name: keyfile-src
+              mountPath: /etc/mongo-keyfile-src
+              readOnly: true
+            - name: keyfile
+              mountPath: /etc/mongo-keyfile
       containers:
         - name: mongo
           image: {{ include "deepfellow.image" (dict "context" . "image" $w.mongo.image) }}
           imagePullPolicy: {{ $w.mongo.image.pullPolicy }}
-          command: ["mongod", "--replSet", {{ $w.mongo.replSetName | quote }}, "--bind_ip_all"]
+          securityContext:
+            {{- include "deepfellow.containerSecurityContext" . | nindent 12 }}
+          args:
+            - --replSet
+            - {{ $w.mongo.replSetName | quote }}
+            - --keyFile
+            - /etc/mongo-keyfile/keyfile
+            - --bind_ip_all
           ports:
             - name: mongo
               containerPort: 27017
@@ -73,10 +111,20 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data/db
+            - name: keyfile
+              mountPath: /etc/mongo-keyfile
+              readOnly: true
           {{- with $w.mongo.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+      volumes:
+        - name: keyfile-src
+          secret:
+            secretName: {{ $appMongoKeySecret }}
+            defaultMode: 0440
+        - name: keyfile
+          emptyDir: {}
       {{- with $w.mongo.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
