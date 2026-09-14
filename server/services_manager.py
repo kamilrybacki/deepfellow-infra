@@ -40,8 +40,11 @@ logger = logging.getLogger("uvicorn.error")
 
 
 class ServicesManager:
-    def __init__(self):
+    EXTERNAL_ONLY_ALLOWED_SERVICE_TYPES: frozenset[str] = frozenset({"openai"})
+
+    def __init__(self, external_only: bool = False):
         self.services: dict[str, BaseService] = {}
+        self.external_only = external_only
         self.docker_tags_cache: dict[tuple[str, str | None, str | None, str | None], tuple[list[str], str, float]] = {}
 
     def split_service_type_and_instance(self, service_id: str) -> tuple[str, str]:
@@ -92,6 +95,8 @@ class ServicesManager:
         """Retrieve service."""
         if service_id in self.services:
             return self.services[service_id]
+        if self.external_only and service_id not in self.EXTERNAL_ONLY_ALLOWED_SERVICE_TYPES:
+            raise HTTPException(status_code=409, detail=f"Service '{service_id}' is disabled by DF_EXTERNAL_ONLY")
         raise HTTPException(status_code=404, detail=f"Service does not exist {service_id}")
 
     async def list_services(self, filters: ListServicesFilters) -> ListServicesOut:

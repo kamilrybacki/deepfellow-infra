@@ -79,7 +79,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         if config.otel_logging_enabled:
             otlp_logging.setup(config)
 
-        if app.state.config.docker_subnet:
+        if not config.external_only and app.state.config.docker_subnet:
             check_subnet(app.state.config.docker_subnet)
 
         app.state.hardware = hardware = Hardware()
@@ -92,7 +92,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         app.state.service_provider = service_provider = ServiceProvider(config)
         parents = [ParentInfra(config, task_manager, config.connect_to_mesh_url)] if config.connect_to_mesh_url else []
         app.state.parent_infra = parent_infra = ParentInfraGroup(parents)
-        app.state.services_manager = services_manager = ServicesManager()
+        app.state.services_manager = services_manager = ServicesManager(external_only=config.external_only)
         app.state.model_tester = model_tester = ModelTester()
         app.state.endpoint_registry = endpoint_registry = EndpointRegistry(config, parent_infra, model_tester, metrics_registry)
         app.state.infra_websocket_server = infra_websocket_server = InfraWebsocketServer(config, parent_infra, endpoint_registry)
@@ -107,24 +107,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         model_input = (config, endpoint_registry, service_provider, model_downloader, docker_service, hardware)
 
         # Register services
-        services_manager.register_service(ClaudeService(*model_input))
-        services_manager.register_service(CoquiService(*model_input))
-        services_manager.register_service(CustomService(*model_input))
-        services_manager.register_service(DeepSeekService(*model_input))
-        services_manager.register_service(DockerModelRunnerService(*model_input))
-        services_manager.register_service(GoogleAIService(*model_input))
-        services_manager.register_service(KimiService(*model_input))
-        services_manager.register_service(LLamacppService(*model_input))
-        services_manager.register_service(McpService(*model_input))
-        services_manager.register_service(OllamaCloudService(*model_input))
-        services_manager.register_service(OllamaExternalService(*model_input))
-        services_manager.register_service(OllamaService(*model_input))
-        services_manager.register_service(OpenAIService(*model_input))
-        services_manager.register_service(RerankService(*model_input))
-        services_manager.register_service(SglangService(*model_input))
-        services_manager.register_service(SpeachesAIService(*model_input))
-        services_manager.register_service(StableDiffusionService(*model_input))
-        services_manager.register_service(VllmService(*model_input))
+        if config.external_only:
+            services_manager.register_service(OpenAIService(*model_input))
+        else:
+            services_manager.register_service(ClaudeService(*model_input))
+            services_manager.register_service(CoquiService(*model_input))
+            services_manager.register_service(CustomService(*model_input))
+            services_manager.register_service(DeepSeekService(*model_input))
+            services_manager.register_service(DockerModelRunnerService(*model_input))
+            services_manager.register_service(GoogleAIService(*model_input))
+            services_manager.register_service(KimiService(*model_input))
+            services_manager.register_service(LLamacppService(*model_input))
+            services_manager.register_service(McpService(*model_input))
+            services_manager.register_service(OllamaCloudService(*model_input))
+            services_manager.register_service(OllamaExternalService(*model_input))
+            services_manager.register_service(OllamaService(*model_input))
+            services_manager.register_service(OpenAIService(*model_input))
+            services_manager.register_service(RerankService(*model_input))
+            services_manager.register_service(SglangService(*model_input))
+            services_manager.register_service(SpeachesAIService(*model_input))
+            services_manager.register_service(StableDiffusionService(*model_input))
+            services_manager.register_service(VllmService(*model_input))
 
         # Load functions
         await context.load_services()

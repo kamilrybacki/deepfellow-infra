@@ -104,10 +104,13 @@ _BASE_PATCHES = [
 ]
 
 
-def _make_config(*, docker_subnet: str = "", stop_on_shutdown: bool = False, otel_logging_enabled: bool = False) -> MagicMock:
+def _make_config(
+    *, docker_subnet: str = "", stop_on_shutdown: bool = False, otel_logging_enabled: bool = False, external_only: bool = False
+) -> MagicMock:
     cfg = MagicMock()
     cfg.docker_subnet = docker_subnet
     cfg.otel_logging_enabled = otel_logging_enabled
+    cfg.external_only = external_only
     cfg.is_stop_containers_on_shutdown_enabled.return_value = stop_on_shutdown
     return cfg
 
@@ -211,6 +214,33 @@ async def test_lifespan_skips_check_subnet_when_empty(app: FastAPI, base_mocks: 
             pass
 
         assert mock_check_subnet.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_lifespan_skips_check_subnet_in_external_only(app: FastAPI, base_mocks: dict[str, Mock]) -> None:
+    cfg = _make_config(docker_subnet="my-net", external_only=True)
+    _apply_base_patches(base_mocks, config=cfg)
+
+    with patch("server.lifecycle.check_subnet") as mock_check_subnet:
+        async with lifespan(app):
+            pass
+
+        assert mock_check_subnet.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_lifespan_external_only_registers_only_openai(app: FastAPI, base_mocks: dict[str, Mock]) -> None:
+    cfg = _make_config(external_only=True)
+    _apply_base_patches(base_mocks, config=cfg)
+    svc_mgr = base_mocks["server.lifecycle.ServicesManager"].return_value
+
+    async with lifespan(app):
+        pass
+
+    assert base_mocks["server.lifecycle.ServicesManager"].call_args == call(external_only=True)
+    assert svc_mgr.register_service.call_count == 1
+    registered = base_mocks["server.lifecycle.OpenAIService"].return_value
+    assert svc_mgr.register_service.call_args == call(registered)
 
 
 @pytest.mark.asyncio

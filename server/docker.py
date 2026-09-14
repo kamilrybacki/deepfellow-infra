@@ -1520,7 +1520,23 @@ class DockerService:
 
 
 async def create_docker_service(port_service: PortService, config: AppSettings) -> DockerService:
-    """Create docker service."""
+    """Create docker service (external-only mode returns an unprobed service, no Docker calls)."""
+    if config.external_only:
+
+        def get_host_platform_external_only() -> str:
+            arch = platform.machine().lower()
+            return normalize_docker_platform(f"linux/{arch}")
+
+        return DockerService(
+            config,
+            port_service,
+            "",
+            False,
+            get_os(),
+            get_cpu_architecture(),
+            False,
+            get_host_platform_external_only(),
+        )
 
     async def get_docker_compose_cmd() -> str:
         """Return docker compose command."""

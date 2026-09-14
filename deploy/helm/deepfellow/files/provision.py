@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
+
 """DeepFellow Suite provisioning — reconcile | verify | status.
 
 Idempotent, fail-closed, and secret-safe:

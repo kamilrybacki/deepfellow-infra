@@ -3392,6 +3392,7 @@ def test_get_docker_compose_file_path_with_prefix_creates_dir(tmp_path: Path) ->
 @pytest.mark.asyncio
 async def test_create_docker_service_docker_compose_plugin(tmp_path: Path) -> None:
     config = MagicMock()
+    config.external_only = False
     config.get_storage_dir.return_value = tmp_path
     port_service = MagicMock()
 
@@ -3420,6 +3421,7 @@ async def test_create_docker_service_docker_compose_plugin(tmp_path: Path) -> No
 @pytest.mark.asyncio
 async def test_create_docker_service_falls_back_to_docker_compose_binary(tmp_path: Path) -> None:
     config = MagicMock()
+    config.external_only = False
     config.get_storage_dir.return_value = tmp_path
     port_service = MagicMock()
 
@@ -3443,6 +3445,33 @@ async def test_create_docker_service_falls_back_to_docker_compose_binary(tmp_pat
         svc = await create_docker_service(port_service, config)
 
     assert svc.docker_compose_cmd == "docker-compose"
+
+
+@pytest.mark.asyncio
+async def test_create_docker_service_external_only_makes_no_docker_calls() -> None:
+    config = MagicMock()
+    config.external_only = True
+    port_service = MagicMock()
+
+    def _fail_which(_cmd: str) -> str | None:
+        raise AssertionError("shutil.which must not be called in external-only mode")
+
+    def _fail_run(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("no docker command must run in external-only mode")
+
+    with (
+        patch("server.docker.shutil.which", side_effect=_fail_which),
+        patch("server.docker.Utils.run_command", new_callable=AsyncMock, side_effect=_fail_run),
+        patch("server.docker.get_docker_auths", return_value={}),
+        patch("server.docker.get_os", return_value="linux"),
+        patch("server.docker.get_cpu_architecture", return_value="amd64"),
+        patch("server.docker.platform.machine", return_value="x86_64"),
+    ):
+        svc = await create_docker_service(port_service, config)
+
+    assert svc.docker_compose_cmd == ""
+    assert svc.has_gpu_support is False
+    assert svc.is_rootless is False
 
 
 def test_docker_path_add_combines_paths() -> None:
@@ -3478,6 +3507,7 @@ async def test_get_existing_or_free_port_docker_exception_in_parse_gets_free_por
 @pytest.mark.asyncio
 async def test_create_docker_service_raises_when_docker_not_installed(tmp_path: Path) -> None:
     config = MagicMock()
+    config.external_only = False
     port_service = MagicMock()
 
     with (
@@ -3540,6 +3570,7 @@ def test_get_docker_compose_file_path_with_prefix_existing_dir_skips_mkdir(docke
 @pytest.mark.asyncio
 async def test_create_docker_service_raises_when_compose_not_available(tmp_path: Path) -> None:
     config = MagicMock()
+    config.external_only = False
     port_service = MagicMock()
 
     def which_side_effect(cmd: str) -> str | None:
