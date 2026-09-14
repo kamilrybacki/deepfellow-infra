@@ -175,6 +175,11 @@ class ServicesManager:
         service_type, instance = self.split_service_type_and_instance(service_id)
         return await self._get_service(service_type).get_instance_install_progress(instance)
 
+    async def cancel_service_install(self, service_id: str) -> None:
+        """Cancel an in-progress service instance install or update."""
+        service_type, instance = self.split_service_type_and_instance(service_id)
+        await self._get_service(service_type).cancel_instance_install(instance)
+
     async def install_model_in_service(
         self,
         service_id: str,

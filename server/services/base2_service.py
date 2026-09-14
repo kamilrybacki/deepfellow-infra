@@ -594,8 +594,13 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             raise HTTPException(404, "Instance doesn't exist.")
         return instance_info
 
-    def _pop_installing_if_current(self, instance: str, model_id: str, reservation: InstallingModel) -> None:
-        """Remove model_id's reservation if it's still this exact one and the instance still exists.
+    def _pop_installing_if_current(
+        self, instance: str, reservation: InstallingModel | InstallingInstance[InstalledInfoType], *, model_id: str | None = None
+    ) -> None:
+        """Remove `reservation` if it's still this exact one and the instance still exists.
+
+        Covers both reservation kinds: pass `model_id` to clear a model's slot in
+        `installing_model_progress`, or omit it to clear the instance's own single `installing` slot.
 
         No-ops otherwise instead of raising, since callers use this before reject()/resolve() and
         must not be blocked by either a superseded reservation or an already-uninstalled instance.
@@ -603,9 +608,12 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         instance_info = self.instances_info.get(instance)
         if instance_info is None:
             return
-        progress = instance_info.installing_model_progress
-        if progress.get(model_id) is reservation:
-            del progress[model_id]
+        if model_id is not None:
+            progress = instance_info.installing_model_progress
+            if progress.get(model_id) is reservation:
+                del progress[model_id]
+        elif instance_info.installing is reservation:
+            instance_info.installing = None
 
     @staticmethod
     async def _wait_for_install_setup(
@@ -667,7 +675,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
                 logger.exception(
                     f"{self.get_id(instance)} pending setup for model {model_id} failed independently of the cancel request"  # noqa: G004
                 )
-            self._pop_installing_if_current(instance, model_id, installing)
+            self._pop_installing_if_current(instance, installing, model_id=model_id)
             return
 
         # Cancel the real pull work and every chained promise (cancel() propagates down the chain),
@@ -681,7 +689,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
 
         promise.progress.close()
 
-        self._pop_installing_if_current(instance, model_id, installing)
+        self._pop_installing_if_current(instance, installing, model_id=model_id)
 
     async def get_instance_install_progress(self, instance: str) -> PromiseWithProgress[InstallServiceOut, StreamChunk]:
         """Return actually installing service."""
@@ -694,6 +702,47 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             return await asyncio.wait_for(installing.wait_chained(), timeout=installing.timeout_seconds)
         except TimeoutError:
             raise HTTPException(504, f"Service {self.get_id(instance)} is still preparing to install; try again shortly.") from None
+
+    async def cancel_instance_install(self, instance: str) -> None:
+        """Cancel an in-progress service instance install or update, stopping the underlying Docker work.
+
+        Unlike `cancel_model_install()`, there's no `pending_task` to cancel up front: the pre-promise
+        setup phase of `_install_instance()` is short and already bounded by `Utils.run_command`'s own
+        kill-on-cancel, so a cancel request arriving during that window simply waits for it to settle
+        (bounded by the reservation's own `timeout_seconds`) instead of interrupting it.
+        """
+        installing = self.get_instance_info(instance).installing
+
+        if not installing:
+            raise HTTPException(404, f"Service {self.get_id(instance)} is not installing now.")
+
+        try:
+            promise = await asyncio.wait_for(installing.wait_ready(), timeout=installing.timeout_seconds)
+        except TimeoutError:
+            # Same reasoning as cancel_model_install(): we don't know whether setup is genuinely stuck
+            # or just slow, so leave the reservation untouched for a retry or a later read to observe
+            # the real eventual outcome instead of guessing.
+            raise HTTPException(504, f"Timed out waiting to confirm cancellation for {self.get_id(instance)}.") from None
+        except Exception as e:
+            # wait_ready() re-raising here means the pre-promise setup failed on its own or was itself
+            # rejected (reject() already turns any CancelledError into a clean HTTPException(409)) -
+            # either way, there's no real promise left to cancel.
+            if not (isinstance(e, HTTPException) and e.status_code == 409):
+                logger.exception(f"{self.get_id(instance)} install/update setup failed independently of the cancel request")  # noqa: G004
+            self._pop_installing_if_current(instance, installing)
+            return
+
+        # Cancel the real install/update work and every chained promise (cancel() propagates down the
+        # chain), plus the chunk reader, then await them all so no task is left pending and GC'd mid-run.
+        promise.cancel()
+        assert installing.task is not None
+        installing.task.cancel()
+        tasks = [*promise.tasks(), installing.task]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        promise.progress.close()
+
+        self._pop_installing_if_current(instance, installing)
 
     def is_installed(self, instance: str) -> bool:
         """Check whether service is installed."""
@@ -1445,11 +1494,11 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         installing_model_progress = self.get_instance_info(instance).installing_model_progress
 
         async def wrapped_on_success(data: InstallModelOut) -> InstallModelOut:
-            self._pop_installing_if_current(instance, model_id, reservation)
+            self._pop_installing_if_current(instance, reservation, model_id=model_id)
             return await on_success(data)
 
         def wrapped_on_error(e: Exception) -> None:
-            self._pop_installing_if_current(instance, model_id, reservation)
+            self._pop_installing_if_current(instance, reservation, model_id=model_id)
             on_error(e)
 
         existing = installing_model_progress.get(model_id)
@@ -1475,7 +1524,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         try:
             promise = await reservation.pending_task
         except BaseException as e:
-            self._pop_installing_if_current(instance, model_id, reservation)
+            self._pop_installing_if_current(instance, reservation, model_id=model_id)
             reservation.reject(e)
             # A CancelledError here can mean two different things: this call's own task was
             # cancelled (e.g. its request disconnected) - which must propagate as-is - or someone

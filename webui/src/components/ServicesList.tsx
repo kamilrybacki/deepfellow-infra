@@ -57,7 +57,7 @@ This software is Licensed under the DeepFellow Free License.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent } from "react";
 import { toast } from "sonner";
 import { ConfirmModal } from "./ConfirmModal";
@@ -87,6 +87,10 @@ export function ServicesList() {
   const hasRealProgressRef = useRef<Record<string, boolean>>({});
   const restartDockerToastIdRef = useRef<string | number | null>(null);
   const uninstallToastIdRef = useRef<string | number | null>(null);
+  const installAbortControllersRef = useRef<Record<string, AbortController>>(
+    {},
+  );
+  const cancelledInstallsRef = useRef<Set<string>>(new Set());
   const queryClient = useQueryClient();
   const installProgress = useInstallProgressSnapshot().services;
 
@@ -294,6 +298,9 @@ export function ServicesList() {
       ignoreWarnings?: boolean;
       update?: boolean;
     }) => {
+      const abortController = new AbortController();
+      installAbortControllersRef.current[serviceId] = abortController;
+
       return new Promise<void>((resolve, reject) => {
         let currentStage: "install" | "download" = "download";
         const installStartTime = Date.now();
@@ -360,6 +367,7 @@ export function ServicesList() {
               }
             },
             ignoreWarnings,
+            abortController.signal,
           )
           .catch(reject);
         modal.close();
@@ -380,6 +388,12 @@ export function ServicesList() {
       );
     },
     onError: (error, variables) => {
+      // Intentional cancel: the UI was already reset by handleCancelInstall — swallow the AbortError.
+      if (cancelledInstallsRef.current.has(variables.serviceId)) {
+        cancelledInstallsRef.current.delete(variables.serviceId);
+        return;
+      }
+
       const simStop = simulationStopFnsRef.current[variables.serviceId];
       if (simStop) {
         simStop.stop();
@@ -406,7 +420,9 @@ export function ServicesList() {
         ),
       );
     },
-    onSettled: () => {
+    onSettled: (_data, _error, variables) => {
+      cancelledInstallsRef.current.delete(variables.serviceId);
+      delete installAbortControllersRef.current[variables.serviceId];
       // Only reset if not showing warnings modal
       if (!hasWarningsRef.current) {
         setInstallingServiceId(null);
@@ -414,6 +430,50 @@ export function ServicesList() {
       }
     },
   });
+
+  // Cancel an in-progress install/update: stop the backend Docker work, abort the local SSE read,
+  // and reset the UI. Not offered for cloud services (see render below) - they have nothing to cancel.
+  const handleCancelInstall = useCallback(
+    async (serviceId: string) => {
+      // Flag the cancel so the install mutation's error path swallows the AbortError it triggers.
+      cancelledInstallsRef.current.add(serviceId);
+
+      // Abort the local SSE fetch (terminates the pending install promise immediately).
+      installAbortControllersRef.current[serviceId]?.abort();
+      delete installAbortControllersRef.current[serviceId];
+
+      // Stop the progress simulation and clear UI progress.
+      simulationStopFnsRef.current[serviceId]?.stop();
+      delete simulationStopFnsRef.current[serviceId];
+      delete hasRealProgressRef.current[serviceId];
+      clearServiceInstallProgress(serviceId);
+
+      setInstallingServiceId(null);
+
+      toast.success(`Installation cancelled for ${serviceId}`, {
+        duration: 8000,
+      });
+
+      try {
+        // Stop the actual install/update work on the backend.
+        await apiClient.cancelAdminServiceInstall(serviceId);
+      } catch (error) {
+        // A 404 just means the install already finished/cleared on the backend — safe to ignore.
+        const isAlreadyGone =
+          error instanceof Error && error.message.includes("HTTP 404");
+        if (!isAlreadyGone) {
+          toast.error(
+            `Failed to cancel installation for ${serviceId} — please try again`,
+          );
+        }
+        console.error(`Failed to cancel install for ${serviceId}:`, error);
+      }
+
+      // Let reconciliation confirm the reset.
+      queryClient.invalidateQueries({ queryKey: ["admin", "services"] });
+    },
+    [queryClient],
+  );
 
   const uninstallMutation = useMutation({
     mutationFn: (serviceId: string) =>
@@ -988,8 +1048,17 @@ export function ServicesList() {
                         className="flex justify-end gap-2"
                         data-prevent-row-click
                       >
-                        {isInProgress ||
-                        installedIsProgress ? null : !isInstalled ? (
+                        {isInProgress || installedIsProgress ? (
+                          service.is_cloud ? null : (
+                            <Button
+                              onClick={() => handleCancelInstall(service.id)}
+                              variant="destructive"
+                              size="sm"
+                            >
+                              Cancel
+                            </Button>
+                          )
+                        ) : !isInstalled ? (
                           <>
                             <TooltipProvider>
                               <Tooltip>

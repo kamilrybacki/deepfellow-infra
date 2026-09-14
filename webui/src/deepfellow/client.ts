@@ -137,6 +137,7 @@ export class DeepFellowClient {
     spec: Record<string, unknown>,
     onProgress: (event: ProgressEvent) => void,
     ignoreWarnings = false,
+    signal?: AbortSignal,
   ): Promise<void> {
     return this.writeAdminServiceStreaming(
       "POST",
@@ -144,6 +145,7 @@ export class DeepFellowClient {
       spec,
       onProgress,
       ignoreWarnings,
+      signal,
     );
   }
 
@@ -152,6 +154,7 @@ export class DeepFellowClient {
     spec: Record<string, unknown>,
     onProgress: (event: ProgressEvent) => void,
     ignoreWarnings = false,
+    signal?: AbortSignal,
   ): Promise<void> {
     return this.writeAdminServiceStreaming(
       "PUT",
@@ -159,6 +162,7 @@ export class DeepFellowClient {
       spec,
       onProgress,
       ignoreWarnings,
+      signal,
     );
   }
 
@@ -168,6 +172,7 @@ export class DeepFellowClient {
     spec: Record<string, unknown>,
     onProgress: (event: ProgressEvent) => void,
     ignoreWarnings = false,
+    signal?: AbortSignal,
   ): Promise<void> {
     const url = `${this.baseURL}/admin/services/${serviceId}`;
     const adminApiKey = AdminApiKeyStorage.get();
@@ -189,6 +194,7 @@ export class DeepFellowClient {
       method,
       headers,
       body: JSON.stringify(body),
+      signal,
     });
 
     if (!response.ok) {
@@ -232,6 +238,17 @@ export class DeepFellowClient {
       // Non-streaming response
       await response.json();
     }
+  }
+
+  async cancelAdminServiceInstall(
+    serviceId: string,
+  ): Promise<{ status: string }> {
+    return this.makeRequest<{ status: string }>(
+      `/admin/services/${serviceId}/cancel`,
+      {
+        method: "POST",
+      },
+    );
   }
 
   async getServiceProgress(
