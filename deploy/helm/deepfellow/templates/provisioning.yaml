@@ -17,12 +17,12 @@
 {{- if include "deepfellow.backendEnabled" (dict "b" $bRaw) }}
 {{- $b := mergeOverwrite (include "deepfellow.modelBackendDefaults" $ | fromYaml) (deepCopy $bRaw) }}
 {{- $svc := include "deepfellow.componentName" (dict "context" $ "component" (printf "mb-%s" $name)) }}
-{{- $backends = append $backends (dict "id" (default $name $b.modelId) "api_url" (printf "http://%s:%v" $svc $b.service.port) "service_type" "openai" "context_length" $b.ctxSize "native" true) }}
+{{- $backends = append $backends (dict "id" (default $name $b.modelId) "instance" $name "api_url" (printf "http://%s:%v" $svc $b.service.port) "service_type" "openai" "context_length" $b.ctxSize "native" true) }}
 {{- end }}
 {{- end }}
 {{- range $name, $b := .Values.externalBackends }}
 {{- if include "deepfellow.backendEnabled" (dict "b" $b) }}
-{{- $entry := dict "id" $b.modelId "api_url" $b.apiUrl "service_type" (default "openai" $b.serviceType) "context_length" (dig "contextLength" 8192 $b) "native" false }}
+{{- $entry := dict "id" $b.modelId "instance" $name "api_url" $b.apiUrl "service_type" (default "openai" $b.serviceType) "context_length" (dig "contextLength" 8192 $b) "native" false }}
 {{- $ak := dig "apiKey" (dict "source" "none") $b }}
 {{- if ne $ak.source "none" }}
 {{- $envName := printf "DF_BACKEND_%s_API_KEY" ($name | upper | replace "-" "_") }}
@@ -57,8 +57,6 @@ metadata:
     app.kubernetes.io/component: provisioning
   annotations:
     helm.sh/resource-policy: keep
-    helm.sh/hook: pre-install,pre-upgrade
-    helm.sh/hook-weight: "0"
 type: Opaque
 ---
 {{- end }}

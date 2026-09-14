@@ -26,6 +26,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
@@ -209,21 +210,33 @@ def register_backend(infra_url, admin_key, backend):
     context_length = int(backend.get("context_length", 8192))
     api_key = os.environ.get(backend["api_key_env"], "") if backend.get("api_key_env") else ""
 
-    status, _ = _request(
+    # Each backend is its OWN service instance (`<type>|<instance>`) so distinct endpoints do
+    # not collide on one shared service. The instance name is the chart map key (DNS-label safe,
+    # so it satisfies Infra's stricter instance charset), NOT model_id, which may contain dots.
+    instance = backend.get("instance") or model_id
+    service_id = f"{service_type}|{instance}"
+    sid = urllib.parse.quote(service_id, safe="")
+
+    status, body = _request(
         "POST",
-        f"{infra_url}/admin/services/{service_type}",
+        f"{infra_url}/admin/services/{sid}",
         auth,
         {"spec": {"api_url": api_url, "api_key": api_key or "none"}, "stream": False, "ignore_warnings": True},
     )
-    if status == 409:
-        # Service already exists — it must point at the same endpoint, else we would grant
-        # against the wrong backend. Reconcile: fetch and compare desired state, fail on drift.
-        gstatus, gbody = _request("GET", f"{infra_url}/admin/services/{service_type}", auth)
+    # An instance that already exists returns 409, or 400 with "already install…" — Infra reports the
+    # already-installed instance as a 400 (base2 install_instance). Both mean "reconcile, don't recreate".
+    exists = status == 409 or (status == 400 and "already install" in json.dumps(body).lower())
+    if exists:
+        gstatus, gbody = _request("GET", f"{infra_url}/admin/services/{sid}", auth)
         if gstatus == 200:
-            existing_url = (gbody.get("spec") or {}).get("api_url")
+            # The configured endpoint lives in `installed` (the instance's saved options spec),
+            # not the top-level `spec` (that is the field schema). `installed` is a dict only when
+            # the instance is actually installed; bool/progress means nothing to compare against.
+            installed = gbody.get("installed")
+            existing_url = installed.get("api_url") if isinstance(installed, dict) else None
             if existing_url and existing_url != api_url:
                 raise SystemExit(
-                    f"service '{service_type}' already registered with api_url {existing_url!r}, "
+                    f"service instance {service_id!r} already registered with api_url {existing_url!r}, "
                     f"but backend {model_id} wants {api_url!r}: refusing to grant against a different endpoint."
                 )
     elif status not in (200, 201):
@@ -231,7 +244,7 @@ def register_backend(infra_url, admin_key, backend):
 
     status, body = _request(
         "POST",
-        f"{infra_url}/admin/services/{service_type}/models/custom",
+        f"{infra_url}/admin/services/{sid}/models/custom",
         auth,
         {"spec": {
             "id": model_id, "type": "llm", "completions": True, "legacy_completions": False,
@@ -245,7 +258,7 @@ def register_backend(infra_url, admin_key, backend):
     if already:
         # Reconcile the existing custom model: a type=None seed (Gate A collision) is a hard error;
         # a differing context length means the desired definition drifted.
-        gstatus, gbody = _request("GET", f"{infra_url}/admin/services/{service_type}/models/{model_id}", auth)
+        gstatus, gbody = _request("GET", f"{infra_url}/admin/services/{sid}/models/{model_id}", auth)
         if gstatus == 200:
             spec = gbody.get("custom_spec") or gbody.get("spec") or gbody
             if spec.get("type") in (None, "None"):
@@ -262,13 +275,13 @@ def register_backend(infra_url, admin_key, backend):
 
     status, _ = _request(
         "POST",
-        f"{infra_url}/admin/services/{service_type}/models/_?model_id={model_id}",
+        f"{infra_url}/admin/services/{sid}/models/_?model_id={model_id}",
         auth,
         {"stream": False, "ignore_warnings": True},
     )
     if status not in (200, 201, 409):
         raise SystemExit(f"model install for {model_id} failed: HTTP {status}")
-    log(f"backend {model_id} registered")
+    log(f"backend {model_id} registered (service instance {service_id})")
 
 
 def infra_model_ready(infra_url, admin_key, model_id, attempts=30, delay=5):

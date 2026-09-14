@@ -70,6 +70,23 @@ Each failed check aborts rendering with a clear, path-prefixed message.
 {{- end -}}
 {{- end -}}
 
+{{/*
+An inline `value` credential that gets interpolated into a connection-string userinfo
+(mongodb://user:PASS@host) must be URL-safe unencoded — the chart does not percent-encode it.
+Allow unreserved chars plus the URL-safe sub-delims; reject %@:/?#[]... which break the URL.
+existingSecret/generate are not checked here (generate is URL-safe by construction; an
+existingSecret's content is opaque at render — its password must be URL-safe or pre-encoded).
+*/}}
+{{- define "deepfellow.validateUrlSafeValue" -}}
+{{- $c := .cred -}}
+{{- $path := .path -}}
+{{- if eq $c.source "value" -}}
+{{- if not (regexMatch "^[A-Za-z0-9!$&'()*+,._~-]+$" $c.value) -}}
+{{- fail (printf "%s.value must be URL-safe (it is placed in a connection-string userinfo unencoded): allowed characters are letters, digits, and !$&'()*+,._~- . Use source=existingSecret for a password with other characters." $path) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{/* Whether a keyed backend entry is enabled (missing `enabled` => true). */}}
 {{- define "deepfellow.backendEnabled" -}}
 {{- if hasKey .b "enabled" -}}{{- if .b.enabled -}}true{{- end -}}{{- else -}}true{{- end -}}
@@ -125,6 +142,7 @@ Each failed check aborts rendering with a clear, path-prefixed message.
 {{/* ---------- Native + external backends ---------- */}}
 {{- $nativeEnabled := 0 -}}
 {{- $modelIds := dict -}}
+{{- $instances := dict -}}
 {{- range $name, $bRaw := .Values.modelBackends -}}
 {{- if include "deepfellow.backendEnabled" (dict "b" $bRaw) -}}
 {{- $b := mergeOverwrite (include "deepfellow.modelBackendDefaults" $ | fromYaml) (deepCopy $bRaw) -}}
@@ -145,6 +163,7 @@ Each failed check aborts rendering with a clear, path-prefixed message.
 {{- fail (printf "duplicate modelId %q (modelBackends.%s and %s): model ids must be unique across modelBackends and externalBackends." $mid $name (index $modelIds $mid)) -}}
 {{- end -}}
 {{- $modelIds = merge $modelIds (dict $mid $name) -}}
+{{- $instances = merge $instances (dict $name "modelBackends") -}}
 {{- end -}}
 {{- end -}}
 {{- if and (gt $nativeEnabled 0) (not .Values.infra.externalOnly.enabled) -}}
@@ -170,6 +189,10 @@ Each failed check aborts rendering with a clear, path-prefixed message.
 {{- fail (printf "duplicate modelId %q (externalBackends.%s and %s): model ids must be unique across modelBackends and externalBackends." $b.modelId $name (index $modelIds $b.modelId)) -}}
 {{- end -}}
 {{- $modelIds = merge $modelIds (dict $b.modelId $name) -}}
+{{- if hasKey $instances $name -}}
+{{- fail (printf "duplicate backend key %q (externalBackends.%s and modelBackends.%s): the map key is the Infra service instance name and must be unique across modelBackends and externalBackends." $name $name $name) -}}
+{{- end -}}
+{{- $instances = merge $instances (dict $name "externalBackends") -}}
 {{- end -}}
 {{- end -}}
 
@@ -225,6 +248,7 @@ Each failed check aborts rendering with a clear, path-prefixed message.
 {{- include "deepfellow.validateSecret" (dict "cred" .Values.workspace.auth.betterAuthSecret "path" "workspace.auth.betterAuthSecret" "required" true) -}}
 {{- include "deepfellow.validateSecret" (dict "cred" .Values.workspace.auth.bootstrapAdmin.password "path" "workspace.auth.bootstrapAdmin.password" "required" true) -}}
 {{- include "deepfellow.validateSecret" (dict "cred" .Values.workspace.mongo.auth.rootPassword "path" "workspace.mongo.auth.rootPassword" "required" true) -}}
+{{- include "deepfellow.validateUrlSafeValue" (dict "cred" .Values.workspace.mongo.auth.rootPassword "path" "workspace.mongo.auth.rootPassword") -}}
 {{- end -}}
 
 {{/* ---------- Provisioning gate ---------- */}}

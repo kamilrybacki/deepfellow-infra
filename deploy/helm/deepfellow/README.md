@@ -103,7 +103,11 @@ externalBackends:         # endpoints you host elsewhere
     modelId: my-model
 ```
 
-A map (not a list) means an overlay adds or disables one backend without restating the rest.
+A map (not a list) means an overlay adds or disables one backend without restating the rest. Each
+backend is registered as its own Infra `openai` service **instance** named by its map key
+(`openai|<key>`), so two backends never collide on one endpoint; keys must be unique across
+`modelBackends` and `externalBackends`. `modelId` stays free-form (it may contain dots) — the map
+key, not `modelId`, carries Infra's instance-name charset constraint.
 An external endpoint's `GET /v1/models` must **not** list its custom `modelId` (a live-listed id
 seeds `type=None` in Infra and collides with custom-model install — Gate A finding).
 
@@ -136,7 +140,10 @@ cannot compare fields). Every message is path-prefixed:
 - **Credentials** — `source` must be valid; `existingSecret` needs a `name`; `value` must be
   non-empty; `generate` takes neither; required credentials cannot be `none`.
 - **Passwords** — an inline `server.admin.password.value` must be ≥10 chars with lower, upper,
-  digit, and special.
+  digit, and special. An inline `workspace.mongo.auth.rootPassword.value` must additionally be
+  URL-safe (letters, digits, `!$&'()*+,._~-`): it is placed in the Workspace `MONGO_URL` userinfo
+  unencoded. A password with other characters must come from an `existingSecret` (already URL-safe
+  or percent-encoded); `generate` is URL-safe by construction.
 - **Infra** — `mesh.key` non-empty (image requires `DF_MESH_KEY`); `externalOnly.enforcement`
   enum; `patched` requires an infra digest; native backends require `externalOnly.enabled`.
 - **Mongo** — `mode` enum; `embedded` needs its passwords; `external` needs `uriSecret.name`.
@@ -161,6 +168,12 @@ cannot compare fields). Every message is path-prefixed:
 | `workspace.enabled` | Deploy the Workspace panel. | `true` |
 | `provisioning.enabled` | Run provisioning (helm hooks). | `false` |
 | `provisioning.{revision,allowNoModels,stateSecret.name}` | Rerun key / no-model escape / dfproj Secret. | `"1"`, `false`, `""` |
+
+> **State Secret.** With `provisioning.stateSecret.name` empty the chart creates and owns the
+> dfproj state Secret (`resource-policy: keep`, so the one-time project key survives uninstall).
+> If you set `provisioning.stateSecret.name` to your own Secret, the chart neither creates it nor
+> grants RBAC to create it — that Secret **must already exist** in the release namespace, otherwise
+> provisioning fails (fail-closed) when it tries to persist the project key.
 | `ingress.enabled` / `networkPolicy.enabled` | Ingress / NetworkPolicies. | `false` / `false` |
 
 See [`values.yaml`](./values.yaml) for the complete, commented set.
