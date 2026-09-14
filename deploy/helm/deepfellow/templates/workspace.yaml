@@ -191,8 +191,11 @@ spec:
             - name: BOOTSTRAP_ADMIN_EMAIL
               value: {{ $w.auth.bootstrapAdmin.email | quote }}
             {{- include "deepfellow.credEnv" (dict "name" "BOOTSTRAP_ADMIN_PASSWORD" "cred" $w.auth.bootstrapAdmin.password "secretName" $secretName "required" true) | nindent 12 }}
+            - name: MONGO_ROOT_USER
+              value: {{ $w.mongo.auth.rootUsername | quote }}
+            {{- include "deepfellow.credEnv" (dict "name" "MONGO_ROOT_PASSWORD" "cred" $w.mongo.auth.rootPassword "secretName" $appMongoSecret "required" true) | nindent 12 }}
             - name: MONGO_URL
-              value: {{ printf "mongodb://%s-0.%s:27017/?replicaSet=%s" $appMongo $appMongo $w.mongo.replSetName | quote }}
+              value: {{ printf "mongodb://$(MONGO_ROOT_USER):$(MONGO_ROOT_PASSWORD)@%s-0.%s:27017/?replicaSet=%s&authSource=admin" $appMongo $appMongo $w.mongo.replSetName | quote }}
             {{- with $w.sessionTitleModel }}
             - name: DF_SESSION_TITLE_MODEL
               value: {{ . | quote }}

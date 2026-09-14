@@ -7,11 +7,12 @@ The chart runs the Suite **socket-free**: model backends are served natively by
 external `openai` services, so no Docker-in-Docker and no Docker socket are required. Only the
 components you enable are rendered.
 
-> **Status: scaffolding (Phase 1).** This directory currently ships the chart skeleton —
-> `Chart.yaml`, `values.yaml`, `values.schema.json`, helpers, and render-time validation.
-> Component templates (Infra, model backends, Server, Mongo, vector DBs, Workspace,
-> provisioning, ingress, network policies) land in later phases. `helm template` renders no
-> workloads yet, but the schema and the fail-closed cross-field validation are already enforced.
+> **Status: templates complete; pre-smoke.** The chart renders the whole Suite — Infra,
+> native model backends, Server, Mongo, vector DBs (Qdrant/Milvus), FalkorDB, Workspace, the
+> provisioning Job, Ingress, and NetworkPolicies — with schema + fail-closed render-time
+> validation. The `DF_EXTERNAL_ONLY` Infra patch ships alongside it. Not yet smoke-tested on a
+> cluster; the separate `deepfellow-server` image's login/health/Mongo-auth contracts are
+> verified during the cluster smoke, not by rendering.
 
 ## Contract philosophy: fail-closed
 

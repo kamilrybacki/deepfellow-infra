@@ -87,6 +87,12 @@ Rendered as a compact standalone; tune resources/storage via values before produ
 {{- $etcdSel := include "deepfellow.selectorLabels" (dict "context" . "component" "etcd") }}
 {{- $minioSel := include "deepfellow.selectorLabels" (dict "context" . "component" "minio") }}
 {{- $milvusSel := include "deepfellow.selectorLabels" (dict "context" . "component" "milvus") }}
+{{- $minioSecret := include "deepfellow.credSecretName" (dict "context" . "component" "minio") }}
+{{- $minioSec := include "deepfellow.chartSecret" (dict "context" . "secretName" $minioSecret "creds" (dict "accessKey" $v.milvus.minio.accessKey "secretKey" $v.milvus.minio.secretKey)) }}
+{{- with $minioSec }}
+{{ . }}
+---
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -122,9 +128,13 @@ spec:
         {{- $etcdSel | nindent 8 }}
     spec:
       {{- include "deepfellow.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "deepfellow.podSecurityContext" . | nindent 8 }}
       containers:
         - name: etcd
           image: {{ include "deepfellow.image" (dict "context" . "image" $v.milvus.etcdImage) }}
+          securityContext:
+            {{- include "deepfellow.containerSecurityContext" . | nindent 12 }}
           command: ["etcd", "-advertise-client-urls=http://127.0.0.1:2379", "-listen-client-urls", "http://0.0.0.0:2379", "--data-dir", "/etcd"]
           env:
             - name: ETCD_AUTO_COMPACTION_MODE
@@ -186,15 +196,17 @@ spec:
         {{- $minioSel | nindent 8 }}
     spec:
       {{- include "deepfellow.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "deepfellow.podSecurityContext" . | nindent 8 }}
       containers:
         - name: minio
           image: {{ include "deepfellow.image" (dict "context" . "image" $v.milvus.minioImage) }}
+          securityContext:
+            {{- include "deepfellow.containerSecurityContext" . | nindent 12 }}
           command: ["minio", "server", "/minio_data", "--console-address", ":9001"]
           env:
-            - name: MINIO_ACCESS_KEY
-              value: minioadmin
-            - name: MINIO_SECRET_KEY
-              value: minioadmin
+            {{- include "deepfellow.credEnv" (dict "name" "MINIO_ACCESS_KEY" "cred" $v.milvus.minio.accessKey "secretName" $minioSecret "required" true) | nindent 12 }}
+            {{- include "deepfellow.credEnv" (dict "name" "MINIO_SECRET_KEY" "cred" $v.milvus.minio.secretKey "secretName" $minioSecret "required" true) | nindent 12 }}
           ports:
             - name: api
               containerPort: 9000
@@ -248,9 +260,13 @@ spec:
         {{- $milvusSel | nindent 8 }}
     spec:
       {{- include "deepfellow.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "deepfellow.podSecurityContext" . | nindent 8 }}
       containers:
         - name: milvus
           image: {{ include "deepfellow.image" (dict "context" . "image" $v.milvus.milvusImage) }}
+          securityContext:
+            {{- include "deepfellow.containerSecurityContext" . | nindent 12 }}
           args: ["milvus", "run", "standalone"]
           env:
             - name: ETCD_ENDPOINTS
@@ -259,6 +275,8 @@ spec:
               value: "{{ $minio }}:9000"
             - name: MQ_TYPE
               value: woodpecker
+            {{- include "deepfellow.credEnv" (dict "name" "MINIO_ACCESS_KEY_ID" "cred" $v.milvus.minio.accessKey "secretName" $minioSecret "required" true) | nindent 12 }}
+            {{- include "deepfellow.credEnv" (dict "name" "MINIO_SECRET_ACCESS_KEY" "cred" $v.milvus.minio.secretKey "secretName" $minioSecret "required" true) | nindent 12 }}
           ports:
             - name: grpc
               containerPort: 19530

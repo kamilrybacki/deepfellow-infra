@@ -1,4 +1,11 @@
 {{- if .Values.networkPolicy.enabled }}
+{{- $inst := .Release.Name }}
+{{- $np := dict "instance" $inst }}
+{{/*
+Per-flow ingress isolation. Egress is left to the cluster default (portability); a homelab
+overlay adds egress control + any BYO-endpoint allows. All selectors are scoped by instance
+so a co-located release in the same namespace is not accidentally matched.
+*/}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -9,48 +16,188 @@ spec:
   podSelector:
     matchLabels:
       app.kubernetes.io/part-of: deepfellow
-      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/instance: {{ $inst }}
   policyTypes:
     - Ingress
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "deepfellow.componentName" (dict "context" . "component" "allow-intra-suite") }}
+  name: {{ include "deepfellow.componentName" (dict "context" . "component" "server") }}
   labels:
     {{- include "deepfellow.labels" . | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/part-of: deepfellow
-      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/instance: {{ $inst }}
+      app.kubernetes.io/component: server
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 8000
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "deepfellow.componentName" (dict "context" . "component" "infra") }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $inst }}
+      app.kubernetes.io/component: infra
   policyTypes:
     - Ingress
   ingress:
     - from:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/part-of: deepfellow
-              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/instance: {{ $inst }}
+              app.kubernetes.io/component: server
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ $inst }}
+              app.kubernetes.io/component: provisioning
+      ports:
+        - port: 8086
+          protocol: TCP
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "deepfellow.componentName" (dict "context" . "component" "allow-entrypoints") }}
+  name: {{ include "deepfellow.componentName" (dict "context" . "component" "model-backends") }}
   labels:
     {{- include "deepfellow.labels" . | nindent 4 }}
 spec:
   podSelector:
-    matchExpressions:
-      - key: app.kubernetes.io/component
-        operator: In
-        values:
-          - server
-          {{- if .Values.workspace.enabled }}
-          - workspace
-          {{- end }}
+    matchLabels:
+      app.kubernetes.io/instance: {{ $inst }}
+      deepfellow.ai/tier: model-backend
   policyTypes:
     - Ingress
   ingress:
-    - {}
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ $inst }}
+              app.kubernetes.io/component: infra
+{{- if eq .Values.server.mongo.mode "embedded" }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "deepfellow.componentName" (dict "context" . "component" "mongo") }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $inst }}
+      app.kubernetes.io/component: mongo
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ $inst }}
+              app.kubernetes.io/component: server
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ $inst }}
+              app.kubernetes.io/component: provisioning
+      ports:
+        - port: 27017
+          protocol: TCP
+{{- end }}
+{{- if and .Values.server.vectorDb.active (eq .Values.server.vectorDb.type "qdrant") (not .Values.server.vectorDb.qdrant.url) }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "deepfellow.componentName" (dict "context" . "component" "qdrant") }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $inst }}
+      app.kubernetes.io/component: qdrant
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ $inst }}
+              app.kubernetes.io/component: server
+{{- end }}
+{{- if .Values.server.graph.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "deepfellow.componentName" (dict "context" . "component" "falkordb") }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $inst }}
+      app.kubernetes.io/component: falkordb
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ $inst }}
+              app.kubernetes.io/component: server
+{{- end }}
+{{- if .Values.workspace.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "deepfellow.componentName" (dict "context" . "component" "workspace") }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $inst }}
+      app.kubernetes.io/component: workspace
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 3000
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "deepfellow.componentName" (dict "context" . "component" "workspace-mongo") }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $inst }}
+      app.kubernetes.io/component: workspace-mongo
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ $inst }}
+              app.kubernetes.io/component: workspace
+      ports:
+        - port: 27017
+          protocol: TCP
+{{- end }}
 {{- end }}

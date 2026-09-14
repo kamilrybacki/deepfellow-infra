@@ -93,30 +93,21 @@ def read_state_secret(ns, name):
 
 
 def write_state_secret(ns, name, data):
+    # The state Secret is pre-created by the chart (RBAC grants only get/update/patch on it),
+    # so this always PATCHes. A 404 means the operator did not pre-create it.
     ctx = _k8s_ctx()
     encoded = {k: base64.b64encode(v.encode()).decode() for k, v in data.items()}
-    existing = read_state_secret(ns, name)
-    payload = {
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": {"name": name, "namespace": ns},
-        "type": "Opaque",
-        "data": encoded,
-    }
-    if existing is None:
-        status, _ = _request(
-            "POST", f"{K8S_API}/api/v1/namespaces/{ns}/secrets", _k8s_headers(), payload, ctx=ctx
-        )
-    else:
-        hdr = dict(_k8s_headers())
-        hdr["Content-Type"] = "application/merge-patch+json"
-        status, _ = _request(
-            "PATCH",
-            f"{K8S_API}/api/v1/namespaces/{ns}/secrets/{name}",
-            hdr,
-            {"data": encoded},
-            ctx=ctx,
-        )
+    hdr = dict(_k8s_headers())
+    hdr["Content-Type"] = "application/merge-patch+json"
+    status, _ = _request(
+        "PATCH",
+        f"{K8S_API}/api/v1/namespaces/{ns}/secrets/{name}",
+        hdr,
+        {"data": encoded},
+        ctx=ctx,
+    )
+    if status == 404:
+        raise SystemExit(f"state secret {name!r} does not exist: it must be pre-created (chart renders it when provisioning.stateSecret.name is empty).")
     if status not in (200, 201):
         raise SystemExit(f"persisting state secret failed: HTTP {status}")
 
@@ -210,20 +201,37 @@ def ensure_workspace(server_url, jwt, org_name, project_name, key_name, state, n
     return org_id, project_id, project_key
 
 
-def register_backend(infra_url, admin_key, model_id, api_url, api_key, context_length):
+def register_backend(infra_url, admin_key, backend):
     auth = {"Authorization": f"Bearer {admin_key}"}
+    model_id = backend["id"]
+    api_url = backend["api_url"]
+    service_type = backend.get("service_type", "openai")
+    context_length = int(backend.get("context_length", 8192))
+    api_key = os.environ.get(backend["api_key_env"], "") if backend.get("api_key_env") else ""
+
     status, _ = _request(
         "POST",
-        f"{infra_url}/admin/services/openai",
+        f"{infra_url}/admin/services/{service_type}",
         auth,
         {"spec": {"api_url": api_url, "api_key": api_key or "none"}, "stream": False, "ignore_warnings": True},
     )
-    if status not in (200, 201, 409):
-        log(f"service register for {model_id} returned HTTP {status} (continuing to reconcile)")
+    if status == 409:
+        # Service already exists — it must point at the same endpoint, else we would grant
+        # against the wrong backend. Reconcile: fetch and compare desired state, fail on drift.
+        gstatus, gbody = _request("GET", f"{infra_url}/admin/services/{service_type}", auth)
+        if gstatus == 200:
+            existing_url = (gbody.get("spec") or {}).get("api_url")
+            if existing_url and existing_url != api_url:
+                raise SystemExit(
+                    f"service '{service_type}' already registered with api_url {existing_url!r}, "
+                    f"but backend {model_id} wants {api_url!r}: refusing to grant against a different endpoint."
+                )
+    elif status not in (200, 201):
+        raise SystemExit(f"service register for {model_id} failed: HTTP {status}")
 
     status, body = _request(
         "POST",
-        f"{infra_url}/admin/services/openai/models/custom",
+        f"{infra_url}/admin/services/{service_type}/models/custom",
         auth,
         {"spec": {
             "id": model_id, "type": "llm", "completions": True, "legacy_completions": False,
@@ -234,10 +242,27 @@ def register_backend(infra_url, admin_key, model_id, api_url, api_key, context_l
     already = status == 400 and "exist" in json.dumps(body).lower()
     if status not in (200, 201) and not already:
         raise SystemExit(f"custom model add for {model_id} failed: HTTP {status}")
+    if already:
+        # Reconcile the existing custom model: a type=None seed (Gate A collision) is a hard error;
+        # a differing context length means the desired definition drifted.
+        gstatus, gbody = _request("GET", f"{infra_url}/admin/services/{service_type}/models/{model_id}", auth)
+        if gstatus == 200:
+            spec = gbody.get("custom_spec") or gbody.get("spec") or gbody
+            if spec.get("type") in (None, "None"):
+                raise SystemExit(
+                    f"model {model_id} exists with type=None (Gate A collision — the backend's /v1/models "
+                    f"lists this id): return an empty /v1/models from the backend and re-run."
+                )
+            existing_ctx = spec.get("context_length")
+            if existing_ctx is not None and int(existing_ctx) != context_length:
+                raise SystemExit(
+                    f"model {model_id} exists with context_length {existing_ctx}, desired {context_length}: "
+                    f"remove the custom model and re-run to change it."
+                )
 
     status, _ = _request(
         "POST",
-        f"{infra_url}/admin/services/openai/models/_?model_id={model_id}",
+        f"{infra_url}/admin/services/{service_type}/models/_?model_id={model_id}",
         auth,
         {"stream": False, "ignore_warnings": True},
     )
@@ -304,6 +329,16 @@ def load_config():
 
 
 def do_reconcile(c):
+    # Read state FIRST and fail closed on a partial/corrupt trio, before any create.
+    state = read_state_secret(c["ns"], c["state_secret"])
+    if state:
+        present = [k for k in ("organization-id", "project-id", "project-api-key") if state.get(k)]
+        if present and len(present) != 3:
+            raise SystemExit(
+                f"state secret {c['state_secret']!r} is partial ({present}): refusing to reconcile — "
+                "manual recovery required (inspect the remote workspace, then complete or clear the secret)."
+            )
+
     wait_healthy(c["infra_url"], "infra")
     wait_healthy(c["server_url"], "server", accept_any=True)
     for b in c["backends"]:
@@ -313,7 +348,6 @@ def do_reconcile(c):
     create_admin(c["admin_name"], c["admin_email"], c["admin_password"])
     jwt = login(c["server_url"], c["admin_email"], c["admin_password"])
 
-    state = read_state_secret(c["ns"], c["state_secret"])
     org_id, project_id, project_key = ensure_workspace(
         c["server_url"], jwt, c["org_name"], c["project_name"], c["key_name"],
         state, c["ns"], c["state_secret"],
@@ -321,10 +355,7 @@ def do_reconcile(c):
 
     model_ids = [b["id"] for b in c["backends"]]
     for b in c["backends"]:
-        register_backend(
-            c["infra_url"], c["infra_admin_key"], b["id"], b["api_url"],
-            b.get("api_key", ""), int(b.get("context_length", 8192)),
-        )
+        register_backend(c["infra_url"], c["infra_admin_key"], b)
     for b in c["backends"]:
         infra_model_ready(c["infra_url"], c["infra_admin_key"], b["id"])
 

@@ -273,6 +273,19 @@ server:
         digest: ""
         allowMutableTag: false
         pullPolicy: IfNotPresent
+      minio:
+        # -- MinIO access key (credential shape; required when vectorDb.type=milvus && active).
+        accessKey:
+          source: existingSecret
+          existingSecret: { name: "", key: "minio-access-key" }
+          value: ""
+          generate: { retain: true }
+        # -- MinIO secret key (credential shape; required when vectorDb.type=milvus && active).
+        secretKey:
+          source: existingSecret
+          existingSecret: { name: "", key: "minio-secret-key" }
+          value: ""
+          generate: { retain: true }
       storage: { size: 20Gi, storageClass: "" }
   graph:
     # -- Enable the FalkorDB graph store.

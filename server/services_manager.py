@@ -244,6 +244,8 @@ class ServicesManager:
 
     async def get_docker_tags_for_service(self, service_id: str, hardware: str | None, model_id: str | None = None) -> list[str]:
         """Fetch available Docker image tags for the service, hardware-filtered and optionally model-scoped."""
+        if self.external_only:
+            raise HTTPException(status_code=409, detail="Docker image tags are disabled by DF_EXTERNAL_ONLY")
         service_type, _instance = self.split_service_type_and_instance(service_id)
         return await self._get_service(service_type).get_docker_tags_for_model(model_id, hardware)
 

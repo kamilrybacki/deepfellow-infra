@@ -69,13 +69,15 @@ spec:
     metadata:
       labels:
         {{- $selector | nindent 8 }}
+        deepfellow.ai/tier: model-backend
     spec:
       {{- include "deepfellow.imagePullSecrets" $ | nindent 6 }}
       securityContext:
         {{- include "deepfellow.podSecurityContext" $ | nindent 8 }}
       initContainers:
         - name: fetch-gguf
-          image: {{ dig "gguf" "downloadImage" "curlimages/curl:8.11.1" $b }}
+          image: {{ include "deepfellow.image" (dict "context" $ "image" $b.downloadImage) }}
+          imagePullPolicy: {{ $b.downloadImage.pullPolicy }}
           securityContext:
             {{- include "deepfellow.containerSecurityContext" $ | nindent 12 }}
           command:
@@ -84,18 +86,28 @@ spec:
             - |
               set -eu
               target="/models/model.gguf"
+              tmp="/models/.model.gguf.part"
               if [ -f "$target" ]; then echo "weights present, skipping"; exit 0; fi
+              rm -f "$tmp"
               if [ -n "${HF_TOKEN:-}" ]; then
                 umask 077
                 printf 'header = "Authorization: Bearer %s"\n' "$HF_TOKEN" > /tmp/curlrc
-                curl -fSL --config /tmp/curlrc -o "$target" "$GGUF_URL"
+                curl -fSL --config /tmp/curlrc -o "$tmp" "$GGUF_URL"
                 rm -f /tmp/curlrc
               else
-                curl -fSL -o "$target" "$GGUF_URL"
+                curl -fSL -o "$tmp" "$GGUF_URL"
               fi
+              if [ -n "${GGUF_SHA256:-}" ]; then
+                echo "${GGUF_SHA256}  ${tmp}" | sha256sum -c -
+              fi
+              mv "$tmp" "$target"
           env:
             - name: GGUF_URL
               value: {{ $b.gguf.url | quote }}
+            {{- with $b.gguf.sha256 }}
+            - name: GGUF_SHA256
+              value: {{ . | quote }}
+            {{- end }}
             {{- include "deepfellow.credEnv" (dict "name" "HF_TOKEN" "cred" $hfToken "secretName" $secretName) | nindent 12 }}
           volumeMounts:
             - name: models

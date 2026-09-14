@@ -124,6 +124,7 @@ Each failed check aborts rendering with a clear, path-prefixed message.
 
 {{/* ---------- Native + external backends ---------- */}}
 {{- $nativeEnabled := 0 -}}
+{{- $modelIds := dict -}}
 {{- range $name, $bRaw := .Values.modelBackends -}}
 {{- if include "deepfellow.backendEnabled" (dict "b" $bRaw) -}}
 {{- $b := mergeOverwrite (include "deepfellow.modelBackendDefaults" $ | fromYaml) (deepCopy $bRaw) -}}
@@ -135,9 +136,15 @@ Each failed check aborts rendering with a clear, path-prefixed message.
 {{- fail (printf "modelBackends.%s.gguf.url is required (the GGUF weights to download)." $name) -}}
 {{- end -}}
 {{- include "deepfellow.validateImage" (dict "image" $b.image "path" (printf "modelBackends.%s.image" $name)) -}}
+{{- include "deepfellow.validateImage" (dict "image" $b.downloadImage "path" (printf "modelBackends.%s.downloadImage" $name)) -}}
 {{- if $b.gguf.hfToken -}}
 {{- include "deepfellow.validateSecret" (dict "cred" $b.gguf.hfToken "path" (printf "modelBackends.%s.gguf.hfToken" $name) "required" false) -}}
 {{- end -}}
+{{- $mid := default $name $b.modelId -}}
+{{- if hasKey $modelIds $mid -}}
+{{- fail (printf "duplicate modelId %q (modelBackends.%s and %s): model ids must be unique across modelBackends and externalBackends." $mid $name (index $modelIds $mid)) -}}
+{{- end -}}
+{{- $modelIds = merge $modelIds (dict $mid $name) -}}
 {{- end -}}
 {{- end -}}
 {{- if and (gt $nativeEnabled 0) (not .Values.infra.externalOnly.enabled) -}}
@@ -159,6 +166,10 @@ Each failed check aborts rendering with a clear, path-prefixed message.
 {{- if $b.apiKey -}}
 {{- include "deepfellow.validateSecret" (dict "cred" $b.apiKey "path" (printf "externalBackends.%s.apiKey" $name) "required" false) -}}
 {{- end -}}
+{{- if hasKey $modelIds $b.modelId -}}
+{{- fail (printf "duplicate modelId %q (externalBackends.%s and %s): model ids must be unique across modelBackends and externalBackends." $b.modelId $name (index $modelIds $b.modelId)) -}}
+{{- end -}}
+{{- $modelIds = merge $modelIds (dict $b.modelId $name) -}}
 {{- end -}}
 {{- end -}}
 
@@ -191,6 +202,19 @@ Each failed check aborts rendering with a clear, path-prefixed message.
 {{- end -}}
 {{- if .Values.server.metrics.enabled -}}
 {{- include "deepfellow.validateSecret" (dict "cred" .Values.server.metrics.password "path" "server.metrics.password" "required" true) -}}
+{{- end -}}
+{{- if and .Values.server.vectorDb.active (eq .Values.server.vectorDb.type "milvus") -}}
+{{- include "deepfellow.validateSecret" (dict "cred" .Values.server.vectorDb.milvus.minio.accessKey "path" "server.vectorDb.milvus.minio.accessKey" "required" true) -}}
+{{- include "deepfellow.validateSecret" (dict "cred" .Values.server.vectorDb.milvus.minio.secretKey "path" "server.vectorDb.milvus.minio.secretKey" "required" true) -}}
+{{- end -}}
+
+{{/* ---------- Ingress ---------- */}}
+{{- if .Values.ingress.enabled -}}
+{{- $hasServer := and .Values.ingress.server.host true -}}
+{{- $hasWorkspace := and .Values.workspace.enabled .Values.ingress.workspace.host -}}
+{{- if not (or $hasServer $hasWorkspace) -}}
+{{- fail "ingress.enabled=true but no host is set: set ingress.server.host and/or ingress.workspace.host (an Ingress with no rules is invalid)." -}}
+{{- end -}}
 {{- end -}}
 
 {{/* ---------- Workspace ---------- */}}

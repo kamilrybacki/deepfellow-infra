@@ -153,6 +153,7 @@ policy-compliant value; fail on upgrade/GitOps where lookup is empty (use existi
 {{- $ctx := .context -}}
 {{- $secretName := .secretName -}}
 {{- $data := dict -}}
+{{- $keep := false -}}
 {{- range $label, $c := .creds -}}
 {{- if or (eq $c.source "value") (eq $c.source "generate") -}}
 {{- $key := $c.existingSecret.key -}}
@@ -160,6 +161,7 @@ policy-compliant value; fail on upgrade/GitOps where lookup is empty (use existi
 {{- if eq $c.source "value" -}}
 {{- $val = $c.value -}}
 {{- else -}}
+{{- if dig "generate" "retain" false $c -}}{{- $keep = true -}}{{- end -}}
 {{- $existing := (lookup "v1" "Secret" $ctx.Release.Namespace $secretName) -}}
 {{- if and $existing (hasKey ($existing.data | default dict) $key) -}}
 {{- $val = (index $existing.data $key | b64dec) -}}
@@ -179,6 +181,10 @@ metadata:
   name: {{ $secretName }}
   labels:
     {{- include "deepfellow.labels" $ctx | nindent 4 }}
+{{- if $keep }}
+  annotations:
+    helm.sh/resource-policy: keep
+{{- end }}
 type: Opaque
 data:
 {{- range $k, $v := $data }}
@@ -205,6 +211,13 @@ image:
   pullPolicy: IfNotPresent
 gguf:
   url: ""
+  sha256: ""
+downloadImage:
+  repository: curlimages/curl
+  tag: "8.11.1"
+  digest: ""
+  allowMutableTag: false
+  pullPolicy: IfNotPresent
 parallel: 1
 threads: 4
 ctxSize: 8192

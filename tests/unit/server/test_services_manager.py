@@ -715,3 +715,15 @@ async def test_non_external_only_unknown_service_returns_404() -> None:
         await services_manager.get_service("llamacpp")
 
     assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_external_only_docker_tags_returns_409() -> None:
+    services_manager = ServicesManager(external_only=True)
+    services_manager.register_service(FakeService("openai"))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await services_manager.get_docker_tags_for_service("openai", "cpu")
+
+    assert exc_info.value.status_code == 409
+    assert "DF_EXTERNAL_ONLY" in exc_info.value.detail
