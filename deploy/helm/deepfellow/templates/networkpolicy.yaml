@@ -1,0 +1,56 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "deepfellow.componentName" (dict "context" . "component" "default-deny") }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: deepfellow
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "deepfellow.componentName" (dict "context" . "component" "allow-intra-suite") }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: deepfellow
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: deepfellow
+              app.kubernetes.io/instance: {{ .Release.Name }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "deepfellow.componentName" (dict "context" . "component" "allow-entrypoints") }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values:
+          - server
+          {{- if .Values.workspace.enabled }}
+          - workspace
+          {{- end }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - {}
+{{- end }}

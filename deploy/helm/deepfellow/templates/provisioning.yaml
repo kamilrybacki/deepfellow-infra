@@ -1,0 +1,174 @@
+{{- if .Values.provisioning.enabled }}
+{{- $fullname := include "deepfellow.componentName" (dict "context" . "component" "provisioning") }}
+{{- $sa := include "deepfellow.provisioning.serviceAccountName" . }}
+{{- $stateSecret := include "deepfellow.provisioning.stateSecretName" . }}
+{{- $infraFullname := include "deepfellow.componentName" (dict "context" . "component" "infra") }}
+{{- $infraSecret := include "deepfellow.credSecretName" (dict "context" . "component" "infra") }}
+{{- $serverFullname := include "deepfellow.componentName" (dict "context" . "component" "server") }}
+{{- $serverSecret := include "deepfellow.credSecretName" (dict "context" . "component" "server") }}
+{{- $mongoFullname := include "deepfellow.componentName" (dict "context" . "component" "mongo") }}
+{{- $mongoSecret := include "deepfellow.credSecretName" (dict "context" . "component" "mongo") }}
+{{- $s := .Values.server }}
+{{- $provImage := ternary $s.image .Values.provisioning.image (empty .Values.provisioning.image.repository) }}
+{{- $backends := list }}
+{{- range $name, $bRaw := .Values.modelBackends }}
+{{- if include "deepfellow.backendEnabled" (dict "b" $bRaw) }}
+{{- $b := mergeOverwrite (include "deepfellow.modelBackendDefaults" $ | fromYaml) (deepCopy $bRaw) }}
+{{- $svc := include "deepfellow.componentName" (dict "context" $ "component" (printf "mb-%s" $name)) }}
+{{- $backends = append $backends (dict "id" (default $name $b.modelId) "api_url" (printf "http://%s:%v" $svc $b.service.port) "api_key" "" "context_length" $b.ctxSize "native" true) }}
+{{- end }}
+{{- end }}
+{{- range $name, $b := .Values.externalBackends }}
+{{- if include "deepfellow.backendEnabled" (dict "b" $b) }}
+{{- $key := "" }}
+{{- if eq (dig "apiKey" "source" "none" $b) "value" }}{{- $key = $b.apiKey.value }}{{- end }}
+{{- $backends = append $backends (dict "id" $b.modelId "api_url" $b.apiUrl "api_key" $key "context_length" (dig "contextLength" 8192 $b) "native" false) }}
+{{- end }}
+{{- end }}
+{{- if .Values.provisioning.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: provisioning
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: provisioning
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["{{ $stateSecret }}"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: provisioning
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ .Release.Namespace }}
+---
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: provisioning
+data:
+  provision.py: |
+{{ .Files.Get "files/provision.py" | indent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-%s" $fullname .Values.provisioning.revision }}
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: provisioning
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        {{- include "deepfellow.selectorLabels" (dict "context" . "component" "provisioning") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ $sa }}
+      restartPolicy: OnFailure
+      {{- include "deepfellow.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "deepfellow.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: provision
+          image: {{ include "deepfellow.image" (dict "context" . "image" $provImage) }}
+          imagePullPolicy: {{ $provImage.pullPolicy }}
+          securityContext:
+            {{- include "deepfellow.containerSecurityContext" . | nindent 12 }}
+          command: ["python", "/scripts/provision.py", "reconcile"]
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: STATE_SECRET_NAME
+              value: {{ $stateSecret | quote }}
+            - name: DF_INFRA_URL
+              value: {{ printf "http://%s:%v" $infraFullname .Values.infra.service.port | quote }}
+            {{- include "deepfellow.credEnv" (dict "name" "DF_INFRA_ADMIN_API_KEY" "cred" .Values.infra.auth.adminApiKey "secretName" $infraSecret "required" true) | nindent 12 }}
+            - name: DF_SERVER_URL
+              value: {{ printf "http://%s:%v" $serverFullname .Values.server.service.port | quote }}
+            - name: ADMIN_NAME
+              value: {{ $s.admin.name | quote }}
+            - name: ADMIN_EMAIL
+              value: {{ $s.admin.email | quote }}
+            {{- include "deepfellow.credEnv" (dict "name" "ADMIN_PASSWORD" "cred" $s.admin.password "secretName" $serverSecret "required" true) | nindent 12 }}
+            - name: PROJECT_ORG_NAME
+              value: {{ $s.project.orgName | quote }}
+            - name: PROJECT_NAME
+              value: {{ $s.project.projectName | quote }}
+            - name: PROJECT_KEY_NAME
+              value: {{ $s.project.keyName | quote }}
+            {{- if eq $s.mongo.mode "embedded" }}
+            - name: DF_MONGO_URL
+              value: {{ printf "%s:27017" $mongoFullname | quote }}
+            - name: DF_MONGO_USER
+              value: {{ $s.mongo.auth.username | quote }}
+            {{- include "deepfellow.credEnv" (dict "name" "DF_MONGO_PASSWORD" "cred" $s.mongo.auth.password "secretName" $mongoSecret "required" true) | nindent 12 }}
+            - name: DF_MONGO_DB
+              value: {{ $s.mongo.auth.database | quote }}
+            {{- else }}
+            - name: DF_MONGO_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s.mongo.external.uriSecret.name }}
+                  key: {{ $s.mongo.external.uriSecret.key }}
+            {{- end }}
+            - name: BACKENDS_JSON
+              value: {{ toJson $backends | quote }}
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+          {{- with .Values.provisioning.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ $fullname }}
+      {{- with .Values.provisioning.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.provisioning.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.provisioning.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
