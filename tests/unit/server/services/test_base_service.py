@@ -3025,6 +3025,387 @@ async def test_update_instance_on_error_records_warning(base2_svc: _Base2Impl, b
 
 
 @pytest.mark.asyncio
+async def test_update_instance_rollback_restores_previous_installation_on_async_failure(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any]
+) -> None:
+    """A reinstall that fails after the old installation was already torn down must be reverted, not left destroyed."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_svc.instances_info["default"].installed = object()
+    previous_options = InstallServiceIn(spec={"key": "old"})
+    preserved = ModelConfig(model_id="m1", options=InstallModelIn())
+    new_installed = object()
+
+    async def fail_func(stream: Any) -> Any:
+        raise RuntimeError("update failed")
+
+    fail_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(func=fail_func)
+    rollback_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value=new_installed)
+
+    async def clear_installed(_instance: str, _options: Any) -> None:
+        # Mirrors every real `_uninstall_instance` override, which clears `installed` as part of tearing down -
+        # the rollback guard needs to see it as None to recognise the reinstall never actually completed.
+        base2_svc.instances_info["default"].installed = None
+
+    with (
+        patch.object(base2_svc, "_uninstall_instance", new=clear_installed),
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(side_effect=[fail_promise, rollback_promise])) as install_mock,
+        patch.object(base2_svc, "_generate_instance_config", return_value=InstanceConfig(options=previous_options, models=[preserved])),
+        patch.object(base2_svc, "load_model", new=AsyncMock()) as load_model_mock,
+    ):
+        result_promise = await base2_svc.update_instance("default", InstallServiceIn(spec={"key": "new"}))
+        with pytest.raises(RuntimeError) as exc_info:
+            await result_promise.wait()
+        await base2_svc.drain_warning_tasks()
+
+    assert install_mock.await_args_list[1].args == ("default", previous_options)
+    load_model_mock.assert_awaited_once_with("default", preserved)
+    assert base2_svc.instances_info["default"].installed is new_installed
+    assert base2_svc.instances_info["default"].installing is None
+
+    # The exception the caller (and hence the API/WebUI error toast) actually sees must say what
+    # happened, not just repeat the raw reinstall failure.
+    assert "automatically reverted to the previous configuration" in str(exc_info.value)
+
+    warning_messages = [c.args[1] for c in base2_deps["service_provider"].add_warning.await_args_list]
+    assert len(warning_messages) == 2
+    assert "failed to update" in warning_messages[0]
+    assert "reverted to its previous configuration" in warning_messages[1]
+
+    # A successful rollback is, from the instance's perspective, a healthy install again - stale,
+    # unrelated warnings must be cleared just like on any other successful install/update.
+    base2_deps["service_provider"].dismiss_warnings_matching_any.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_update_instance_rollback_triggered_by_cancelled_reinstall(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """A cancelled reinstall must trigger the same rollback attempt a failed one does - the ticket scopes
+    rollback for failure *or* cancellation, not failure only - and must not leave `installing` stuck by
+    silently skipping `on_failure` (CancelledError is a BaseException, not an Exception).
+    """
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_svc.instances_info["default"].installed = object()
+    previous_options = InstallServiceIn(spec={"key": "old"})
+    preserved = ModelConfig(model_id="m1", options=InstallModelIn())
+    new_installed = object()
+
+    async def cancel_func(stream: Any) -> Any:
+        raise asyncio.CancelledError
+
+    cancel_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(func=cancel_func)
+    rollback_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value=new_installed)
+
+    async def clear_installed(_instance: str, _options: Any) -> None:
+        base2_svc.instances_info["default"].installed = None
+
+    with (
+        patch.object(base2_svc, "_uninstall_instance", new=clear_installed),
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(side_effect=[cancel_promise, rollback_promise])) as install_mock,
+        patch.object(base2_svc, "_generate_instance_config", return_value=InstanceConfig(options=previous_options, models=[preserved])),
+        patch.object(base2_svc, "load_model", new=AsyncMock()) as load_model_mock,
+    ):
+        result_promise = await base2_svc.update_instance("default", InstallServiceIn(spec={"key": "new"}))
+        with pytest.raises(asyncio.CancelledError):
+            await result_promise.wait()
+        await base2_svc.drain_warning_tasks()
+
+    # The rollback attempt actually happened - same as a normal failure - not just a stuck-safe bailout.
+    assert install_mock.await_args_list[1].args == ("default", previous_options)
+    load_model_mock.assert_awaited_once_with("default", preserved)
+    assert base2_svc.instances_info["default"].installed is new_installed
+    assert base2_svc.instances_info["default"].installing is None
+
+    # `_append_rollback_outcome`'s annotation is lost for cancellation specifically: awaiting a future
+    # cancelled via `.cancel()` (not `.set_exception()`) always synthesizes a fresh, message-less
+    # CancelledError at each layer of the promise chain, disconnected from the instance we mutated - a
+    # property of `PromiseWithProgress`, not something worth working around here. The informative
+    # outcome still reaches the Warnings panel, unaffected since that's a separate channel.
+    warning_messages = [c.args[1] for c in base2_deps["service_provider"].add_warning.await_args_list]
+    assert any("reverted to its previous configuration" in m for m in warning_messages)
+
+
+@pytest.mark.asyncio
+async def test_update_instance_rollback_success_survives_failing_dismiss(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """A successfully-reverted rollback must not fail just because clearing its warnings afterwards errors."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_deps["service_provider"].dismiss_warnings_matching_any = AsyncMock(side_effect=RuntimeError("disk full"))
+    base2_svc.instances_info["default"].installed = object()
+    previous_options = InstallServiceIn(spec={"key": "old"})
+    new_installed = object()
+
+    async def fail_func(stream: Any) -> Any:
+        raise RuntimeError("update failed")
+
+    fail_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(func=fail_func)
+    rollback_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value=new_installed)
+
+    async def clear_installed(_instance: str, _options: Any) -> None:
+        base2_svc.instances_info["default"].installed = None
+
+    with (
+        patch.object(base2_svc, "_uninstall_instance", new=clear_installed),
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(side_effect=[fail_promise, rollback_promise])),
+        patch.object(base2_svc, "_generate_instance_config", return_value=InstanceConfig(options=previous_options, models=[])),
+    ):
+        result_promise = await base2_svc.update_instance("default", InstallServiceIn(spec={"key": "new"}))
+        with pytest.raises(RuntimeError):
+            await result_promise.wait()
+        await base2_svc.drain_warning_tasks()
+
+    assert base2_svc.instances_info["default"].installed is new_installed
+    assert base2_svc.instances_info["default"].installing is None
+
+
+@pytest.mark.asyncio
+async def test_update_instance_rollback_clears_installing_when_post_reinstall_bookkeeping_fails(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any]
+) -> None:
+    """A rollback whose own reinstall succeeds but whose bookkeeping afterwards fails must still clear
+    `installing` - not leave the instance stuck rejecting every future install/update forever.
+    """
+    base2_svc.instances_info["default"].installed = object()
+    previous_options = InstallServiceIn(spec={"key": "old"})
+    new_installed = object()
+
+    async def fail_func(stream: Any) -> Any:
+        raise RuntimeError("update failed")
+
+    fail_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(func=fail_func)
+    rollback_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value=new_installed)
+
+    async def clear_installed(_instance: str, _options: Any) -> None:
+        base2_svc.instances_info["default"].installed = None
+
+    with (
+        patch.object(base2_svc, "_uninstall_instance", new=clear_installed),
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(side_effect=[fail_promise, rollback_promise])),
+        patch.object(base2_svc, "_generate_instance_config", return_value=InstanceConfig(options=previous_options, models=[])),
+        patch.object(base2_svc, "_after_install", new=AsyncMock(side_effect=RuntimeError("bookkeeping boom"))),
+    ):
+        result_promise = await base2_svc.update_instance("default", InstallServiceIn(spec={"key": "new"}))
+        with pytest.raises(RuntimeError) as exc_info:
+            await result_promise.wait()
+        await base2_svc.drain_warning_tasks()
+
+    # `installed` is still set from the rollback's successful reinstall - only the bookkeeping after
+    # it failed - and `installing` must not be left stuck because of that.
+    assert base2_svc.instances_info["default"].installed is new_installed
+    assert base2_svc.instances_info["default"].installing is None
+
+    # The caller sees the *original* update failure (not the unrelated bookkeeping exception), still
+    # annotated as reverted.
+    assert "update failed" in str(exc_info.value)
+    assert "automatically reverted to the previous configuration" in str(exc_info.value)
+
+    warning_messages = [c.args[1] for c in base2_deps["service_provider"].add_warning.await_args_list]
+    assert any("finishing the restore ran into a problem" in m for m in warning_messages)
+
+
+@pytest.mark.asyncio
+async def test_update_instance_skips_rollback_when_reinstall_itself_succeeded(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """A failure in post-install bookkeeping (after the reinstall itself succeeded) must not roll back -
+
+    the new installation is already up and running; rolling back would tear down a working instance
+    instead of recovering a broken one.
+    """
+    base2_svc.instances_info["default"].installed = object()
+    previous_options = InstallServiceIn(spec={"key": "old"})
+    new_installed = object()
+
+    with (
+        patch.object(base2_svc, "_uninstall_instance", new=AsyncMock()),
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(return_value=PromiseWithProgress(value=new_installed))) as install_mock,
+        patch.object(base2_svc, "_generate_instance_config", return_value=InstanceConfig(options=previous_options, models=[])),
+        patch.object(base2_svc, "_after_install", new=AsyncMock(side_effect=RuntimeError("bookkeeping failed"))),
+    ):
+        result_promise = await base2_svc.update_instance("default", InstallServiceIn(spec={"key": "new"}))
+        with pytest.raises(RuntimeError) as exc_info:
+            await result_promise.wait()
+        await base2_svc.drain_warning_tasks()
+
+    install_mock.assert_awaited_once()
+    assert base2_svc.instances_info["default"].installed is new_installed
+    assert base2_svc.instances_info["default"].installing is None
+    base2_deps["service_provider"].add_warning.assert_awaited_once()
+    # No rollback was attempted, so the original error must reach the caller unmodified.
+    assert str(exc_info.value) == "bookkeeping failed"
+
+
+@pytest.mark.asyncio
+async def test_update_instance_rollback_failure_leaves_instance_uninstalled_with_prominent_warning(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any]
+) -> None:
+    """If the automatic rollback itself fails, the instance is genuinely gone - that must be called out distinctly."""
+    base2_svc.instances_info["default"].installed = object()
+    previous_options = InstallServiceIn(spec={"key": "old"})
+
+    async def fail_func(stream: Any) -> Any:
+        raise RuntimeError("update failed")
+
+    fail_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(func=fail_func)
+
+    async def clear_installed(_instance: str, _options: Any) -> None:
+        # Mirrors every real `_uninstall_instance` override, which clears `installed` as part of tearing down.
+        base2_svc.instances_info["default"].installed = None
+
+    with (
+        patch.object(base2_svc, "_uninstall_instance", new=clear_installed),
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(side_effect=[fail_promise, RuntimeError("rollback also failed")])),
+        patch.object(base2_svc, "_generate_instance_config", return_value=InstanceConfig(options=previous_options, models=[])),
+    ):
+        result_promise = await base2_svc.update_instance("default", InstallServiceIn(spec={"key": "new"}))
+        with pytest.raises(RuntimeError) as exc_info:
+            await result_promise.wait()
+        await base2_svc.drain_warning_tasks()
+
+    assert base2_svc.instances_info["default"].installed is None
+    assert base2_svc.instances_info["default"].installing is None
+
+    # The caller must be told the instance is now fully gone, not just that the update failed.
+    assert "fully uninstalled" in str(exc_info.value)
+    assert "fresh install" in str(exc_info.value)
+
+    warning_messages = [c.args[1] for c in base2_deps["service_provider"].add_warning.await_args_list]
+    assert len(warning_messages) == 2
+    assert "fully uninstalled" in warning_messages[1]
+    assert "needs a fresh install" in warning_messages[1]
+
+
+@pytest.mark.asyncio
+async def test_update_instance_sync_failure_after_uninstall_triggers_rollback(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """A reinstall that fails to even start (raises synchronously) must roll back just like an async failure."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_svc.instances_info["default"].installed = object()
+    previous_options = InstallServiceIn(spec={"key": "old"})
+    new_installed = object()
+    rollback_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value=new_installed)
+
+    with (
+        patch.object(base2_svc, "_uninstall_instance", new=AsyncMock()),
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(side_effect=[RuntimeError("boom"), rollback_promise])) as install_mock,
+        patch.object(base2_svc, "_generate_instance_config", return_value=InstanceConfig(options=previous_options, models=[])),
+    ):
+        with pytest.raises(RuntimeError):
+            await base2_svc.update_instance("default", InstallServiceIn(spec={"key": "new"}))
+        await base2_svc.drain_warning_tasks()
+
+    assert install_mock.await_count == 2
+    assert base2_svc.instances_info["default"].installed is new_installed
+    assert base2_svc.instances_info["default"].installing is None
+
+
+@pytest.mark.asyncio
+async def test_update_instance_rollback_outcome_appended_to_http_exception_detail_not_message(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any]
+) -> None:
+    """An HTTPException's `.detail` (not a generic message) must carry the rollback outcome, and its status_code must survive."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_svc.instances_info["default"].installed = object()
+    previous_options = InstallServiceIn(spec={"key": "old"})
+    new_installed = object()
+    rollback_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value=new_installed)
+
+    with (
+        patch.object(base2_svc, "_uninstall_instance", new=AsyncMock()),
+        patch.object(
+            base2_svc,
+            "_install_instance",
+            new=AsyncMock(side_effect=[HTTPException(409, "image busy"), rollback_promise]),
+        ),
+        patch.object(base2_svc, "_generate_instance_config", return_value=InstanceConfig(options=previous_options, models=[])),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await base2_svc.update_instance("default", InstallServiceIn(spec={"key": "new"}))
+        await base2_svc.drain_warning_tasks()
+
+    assert exc_info.value.status_code == 409
+    assert "image busy" in exc_info.value.detail
+    assert "automatically reverted to the previous configuration" in exc_info.value.detail
+
+
+def test_append_rollback_outcome_on_argless_exception() -> None:
+    """An exception raised with no message at all must still end up with a readable, informative one."""
+    e = Exception()
+    Base2Service._append_rollback_outcome(e, reverted=True)  # pyright: ignore[reportPrivateUsage]
+    assert str(e) == "(automatically reverted to the previous configuration)"
+
+
+@pytest.mark.asyncio
+async def test_rollback_after_failed_update_clears_installing_on_cancellation(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """A rollback attempt that gets cancelled (e.g. app shutdown) must not leave the instance stuck "installing" forever."""
+    base2_svc.instances_info["default"].installing = MagicMock()
+    previous_options = InstallServiceIn(spec={"key": "old"})
+
+    with patch.object(base2_svc, "_install_instance", new=AsyncMock(side_effect=asyncio.CancelledError())):
+        with pytest.raises(asyncio.CancelledError):
+            await base2_svc._rollback_after_failed_update(  # pyright: ignore[reportPrivateUsage]
+                "default", previous_options, [], RuntimeError("update failed")
+            )
+        await base2_svc.drain_warning_tasks()
+
+    assert base2_svc.instances_info["default"].installing is None
+    base2_deps["service_provider"].add_warning.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_instance_rollback_blocks_concurrent_calls_until_settled(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """A concurrent install/update must be rejected while the automatic rollback is still in flight, not race it."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_svc.instances_info["default"].installed = object()
+    previous_options = InstallServiceIn(spec={"key": "old"})
+    rollback_started = asyncio.Event()
+    release_rollback = asyncio.Event()
+    call_count = 0
+
+    async def fail_func(stream: Any) -> Any:
+        raise RuntimeError("update failed")
+
+    fail_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(func=fail_func)
+
+    async def clear_installed(_instance: str, _options: Any) -> None:
+        # Mirrors every real `_uninstall_instance` override, which clears `installed` as part of tearing down -
+        # the rollback guard needs to see it as None to recognise the reinstall never actually completed.
+        base2_svc.instances_info["default"].installed = None
+
+    async def fake_install_instance(_instance: str, _options: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return fail_promise
+        rollback_started.set()
+        await release_rollback.wait()
+        return PromiseWithProgress(value=object())
+
+    with (
+        patch.object(base2_svc, "_uninstall_instance", new=clear_installed),
+        patch.object(base2_svc, "_install_instance", new=fake_install_instance),
+        patch.object(base2_svc, "_generate_instance_config", return_value=InstanceConfig(options=previous_options, models=[])),
+    ):
+        # update_instance() itself returns as soon as the (failing) reinstall promise exists - it's
+        # *awaiting that promise* that now blocks until a triggered rollback has settled. So the only
+        # way to observe "still rolling back" from outside is to run that wait as its own task and poll
+        # in from a second, genuinely concurrent caller while it's still pending.
+        result_promise = await base2_svc.update_instance("default", InstallServiceIn(spec={"key": "new"}))
+
+        async def wait_for_result() -> None:
+            with pytest.raises(RuntimeError):
+                await result_promise.wait()
+
+        wait_task = asyncio.create_task(wait_for_result())
+        await rollback_started.wait()
+
+        assert base2_svc.instances_info["default"].installing is not None
+        with pytest.raises(HTTPException) as exc_info:
+            await base2_svc.update_instance("default", InstallServiceIn(spec={}))
+        assert exc_info.value.status_code == 400
+
+        release_rollback.set()
+        await wait_task
+        await base2_svc.drain_warning_tasks()
+
+    assert base2_svc.instances_info["default"].installing is None
+
+
+@pytest.mark.asyncio
 async def test_reconcile_hooks_default_to_not_implemented(base2_svc: _Base2Impl) -> None:
     with pytest.raises(NotImplementedError):
         base2_svc._reconcile_container_name("default", None, None)  # pyright: ignore[reportPrivateUsage]

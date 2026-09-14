@@ -235,8 +235,22 @@ class InstallingInstance(Generic[InstalledInfoType]):  # noqa: UP046
         `.cancel()` actually reaches `_install_instance()`'s work), while `wait_chained()` needs the
         bookkeeping-wrapped one, and only resolving from the real promise lets both stay available.
         """
+        return self.resolve_with_chain(promise, promise.next(on_success, on_error))
+
+    def resolve_with_chain(
+        self,
+        promise: PromiseWithProgress[InstalledInfoType, StreamChunk],
+        chained_promise: PromiseWithProgress[InstallServiceOut, StreamChunk],
+    ) -> PromiseWithProgress[InstallServiceOut, StreamChunk]:
+        """Like `resolve()`, but for a caller that built its own chained promise instead of via `.next()`.
+
+        `.next()`'s `on_error` is a synchronous, fire-and-forget callback - it can't express "await more
+        recovery work, then let *that* decide the final outcome" (see `update_instance()`'s rollback,
+        which needs exactly that so a caller isn't told "update failed" before the restore attempt has
+        actually concluded). A caller needing that builds its own chained promise and hands it here.
+        """
         self.promise = promise
-        self.chained_promise = promise.next(on_success, on_error)
+        self.chained_promise = chained_promise
 
         async def the_func() -> None:
             async for chunk in promise.progress.as_generator():
@@ -313,6 +327,12 @@ _INSTANCE_INSTALL_STATUS_WAIT_TIMEOUT_SECONDS = 30
 # teardown work (stopping/removing containers, unregistering models), whose duration scales with what
 # was installed rather than indicating a hang. Budgeted more generously so tearing down a busy instance
 # doesn't trip a spurious timeout.
+# If _install_instance() itself raises synchronously (before ever producing a promise), the reservation
+# also doesn't reject until a same-shaped rollback attempt (_rollback_after_failed_update) finishes -
+# so a progress poller can, in that specific case, still time out here even though update_instance()'s
+# own caller is legitimately still working through the restore. Rare in practice: this only applies to
+# the synchronous-failure path, not the far more common case of _install_instance()'s own promise
+# failing later (see the async `on_failure` path, whose rollback isn't bound by this timeout at all).
 _INSTANCE_UPDATE_STATUS_WAIT_TIMEOUT_SECONDS = 120
 
 
@@ -919,6 +939,15 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
 
         The underlying container is recreated to pick up the new options; already-installed models are
         preserved (their weights stay on disk) and re-registered against the recreated container.
+
+        If the reinstall step then fails or is cancelled, the previous installation is automatically
+        restored from the options/models captured here, just before the uninstall - see
+        `_rollback_after_failed_update`. The restore is awaited as part of the same promise the caller
+        is already watching, so "update failed" is never reported before the instance's true final state
+        - reverted, or genuinely gone - is actually known; a caller isn't left thinking the operation is
+        over while a recovery is still quietly happening behind it. Without a rollback at all, a failed
+        or cancelled update would otherwise leave the instance permanently uninstalled: the old
+        installation is already torn down by the time the new one fails, and nothing else brings it back.
         """
         info = self.get_instance_info(instance)
         if info.installing:
@@ -926,43 +955,176 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         if not info.installed:
             raise HTTPException(status_code=400, detail=f"Service {self.get_id(instance)} on {instance} instance is not installed")
 
-        preserved_models = (self._generate_instance_config(instance, info.installed, info.config.custom).models) or []
-        preserved_models = self._preserve_failed_models(instance, preserved_models)
+        previous_config = self._generate_instance_config(instance, info.installed, info.config.custom)
+        previous_options = previous_config.options
+        preserved_models = self._preserve_failed_models(instance, previous_config.models or [])
 
         # Reserve the slot synchronously (no `await` before this point) so a concurrent call can
         # never observe "not installing" once this one has started, no matter how long validation,
-        # the uninstall, or the service's own `_install_instance()` take to run.
+        # the uninstall, the service's own `_install_instance()`, or a subsequent rollback take to run.
         reservation: InstallingInstance[InstalledInfoType] = InstallingInstance(_INSTANCE_UPDATE_STATUS_WAIT_TIMEOUT_SECONDS)
         info.installing = reservation
 
-        async def func(data: InstalledInfoType) -> InstallServiceOut:
+        async def on_success(data: InstalledInfoType) -> InstallServiceOut:
+            await self._finish_successful_reinstall(instance, data, preserved_models, context="update")
+            return InstallServiceOut(status="OK")
+
+        async def on_failure(e: BaseException) -> None:
+            """Await the rollback (if applicable) before the caller's promise settles with `e`.
+
+            Only attempted if the reinstall itself never actually completed (`installed` is still
+            `None`) - if `on_success` already set it before failing later (e.g. `_after_install`/`_save`
+            raising), the new instance is genuinely up and running, and rolling back would tear down a
+            working install for nothing instead of recovering a reinstall that never completed.
+            """
+            self._record_warning_in_background(f"Service instance '{instance}' failed to update: {e}", instance=instance)
+            if previous_options is not None and self.instances_info[instance].installed is None:
+                reverted = await self._rollback_after_failed_update(instance, previous_options, preserved_models, e)
+                self._append_rollback_outcome(e, reverted)
+            else:
+                self.instances_info[instance].installing = None
+
+        async def the_func(_stream: Stream[StreamChunk]) -> InstallServiceOut:
+            # Mirrors `PromiseWithProgress.next()`'s own try/except shape (both the wait and the
+            # success callback inside one try, so a failure from either routes to on_failure), except
+            # on_failure is awaited here rather than fired as a synchronous, side-effect-only callback -
+            # that's what lets it run the rollback to completion before this promise (and hence the
+            # caller) settles.
+            try:
+                data = await promise.wait()
+                return await on_success(data)
+            except BaseException as e:
+                await on_failure(e)
+                raise
+
+        uninstalled = False
+        try:
+            await self._validate_update_options(options)
+            await self._uninstall_instance(instance, UninstallServiceIn(purge=False))
+            uninstalled = True
+            self._failed_models.pop(instance, None)
+            promise = await self._install_instance(instance, options)
+        except BaseException as e:
+            # Only attempt a rollback once the previous installation has actually been torn down - a
+            # rejection from `_validate_update_options` leaves it untouched, so there's nothing to
+            # restore. Awaited inline (this whole method is itself awaited by its caller) so the caller
+            # doesn't get a response before the instance's true final state is known.
+            if uninstalled and previous_options is not None:
+                reverted = await self._rollback_after_failed_update(instance, previous_options, preserved_models, e)
+                self._append_rollback_outcome(e, reverted)
+            else:
+                self.instances_info[instance].installing = None
+            reservation.reject(e)
+            raise
+
+        chained_promise: PromiseWithProgress[InstallServiceOut, StreamChunk] = PromiseWithProgress(func=the_func)
+        chained_promise.progress = promise.progress
+        return reservation.resolve_with_chain(promise, chained_promise)
+
+    async def _finish_successful_reinstall(
+        self, instance: str, data: InstalledInfoType, preserved_models: list[ModelConfig], *, context: str
+    ) -> None:
+        """Shared post-reinstall bookkeeping for a reinstall that just succeeded.
+
+        Used by both the original update's own reinstall and a rollback's restore of the previous
+        installation - `context` ("update"/"rollback") only distinguishes the two in log output, so a
+        dismiss-warnings failure logged here is still traceable to which flow it happened in. `installing`
+        is always cleared, even if a step here fails, so neither caller can leave the instance stuck
+        permanently rejecting every future install/update as "currently installing".
+        """
+        try:
             self.instances_info[instance].installed = data
             for model in preserved_models:
                 await self.load_model(instance, model)
             await self._after_install(instance)
             await self._save()
+        finally:
             self.instances_info[instance].installing = None
-            try:
-                await self.service_provider.dismiss_warnings_matching_any(self.get_type(), [(None, None), (instance, None)])
-            except Exception:
-                logger.exception(f"{self.get_id(instance)} failed to dismiss warnings after successful update")  # noqa: G004
-            return InstallServiceOut(status="OK")
+        try:
+            await self.service_provider.dismiss_warnings_matching_any(self.get_type(), [(None, None), (instance, None)])
+        except Exception:
+            logger.exception(f"{self.get_id(instance)} failed to dismiss warnings after successful {context}")  # noqa: G004
 
-        def on_error(e: Exception) -> None:
+    async def _rollback_after_failed_update(
+        self, instance: str, previous_options: InstallServiceIn, preserved_models: list[ModelConfig], original_error: BaseException
+    ) -> bool:
+        """Best-effort restore of the pre-update installation after `update_instance()`'s reinstall step failed.
+
+        Re-runs `_install_instance` with the options captured before the uninstall and reloads the
+        preserved models onto the recreated container - mirroring `update_instance()`'s own success path.
+        If the restore itself fails too, the instance is genuinely gone: that's surfaced as a distinct,
+        more prominent warning so it isn't mistaken for the original, potentially transient, update
+        failure.
+
+        Returns True if the previous installation was successfully restored, False if the rollback
+        itself also failed - the caller uses this to tell the client which of the two actually happened
+        (see `_append_rollback_outcome`).
+        """
+        logger.warning(f"{self.get_id(instance)} update failed ({original_error}); attempting to restore the previous installation")  # noqa: G004
+        try:
+            promise = await self._install_instance(instance, previous_options)
+            data = await promise.wait()
+        except asyncio.CancelledError:
+            # Never swallow cancellation (e.g. app shutdown) - but still clear `installing` first, so
+            # this instance isn't left permanently rejecting every future install/update just because
+            # this attempt never got the chance to finish either way.
             self.instances_info[instance].installing = None
-            self._record_warning_in_background(f"Service instance '{instance}' failed to update: {e}", instance=instance)
+            raise
+        except Exception as rollback_error:
+            logger.exception(f"{self.get_id(instance)} rollback after a failed update also failed; instance left fully uninstalled")  # noqa: G004
+            self.instances_info[instance].installing = None
+            self._record_warning_in_background(
+                f"Service instance '{instance}' failed to update ({original_error}) and the automatic rollback to its previous "
+                f"configuration also failed ({rollback_error}). The service is now fully uninstalled - it needs a fresh install, "
+                "not a retry.",
+                instance=instance,
+            )
+            return False
 
         try:
-            await self._validate_update_options(options)
-            await self._uninstall_instance(instance, UninstallServiceIn(purge=False))
-            self._failed_models.pop(instance, None)
-            promise = await self._install_instance(instance, options)
-        except BaseException as e:
-            self.instances_info[instance].installing = None
-            reservation.reject(e)
-            raise
+            await self._finish_successful_reinstall(instance, data, preserved_models, context="rollback")
+        except Exception:
+            # The rollback's own reinstall succeeded (the instance IS running the previous
+            # configuration again) - only the bookkeeping after it failed. Distinguished from the
+            # "rollback itself failed" case above since it's a much smaller problem: the caller still
+            # gets told the instance was reverted, plus a heads-up that something needs a look.
+            logger.exception(f"{self.get_id(instance)} rollback reinstall succeeded but its post-install bookkeeping failed")  # noqa: G004
+            self._record_warning_in_background(
+                f"Service instance '{instance}' failed to update ({original_error}) and was reverted to its previous "
+                "installation, but finishing the restore ran into a problem afterwards - check the service's state.",
+                instance=instance,
+            )
+            return True
 
-        return reservation.resolve(promise, func, on_error)
+        self._record_warning_in_background(
+            f"Service instance '{instance}' failed to update ({original_error}) and was automatically reverted to its previous "
+            "configuration.",
+            instance=instance,
+        )
+        return True
+
+    @staticmethod
+    def _append_rollback_outcome(e: BaseException, reverted: bool) -> None:
+        """Mutate `e`'s message in place so a client displaying just `str(e)` learns the rollback outcome.
+
+        The API layer (and the WebUI, which shows the raised exception's message verbatim in an error
+        toast) otherwise only ever sees the original, potentially cryptic reinstall failure - with no
+        indication that anything was automatically recovered, or that the instance is now fully gone and
+        needs a fresh install rather than a retry. Mutating `.args`/`.detail` works uniformly across
+        exception types without assuming a particular constructor signature, and preserves the original
+        type (e.g. an `HTTPException`'s `status_code`) for anything downstream that still inspects it.
+        """
+        suffix = (
+            "(automatically reverted to the previous configuration)"
+            if reverted
+            else "(automatic rollback also failed - the service is now fully uninstalled; a fresh install is required)"
+        )
+        if isinstance(e, HTTPException):
+            e.detail = f"{e.detail} {suffix}"
+        elif e.args:
+            e.args = (f"{e.args[0]} {suffix}", *e.args[1:])
+        else:
+            e.args = (suffix,)
 
     async def _validate_update_options(self, options: InstallServiceIn) -> None:
         """Validate new options before update_instance tears down the existing installation.
