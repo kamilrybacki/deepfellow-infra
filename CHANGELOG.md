@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Fixed
+- Reconfiguring OTLP log export via `/admin/config` no longer blocks the API for up to ~30s when the OTLP collector is unreachable, and a failed reconfigure no longer permanently disables further log-export retries.
+
 ## [0.33.0] - 2026-09-11
 
 ### Added

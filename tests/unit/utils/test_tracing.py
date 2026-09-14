@@ -3,6 +3,8 @@
 
 import inspect
 import logging
+import threading
+import time
 from typing import Any
 from unittest.mock import MagicMock, call, patch
 
@@ -183,22 +185,24 @@ def test_setup_otlp_logging_attaches_handler_to_root_and_uvicorn_loggers() -> No
         assert logger_call == call(handler)
 
 
-def test_teardown_otlp_logging_noop_when_no_handler() -> None:
+@pytest.mark.asyncio
+async def test_teardown_otlp_logging_noop_when_no_handler() -> None:
     manager = OtlpLoggingManager()
 
     with patch("server.utils.tracing.logging.getLogger") as mock_get_logger:
-        manager.teardown()
+        await manager.teardown()
 
     assert mock_get_logger.call_count == 0
 
 
-def test_teardown_otlp_logging_removes_handler_from_loggers() -> None:
+@pytest.mark.asyncio
+async def test_teardown_otlp_logging_removes_handler_from_loggers() -> None:
     manager = OtlpLoggingManager()
     handler = MagicMock()
     manager._handler = handler  # pyright: ignore[reportPrivateUsage]
 
     with patch("server.utils.tracing.logging.getLogger") as mock_get_logger:
-        manager.teardown()
+        await manager.teardown()
 
         logger_names = [c[0][0] if c[0] else "" for c in mock_get_logger.call_args_list]
         assert logger_names == ["", "uvicorn", "uvicorn.error", "uvicorn.access"]
@@ -208,55 +212,139 @@ def test_teardown_otlp_logging_removes_handler_from_loggers() -> None:
         assert manager._handler is None  # pyright: ignore[reportPrivateUsage]
 
 
-def test_teardown_otlp_logging_shuts_down_old_provider() -> None:
+@pytest.mark.asyncio
+async def test_teardown_otlp_logging_shuts_down_old_provider() -> None:
     manager = OtlpLoggingManager()
     manager._handler = MagicMock()  # pyright: ignore[reportPrivateUsage]
     provider = MagicMock()
     manager._provider = provider  # pyright: ignore[reportPrivateUsage]
 
     with patch("server.utils.tracing.logging.getLogger"):
-        manager.teardown()
+        await manager.teardown()
 
     assert provider.shutdown.call_count == 1
     assert manager._provider is None  # pyright: ignore[reportPrivateUsage]
 
 
-def test_reconfigure_otlp_logging_shuts_down_previous_provider_before_rebuilding() -> None:
+@pytest.mark.asyncio
+async def test_reconfigure_otlp_logging_shuts_down_previous_provider_before_rebuilding() -> None:
     cfg = _make_config()
     cfg.otel_logging_enabled = True
     manager = OtlpLoggingManager()
     patches = _patch_otlp_logging_context_managers()
 
-    with patches[0] as mock_provider_cls, patches[1], patches[2], patches[3], patches[4], patch("server.utils.tracing.logging.getLogger"):
+    with (
+        patches[0] as mock_provider_cls,
+        patches[1],
+        patches[2],
+        patches[3],
+        patches[4],
+        patch("server.utils.tracing.logging.getLogger"),
+    ):
         first_provider = mock_provider_cls.return_value
         manager.setup(cfg)
-        manager.reconfigure(cfg)
+        await manager.reconfigure(cfg)
 
     assert first_provider.shutdown.call_count == 1
 
 
-def test_reconfigure_otlp_logging_sets_up_when_enabled() -> None:
+@pytest.mark.asyncio
+async def test_reconfigure_otlp_logging_sets_up_when_enabled() -> None:
     cfg = _make_config()
     cfg.otel_logging_enabled = True
     manager = OtlpLoggingManager()
 
-    with patch.object(manager, "teardown") as mock_teardown, patch.object(manager, "setup") as mock_setup:
-        manager.reconfigure(cfg)
+    async def _noop_teardown() -> None:
+        return None
+
+    with patch.object(manager, "teardown", side_effect=_noop_teardown) as mock_teardown, patch.object(manager, "setup") as mock_setup:
+        await manager.reconfigure(cfg)
 
     assert mock_teardown.call_count == 1
     assert mock_setup.call_args == call(cfg)
 
 
-def test_reconfigure_otlp_logging_skips_setup_when_disabled() -> None:
+@pytest.mark.asyncio
+async def test_reconfigure_otlp_logging_skips_setup_when_disabled() -> None:
     cfg = _make_config()
     cfg.otel_logging_enabled = False
     manager = OtlpLoggingManager()
 
-    with patch.object(manager, "teardown") as mock_teardown, patch.object(manager, "setup") as mock_setup:
-        manager.reconfigure(cfg)
+    async def _noop_teardown() -> None:
+        return None
+
+    with patch.object(manager, "teardown", side_effect=_noop_teardown) as mock_teardown, patch.object(manager, "setup") as mock_setup:
+        await manager.reconfigure(cfg)
 
     assert mock_teardown.call_count == 1
     assert mock_setup.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_teardown_otlp_logging_swallows_provider_shutdown_error(caplog: pytest.LogCaptureFixture) -> None:
+    """A failed provider shutdown (e.g. an unreachable OTLP collector) must not raise, and must
+    still reset `self._provider` so the manager isn't left holding a provider it can never retry.
+    """
+    manager = OtlpLoggingManager()
+    manager._handler = MagicMock()  # pyright: ignore[reportPrivateUsage]
+    provider = MagicMock()
+    provider.shutdown.side_effect = RuntimeError("boom")
+    manager._provider = provider  # pyright: ignore[reportPrivateUsage]
+
+    with caplog.at_level(logging.WARNING):
+        await manager.teardown()  # must not raise
+
+    assert manager._provider is None  # pyright: ignore[reportPrivateUsage]
+    assert "Failed to shut down OTel log provider" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_teardown_otlp_logging_retries_provider_left_over_from_prior_failure() -> None:
+    """Regression test for DFINFRA-314.
+
+    Before the fix, `teardown()` guarded both handler and provider cleanup behind one
+    `if self._handler is None: return`. A provider orphaned by an earlier failed shutdown attempt
+    always has its handler already cleared (that happens first), so the *next* `teardown()` call
+    exited immediately on that guard, before ever reaching the provider cleanup line again — leaving
+    the provider and its background export thread stuck forever, with no way to retry short of a
+    process restart. Simulate that exact state directly: handler already `None`, provider still set.
+    """
+    manager = OtlpLoggingManager()
+    manager._handler = None  # pyright: ignore[reportPrivateUsage]
+    provider = MagicMock()
+    manager._provider = provider  # pyright: ignore[reportPrivateUsage]
+
+    with patch("server.utils.tracing.logging.getLogger"):
+        await manager.teardown()
+
+    assert provider.shutdown.call_count == 1
+    assert manager._provider is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_teardown_otlp_logging_does_not_block_past_shutdown_timeout() -> None:
+    """A stuck `provider.shutdown()` (e.g. an unreachable OTLP collector) must not stall the caller
+    past `_OTEL_SHUTDOWN_TIMEOUT_MILLIS` — it keeps finishing on its own daemon thread instead.
+    """
+    manager = OtlpLoggingManager()
+    manager._handler = MagicMock()  # pyright: ignore[reportPrivateUsage]
+    provider = MagicMock()
+
+    release = threading.Event()
+
+    def _hanging_shutdown() -> None:
+        release.wait(timeout=2)
+
+    provider.shutdown.side_effect = _hanging_shutdown
+    manager._provider = provider  # pyright: ignore[reportPrivateUsage]
+
+    with patch("server.utils.tracing.logging.getLogger"), patch("server.utils.tracing._OTEL_SHUTDOWN_TIMEOUT_MILLIS", 50):
+        start = time.monotonic()
+        await manager.teardown()
+        elapsed = time.monotonic() - start
+
+    release.set()  # let the background thread finish so it doesn't outlive the test
+    assert elapsed < 1.0
 
 
 def test_func_args_defaults_are_none() -> None:

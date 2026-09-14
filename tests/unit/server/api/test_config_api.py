@@ -5,7 +5,7 @@
 
 import asyncio
 from collections.abc import Generator
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
@@ -83,7 +83,9 @@ def config_lock() -> asyncio.Lock:
 
 @pytest.fixture
 def otlp_logging() -> MagicMock:
-    return MagicMock()
+    mock = MagicMock()
+    mock.reconfigure = AsyncMock()
+    return mock
 
 
 @pytest.fixture
@@ -266,7 +268,7 @@ def test_update_config_mesh_url_change_triggers_parent_reconfigure(
 
     assert resp.status_code == 200
     parent_infra.reconfigure.assert_awaited_once_with(config, task_manager)
-    assert otlp_logging.reconfigure.call_count == 0
+    otlp_logging.reconfigure.assert_not_awaited()
 
 
 def test_update_config_otel_change_triggers_otlp_reconfigure(
@@ -276,7 +278,7 @@ def test_update_config_otel_change_triggers_otlp_reconfigure(
         resp = client.put("/admin/config", json={"otel_logging_enabled": True}, headers=auth_header)
 
     assert resp.status_code == 200
-    assert otlp_logging.reconfigure.call_args == call(config)
+    otlp_logging.reconfigure.assert_awaited_once_with(config)
     parent_infra.reconfigure.assert_not_awaited()
 
 
@@ -344,7 +346,7 @@ def test_update_config_no_relevant_change_skips_reconfigure(
 
     assert resp.status_code == 200
     parent_infra.reconfigure.assert_not_awaited()
-    assert otlp_logging.reconfigure.call_count == 0
+    otlp_logging.reconfigure.assert_not_awaited()
     assert model_downloader.create_downloaders.call_count == 0
 
 

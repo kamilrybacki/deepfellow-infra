@@ -182,7 +182,7 @@ async def update_dynamic_config(
             if mesh_changed:
                 await parent_infra.reconfigure(config, task_manager)
             if otel_logging_changed:
-                otlp_logging.reconfigure(config)
+                await otlp_logging.reconfigure(config)
             if otel_tracing_disabled:
                 # Endpoint changes are already picked up lazily by tracer._get_tracer()/
                 # _get_mcp_instruments(); only a disable transition needs an explicit stop, since

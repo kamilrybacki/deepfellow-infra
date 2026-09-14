@@ -70,23 +70,56 @@ class OtlpLoggingManager:
         for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
             logging.getLogger(name).addHandler(handler)
 
-    def teardown(self) -> None:
-        """Detach the OTLP log handler previously attached by `setup()`, if any."""
-        if self._handler is None:
-            return
-        for name in ("", "uvicorn", "uvicorn.error", "uvicorn.access"):
-            logging.getLogger(name).removeHandler(self._handler)
-        self._handler = None
+    def _shutdown_provider(self, provider: LoggerProvider) -> None:
+        """Shut down a `LoggerProvider` without blocking the caller for up to the default 30s.
+
+        Like `TracerProvider.shutdown()`, `LoggerProvider.shutdown()` accepts no timeout parameter,
+        so a stuck exporter (e.g. an unreachable OTLP endpoint) would otherwise stall whichever
+        request triggered the reconfigure for up to 30s. Run it on a background thread and only wait
+        up to our own bound — if the shutdown is still slow, it keeps finishing on its own thread
+        instead of blocking this one.
+
+        Called from `teardown()` (already off the event loop thread via `asyncio.to_thread()`).
+        """
+        thread = threading.Thread(target=self._run_provider_shutdown, args=(provider,), daemon=True)
+        thread.start()
+        thread.join(timeout=_OTEL_SHUTDOWN_TIMEOUT_MILLIS / 1000)
+
+    def _run_provider_shutdown(self, provider: LoggerProvider) -> None:
+        """Run `LoggerProvider.shutdown()`, logging (not propagating) any exception it raises.
+
+        Never letting this raise is what makes `teardown()`'s `self._provider = None` reset
+        unconditional — a failed shutdown is logged here and then treated as done, so the next
+        `teardown()` call doesn't retry a provider that's already been given up on, but also isn't
+        left permanently unreachable by an early-return guarded on unrelated state (see `teardown()`).
+        """
+        try:
+            provider.shutdown()
+        except Exception:
+            uvicorn_logger.warning("Failed to shut down OTel log provider", exc_info=True)
+
+    async def teardown(self) -> None:
+        """Detach the OTLP log handler previously attached by `setup()`, if any.
+
+        Handler cleanup and provider cleanup are independent `if` blocks (not one `self._handler is
+        None` guard covering both) — otherwise a provider left over from a previously failed shutdown
+        would never be retried once the handler had already been cleared on that earlier attempt.
+        """
+        if self._handler is not None:
+            for name in ("", "uvicorn", "uvicorn.error", "uvicorn.access"):
+                logging.getLogger(name).removeHandler(self._handler)
+            self._handler = None
 
         # Stop the old BatchLogRecordProcessor's background export thread — otherwise every
-        # reconfigure() leaks one more thread that outlives its now-detached handler forever.
+        # reconfigure() leaks one more thread that outlives its now-detached handler forever. Run off
+        # the event loop thread since the shutdown itself may block; see `_shutdown_provider()`.
         if self._provider is not None:
-            self._provider.shutdown()
+            await asyncio.to_thread(self._shutdown_provider, self._provider)
             self._provider = None
 
-    def reconfigure(self, config: AppSettings) -> None:
+    async def reconfigure(self, config: AppSettings) -> None:
         """Apply an `otel_logging_enabled`/`otel_exporter_otlp_endpoint` change without a restart."""
-        self.teardown()
+        await self.teardown()
         if config.otel_logging_enabled:
             self.setup(config)
 
