@@ -118,6 +118,10 @@ class BaseService(ABC):
         """Cancel an in-progress model install. Services without install progress cannot cancel."""
         raise HTTPException(405, f"Service for model {model_id} does not support cancelling an installation.")
 
+    async def cancel_instance_install(self, instance: str) -> None:
+        """Cancel an in-progress service instance install/update. Services without install progress cannot cancel."""
+        raise HTTPException(405, f"Service instance {instance} does not support cancelling an installation.")
+
     async def refresh_catalog(self) -> PromiseWithProgress[CatalogRefreshOut, StreamChunk]:
         """Refresh the model catalog from an external library API. Services without a catalog cannot refresh."""
         raise HTTPException(405, "This service does not support catalog refresh")

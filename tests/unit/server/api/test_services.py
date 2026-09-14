@@ -7,7 +7,7 @@ from collections.abc import Generator
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from starlette.testclient import TestClient
 
@@ -50,6 +50,7 @@ def services_manager() -> MagicMock:
     manager.uninstall_service = AsyncMock(return_value=None)
     manager.get_service = AsyncMock(return_value=_make_retrieve_service_out())
     manager.get_service_install_progress = AsyncMock(return_value=promise)
+    manager.cancel_service_install = AsyncMock(return_value=None)
     manager.list_services = AsyncMock(return_value=ListServicesOut(list=[]))
     manager.list_models_from_all_services = AsyncMock(return_value=ListAllModelsOut(list=[]))
     manager.get_docker_logs = AsyncMock(return_value="some logs")
@@ -172,6 +173,40 @@ def test_update_service_stream_returns_streaming_response(
             headers=auth_header,
         )
     assert resp.status_code == 200
+
+
+def test_cancel_service_install_returns_200(client: TestClient, auth_header: dict[str, str]) -> None:
+    resp = client.post("/admin/services/ollama/cancel", headers=auth_header)
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "OK"
+
+
+def test_cancel_service_install_calls_manager(services_manager: MagicMock, client: TestClient, auth_header: dict[str, str]) -> None:
+    client.post("/admin/services/my-svc/cancel", headers=auth_header)
+
+    assert services_manager.cancel_service_install.call_count == 1
+    assert services_manager.cancel_service_install.call_args.args[0] == "my-svc"
+
+
+def test_cancel_service_install_surfaces_404_when_not_installing(
+    services_manager: MagicMock, client: TestClient, auth_header: dict[str, str]
+) -> None:
+    services_manager.cancel_service_install = AsyncMock(side_effect=HTTPException(404, "This service is not installing now."))
+
+    resp = client.post("/admin/services/ollama/cancel", headers=auth_header)
+
+    assert resp.status_code == 404
+
+
+def test_cancel_service_install_surfaces_504_on_timeout(
+    services_manager: MagicMock, client: TestClient, auth_header: dict[str, str]
+) -> None:
+    services_manager.cancel_service_install = AsyncMock(side_effect=HTTPException(504, "Timed out waiting to confirm cancellation."))
+
+    resp = client.post("/admin/services/ollama/cancel", headers=auth_header)
+
+    assert resp.status_code == 504
 
 
 UNINSTALL_BODY = {"purge": False}

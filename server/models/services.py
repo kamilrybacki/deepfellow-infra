@@ -31,6 +31,10 @@ class UninstallServiceOut(BaseModel):
     status: Literal["OK"]
 
 
+class CancelServiceInstallOut(BaseModel):
+    status: Literal["OK"]
+
+
 class ServiceField(BaseModel):
     type: str
     name: str

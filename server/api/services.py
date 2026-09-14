@@ -16,6 +16,7 @@ from server.core.dependencies import auth_admin, get_endpoint_registry, get_serv
 from server.endpointregistry import EndpointRegistry
 from server.models.api import RegistrationId
 from server.models.services import (
+    CancelServiceInstallOut,
     CatalogRefreshOut,
     DockerTagsOut,
     InstallServiceIn,
@@ -68,6 +69,26 @@ async def install_service(
     msg = f"{service_id} service installed."
     logger.info(msg)
     return result_json
+
+
+@router.post(
+    "/{service_id}/cancel",
+    summary="Cancel an in-progress service install or update.",
+)
+@tracer.trace_request()
+async def cancel_service_install(
+    request: Request,  # noqa: ARG001 needed for tracer
+    service_id: Annotated[str, Path(description="The ID of the service to use.")],
+    services_manager: Annotated[ServicesManager, Depends(get_services_manager)],
+    _: Annotated[str, Depends(auth_admin)],
+) -> CancelServiceInstallOut:
+    """Cancel an in-progress service install or update, stopping the underlying Docker work."""
+    msg = f"{service_id} service install cancelling."
+    logger.debug(msg)
+    await services_manager.cancel_service_install(service_id)
+    msg = f"{service_id} service install cancelled."
+    logger.info(msg)
+    return CancelServiceInstallOut(status="OK")
 
 
 @router.put(
