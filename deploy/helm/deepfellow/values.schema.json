@@ -1,0 +1,121 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DeepFellow Suite chart values",
+  "description": "Settled invariants only. Cross-field checks, credential source rules, image digest gating, and password complexity live in templates/_validate.tpl (Helm's gojsonschema uses RE2 — no lookahead — and cannot compare two fields). Unconstrained keys are allowed so later chart phases extend values without a schema change.",
+  "type": "object",
+  "definitions": {
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": { "type": "string" },
+        "tag": { "type": "string" },
+        "digest": { "type": "string", "pattern": "^(sha256:[a-f0-9]{64})?$" },
+        "allowMutableTag": { "type": "boolean" },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "credential": {
+      "type": "object",
+      "properties": {
+        "source": { "type": "string", "enum": ["existingSecret", "value", "generate", "none"] },
+        "existingSecret": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "key": { "type": "string" }
+          }
+        },
+        "value": { "type": "string" }
+      }
+    },
+    "backendMap": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", "maxLength": 63 }
+    }
+  },
+  "properties": {
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "infra": {
+      "type": "object",
+      "properties": {
+        "image": { "$ref": "#/definitions/image" },
+        "externalOnly": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "enforcement": { "type": "string", "enum": ["compatibility", "patched"] }
+          }
+        },
+        "auth": {
+          "type": "object",
+          "properties": {
+            "adminApiKey": { "$ref": "#/definitions/credential" },
+            "apiKey": { "$ref": "#/definitions/credential" },
+            "huggingFaceToken": { "$ref": "#/definitions/credential" }
+          }
+        }
+      }
+    },
+    "modelBackends": { "$ref": "#/definitions/backendMap" },
+    "externalBackends": { "$ref": "#/definitions/backendMap" },
+    "server": {
+      "type": "object",
+      "properties": {
+        "image": { "$ref": "#/definitions/image" },
+        "admin": {
+          "type": "object",
+          "properties": {
+            "email": { "type": "string", "minLength": 3 },
+            "password": { "$ref": "#/definitions/credential" }
+          }
+        },
+        "mongo": {
+          "type": "object",
+          "properties": {
+            "mode": { "type": "string", "enum": ["embedded", "external"] },
+            "image": { "$ref": "#/definitions/image" }
+          }
+        },
+        "vectorDb": {
+          "type": "object",
+          "properties": {
+            "active": { "type": "boolean" },
+            "type": { "type": "string", "enum": ["qdrant", "milvus"] }
+          }
+        },
+        "graph": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "password": { "$ref": "#/definitions/credential" }
+          }
+        }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "image": { "$ref": "#/definitions/image" }
+      }
+    },
+    "provisioning": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "allowNoModels": { "type": "boolean" },
+        "revision": { "type": "string" },
+        "image": { "$ref": "#/definitions/image" }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "properties": { "enabled": { "type": "boolean" } }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": { "enabled": { "type": "boolean" } }
+    }
+  }
+}

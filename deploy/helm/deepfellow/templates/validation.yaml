@@ -1,0 +1,7 @@
+{{/*
+Single invocation point for chart-wide cross-field validation. Renders to nothing
+when every check passes; aborts `helm template`/`helm lint`/`helm install` with a
+clear message otherwise. Keeping the checks here (not scattered per component) means
+they run even in this skeleton, before any component template exists.
+*/}}
+{{- include "deepfellow.validate" . -}}

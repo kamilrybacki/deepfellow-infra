@@ -1,0 +1,39 @@
+apiVersion: v2
+name: deepfellow
+description: >-
+  The Kubernetes distribution of the DeepFellow Suite (Infra + Server + Workspace).
+  Runs socket-free: model backends are served natively by llama.cpp Deployments and
+  registered into Infra as external `openai` services, so no Docker-in-Docker and no
+  Docker socket are required. Provisioning is declarative and granular — only the
+  components you enable are rendered.
+type: application
+
+# Chart's own version — bump on every chart change (SemVer). Independent of the
+# DeepFellow Suite version, which is tracked by the component image tags in values.yaml.
+version: 0.1.0
+
+# The DeepFellow Suite the default images target. Component images publish only `:latest`
+# upstream, so this tracks the suite line rather than a pinned release. Pin digests in
+# values.yaml (see infra.image.digest / server.image.digest) for reproducible deploys.
+appVersion: "latest"
+
+keywords:
+  - deepfellow
+  - llm
+  - inference
+  - openai-compatible
+  - llama-cpp
+  - kubernetes
+home: https://deepfellow.ai
+sources:
+  - https://github.com/simplito/deepfellow-infra
+maintainers:
+  - name: Simplito sp. z o.o.
+    url: https://deepfellow.ai
+annotations:
+  category: AITransformers
+  # Component image compatibility (see values.yaml for the pinned defaults).
+  deepfellow.ai/infra-image: "hub.simplito.com/deepfellow/deepfellow-infra:latest"
+  deepfellow.ai/server-image: "hub.simplito.com/deepfellow/deepfellow-server:latest"
+  deepfellow.ai/workspace-image: "hub.simplito.com/deepfellow/deepfellow-workspace:latest"
+  deepfellow.ai/model-backend-image: "ghcr.io/ggml-org/llama.cpp:server"

@@ -1,0 +1,418 @@
+# Default values for the DeepFellow Suite chart.
+#
+# Grouped by the request path: consumer -> Server (:8000) -> Infra (:8086) -> model
+# backends (native llama.cpp registered as external `openai` services, or bring-your-own
+# external endpoints). Every value is documented with a `# --` comment (helm-docs).
+#
+# CONTRACT PHILOSOPHY: fail-closed. The chart does NOT auto-generate credentials or run
+# against mutable tags by default. A default `helm template` intentionally FAILS until the
+# operator supplies credentials (a Secret, or an explicit inline value / opt-in generation)
+# and either an image digest or an explicit `allowMutableTag: true`. This is the safe default
+# for GitOps/ArgoCD, where render-time `randAlphaNum` drifts and a repo-server cannot look up
+# live cluster Secrets. Cross-field rules that Helm's JSON schema cannot express (Go RE2 has
+# no lookahead; schema cannot compare two fields) are enforced by templates/_validate.tpl.
+#
+# CREDENTIAL SHAPE (reused wherever a secret is needed):
+#   <cred>:
+#     source: existingSecret        # existingSecret | value | generate | none
+#     existingSecret: {name: "", key: "<fixed-key>"}   # source=existingSecret
+#     value: ""                                          # source=value
+#     generate: {retain: true}                           # source=generate (opt-in; NOT GitOps-safe)
+# Rules: existingSecret -> name required, value forbidden; value -> non-empty, existingSecret
+# forbidden; generate -> neither supplied (needs a live `helm` op, rejected under pure GitOps);
+# none -> only for optional credentials.
+
+# -- Override the chart name portion of resource names.
+nameOverride: ""
+# -- Override the fully qualified release name for all resources.
+fullnameOverride: ""
+
+# -- Settings shared by every component (Helm's subchart-propagation namespace).
+global:
+  # -- Registry prefix prepended to every image `repository` when set (e.g. `myregistry.local`).
+  imageRegistry: ""
+  # -- Image pull secrets applied to all pods. Anonymous pull works for the default images.
+  imagePullSecrets: []
+
+# ============================================================================
+# Infra — the OpenAI-compatible proxy (:8086). Driven socket-free.
+# ============================================================================
+infra:
+  image:
+    # -- Infra image repository.
+    repository: hub.simplito.com/deepfellow/deepfellow-infra
+    # -- Human-readable tag (provenance only; dev/discovery). Not the deploy identity.
+    tag: latest
+    # -- Image digest (`sha256:...`). THE deploy identity; takes precedence over `tag`.
+    digest: ""
+    # -- Acknowledge a mutable tag when no digest is set. Render FAILS unless digest or this is true.
+    allowMutableTag: false
+    # -- Image pull policy.
+    pullPolicy: IfNotPresent
+  externalOnly:
+    # -- Socket-free deployment intent: no docker socket/hostPath, native/external model paths only,
+    # exports `DF_EXTERNAL_ONLY=true`. Required whenever native `modelBackends` are enabled.
+    enabled: true
+    # -- `compatibility` = legacy image that ignores DF_EXTERNAL_ONLY (boots socket-free anyway;
+    # README says so). `patched` = a Phase-5 image that truly honors it; requires an image digest.
+    enforcement: compatibility
+  auth:
+    # -- Admin bearer token (`DF_INFRA_ADMIN_API_KEY`). Fail-closed: default source requires a Secret.
+    adminApiKey:
+      source: existingSecret
+      existingSecret: { name: "", key: "infra-admin-api-key" }
+      value: ""
+      generate: { retain: true }
+    # -- Server-facing bearer token (`DF_INFRA_API_KEY`) the Server uses to reach Infra.
+    apiKey:
+      source: existingSecret
+      existingSecret: { name: "", key: "infra-api-key" }
+      value: ""
+      generate: { retain: true }
+  mesh:
+    # -- Join a mesh. When false the key is still exported (image requires DF_MESH_KEY at boot).
+    enabled: false
+    # -- Mesh join URL (`DF_CONNECT_TO_MESH_URL`). Required when `enabled`.
+    connectUrl: ""
+    # -- `DF_MESH_KEY`. Not sensitive when no mesh is joined but must be non-empty (image requirement).
+    key: "unused-change-to-join-a-mesh"
+  # -- HuggingFace token (`DF_HUGGING_FACE_TOKEN`) for gated pulls. `none` = not set.
+  huggingFaceToken:
+    source: none
+    existingSecret: { name: "", key: "hf-token" }
+    value: ""
+  storage:
+    # -- Infra state PVC (config.json + endpoint registry; NO weights).
+    size: 1Gi
+    # -- StorageClass. Empty = cluster default.
+    storageClass: ""
+    # -- Use an existing PVC instead of creating one.
+    existingClaim: ""
+  service:
+    # -- Infra Service type.
+    type: ClusterIP
+    # -- Infra Service port.
+    port: 8086
+  # -- Pod resource requests/limits.
+  resources: {}
+  # -- Node selector.
+  nodeSelector: {}
+  # -- Tolerations.
+  tolerations: []
+  # -- Affinity.
+  affinity: {}
+
+# ============================================================================
+# Native model backends — llama.cpp Deployments, registered into Infra as external
+# `openai` services. KEYED MAP: add/disable one backend without restating the rest.
+# ============================================================================
+# -- Native llama.cpp backends, keyed by name (the key is the Deployment/Service name and
+# default modelId). Empty = none (use `externalBackends` for BYO endpoints).
+modelBackends: {}
+  # llama:
+  #   # -- Render this backend.
+  #   enabled: true
+  #   # -- Backend type (only llamaCpp today).
+  #   type: llamaCpp
+  #   # -- Model id registered into Infra and granted to the project. Defaults to the map key.
+  #   modelId: ""
+  #   image:
+  #     repository: ghcr.io/ggml-org/llama.cpp
+  #     tag: server
+  #     digest: ""
+  #     allowMutableTag: false
+  #     pullPolicy: IfNotPresent
+  #   gguf:
+  #     # -- GGUF weights URL, fetched by an initContainer.
+  #     url: ""
+  #     # -- HF token for gated GGUF (credential shape; `none` by default).
+  #     hfToken: { source: none, existingSecret: { name: "", key: "hf-token" }, value: "" }
+  #   # -- llama.cpp server flags (WE own the full set; DeepFellow's managed path cannot).
+  #   parallel: 1
+  #   threads: 4
+  #   ctxSize: 8192
+  #   extraArgs: []
+  #   gpu: { enabled: false, count: 1 }
+  #   storage: { size: 20Gi, medium: "", storageClass: "" }   # medium: Memory -> emptyDir tmpfs
+  #   # -- Backend Service port. llama.cpp serves OpenAI-compat at the ROOT; Infra appends `v1/`.
+  #   service: { port: 8080 }
+  #   resources: {}
+  #   nodeSelector: {}
+  #   tolerations: []
+  #   affinity: {}
+
+# ============================================================================
+# External (bring-your-own) backends — registered into Infra as external services,
+# pointing at an endpoint this chart does NOT deploy. KEYED MAP.
+# ============================================================================
+# -- BYO external endpoints, keyed by name. Kept separate from `modelBackends` so intent is
+# explicit and Phase-2 templates never infer native-vs-BYO from missing fields.
+externalBackends: {}
+  # remote:
+  #   enabled: true
+  #   # -- Infra service type (minimally `openai`).
+  #   serviceType: openai
+  #   # -- Endpoint ROOT URL (Infra appends `v1/`), e.g. http://host:8080 — NOT .../v1.
+  #   apiUrl: ""
+  #   # -- Model id registered + granted. The endpoint's GET /v1/models must NOT list this id
+  #   # (Gate A: a live-listed id seeds type=None and collides with custom-model install).
+  #   modelId: ""
+  #   # -- Context length declared for the custom model.
+  #   contextLength: 8192
+  #   # -- Endpoint bearer (credential shape; `none` if unauthenticated).
+  #   apiKey: { source: none, existingSecret: { name: "", key: "api-key" }, value: "" }
+
+# ============================================================================
+# Server — the OpenAI-compatible entrypoint (:8000).
+# ============================================================================
+server:
+  image:
+    repository: hub.simplito.com/deepfellow/deepfellow-server
+    tag: latest
+    digest: ""
+    allowMutableTag: false
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 8000
+  storage:
+    # -- Server storage PVC (uploaded files for vector stores; plugins dir).
+    size: 5Gi
+    storageClass: ""
+    existingClaim: ""
+  # -- Server log level (`DF_LOG_LEVEL`).
+  logLevel: INFO
+  admin:
+    # -- Bootstrap admin display name.
+    name: admin
+    # -- Bootstrap admin email (login).
+    email: admin@deepfellow.local
+    # -- Bootstrap admin password (credential shape). When source=value the policy is enforced:
+    # >=10 chars incl lower + upper + digit + special.
+    password:
+      source: existingSecret
+      existingSecret: { name: "", key: "admin-password" }
+      value: ""
+      generate: { retain: true }
+  project:
+    # -- Organization / project / key names created by provisioning.
+    orgName: Workspace
+    projectName: Default
+    keyName: app
+  mongo:
+    # -- `embedded` = deploy an in-chart MongoDB; `external` = use `external.uriSecret`.
+    mode: embedded
+    # -- MongoDB image (embedded mode; digest-pinned to match upstream).
+    image:
+      repository: mongo
+      tag: "8.2.7"
+      digest: "sha256:7abfba0d07c9330373f8173981ea4d09cd8a82cdf0e86ccaf7008848d1d24f62"
+      allowMutableTag: false
+      pullPolicy: IfNotPresent
+    auth:
+      # -- Application user (`DF_MONGO_USER`) and database (`DF_MONGO_DB`).
+      username: deepfellow
+      database: deepfellow
+      # -- Mongo root password (credential shape; embedded mode).
+      rootPassword:
+        source: existingSecret
+        existingSecret: { name: "", key: "mongo-root-password" }
+        value: ""
+        generate: { retain: true }
+      # -- Application user password (credential shape; embedded mode).
+      password:
+        source: existingSecret
+        existingSecret: { name: "", key: "mongo-password" }
+        value: ""
+        generate: { retain: true }
+    storage:
+      size: 8Gi
+      storageClass: ""
+    external:
+      # -- External MongoDB URI (`DF_MONGO_URL`) as a Secret ref (external mode).
+      uriSecret: { name: "", key: "uri" }
+  vectorDb:
+    # -- Enable RAG / vector store (`DF_VECTOR_DATABASE__PROVIDER__ACTIVE`).
+    active: false
+    # -- One of: qdrant, milvus.
+    type: qdrant
+    embedding:
+      endpoint: openai
+      model: mxbai-embed-large
+      size: 1024
+    qdrant:
+      image:
+        repository: qdrant/qdrant
+        tag: v1.15
+        digest: ""
+        allowMutableTag: false
+        pullPolicy: IfNotPresent
+      # -- External Qdrant URL. Empty = deploy in-chart qdrant.
+      url: ""
+      storage: { size: 10Gi, storageClass: "" }
+    milvus:
+      etcdImage:
+        repository: quay.io/coreos/etcd
+        tag: v3.5.18
+        digest: ""
+        allowMutableTag: false
+        pullPolicy: IfNotPresent
+      minioImage:
+        repository: minio/minio
+        tag: RELEASE.2024-12-18T13-15-44Z
+        digest: ""
+        allowMutableTag: false
+        pullPolicy: IfNotPresent
+      milvusImage:
+        repository: milvusdb/milvus
+        tag: v2.6.2
+        digest: ""
+        allowMutableTag: false
+        pullPolicy: IfNotPresent
+      storage: { size: 20Gi, storageClass: "" }
+  graph:
+    # -- Enable the FalkorDB graph store.
+    enabled: false
+    image:
+      repository: falkordb/falkordb
+      tag: v4.12.4
+      digest: ""
+      allowMutableTag: false
+      pullPolicy: IfNotPresent
+    # -- FalkorDB password (credential shape; required when enabled).
+    password:
+      source: existingSecret
+      existingSecret: { name: "", key: "graph-password" }
+      value: ""
+      generate: { retain: true }
+    storage: { size: 5Gi, storageClass: "" }
+  plugins:
+    # -- Structured plugin setup JSON (`DF_PLUGINS_SETUP`). Empty = no plugins.
+    setup: ""
+    # -- Model id used by the abuse-detection plugin.
+    abuseModel: ""
+    # -- Model ids used by the anonymize plugin.
+    anonymizeModels: []
+  otel:
+    # -- Enable OpenTelemetry export.
+    enabled: false
+    # -- OTLP collector endpoint. Required when enabled.
+    endpoint: ""
+  metrics:
+    # -- Enable metrics basic-auth (`DF_METRICS_USERNAME`/`DF_METRICS_PASSWORD`).
+    enabled: false
+    username: ""
+    # -- Metrics password (credential shape; required when metrics.enabled).
+    password:
+      source: none
+      existingSecret: { name: "", key: "metrics-password" }
+      value: ""
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ============================================================================
+# Workspace — the web panel (:3000). Image name inferred; not Gate-A-tested.
+# ============================================================================
+workspace:
+  # -- Deploy the Workspace panel.
+  enabled: true
+  image:
+    repository: hub.simplito.com/deepfellow/deepfellow-workspace
+    tag: latest
+    digest: ""
+    allowMutableTag: false
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 3000
+  auth:
+    # -- better-auth signing secret (`BETTER_AUTH_SECRET`) (credential shape).
+    betterAuthSecret:
+      source: existingSecret
+      existingSecret: { name: "", key: "better-auth-secret" }
+      value: ""
+      generate: { retain: true }
+    bootstrapAdmin:
+      # -- Workspace bootstrap admin email (`BOOTSTRAP_ADMIN_EMAIL`).
+      email: admin@deepfellow.local
+      # -- Workspace bootstrap admin password (credential shape).
+      password:
+        source: existingSecret
+        existingSecret: { name: "", key: "workspace-admin-password" }
+        value: ""
+        generate: { retain: true }
+  # -- Model ids used by the Workspace.
+  sessionTitleModel: ""
+  smallModel: ""
+  mongo:
+    # -- Workspace's own MongoDB (separate app-mongo; single-node replSet for transactions).
+    image:
+      repository: mongo
+      tag: "8.2.7"
+      digest: "sha256:7abfba0d07c9330373f8173981ea4d09cd8a82cdf0e86ccaf7008848d1d24f62"
+      allowMutableTag: false
+      pullPolicy: IfNotPresent
+    replSetName: rs0
+    auth:
+      # -- Workspace mongo root password (credential shape).
+      rootPassword:
+        source: existingSecret
+        existingSecret: { name: "", key: "workspace-mongo-root-password" }
+        value: ""
+        generate: { retain: true }
+    storage: { size: 4Gi, storageClass: "" }
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ============================================================================
+# Provisioning — creates admin/org/project, mints the project key into a Secret
+# (GET-ONCE), registers backends into Infra, grants the project. Off by default.
+# ============================================================================
+provisioning:
+  # -- Run provisioning (helm hooks). Fail-closed: off by default so a bare suite can deploy.
+  enabled: false
+  # -- Bump to intentionally rerun reconciliation (Job name derives from it; upgrades otherwise skip).
+  revision: "1"
+  # -- Allow provisioning with no enabled backend of either kind (would provision an unusable project).
+  allowNoModels: false
+  # -- Image running the provisioning scripts. Empty = reuse the Server image (carries the scripts).
+  image:
+    repository: ""
+    tag: ""
+    digest: ""
+    allowMutableTag: false
+    pullPolicy: IfNotPresent
+  # -- Dedicated Secret holding the GET-ONCE dfproj credentials (org_id/project_id/project_api_key).
+  # Empty = derive a deterministic name from the release. (Phase 3 will mark it kept-on-uninstall
+  # via `helm.sh/resource-policy: keep` so the one-time key survives a reinstall.)
+  stateSecret: { name: "" }
+  serviceAccount:
+    # -- Create a ServiceAccount scoped (Role) to the one credential Secret in this namespace.
+    create: true
+    name: ""
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ============================================================================
+# Ingress — off by default. Targets Server (/v1) and Workspace.
+# ============================================================================
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  server: { host: "", path: /v1 }
+  workspace: { host: "" }
+  tls: []
+
+# ============================================================================
+# NetworkPolicy — off by default (vanilla portability). Docker socket is NEVER a
+# configurable mount. Overlays add default-deny + intra-suite allows.
+# ============================================================================
+networkPolicy:
+  enabled: false

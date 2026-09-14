@@ -1,0 +1,24 @@
+# Minimal values that satisfy the fail-closed contract, for `helm lint`/`helm template`
+# smoke tests. Excluded from the packaged chart by .helmignore (ci/).
+infra:
+  image: { allowMutableTag: true }
+  auth:
+    adminApiKey: { source: existingSecret, existingSecret: { name: df-secrets } }
+    apiKey: { source: existingSecret, existingSecret: { name: df-secrets } }
+server:
+  image: { allowMutableTag: true }
+  admin:
+    password: { source: existingSecret, existingSecret: { name: df-secrets } }
+  mongo:
+    auth:
+      rootPassword: { source: existingSecret, existingSecret: { name: df-secrets } }
+      password: { source: existingSecret, existingSecret: { name: df-secrets } }
+workspace:
+  image: { allowMutableTag: true }
+  auth:
+    betterAuthSecret: { source: existingSecret, existingSecret: { name: df-secrets } }
+    bootstrapAdmin:
+      password: { source: existingSecret, existingSecret: { name: df-secrets } }
+  mongo:
+    auth:
+      rootPassword: { source: existingSecret, existingSecret: { name: df-secrets } }
