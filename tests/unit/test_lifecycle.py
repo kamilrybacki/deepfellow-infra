@@ -136,6 +136,9 @@ def _apply_base_patches(active_patches: dict[str, Mock], *, config: MagicMock | 
     svc_mgr.stop_all_services = AsyncMock()
     svc_mgr.drain_warning_tasks = AsyncMock()
 
+    otlp_logging = active_patches["server.lifecycle.OtlpLoggingManager"].return_value
+    otlp_logging.teardown = AsyncMock()
+
     return cfg
 
 
@@ -187,6 +190,18 @@ async def test_lifespan_shuts_down_tracer_on_exit(app: FastAPI, base_mocks: dict
             pass
 
         assert mock_tracer.shutdown.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_lifespan_tears_down_otlp_logging_on_exit(app: FastAPI, base_mocks: dict[str, Mock]) -> None:
+    cfg = _make_config(otel_logging_enabled=True)
+    _apply_base_patches(base_mocks, config=cfg)
+
+    async with lifespan(app):
+        pass
+
+    otlp_logging = base_mocks["server.lifecycle.OtlpLoggingManager"].return_value
+    assert otlp_logging.teardown.call_count == 1
 
 
 @pytest.mark.asyncio

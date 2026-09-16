@@ -139,6 +139,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     if config.is_stop_containers_on_shutdown_enabled():
         await services_manager.stop_all_services()
     await tracer.shutdown()
+    await otlp_logging.teardown()
 
 
 def check_subnet(subnet: str) -> None:
