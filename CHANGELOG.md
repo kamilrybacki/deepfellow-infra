@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 - Reconfiguring OTLP log export via `/admin/config` no longer blocks the API for up to ~30s when the OTLP collector is unreachable, and a failed reconfigure no longer permanently disables further log-export retries.
+- OTLP log export is now properly shut down when the app exits, giving buffered log records a chance to flush.
 
 ## [0.33.0] - 2026-09-11
 

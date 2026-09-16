@@ -38,6 +38,10 @@ uvicorn_logger = logging.getLogger("uvicorn")
 
 _OTEL_SHUTDOWN_TIMEOUT_MILLIS = 5000
 
+# "" is the root logger's name in logging.getLogger(). uvicorn/.error/.access have propagate=false
+# in logging_config.yaml so they won't reach root and need the handler attached directly.
+_OTLP_LOG_HANDLER_LOGGER_NAMES = ("", "uvicorn", "uvicorn.error", "uvicorn.access")
+
 
 class OtlpLoggingManager:
     """Owns the OTLP log handler lifecycle for one app instance.
@@ -64,10 +68,7 @@ class OtlpLoggingManager:
         set_logger_provider(provider)
 
         handler = self._handler = LoggingHandler(level=logging.DEBUG, logger_provider=provider)
-        logging.getLogger().addHandler(handler)
-
-        # uvicorn loggers have propagate=false in logging_config.yaml so they won't reach root
-        for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        for name in _OTLP_LOG_HANDLER_LOGGER_NAMES:
             logging.getLogger(name).addHandler(handler)
 
     def _shutdown_provider(self, provider: LoggerProvider) -> None:
@@ -106,7 +107,7 @@ class OtlpLoggingManager:
         would never be retried once the handler had already been cleared on that earlier attempt.
         """
         if self._handler is not None:
-            for name in ("", "uvicorn", "uvicorn.error", "uvicorn.access"):
+            for name in _OTLP_LOG_HANDLER_LOGGER_NAMES:
                 logging.getLogger(name).removeHandler(self._handler)
             self._handler = None
 
