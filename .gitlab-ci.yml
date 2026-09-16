@@ -229,7 +229,13 @@ tag_docker_image:
     - export IMAGE_ID=$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
     - export IMAGE_TAG_ID=$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG
     - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
-    - docker pull $IMAGE_ID
+    - |
+      for i in $(seq 1 60); do
+        docker pull "$IMAGE_ID" && break
+        echo "Image $IMAGE_ID not published yet (attempt $i/60) — main's build_and_publish_docker_image job may still be running. Retrying in 20s..."
+        sleep 20
+      done
+    - docker pull "$IMAGE_ID"
     - docker tag $IMAGE_ID $IMAGE_TAG_ID
     - docker push $IMAGE_TAG_ID
   except:
