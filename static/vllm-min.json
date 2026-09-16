@@ -1,12 +1,24 @@
 {
     "llms": [
         {
+            "name": "Accio-Lab/occamy-1.0",
+            "size": "65GB"
+        },
+        {
             "name": "AEON-7/Qwen3.6-35B-A3B-heretic-NVFP4",
             "size": "21GB"
         },
         {
+            "name": "Agnes-AI/Agnes-3.0-Flash",
+            "size": "61GB"
+        },
+        {
             "name": "ai-sage/GigaChat3.5-432B-A28B-Reasoning",
             "size": "415GB"
+        },
+        {
+            "name": "audnai/penclaw-GLM-5.3-abliterated",
+            "size": "3TB"
         },
         {
             "name": "Bahushruth/Qwen3.6-35B-A3B-abliterated-v4",
@@ -61,6 +73,10 @@
             "size": "19GB"
         },
         {
+            "name": "DavidAU/Qwen3.5-9B-Claude-4.6-HighIQ-INSTRUCT-HERETIC-UNCENSORED",
+            "size": "17GB"
+        },
+        {
             "name": "DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NM-DAU",
             "size": "51GB"
         },
@@ -69,15 +85,15 @@
             "size": "51GB"
         },
         {
+            "name": "DavidAU/Qwen3.8-27B-TWIN-TURBO-Fable-Cold-Fusion-709-ULTRA-HERETIC-Uncensored",
+            "size": "51GB"
+        },
+        {
             "name": "dealignai/Gemma-4-31B-JANG_4M-CRACK",
             "size": "21GB"
         },
         {
             "name": "dealignai/GLM-5.3-CYBERSECURITY-FP8",
-            "size": "703GB"
-        },
-        {
-            "name": "dealignai/GLM-5.3-UNCENSORED-FP8",
             "size": "703GB"
         },
         {
@@ -129,10 +145,6 @@
             "size": "64GB"
         },
         {
-            "name": "dphn/Dolphin-Mistral-24B-Venice-Edition",
-            "size": "44GB"
-        },
-        {
             "name": "Edge0/Edge0-35B-A3B-preview",
             "size": "18GB"
         },
@@ -163,10 +175,6 @@
         {
             "name": "google/diffusiongemma-26B-A4B-it",
             "size": "48GB"
-        },
-        {
-            "name": "google/functiongemma-270m-it",
-            "size": "823MB"
         },
         {
             "name": "google/gemma-3n-E4B-it",
@@ -233,6 +241,10 @@
             "size": "7GB"
         },
         {
+            "name": "huihui-ai/Huihui-Qwen3.8-27B-abliterated",
+            "size": "51GB"
+        },
+        {
             "name": "ibm-granite/granite-4.1-30b",
             "size": "53GB"
         },
@@ -245,8 +257,8 @@
             "size": "2GB"
         },
         {
-            "name": "IFM/K2-Horizon-375B-A23B",
-            "size": "706GB"
+            "name": "IFM/K2-Horizon-3.7B",
+            "size": "9GB"
         },
         {
             "name": "IFM/K2-Horizon-7B",
@@ -257,20 +269,8 @@
             "size": "69GB"
         },
         {
-            "name": "inclusionAI/Ling-3.0-flash-Fin",
-            "size": "237GB"
-        },
-        {
             "name": "inclusionAI/Ling-3.0-flash-VL",
             "size": "232GB"
-        },
-        {
-            "name": "inclusionAI/Ling-3.0-flash-VL-fp8",
-            "size": "117GB"
-        },
-        {
-            "name": "inclusionAI/Ling-3.0-tiny",
-            "size": "14GB"
         },
         {
             "name": "Inferact/Qwen3.8-27B-NVFP4",
@@ -281,12 +281,24 @@
             "size": "8GB"
         },
         {
+            "name": "internlm/Intern-S2-397B",
+            "size": "751GB"
+        },
+        {
             "name": "ISTA-DASLab/gemma-3-27b-it-GPTQ-4b-128g",
             "size": "15GB"
         },
         {
             "name": "Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled",
             "size": "51GB"
+        },
+        {
+            "name": "k-chirkunov/gemma4-e4b-claims-comparison",
+            "size": "14GB"
+        },
+        {
+            "name": "LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct-AWQ",
+            "size": "4GB"
         },
         {
             "name": "LilaRest/gemma-4-31B-it-NVFP4-turbo",
@@ -381,19 +393,11 @@
             "size": "1GB"
         },
         {
-            "name": "microsoft/Fara-7B",
-            "size": "15GB"
-        },
-        {
             "name": "microsoft/Phi-3-mini-128k-instruct",
             "size": "7GB"
         },
         {
             "name": "microsoft/Phi-3-mini-4k-instruct",
-            "size": "7GB"
-        },
-        {
-            "name": "microsoft/Phi-3.5-mini-instruct",
             "size": "7GB"
         },
         {
@@ -403,10 +407,6 @@
         {
             "name": "microsoft/phi-4",
             "size": "27GB"
-        },
-        {
-            "name": "microsoft/Phi-4-mini-instruct",
-            "size": "7GB"
         },
         {
             "name": "MiniMaxAI/MiniMax-M2",
@@ -465,20 +465,12 @@
             "size": "7GB"
         },
         {
-            "name": "Nanbeige/Nanbeige4.2-3B",
-            "size": "7GB"
-        },
-        {
             "name": "nex-agi/Nex-N2.5-Max",
             "size": "1TB"
         },
         {
             "name": "nex-agi/Nex-N2.5-mini",
             "size": "65GB"
-        },
-        {
-            "name": "nex-agi/Nex-N2.5-Pro",
-            "size": "379GB"
         },
         {
             "name": "nm-testing/SmolLM-1.7B-Instruct-quantized.w4a16",
@@ -507,10 +499,6 @@
         {
             "name": "nvidia/LocateAnything-3B",
             "size": "7GB"
-        },
-        {
-            "name": "nvidia/MiniMax-M2.5-NVFP4",
-            "size": "130GB"
         },
         {
             "name": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
@@ -547,6 +535,10 @@
         {
             "name": "nvidia/NVLM-D-72B",
             "size": "164GB"
+        },
+        {
+            "name": "nvidia/Qwen3-14B-NVFP4",
+            "size": "9GB"
         },
         {
             "name": "nvidia/Qwen3.5-122B-A10B-NVFP4",
@@ -593,10 +585,6 @@
             "size": "4GB"
         },
         {
-            "name": "openbmb/MiniCPM5-2B-MLX",
-            "size": "1GB"
-        },
-        {
             "name": "openchat/openchat_3.5",
             "size": "13GB"
         },
@@ -609,10 +597,6 @@
             "size": "4GB"
         },
         {
-            "name": "orcarouter/GLM-5.3-Flash-Uncensored-FP8",
-            "size": "305GB"
-        },
-        {
             "name": "orcarouter/Qwen3.8-27B-Uncensored",
             "size": "51GB"
         },
@@ -623,10 +607,6 @@
         {
             "name": "orcarouter/Qwen3.8-27B-Uncensored-MLX",
             "size": "88GB"
-        },
-        {
-            "name": "orcarouter/Qwen3.8-27B-Uncensored-NVFP4",
-            "size": "23GB"
         },
         {
             "name": "Orion-zhen/Qwen2.5-Coder-7B-Instruct-AWQ",
@@ -661,12 +641,12 @@
             "size": "751GB"
         },
         {
-            "name": "ornith-ai/Ornith-1.5-9B-NVFP4",
-            "size": "8GB"
+            "name": "ornith-ai/Ornith-1.5-9B",
+            "size": "18GB"
         },
         {
-            "name": "palmfuture/Qwen3.6-35B-A3B-GPTQ-Int4",
-            "size": "22GB"
+            "name": "ornith-ai/Ornith-1.5-9B-NVFP4",
+            "size": "8GB"
         },
         {
             "name": "philbert440/Qwen3.8-27B-W4A16-AWQ",
@@ -707,10 +687,6 @@
         {
             "name": "QuantTrio/Qwen3.6-35B-A3B-AWQ",
             "size": "23GB"
-        },
-        {
-            "name": "QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4",
-            "size": "19GB"
         },
         {
             "name": "Qwen/Qwen-Drive-1.0-4B",
@@ -781,12 +757,8 @@
             "size": "5GB"
         },
         {
-            "name": "Qwen/Qwen2.5-3B-Instruct-AWQ",
-            "size": "2GB"
-        },
-        {
-            "name": "Qwen/Qwen2.5-72B-Instruct",
-            "size": "135GB"
+            "name": "Qwen/Qwen2.5-72B-Instruct-AWQ",
+            "size": "38GB"
         },
         {
             "name": "Qwen/Qwen2.5-7B",
@@ -851,10 +823,6 @@
         {
             "name": "Qwen/Qwen2.5-VL-3B-Instruct",
             "size": "7GB"
-        },
-        {
-            "name": "Qwen/Qwen2.5-VL-3B-Instruct-AWQ",
-            "size": "3GB"
         },
         {
             "name": "Qwen/Qwen2.5-VL-72B-Instruct",
@@ -1125,6 +1093,10 @@
             "size": "20GB"
         },
         {
+            "name": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+            "size": "126GB"
+        },
+        {
             "name": "raxcore-dev/Rax-4.5",
             "size": "4GB"
         },
@@ -1146,15 +1118,11 @@
         },
         {
             "name": "ReliquaryForge/qwen3-4b-base-dapo-v4",
-            "size": "15GB"
+            "size": "7GB"
         },
         {
             "name": "rhymes-ai/Aria",
             "size": "47GB"
-        },
-        {
-            "name": "sakamakismile/Ornith-1.0-35B-NVFP4",
-            "size": "20GB"
         },
         {
             "name": "sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP",
@@ -1173,12 +1141,12 @@
             "size": "15GB"
         },
         {
-            "name": "tencent/HY-Embodied-0.5",
-            "size": "7GB"
+            "name": "TaichuAI/ZDTaichu5.0-9B",
+            "size": "18GB"
         },
         {
-            "name": "tencent/Hy4-preview",
-            "size": "1TB"
+            "name": "tencent/HY-Embodied-0.5",
+            "size": "7GB"
         },
         {
             "name": "thesysdev/OUI-1",
@@ -1191,6 +1159,10 @@
         {
             "name": "thinkingmachines/Inkling-Small",
             "size": "495GB"
+        },
+        {
+            "name": "thinkingmachines/Inkling-Small-NVFP4",
+            "size": "159GB"
         },
         {
             "name": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
@@ -1209,16 +1181,8 @@
             "size": "53MB"
         },
         {
-            "name": "trl-internal-testing/tiny-Gemma3ForConditionalGeneration",
-            "size": "45MB"
-        },
-        {
             "name": "trl-internal-testing/tiny-GptOssForCausalLM",
             "size": "32MB"
-        },
-        {
-            "name": "trl-internal-testing/tiny-LlamaForCausalLM-3.2",
-            "size": "18MB"
         },
         {
             "name": "trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration",
@@ -1227,14 +1191,6 @@
         {
             "name": "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
             "size": "19MB"
-        },
-        {
-            "name": "trl-internal-testing/tiny-Qwen3_5ForConditionalGeneration-NoThink",
-            "size": "27MB"
-        },
-        {
-            "name": "trl-internal-testing/tiny-Qwen3_5MoeForConditionalGeneration-3.6",
-            "size": "35MB"
         },
         {
             "name": "trl-internal-testing/tiny-Qwen3ForCausalLM",
@@ -1249,8 +1205,8 @@
             "size": "42GB"
         },
         {
-            "name": "unsloth/gemma-4-E2B-it-NVFP4",
-            "size": "5GB"
+            "name": "ukisai/Swift-Qwen3.8-27b",
+            "size": "51GB"
         },
         {
             "name": "unsloth/gemma-4-E4B-it-unsloth-bnb-4bit",
@@ -1263,10 +1219,6 @@
         {
             "name": "unsloth/Qwen3.6-35B-A3B-NVFP4",
             "size": "24GB"
-        },
-        {
-            "name": "XHToken/Spark-X2.5-1.7B",
-            "size": "3GB"
         },
         {
             "name": "XHToken/Spark-X2.5-4B",
@@ -1377,13 +1329,13 @@
             "is_generative": false
         },
         {
-            "name": "onnx-community/bge-reranker-v2-m3-ONNX",
-            "size": "7GB",
+            "name": "OpenSciLM/OpenScholar_Reranker",
+            "size": "2GB",
             "is_generative": false
         },
         {
-            "name": "sshalimov04/ru-reranker-edge-150m",
-            "size": "861MB",
+            "name": "qilowoq/bge-reranker-v2-m3-en-ru",
+            "size": "1GB",
             "is_generative": false
         }
     ],
@@ -1417,20 +1369,12 @@
             "size": "418MB"
         },
         {
-            "name": "dnotitia/DNA-VL-STEER-2B",
-            "size": "4GB"
-        },
-        {
             "name": "google/embeddinggemma-300m",
             "size": "1GB"
         },
         {
             "name": "ibm-granite/granite-embedding-small-english-r2",
             "size": "185MB"
-        },
-        {
-            "name": "InfocubeSrl/pplx-embed-v1-0.6b-acta-ita",
-            "size": "2GB"
         },
         {
             "name": "intfloat/multilingual-e5-base",
@@ -1453,12 +1397,8 @@
             "size": "3GB"
         },
         {
-            "name": "NbAiLab/borealis-embed-212m",
-            "size": "817MB"
-        },
-        {
-            "name": "nlpai-lab/KURE-v2",
-            "size": "294MB"
+            "name": "llm-semantic-router/Vela-1.0-Encoder-307M-Embedding",
+            "size": "2GB"
         },
         {
             "name": "nomic-ai/nomic-embed-text-v1",
@@ -1473,7 +1413,19 @@
             "size": "1GB"
         },
         {
+            "name": "nomic-ai/nomic-embed-vision-v1.5",
+            "size": "1GB"
+        },
+        {
+            "name": "nvidia/Nemotron-3-Embed-1B-BF16",
+            "size": "2GB"
+        },
+        {
             "name": "nvidia/Nemotron-3-Embed-8B-BF16",
+            "size": "14GB"
+        },
+        {
+            "name": "Octen/Octen-Embedding-8B",
             "size": "14GB"
         },
         {
@@ -1507,14 +1459,6 @@
         {
             "name": "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
             "size": "10GB"
-        },
-        {
-            "name": "tencent/WeMM-Embedding-2B",
-            "size": "5GB"
-        },
-        {
-            "name": "tencent/WeMM-Embedding-4B",
-            "size": "9GB"
         },
         {
             "name": "tencent/WeMM-Embedding-9B",
