@@ -91,7 +91,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         app.state.task_manager = task_manager = TaskManager()
         app.state.service_provider = service_provider = ServiceProvider(config)
         parents = [ParentInfra(config, task_manager, config.connect_to_mesh_url)] if config.connect_to_mesh_url else []
-        app.state.parent_infra = parent_infra = ParentInfraGroup(parents)
+        app.state.parent_infra = parent_infra = ParentInfraGroup(
+            parents, configured_mesh_url=config.connect_to_mesh_url, configured_mesh_key=config.connect_to_mesh_key
+        )
         app.state.services_manager = services_manager = ServicesManager()
         app.state.model_tester = model_tester = ModelTester()
         app.state.endpoint_registry = endpoint_registry = EndpointRegistry(config, parent_infra, model_tester, metrics_registry)

@@ -149,19 +149,14 @@ async def update_dynamic_config(
         except ValidationError as e:
             raise HTTPException(status_code=400, detail=jsonable_encoder(e.errors())) from e
 
-        mesh_changed = new_settings.connect_to_mesh_url != current.connect_to_mesh_url or (
-            new_settings.connect_to_mesh_key.get_secret_value() != current.connect_to_mesh_key.get_secret_value()
+        # Diffed against what parent_infra/otlp_logging last confirmed applied, not `current` —
+        # `apply_dynamic_settings()` below overwrites `config` regardless of success.
+        mesh_changed = new_settings.connect_to_mesh_url != parent_infra.configured_mesh_url or (
+            new_settings.connect_to_mesh_key.get_secret_value() != parent_infra.configured_mesh_key.get_secret_value()
         )
         otel_logging_changed = (
-            new_settings.otel_logging_enabled != current.otel_logging_enabled
-            or new_settings.otel_exporter_otlp_endpoint != current.otel_exporter_otlp_endpoint
-        )
-        otel_tracing_disabled = current.otel_tracing_enabled and not new_settings.otel_tracing_enabled
-        ancestor_broadcast_needed = (
-            new_settings.share_models_downstream != current.share_models_downstream
-            or new_settings.infra_api_key.get_secret_value() != current.infra_api_key.get_secret_value()
-            or new_settings.name != current.name
-            or new_settings.infra_url != current.infra_url
+            new_settings.otel_logging_enabled != otlp_logging.configured_enabled
+            or new_settings.otel_exporter_otlp_endpoint != otlp_logging.configured_endpoint
         )
         downloaders_changed = (
             new_settings.hugging_face_token.get_secret_value() != current.hugging_face_token.get_secret_value()
@@ -183,13 +178,13 @@ async def update_dynamic_config(
                 await parent_infra.reconfigure(config, task_manager)
             if otel_logging_changed:
                 await otlp_logging.reconfigure(config)
-            if otel_tracing_disabled:
-                # Endpoint changes are already picked up lazily by tracer._get_tracer()/
-                # _get_mcp_instruments(); only a disable transition needs an explicit stop, since
-                # nothing calls those getters again to shut down the now-unreferenced providers.
+            if not new_settings.otel_tracing_enabled and tracer.is_active:
+                # Only a disable needs an explicit stop; endpoint changes are picked up lazily
+                # elsewhere. Checked against live state, not a flag, so a retry isn't skipped.
                 await tracer.shutdown()
-            if ancestor_broadcast_needed:
-                infra_websocket_server.broadcast_ancestors_to_children()
+            # Stateless and cheap — run unconditionally rather than gating on a flag that could go
+            # stale like the ones above used to.
+            infra_websocket_server.broadcast_ancestors_to_children()
             if downloaders_changed:
                 model_downloader.create_downloaders(config)
         except Exception as e:

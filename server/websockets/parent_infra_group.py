@@ -6,6 +6,8 @@
 import asyncio
 from typing import TYPE_CHECKING, Literal
 
+from pydantic import SecretStr
+
 from server.models.api import Model
 from server.models.mesh import CheckMeshConnection
 from server.websockets.models import AncestorInfo, TopologyUpdateRequest, UsageChangeRequest, WarmChangeRequest
@@ -20,11 +22,16 @@ if TYPE_CHECKING:
 
 
 class ParentInfraGroup:
-    def __init__(self, parents: list[ParentInfra]):
+    def __init__(self, parents: list[ParentInfra], configured_mesh_url: str = "", configured_mesh_key: SecretStr | None = None):
         self.parents = parents
         self._endpoint_registry: EndpointRegistry | None = None
         self._get_children: Callable[[], dict[str, TopologyUpdateRequest]] = dict
         self._on_mesh_visibility_changed: Callable[[], None] = lambda: None
+
+        # Last confirmed-applied mesh settings, not `config` itself — `config` gets overwritten
+        # regardless of success, which would hide a still-pending change from a retry.
+        self.configured_mesh_url = configured_mesh_url
+        self.configured_mesh_key = configured_mesh_key if configured_mesh_key is not None else SecretStr("")
 
     @property
     def enabled(self) -> bool:
@@ -146,3 +153,8 @@ class ParentInfraGroup:
         self.parents = new_parents
         for parent in new_parents:
             task_manager.add_task_safe(parent.run(), "parent_infra_group.reconfigure")
+
+        # Only recorded once the rebuild above fully commits, so a failure partway through leaves
+        # these accurate for a retry.
+        self.configured_mesh_url = config.connect_to_mesh_url
+        self.configured_mesh_key = config.connect_to_mesh_key

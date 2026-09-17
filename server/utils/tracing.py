@@ -54,6 +54,11 @@ class OtlpLoggingManager:
         self._handler: LoggingHandler | None = None
         self._provider: LoggerProvider | None = None
 
+        # Last confirmed-applied logging config, not `config` itself — `config` gets overwritten
+        # regardless of success, which would hide a still-pending change from a retry.
+        self.configured_endpoint: str | None = None
+        self.configured_enabled: bool = False
+
     def setup(self, config: AppSettings) -> None:
         """Attach an OTLP log handler to the root Python logger and non-propagating uvicorn loggers.
 
@@ -70,6 +75,10 @@ class OtlpLoggingManager:
         handler = self._handler = LoggingHandler(level=logging.DEBUG, logger_provider=provider)
         for name in _OTLP_LOG_HANDLER_LOGGER_NAMES:
             logging.getLogger(name).addHandler(handler)
+
+        # Only record success once attached, so a prior failure still shows as pending on retry.
+        self.configured_endpoint = config.otel_exporter_otlp_endpoint
+        self.configured_enabled = True
 
     def _shutdown_provider(self, provider: LoggerProvider) -> None:
         """Shut down a `LoggerProvider` without blocking the caller for up to the default 30s.
@@ -118,6 +127,9 @@ class OtlpLoggingManager:
             await asyncio.to_thread(self._shutdown_provider, self._provider)
             self._provider = None
 
+        # _run_provider_shutdown() never raises, so this always reflects reality once reached.
+        self.configured_enabled = False
+
     async def reconfigure(self, config: AppSettings) -> None:
         """Apply an `otel_logging_enabled`/`otel_exporter_otlp_endpoint` change without a restart."""
         await self.teardown()
@@ -164,6 +176,15 @@ class InfraTracer:
             msg = "InfraTracer.config was not set. Ensure lifecycle.py assigns `tracer.config` at startup."
             raise RuntimeError(msg)
         return self.config
+
+    @property
+    def is_active(self) -> bool:
+        """Whether shutdown() still has a live provider to tear down.
+
+        Checks both independently — mcp_instruments() can build _meter_provider without span()
+        ever building _provider.
+        """
+        return self._provider is not None or self._meter_provider is not None
 
     def _shutdown_span_provider(self, provider: TracerProvider) -> None:
         """Shut down a `TracerProvider` without blocking the caller for up to the default 30s.

@@ -118,6 +118,12 @@ def _patch_otlp_logging_context_managers():
     ]
 
 
+def test_otlp_logging_manager_configured_state_defaults() -> None:
+    manager = OtlpLoggingManager()
+    assert manager.configured_endpoint is None
+    assert manager.configured_enabled is False
+
+
 def test_setup_otlp_logging_creates_provider_with_service_name() -> None:
     cfg = _make_config(endpoint="http://otel:4317")
     patches = _patch_otlp_logging_context_managers()
@@ -185,6 +191,18 @@ def test_setup_otlp_logging_attaches_handler_to_root_and_uvicorn_loggers() -> No
         assert logger_call == call(handler)
 
 
+def test_setup_otlp_logging_records_configured_endpoint_and_enabled() -> None:
+    cfg = _make_config(endpoint="http://otel:4317")
+    patches = _patch_otlp_logging_context_managers()
+    manager = OtlpLoggingManager()
+
+    with patches[0], patches[1], patches[2], patches[3], patches[4], patch("server.utils.tracing.logging.getLogger"):
+        manager.setup(cfg)
+
+    assert manager.configured_endpoint == "http://otel:4317"
+    assert manager.configured_enabled is True
+
+
 @pytest.mark.asyncio
 async def test_teardown_otlp_logging_noop_when_no_handler() -> None:
     manager = OtlpLoggingManager()
@@ -224,6 +242,35 @@ async def test_teardown_otlp_logging_shuts_down_old_provider() -> None:
 
     assert provider.shutdown.call_count == 1
     assert manager._provider is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_teardown_otlp_logging_records_configured_enabled_false_on_success() -> None:
+    manager = OtlpLoggingManager()
+    manager._handler = MagicMock()  # pyright: ignore[reportPrivateUsage]
+    manager._provider = MagicMock()  # pyright: ignore[reportPrivateUsage]
+    manager.configured_enabled = True
+
+    with patch("server.utils.tracing.logging.getLogger"):
+        await manager.teardown()
+
+    assert manager.configured_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_teardown_otlp_logging_records_configured_enabled_false_even_when_provider_shutdown_fails() -> None:
+    """DFINFRA-314 swallows the shutdown failure, so teardown() never raises here anymore."""
+    manager = OtlpLoggingManager()
+    manager._handler = MagicMock()  # pyright: ignore[reportPrivateUsage]
+    provider = MagicMock()
+    provider.shutdown.side_effect = RuntimeError("boom")
+    manager._provider = provider  # pyright: ignore[reportPrivateUsage]
+    manager.configured_enabled = True
+
+    with patch("server.utils.tracing.logging.getLogger"):
+        await manager.teardown()  # must not raise
+
+    assert manager.configured_enabled is False
 
 
 @pytest.mark.asyncio
@@ -374,6 +421,24 @@ def test_get_config_returns_config_when_set() -> None:
     t.config = cfg
 
     assert t._get_config() is cfg  # pyright: ignore[reportPrivateUsage]
+
+
+def test_is_active_false_when_no_provider() -> None:
+    t = InfraTracer("svc")
+    assert t.is_active is False
+
+
+def test_is_active_true_when_provider_exists() -> None:
+    t = InfraTracer("svc")
+    t._provider = MagicMock()  # pyright: ignore[reportPrivateUsage]
+    assert t.is_active is True
+
+
+def test_is_active_true_when_only_meter_provider_exists() -> None:
+    """mcp_instruments() can build _meter_provider without span() building _provider."""
+    t = InfraTracer("svc")
+    t._meter_provider = MagicMock()  # pyright: ignore[reportPrivateUsage]
+    assert t.is_active is True
 
 
 def test_get_config_raises_when_not_set() -> None:

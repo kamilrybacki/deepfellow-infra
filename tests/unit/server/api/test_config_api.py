@@ -68,6 +68,9 @@ def config() -> MagicMock:
 def parent_infra() -> MagicMock:
     mock = MagicMock()
     mock.reconfigure = AsyncMock()
+    # Must match `config`'s initial values, so `mesh_changed` starts out "unchanged".
+    mock.configured_mesh_url = ""
+    mock.configured_mesh_key = SecretStr("")
     return mock
 
 
@@ -85,6 +88,9 @@ def config_lock() -> asyncio.Lock:
 def otlp_logging() -> MagicMock:
     mock = MagicMock()
     mock.reconfigure = AsyncMock()
+    # Must match `config`'s initial values, so `otel_logging_changed` starts out "unchanged".
+    mock.configured_enabled = False
+    mock.configured_endpoint = "http://localhost:4317"
     return mock
 
 
@@ -286,6 +292,7 @@ def test_update_config_otel_tracing_disabled_shuts_down_tracer(client: TestClien
     config.otel_tracing_enabled = True
     with patch("server.api.config.dynamic_config.persist_settings"), patch("server.api.config.tracer") as mock_tracer:
         mock_tracer.shutdown = AsyncMock()
+        mock_tracer.is_active = True
         resp = client.put("/admin/config", json={"otel_tracing_enabled": False}, headers=auth_header)
 
     assert resp.status_code == 200
@@ -406,7 +413,7 @@ def test_update_config_persist_failure_returns_502(client: TestClient, config: M
 
 @pytest.mark.asyncio
 async def test_update_config_serializes_concurrent_writes(
-    config: MagicMock, parent_infra: MagicMock, task_manager: MagicMock, auth_header: dict[str, str]
+    config: MagicMock, parent_infra: MagicMock, task_manager: MagicMock, otlp_logging: MagicMock, auth_header: dict[str, str]
 ) -> None:
     """Two concurrent PUTs must not interleave their read-merge-write critical sections.
 
@@ -437,7 +444,7 @@ async def test_update_config_serializes_concurrent_writes(
     app.dependency_overrides[get_parent_infra] = lambda: parent_infra
     app.dependency_overrides[get_task_manager] = lambda: task_manager
     app.dependency_overrides[get_config_lock] = lambda: shared_lock
-    app.dependency_overrides[get_otlp_logging] = lambda: MagicMock()
+    app.dependency_overrides[get_otlp_logging] = lambda: otlp_logging
     app.dependency_overrides[get_infra_websocket_server] = lambda: MagicMock()
     app.dependency_overrides[get_model_downloader] = lambda: MagicMock()
 
@@ -468,3 +475,63 @@ def test_update_config_preserves_unset_secret_field(client: TestClient, config: 
 
     assert resp.status_code == 200
     assert mock_persist.call_args[0][1].mesh_key.get_secret_value() == "existing-mesh-secret"
+
+
+def test_update_config_mesh_reconfigure_retry_after_failure_re_attempts_reconfigure(
+    client: TestClient, parent_infra: MagicMock, auth_header: dict[str, str]
+) -> None:
+    """A retry must not silently skip a mesh reconfigure that failed."""
+    parent_infra.reconfigure = AsyncMock(side_effect=[RuntimeError("mesh unreachable"), None])
+
+    with patch("server.api.config.dynamic_config.persist_settings"):
+        first = client.put("/admin/config", json={"connect_to_mesh_url": "ws://new.example"}, headers=auth_header)
+        second = client.put("/admin/config", json={"connect_to_mesh_url": "ws://new.example"}, headers=auth_header)
+
+    assert first.status_code == 502
+    assert second.status_code == 200
+    assert parent_infra.reconfigure.await_count == 2
+
+
+def test_update_config_otel_logging_reconfigure_retry_after_failure_re_attempts_reconfigure(
+    client: TestClient, otlp_logging: MagicMock, auth_header: dict[str, str]
+) -> None:
+    """A retry must not silently skip an OTEL logging reconfigure that failed."""
+    otlp_logging.reconfigure = AsyncMock(side_effect=[RuntimeError("otlp collector unreachable"), None])
+
+    with patch("server.api.config.dynamic_config.persist_settings"):
+        first = client.put("/admin/config", json={"otel_logging_enabled": True}, headers=auth_header)
+        second = client.put("/admin/config", json={"otel_logging_enabled": True}, headers=auth_header)
+
+    assert first.status_code == 502
+    assert second.status_code == 200
+    assert otlp_logging.reconfigure.await_count == 2
+
+
+def test_update_config_tracer_shutdown_retried_when_still_active_after_prior_failure(
+    client: TestClient, config: MagicMock, auth_header: dict[str, str]
+) -> None:
+    """Tracer shutdown is checked against live provider state, not a flag."""
+    config.otel_tracing_enabled = False
+    with patch("server.api.config.dynamic_config.persist_settings"), patch("server.api.config.tracer") as mock_tracer:
+        mock_tracer.shutdown = AsyncMock()
+        mock_tracer.is_active = True  # a live provider left over from a prior, partially-failed attempt
+        resp = client.put("/admin/config", json={"metrics_username": "newname"}, headers=auth_header)
+
+    assert resp.status_code == 200
+    assert mock_tracer.shutdown.call_count == 1
+
+
+def test_update_config_unrelated_change_skips_reconfigure_but_broadcasts_ancestors(
+    client: TestClient,
+    parent_infra: MagicMock,
+    otlp_logging: MagicMock,
+    infra_websocket_server: MagicMock,
+    auth_header: dict[str, str],
+) -> None:
+    with patch("server.api.config.dynamic_config.persist_settings"):
+        resp = client.put("/admin/config", json={"hugging_face_token": "new-hf-token"}, headers=auth_header)
+
+    assert resp.status_code == 200
+    parent_infra.reconfigure.assert_not_awaited()
+    assert otlp_logging.reconfigure.call_count == 0
+    infra_websocket_server.broadcast_ancestors_to_children.assert_called_once()
