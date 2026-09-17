@@ -76,6 +76,11 @@ export function ServicesList() {
   const [installingServiceId, setInstallingServiceId] = useState<string | null>(
     null,
   );
+  // Services whose cancel request is in flight - blocks navigation and hides row controls for as
+  // long as a possible DFINFRA-318 rollback may still be running.
+  const [cancellingServiceIds, setCancellingServiceIds] = useState<Set<string>>(
+    new Set<string>(),
+  );
   const pendingInstallationRef = useRef<{
     serviceId: string;
     spec: Record<string, unknown>;
@@ -85,6 +90,11 @@ export function ServicesList() {
   const hasWarningsRef = useRef(false);
   const simulationStopFnsRef = useRef<Record<string, SimulationHandle>>({});
   const hasRealProgressRef = useRef<Record<string, boolean>>({});
+  // Per-service, set in installMutation's onMutate from that call's own variables - unlike
+  // pendingInstallationRef (a single slot, only meant for the "retry after warnings" flow), this
+  // can't be clobbered by a second install/update starting for a different service while an earlier
+  // one's cancel is still resolving. Still local-only, so it doesn't survive a page reload.
+  const isUpdateByServiceRef = useRef<Record<string, boolean>>({});
   const restartDockerToastIdRef = useRef<string | number | null>(null);
   const uninstallToastIdRef = useRef<string | number | null>(null);
   const installAbortControllersRef = useRef<Record<string, AbortController>>(
@@ -161,7 +171,11 @@ export function ServicesList() {
       }
     }
     for (const id of Object.keys(getSnapshot().services)) {
-      if (!inProgressIds.has(id)) clearServiceInstallProgress(id);
+      // Skip services with a pending cancel - the query has no periodic refresh, so stale data here
+      // could otherwise wipe tracking for a service still mid-rollback, flashing it as "Installed".
+      if (!inProgressIds.has(id) && !cancellingServiceIds.has(id)) {
+        clearServiceInstallProgress(id);
+      }
     }
 
     const cleanups: Array<() => void> = [];
@@ -282,7 +296,7 @@ export function ServicesList() {
     return () => {
       for (const cleanup of cleanups) cleanup();
     };
-  }, [servicesList, queryClient]);
+  }, [servicesList, queryClient, cancellingServiceIds]);
 
   const installMutation = useMutation({
     mutationFn: ({
@@ -373,8 +387,9 @@ export function ServicesList() {
         modal.close();
       });
     },
-    onMutate: ({ serviceId }) => {
+    onMutate: ({ serviceId, update = false }) => {
       setInstallingServiceId(serviceId);
+      isUpdateByServiceRef.current[serviceId] = update;
     },
     onSuccess: (_data, variables) => {
       delete simulationStopFnsRef.current[variables.serviceId];
@@ -442,24 +457,33 @@ export function ServicesList() {
       installAbortControllersRef.current[serviceId]?.abort();
       delete installAbortControllersRef.current[serviceId];
 
-      // Stop the progress simulation and clear UI progress.
+      // Freeze the simulated progress - nothing real to report from here. Only an update can trigger
+      // DFINFRA-318's rollback, so label it "Rolling back"; a fresh install stays "Installing".
       simulationStopFnsRef.current[serviceId]?.stop();
       delete simulationStopFnsRef.current[serviceId];
-      delete hasRealProgressRef.current[serviceId];
-      clearServiceInstallProgress(serviceId);
+      const isUpdateCancel = isUpdateByServiceRef.current[serviceId] === true;
+      setServiceInstallProgress(serviceId, {
+        stage: isUpdateCancel ? "rollback" : "install",
+        value: getSnapshot().services[serviceId]?.value ?? 0,
+      });
+      setCancellingServiceIds((prev) => new Set(prev).add(serviceId));
 
-      setInstallingServiceId(null);
-
+      // True immediately: the original work does stop right away. A triggered rollback takes longer
+      // to settle and gets its own toast below, once that outcome is known.
       toast.success(`Installation cancelled for ${serviceId}`, {
         duration: 8000,
       });
 
+      let cancelRequestSucceeded = true;
+      let isAlreadyGone = false;
       try {
-        // Stop the actual install/update work on the backend.
+        // Stops the backend work. For an update, this doesn't resolve until a triggered rollback
+        // settles - installProgress stays set for that whole wait, so the row stays non-clickable.
         await apiClient.cancelAdminServiceInstall(serviceId);
       } catch (error) {
+        cancelRequestSucceeded = false;
         // A 404 just means the install already finished/cleared on the backend — safe to ignore.
-        const isAlreadyGone =
+        isAlreadyGone =
           error instanceof Error && error.message.includes("HTTP 404");
         if (!isAlreadyGone) {
           toast.error(
@@ -469,8 +493,54 @@ export function ServicesList() {
         console.error(`Failed to cancel install for ${serviceId}:`, error);
       }
 
-      // Let reconciliation confirm the reset.
-      queryClient.invalidateQueries({ queryKey: ["admin", "services"] });
+      // The cancel response doesn't say whether the rollback reverted or also failed - fetch the
+      // service's now-settled state instead of assuming.
+      if (cancelRequestSucceeded && isUpdateCancel) {
+        try {
+          const fresh = await apiClient.getAdminService(serviceId);
+          const reverted =
+            !!fresh.installed &&
+            !(
+              typeof fresh.installed === "object" && "stage" in fresh.installed
+            );
+          if (reverted) {
+            toast.success(
+              `Rollback finished for ${serviceId} - reverted to its previous configuration`,
+            );
+          } else {
+            toast.error(
+              `Rollback for ${serviceId} could not restore the previous configuration - the service is now fully uninstalled`,
+            );
+          }
+        } catch (error) {
+          console.error(
+            `Failed to check rollback outcome for ${serviceId}:`,
+            error,
+          );
+        }
+      }
+
+      // installProgress (the row's source of truth for "still busy") only clears once the backend is
+      // known to be done: the call succeeded, or 404'd because the reservation was already gone. Any
+      // other failure (e.g. a 504 timeout) leaves `installing` set on the backend, so this stays too.
+      if (cancelRequestSucceeded || isAlreadyGone) {
+        delete hasRealProgressRef.current[serviceId];
+        clearServiceInstallProgress(serviceId);
+        setInstallingServiceId(null);
+      }
+
+      // Refresh before releasing cancellingServiceIds below: the reconciliation effect decides whether
+      // it's safe to treat this service as "not in progress" from the services-list query, so it must
+      // see the real (still-busy, on failure) state before that guard comes off.
+      await queryClient.invalidateQueries({ queryKey: ["admin", "services"] });
+
+      // cancellingServiceIds only hides the Cancel button/controls while this request is in flight -
+      // clear it regardless of outcome, so a failure can be retried instead of requiring a page reload.
+      setCancellingServiceIds((prev) => {
+        const next = new Set(prev);
+        next.delete(serviceId);
+        return next;
+      });
     },
     [queryClient],
   );
@@ -955,6 +1025,7 @@ export function ServicesList() {
                   installingServiceId === service.id;
                 const currentProgress = installProgress[service.id];
                 const isInProgress = !!currentProgress;
+                const isCancelling = cancellingServiceIds.has(service.id);
                 // Check if installed is InstallProgress type (has stage and value)
                 const installedIsProgress =
                   service.installed &&
@@ -973,6 +1044,7 @@ export function ServicesList() {
                         !isInstalled ||
                         installedIsProgress ||
                         isInProgress ||
+                        isCancelling ||
                         isDisabled
                       )
                         return;
@@ -983,6 +1055,7 @@ export function ServicesList() {
                         isInstalled &&
                         !installedIsProgress &&
                         !isInProgress &&
+                        !isCancelling &&
                         !isDisabled
                           ? "cursor-pointer hover:bg-muted/50"
                           : undefined,
@@ -994,7 +1067,10 @@ export function ServicesList() {
                   >
                     <TableCell className="font-semibold">
                       <div>
-                        {isInstalled && !installedIsProgress ? (
+                        {isInstalled &&
+                        !installedIsProgress &&
+                        !isInProgress &&
+                        !isCancelling ? (
                           <Link
                             to="/dashboard/services/$serviceId"
                             params={{ serviceId: service.id }}
@@ -1048,7 +1124,8 @@ export function ServicesList() {
                         className="flex justify-end gap-2"
                         data-prevent-row-click
                       >
-                        {isInProgress || installedIsProgress ? (
+                        {isCancelling ? null : isInProgress ||
+                          installedIsProgress ? (
                           service.is_cloud ? null : (
                             <Button
                               onClick={() => handleCancelInstall(service.id)}

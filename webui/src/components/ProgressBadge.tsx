@@ -9,10 +9,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 import { Badge } from "@/components/ui/badge";
+import type { InstallStage } from "@/state/install-progress-store";
 import { getStageLabel } from "@/utils/sse-stream";
 
 interface ProgressBadgeProps {
-  stage: "install" | "download";
+  stage: InstallStage;
   value: number; // 0.0 to 1.0
   variant?: "default" | "secondary";
   simulated?: boolean;

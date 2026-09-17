@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
 
-export type InstallStage = "install" | "download";
+// "rollback" is a client-side-only label (ServicesList.tsx) - the backend never sends it.
+export type InstallStage = "install" | "download" | "rollback";
 
 export type InstallProgress = {
   stage: InstallStage;
@@ -10,6 +11,7 @@ export type InstallProgress = {
 const STAGE_ORDER: Record<InstallStage, number> = {
   download: 0,
   install: 1,
+  rollback: 2,
 };
 
 type Snapshot = {

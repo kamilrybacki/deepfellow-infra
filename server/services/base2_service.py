@@ -334,6 +334,12 @@ _INSTANCE_INSTALL_STATUS_WAIT_TIMEOUT_SECONDS = 30
 # the synchronous-failure path, not the far more common case of _install_instance()'s own promise
 # failing later (see the async `on_failure` path, whose rollback isn't bound by this timeout at all).
 _INSTANCE_UPDATE_STATUS_WAIT_TIMEOUT_SECONDS = 120
+# Bounds cancel_instance_install()'s wait for a triggered DFINFRA-318 rollback to settle. Deliberately
+# separate from _INSTANCE_UPDATE_STATUS_WAIT_TIMEOUT_SECONDS above (used for the short pre-promise setup
+# wait): a rollback re-runs a full _install_instance(), comparable in duration to the original
+# install/update, not to setup - reusing the shorter setup timeout here made this wait time out
+# routinely rather than rarely.
+_INSTANCE_CANCEL_ROLLBACK_WAIT_TIMEOUT_SECONDS = 300
 
 
 class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  # noqa: UP046
@@ -710,6 +716,10 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         setup phase of `_install_instance()` is short and already bounded by `Utils.run_command`'s own
         kill-on-cancel, so a cancel request arriving during that window simply waits for it to settle
         (bounded by the reservation's own `timeout_seconds`) instead of interrupting it.
+
+        Cancelling an update may trigger DFINFRA-318's automatic rollback - this method waits for it to
+        settle before returning, so a caller never observes "not installing" before the true final
+        state (reverted, or fully uninstalled) is known.
         """
         installing = self.get_instance_info(instance).installing
 
@@ -741,6 +751,32 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         await asyncio.gather(*tasks, return_exceptions=True)
 
         promise.progress.close()
+
+        # `chained_promise` isn't a child of `promise` for an update (see resolve_with_chain()), so
+        # cancelling `promise` doesn't cancel the rollback too - it keeps running here. This is the
+        # only place that can wait for a cancellation-triggered rollback's outcome. For a plain
+        # install, `chained_promise` is already a child of `promise` and already finished above.
+        #
+        # Shielded: `asyncio.wait_for()` cancels whatever it's timing out on - and since
+        # `chained_promise._future` is shared with any other reader (a later cancel retry, or a
+        # progress-stream reattachment), an unshielded timeout here would cancel that shared future
+        # too, permanently poisoning it for everyone else even though the rollback itself keeps running
+        # unaffected in the background. `shield()` lets our own wait time out without touching it.
+        assert installing.chained_promise is not None
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(installing.chained_promise.wait()), timeout=_INSTANCE_CANCEL_ROLLBACK_WAIT_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            raise HTTPException(504, f"Timed out waiting for {self.get_id(instance)}'s cancellation to fully settle.") from None
+        except asyncio.CancelledError:
+            # chained_promise's future routinely ends up cancelled here (see DFINFRA-318's the_func) -
+            # expected, not a sign this request was cancelled. Only propagate this call's own cancellation.
+            if is_own_cancellation():
+                raise  # pragma: no cover - coverage.py can't trace a bare raise here; see test above
+        except Exception:
+            # Already recorded via on_failure()/_rollback_after_failed_update()'s own logging.
+            pass
 
         self._pop_installing_if_current(instance, installing)
 
