@@ -87,6 +87,8 @@ export function getStageLabel(stage: string): string {
       return "Installing";
     case "download":
       return "Downloading";
+    case "rollback":
+      return "Rolling back";
     default:
       return stage;
   }

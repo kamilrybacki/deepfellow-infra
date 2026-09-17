@@ -1161,6 +1161,375 @@ async def test_cancel_instance_update_cancels_tasks_and_clears_tracking(base2_sv
 
 
 @pytest.mark.asyncio
+async def test_cancel_instance_update_waits_for_triggered_rollback_to_settle(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """DFINFRA-322: cancelling an update whose cancellation triggers DFINFRA-318's rollback must not
+    return - and must not clear `installing` - until that rollback has actually finished. There's no
+    other reliable channel back to a caller for a cancellation-triggered rollback's outcome (unlike a
+    rollback triggered by a genuine failure, which is already awaited inline by update_instance()'s own
+    direct caller), so cancel_instance_install() is the only place that can wait for it.
+    """
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_svc.instances_info["default"].installed = object()
+    previous_options = InstallServiceIn(spec={"key": "old"})
+    preserved = ModelConfig(model_id="m1", options=InstallModelIn())
+    new_installed = object()
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def reinstall_func(_stream: Stream[StreamChunk]) -> Any:
+        started.set()
+        await release.wait()
+        return InstallServiceOut(status="OK")
+
+    reinstall_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(func=reinstall_func)
+
+    rollback_called = asyncio.Event()
+    rollback_release = asyncio.Event()
+    install_call_count = 0
+
+    async def install_side_effect(_instance: str, _options: Any) -> Any:
+        nonlocal install_call_count
+        install_call_count += 1
+        if install_call_count == 1:
+            return reinstall_promise
+        rollback_called.set()
+
+        async def rollback_func(_stream: Stream[StreamChunk]) -> Any:
+            await rollback_release.wait()
+            return new_installed
+
+        return PromiseWithProgress(func=rollback_func)
+
+    async def clear_installed(_instance: str, _options: Any) -> None:
+        base2_svc.instances_info["default"].installed = None
+
+    with (
+        patch.object(base2_svc, "_validate_update_options", new=AsyncMock(return_value=None)),
+        patch.object(base2_svc, "_uninstall_instance", new=clear_installed),
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(side_effect=install_side_effect)),
+        patch.object(base2_svc, "_generate_instance_config", return_value=InstanceConfig(options=previous_options, models=[preserved])),
+        patch.object(base2_svc, "load_model", new=AsyncMock()),
+    ):
+        await base2_svc.update_instance("default", InstallServiceIn(spec={"key": "new"}))
+        await started.wait()
+
+        installing = base2_svc.instances_info["default"].installing
+        assert installing is not None
+
+        cancel_task = asyncio.create_task(base2_svc.cancel_instance_install("default"))
+        await rollback_called.wait()
+
+        # The bug this test guards against: cancel_instance_install() must not report completion (and
+        # must not clear `installing`) while the rollback it just triggered is still running.
+        assert not cancel_task.done()
+        assert base2_svc.instances_info["default"].installing is installing
+
+        rollback_release.set()
+        await cancel_task
+        await base2_svc.drain_warning_tasks()
+
+    assert base2_svc.instances_info["default"].installing is None
+    assert base2_svc.instances_info["default"].installed is new_installed
+
+
+@pytest.mark.asyncio
+async def test_cancel_instance_update_waits_for_triggered_rollback_that_also_fails(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any]
+) -> None:
+    """Same as the rollback-succeeds case, but the rollback's own restore attempt also fails -
+    cancel_instance_install() must still wait for that failure to be known before returning, and the
+    instance ends up fully uninstalled rather than stuck reporting as installing forever.
+    """
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_svc.instances_info["default"].installed = object()
+    previous_options = InstallServiceIn(spec={"key": "old"})
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def reinstall_func(_stream: Stream[StreamChunk]) -> Any:
+        started.set()
+        await release.wait()
+        return InstallServiceOut(status="OK")
+
+    reinstall_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(func=reinstall_func)
+
+    rollback_called = asyncio.Event()
+    rollback_release = asyncio.Event()
+    install_call_count = 0
+
+    async def install_side_effect(_instance: str, _options: Any) -> Any:
+        nonlocal install_call_count
+        install_call_count += 1
+        if install_call_count == 1:
+            return reinstall_promise
+        rollback_called.set()
+
+        async def rollback_func(_stream: Stream[StreamChunk]) -> Any:
+            await rollback_release.wait()
+            raise RuntimeError("rollback failed too")
+
+        return PromiseWithProgress(func=rollback_func)
+
+    async def clear_installed(_instance: str, _options: Any) -> None:
+        base2_svc.instances_info["default"].installed = None
+
+    with (
+        patch.object(base2_svc, "_validate_update_options", new=AsyncMock(return_value=None)),
+        patch.object(base2_svc, "_uninstall_instance", new=clear_installed),
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(side_effect=install_side_effect)),
+        patch.object(base2_svc, "_generate_instance_config", return_value=InstanceConfig(options=previous_options, models=[])),
+    ):
+        await base2_svc.update_instance("default", InstallServiceIn(spec={"key": "new"}))
+        await started.wait()
+
+        installing = base2_svc.instances_info["default"].installing
+        assert installing is not None
+
+        cancel_task = asyncio.create_task(base2_svc.cancel_instance_install("default"))
+        await rollback_called.wait()
+
+        assert not cancel_task.done()
+        assert base2_svc.instances_info["default"].installing is installing
+
+        rollback_release.set()
+        await cancel_task
+        await base2_svc.drain_warning_tasks()
+
+    assert base2_svc.instances_info["default"].installing is None
+    assert base2_svc.instances_info["default"].installed is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_instance_update_times_out_waiting_for_stuck_rollback(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """If a triggered rollback never settles, cancel_instance_install() must time out with a clean 504
+    instead of hanging forever, and must leave the reservation untouched (still reporting as
+    installing) rather than guessing that it's safe to clear."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_svc.instances_info["default"].installed = object()
+    previous_options = InstallServiceIn(spec={"key": "old"})
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def reinstall_func(_stream: Stream[StreamChunk]) -> Any:
+        started.set()
+        await release.wait()
+        return InstallServiceOut(status="OK")
+
+    reinstall_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(func=reinstall_func)
+    rollback_called = asyncio.Event()
+    stuck_release = asyncio.Event()
+    install_call_count = 0
+
+    async def install_side_effect(_instance: str, _options: Any) -> Any:
+        nonlocal install_call_count
+        install_call_count += 1
+        if install_call_count == 1:
+            return reinstall_promise
+        rollback_called.set()
+
+        async def rollback_func(_stream: Stream[StreamChunk]) -> Any:
+            await stuck_release.wait()  # never set - simulates a rollback that never settles
+            return object()
+
+        return PromiseWithProgress(func=rollback_func)
+
+    async def clear_installed(_instance: str, _options: Any) -> None:
+        base2_svc.instances_info["default"].installed = None
+
+    with (
+        patch("server.services.base2_service._INSTANCE_UPDATE_STATUS_WAIT_TIMEOUT_SECONDS", 0.05),
+        patch("server.services.base2_service._INSTANCE_CANCEL_ROLLBACK_WAIT_TIMEOUT_SECONDS", 0.05),
+        patch.object(base2_svc, "_validate_update_options", new=AsyncMock(return_value=None)),
+        patch.object(base2_svc, "_uninstall_instance", new=clear_installed),
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(side_effect=install_side_effect)),
+        patch.object(base2_svc, "_generate_instance_config", return_value=InstanceConfig(options=previous_options, models=[])),
+    ):
+        await base2_svc.update_instance("default", InstallServiceIn(spec={"key": "new"}))
+        await started.wait()
+
+        installing = base2_svc.instances_info["default"].installing
+        assert installing is not None
+
+        with pytest.raises(HTTPException) as exc_info:
+            await base2_svc.cancel_instance_install("default")
+        assert exc_info.value.status_code == 504
+
+        assert base2_svc.instances_info["default"].installing is installing
+        assert rollback_called.is_set()
+
+        stuck_release.set()
+        await base2_svc.drain_warning_tasks()
+
+
+@pytest.mark.asyncio
+async def test_cancel_instance_install_timeout_does_not_poison_shared_future_for_later_readers(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any]
+) -> None:
+    """`asyncio.wait_for()` cancels whatever it's timing out on - since `chained_promise`'s future is
+    shared with any other reader (a later cancel retry, or a progress-stream reattachment), an
+    unshielded timeout here would cancel that shared future too, permanently poisoning it: a later
+    reader would then immediately (and incorrectly) observe "already cancelled" instead of genuinely
+    waiting for and reporting the rollback's real outcome. The wait must be shielded against this."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_svc.instances_info["default"].installed = object()
+    previous_options = InstallServiceIn(spec={"key": "old"})
+    new_installed = object()
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def reinstall_func(_stream: Stream[StreamChunk]) -> Any:
+        started.set()
+        await release.wait()
+        return InstallServiceOut(status="OK")
+
+    reinstall_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(func=reinstall_func)
+    rollback_release = asyncio.Event()
+    install_call_count = 0
+
+    async def install_side_effect(_instance: str, _options: Any) -> Any:
+        nonlocal install_call_count
+        install_call_count += 1
+        if install_call_count == 1:
+            return reinstall_promise
+
+        async def rollback_func(_stream: Stream[StreamChunk]) -> Any:
+            await rollback_release.wait()
+            return new_installed
+
+        return PromiseWithProgress(func=rollback_func)
+
+    async def clear_installed(_instance: str, _options: Any) -> None:
+        base2_svc.instances_info["default"].installed = None
+
+    with (
+        patch("server.services.base2_service._INSTANCE_CANCEL_ROLLBACK_WAIT_TIMEOUT_SECONDS", 0.05),
+        patch.object(base2_svc, "_validate_update_options", new=AsyncMock(return_value=None)),
+        patch.object(base2_svc, "_uninstall_instance", new=clear_installed),
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(side_effect=install_side_effect)),
+        patch.object(base2_svc, "_generate_instance_config", return_value=InstanceConfig(options=previous_options, models=[])),
+    ):
+        await base2_svc.update_instance("default", InstallServiceIn(spec={"key": "new"}))
+        await started.wait()
+
+        installing = base2_svc.instances_info["default"].installing
+        assert installing is not None
+        assert installing.chained_promise is not None
+        shared_future = installing.chained_promise._future  # pyright: ignore[reportPrivateUsage]
+
+        # First attempt times out - the rollback is still genuinely running (rollback_release never set).
+        with pytest.raises(HTTPException) as exc_info:
+            await base2_svc.cancel_instance_install("default")
+        assert exc_info.value.status_code == 504
+        assert base2_svc.instances_info["default"].installing is installing
+
+        # The shared future must not have been poisoned by that timeout.
+        assert not shared_future.cancelled()
+        assert not shared_future.done()
+
+        # Let the rollback genuinely finish, then confirm a second attempt observes the real outcome
+        # instead of a stale/poisoned "already cancelled" result.
+        rollback_release.set()
+        with patch("server.services.base2_service._INSTANCE_CANCEL_ROLLBACK_WAIT_TIMEOUT_SECONDS", 5):
+            await base2_svc.cancel_instance_install("default")
+
+        assert base2_svc.instances_info["default"].installing is None
+        assert base2_svc.instances_info["default"].installed is new_installed
+        await base2_svc.drain_warning_tasks()
+
+
+@pytest.mark.asyncio
+async def test_cancel_instance_install_propagates_own_cancellation_while_waiting_for_rollback(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any]
+) -> None:
+    """A genuine cancellation of cancel_instance_install()'s own task (e.g. client disconnect) while
+    it's waiting for a triggered rollback must propagate, not be swallowed - only the chained promise's
+    own outcome (which routinely surfaces as CancelledError too, per DFINFRA-318) should be caught."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_svc.instances_info["default"].installed = object()
+    previous_options = InstallServiceIn(spec={"key": "old"})
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def reinstall_func(_stream: Stream[StreamChunk]) -> Any:
+        started.set()
+        await release.wait()
+        return InstallServiceOut(status="OK")
+
+    reinstall_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(func=reinstall_func)
+    rollback_called = asyncio.Event()
+    stuck_release = asyncio.Event()
+    install_call_count = 0
+
+    async def install_side_effect(_instance: str, _options: Any) -> Any:
+        nonlocal install_call_count
+        install_call_count += 1
+        if install_call_count == 1:
+            return reinstall_promise
+        rollback_called.set()
+
+        async def rollback_func(_stream: Stream[StreamChunk]) -> Any:
+            await stuck_release.wait()
+            return object()
+
+        return PromiseWithProgress(func=rollback_func)
+
+    async def clear_installed(_instance: str, _options: Any) -> None:
+        base2_svc.instances_info["default"].installed = None
+
+    with (
+        patch.object(base2_svc, "_validate_update_options", new=AsyncMock(return_value=None)),
+        patch.object(base2_svc, "_uninstall_instance", new=clear_installed),
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(side_effect=install_side_effect)),
+        patch.object(base2_svc, "_generate_instance_config", return_value=InstanceConfig(options=previous_options, models=[])),
+    ):
+        await base2_svc.update_instance("default", InstallServiceIn(spec={"key": "new"}))
+        await started.wait()
+
+        cancel_task = asyncio.create_task(base2_svc.cancel_instance_install("default"))
+        await rollback_called.wait()
+        assert not cancel_task.done()
+
+        cancel_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancel_task
+
+        stuck_release.set()
+        await base2_svc.drain_warning_tasks()
+
+
+@pytest.mark.asyncio
+async def test_cancel_instance_install_swallows_non_cancellation_chained_promise_failure(base2_svc: _Base2Impl) -> None:
+    """If `chained_promise`'s own future already settled with a plain (non-cancellation) exception by
+    the time cancel_instance_install() reaches the final wait, that outcome has already been recorded
+    elsewhere - the call should just finish clearing the reservation, not re-raise it."""
+    reservation: InstallingInstance[Any] = InstallingInstance(30)
+
+    async def install_func(_stream: Stream[StreamChunk]) -> Any:
+        return object()
+
+    promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(func=install_func)
+    await promise.task
+
+    async def failing_chained_func(_stream: Stream[StreamChunk]) -> Any:
+        raise RuntimeError("bookkeeping failed independently of any cancellation")
+
+    chained_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(func=failing_chained_func)
+    await chained_promise.task
+
+    reservation.resolve_with_chain(promise, chained_promise)
+    base2_svc.instances_info["default"].installing = reservation
+
+    await base2_svc.cancel_instance_install("default")
+
+    assert base2_svc.instances_info["default"].installing is None
+
+
+@pytest.mark.asyncio
 async def test_cancel_instance_install_during_pre_promise_setup_waits_then_cancels(base2_svc: _Base2Impl) -> None:
     """Unlike cancel_model_install(), there's no pending_task to actively interrupt setup - a cancel
     request arriving while `_install_instance()` is still doing its pre-promise setup must simply wait
