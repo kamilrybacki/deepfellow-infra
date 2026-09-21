@@ -1168,7 +1168,7 @@ def test_get_docker_image_repo_for_model_raises_registry_unavailable_when_option
 def test_get_docker_image_repo_for_model_logs_when_options_raises(svc: CustomService, caplog: pytest.LogCaptureFixture) -> None:
     svc.models["default"]["broken"] = _broken_model()
 
-    with caplog.at_level(logging.ERROR, logger="uvicorn.error"), pytest.raises(RegistryUnavailableError):
+    with caplog.at_level(logging.ERROR, logger="uvicorn"), pytest.raises(RegistryUnavailableError):
         svc.get_docker_image_repo_for_model("broken", "CPU")
 
     assert any("Failed to resolve default image" in record.message and "broken" in record.message for record in caplog.records)

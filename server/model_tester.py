@@ -6,7 +6,6 @@
 import base64
 import io
 import json
-import logging
 import wave
 from typing import Any, NamedTuple
 
@@ -33,8 +32,7 @@ from server.models.api import (
     UserMessage,
 )
 from server.models.common import JsonSerializable, StarletteResponse
-
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 LLM_TEST_HANDLERS = {
     "v3": "_test_responses",

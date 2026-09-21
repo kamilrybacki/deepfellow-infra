@@ -12,7 +12,6 @@ Two separate routers, kept deliberately apart:
   DeepFellow's own `auth_admin`/`auth_server` bearer-token gate on its own API.
 """
 
-import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Path, Query
@@ -22,8 +21,6 @@ from pydantic import BaseModel
 from server.core.dependencies import auth_admin, get_services_manager
 from server.services.mcp_service import McpOAuthStatusOut, McpService, get_mcp_service_instance, render_oauth_callback_page
 from server.services_manager import ServicesManager
-
-logger = logging.getLogger("uvicorn.error")
 
 router = APIRouter(prefix="/admin/services/{service_id}/models/{model_id}/oauth", tags=["MCP OAuth"])
 callback_router = APIRouter(prefix="/mcp-oauth", tags=["MCP OAuth"])

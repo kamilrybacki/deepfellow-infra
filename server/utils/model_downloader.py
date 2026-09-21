@@ -4,7 +4,6 @@
 """Model downloaders."""
 
 import json
-import logging
 import re
 from abc import abstractmethod
 from collections.abc import AsyncGenerator
@@ -27,8 +26,7 @@ from server.utils.core import (
     download_file,
 )
 from server.utils.loading import Progress
-
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 _PROGRESS_LOG_STEP = 0.1  # log every ~10% of progress so the console isn't flooded with updates
 

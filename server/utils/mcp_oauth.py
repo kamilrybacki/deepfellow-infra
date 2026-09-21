@@ -12,7 +12,6 @@ registration (RFC 7591), and the PKCE (S256-only) authorization-code flow.
 
 import base64
 import hashlib
-import logging
 import secrets
 import time
 from typing import Any, NoReturn
@@ -21,7 +20,7 @@ from urllib.parse import urlencode, urljoin, urlparse
 import aiohttp
 from pydantic import BaseModel, field_validator
 
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 _HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10, connect=5)
 _TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS = 60

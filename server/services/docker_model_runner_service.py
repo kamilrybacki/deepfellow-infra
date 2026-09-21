@@ -5,7 +5,6 @@
 
 import html
 import json
-import logging
 import platform
 from dataclasses import dataclass
 from typing import Any
@@ -50,9 +49,8 @@ from server.utils.core import (
     try_parse_pydantic,
 )
 from server.utils.loading import Progress
+from server.utils.logger import logger
 from server.utils.size_fetcher import fmt_size
-
-logger = logging.getLogger("uvicorn.error")
 
 
 class DmrModel(BaseModel):
@@ -304,7 +302,7 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
     async def _sync_models(self, instance: str, installed_info: InstalledInfo, *, is_initial: bool = False) -> None:
         res = await fetch_from(f"{installed_info.base_url}/engines/v1/models", "GET", None)
         if res.status_code != 200:
-            logger.warning(f"DMR model sync for instance {instance} failed: HTTP {res.status_code}")  # noqa: G004
+            logger.warning(f"DMR model sync for instance {instance} failed: HTTP {res.status_code}")
             return
 
         data = json.loads(res.data)
@@ -512,7 +510,7 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
         if record is None:
             # Warn once per pull — an unparseable stream would otherwise flood the log with one entry per line.
             if not skipped_lines:
-                logger.warning(f"DMR pull stream sent an unparseable line: {line!r}")  # noqa: G004
+                logger.warning(f"DMR pull stream sent an unparseable line: {line!r}")
             skipped_lines.append(line)
             return
         self._handle_pull_record(stream, record, progress, last_layer_values)
@@ -539,7 +537,7 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         self._handle_pull_line(stream, buffer, progress, last_layer_values, skipped_lines)
         if skipped_lines:
-            logger.warning(f"DMR pull stream sent {len(skipped_lines)} unparseable line(s) while pulling {model_id}")  # noqa: G004
+            logger.warning(f"DMR pull stream sent {len(skipped_lines)} unparseable line(s) while pulling {model_id}")
         stream.emit(StreamChunkProgress(type="progress", stage="download", value=1, data={}))
 
     async def _install_model(

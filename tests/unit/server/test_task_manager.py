@@ -73,7 +73,7 @@ async def test_add_task_safe_logs_exception_and_does_not_propagate(task_manager:
     async def failing() -> None:
         raise ValueError("boom")
 
-    with caplog.at_level(logging.ERROR, logger="uvicorn.error"):
+    with caplog.at_level(logging.ERROR, logger="uvicorn"):
         task = task_manager.add_task_safe(failing(), err_msg="test error")
         await task
 
@@ -85,7 +85,7 @@ async def test_add_task_safe_includes_err_msg_in_log(task_manager: TaskManager, 
     async def failing() -> None:
         raise RuntimeError("oops")
 
-    with caplog.at_level(logging.ERROR, logger="uvicorn.error"):
+    with caplog.at_level(logging.ERROR, logger="uvicorn"):
         task = task_manager.add_task_safe(failing(), err_msg="custom context")
         await task
 

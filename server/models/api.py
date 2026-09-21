@@ -3,7 +3,6 @@
 
 """Models for chat completions."""
 
-import logging
 from abc import abstractmethod
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, Union
@@ -14,7 +13,7 @@ from fastapi import File as FastApiFile
 from fastapi import UploadFile
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 LLM_ENDPOINTS = ["/v1/completions", "/v1/chat/completions", "/v1/responses", "/v1/messages", "/api/chat"]
 LLM_SUFFIX_MAP: tuple[tuple[str, str], ...] = (

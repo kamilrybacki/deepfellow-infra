@@ -6,7 +6,6 @@
 import asyncio
 import hashlib
 import json
-import logging
 import shutil
 from collections.abc import Sequence
 from contextlib import suppress
@@ -64,6 +63,7 @@ from server.utils.core import (
 from server.utils.files import detect_context_window_from_path
 from server.utils.hardware import GpuInfo, HardwarePartInfo, IntelGpuInfo
 from server.utils.loading import Progress
+from server.utils.logger import logger
 from server.utils.ollama import raise_ollama_pull_error
 from server.utils.ollama_catalog import OllamaCatalogClient
 from server.utils.registry_client import image_without_registry_prefix, registry_for
@@ -77,8 +77,6 @@ from server.utils.vram_calculator import (
     parse_cache_type_bits,
     parse_parameter_count,
 )
-
-logger = logging.getLogger("uvicorn.error")
 
 _PROGRESS_LOG_STEP = 0.1  # log every ~10% of progress so the console isn't flooded with updates
 _WARMTH_POLL_INTERVAL_SECONDS = 15  # matches the staleness already tolerated for the UI's loaded-model display
@@ -839,7 +837,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                 try:
                     await self._sync_warm_state(instance, info.installed)
                 except Exception:
-                    logger.exception(f"{self.get_id(instance)} warmth poll tick failed")  # noqa: G004
+                    logger.exception(f"{self.get_id(instance)} warmth poll tick failed")
 
         def _forget_if_current(finished: asyncio.Task[None]) -> None:
             # Only drop the dict entry if it still points at this task: a restart may have
@@ -847,7 +845,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             if self._warmth_poll_tasks.get(instance) is finished:
                 del self._warmth_poll_tasks[instance]
             if not finished.cancelled() and (exc := finished.exception()):
-                logger.error(f"{self.get_id(instance)} warmth poll task died unexpectedly", exc_info=exc)  # noqa: G004
+                logger.error(f"{self.get_id(instance)} warmth poll task died unexpectedly", exc_info=exc)
 
         task = asyncio.create_task(_poll_loop())
         task.add_done_callback(_forget_if_current)

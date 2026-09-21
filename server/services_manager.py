@@ -4,7 +4,6 @@
 """Services manager."""
 
 import asyncio
-import logging
 import re
 from typing import Any
 
@@ -35,8 +34,7 @@ from server.serviceprovider import ServiceRawConfig
 from server.services.base2_service import Base2Service
 from server.services.base_service import BaseService
 from server.utils.core import PromiseWithProgress, StreamChunk
-
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 
 class ServicesManager:

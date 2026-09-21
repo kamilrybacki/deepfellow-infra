@@ -3,7 +3,6 @@
 
 """Base service."""
 
-import logging
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -34,9 +33,8 @@ from server.models.services import (
 )
 from server.serviceprovider import ServiceRawConfig
 from server.utils.core import PromiseWithProgress, StreamChunk
+from server.utils.logger import logger
 from server.utils.registry_client import RegistryUnavailableError, image_without_registry_prefix, registry_for
-
-logger = logging.getLogger("uvicorn.error")
 
 
 class BaseService(ABC):

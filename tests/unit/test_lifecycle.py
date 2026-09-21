@@ -258,7 +258,7 @@ async def test_lifespan_reports_config_json_error_instead_of_env_hint(
 
     with (
         patch("server.lifecycle.os._exit", side_effect=SystemExit(1)),
-        caplog.at_level("ERROR", logger="uvicorn.error"),
+        caplog.at_level("ERROR", logger="uvicorn"),
         pytest.raises(SystemExit),
     ):
         async with lifespan(app):

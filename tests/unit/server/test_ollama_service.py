@@ -733,7 +733,7 @@ async def test_download_with_ollama_logs_progress_percentage(caplog: pytest.LogC
 
     with (
         patch("server.services.ollama_service.stream_fetch_from", side_effect=mock_stream),
-        caplog.at_level("INFO", logger="uvicorn.error"),
+        caplog.at_level("INFO", logger="uvicorn"),
     ):
         await svc._download_with_ollama(stream, "http://localhost:11434", "llama3", "4GB")  # pyright: ignore[reportPrivateUsage]
 

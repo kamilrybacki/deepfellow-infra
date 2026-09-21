@@ -4,7 +4,6 @@
 """GoogleAI service."""
 
 import json
-import logging
 from collections.abc import Sequence
 from urllib.parse import urljoin
 
@@ -18,8 +17,7 @@ from server.services.remote_service import (
     RemoteModelType,
     RemoteService,
 )
-
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 _MAX_PAGES = 20
 _FETCH_TIMEOUT = aiohttp.ClientTimeout(total=15)

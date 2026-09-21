@@ -5,7 +5,6 @@
 
 import asyncio
 import json
-import logging
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
@@ -50,6 +49,7 @@ from server.utils.core import (
     try_parse_pydantic,
 )
 from server.utils.loading import Progress
+from server.utils.logger import logger
 from server.utils.ollama import raise_ollama_pull_error
 from server.utils.size_fetcher import fetch_ollama_ref_bytes, fmt_size
 
@@ -97,8 +97,6 @@ class OllamaAiConst(BaseModel):
 _const = OllamaAiConst(
     models=_read_models(),
 )
-
-logger = logging.getLogger("uvicorn.error")
 
 _WARMTH_POLL_INTERVAL_SECONDS = 15  # matches the staleness already tolerated for the UI's loaded-model display
 
@@ -356,7 +354,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                 try:
                     await self._sync_warm_state(info.installed)
                 except Exception:
-                    logger.exception(f"{self.get_id(instance)} warmth poll tick failed")  # noqa: G004
+                    logger.exception(f"{self.get_id(instance)} warmth poll tick failed")
 
         def _forget_if_current(finished: asyncio.Task[None]) -> None:
             # Only drop the dict entry if it still points at this task: a restart may have
@@ -364,7 +362,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
             if self._warmth_poll_tasks.get(instance) is finished:
                 del self._warmth_poll_tasks[instance]
             if not finished.cancelled() and (exc := finished.exception()):
-                logger.error(f"{self.get_id(instance)} warmth poll task died unexpectedly", exc_info=exc)  # noqa: G004
+                logger.error(f"{self.get_id(instance)} warmth poll task died unexpectedly", exc_info=exc)
 
         task = asyncio.create_task(_poll_loop())
         task.add_done_callback(_forget_if_current)

@@ -3,15 +3,12 @@
 
 """Additional dependencies for websocket endpoints."""
 
-import logging
 from typing import Any
 
 from fastapi import WebSocket
 
 from server.config import AppSettings
 from server.websockets.infra_websocket_server import InfraWebsocketServer
-
-logger = logging.getLogger("uvicorn.error")
 
 
 def get_dependency(ws: WebSocket, name: str) -> Any:  # noqa: ANN401

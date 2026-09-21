@@ -4,11 +4,10 @@
 """Task Manager."""
 
 import asyncio
-import logging
 from collections.abc import Coroutine
 from typing import Any
 
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 
 class TaskManager:

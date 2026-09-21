@@ -3,7 +3,6 @@
 
 """Utilities for auto-fetching model sizes from remote sources."""
 
-import logging
 import re
 from typing import Any
 from urllib.parse import quote
@@ -11,8 +10,7 @@ from urllib.parse import quote
 import aiohttp
 
 from server.utils.core import convert_size_to_bytes
-
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 HF_API = "https://huggingface.co/api"
 OLLAMA_BASE = "https://ollama.com"

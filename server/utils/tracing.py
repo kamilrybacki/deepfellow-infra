@@ -33,8 +33,7 @@ from opentelemetry.trace import Span, Tracer
 from pydantic import BaseModel
 
 from server.config import AppSettings
-
-uvicorn_logger = logging.getLogger("uvicorn")
+from server.utils.logger import logger
 
 _OTEL_SHUTDOWN_TIMEOUT_MILLIS = 5000
 
@@ -106,7 +105,7 @@ class OtlpLoggingManager:
         try:
             provider.shutdown()
         except Exception:
-            uvicorn_logger.warning("Failed to shut down OTel log provider", exc_info=True)
+            logger.warning("Failed to shut down OTel log provider", exc_info=True)
 
     async def teardown(self) -> None:
         """Detach the OTLP log handler previously attached by `setup()`, if any.
@@ -225,7 +224,7 @@ class InfraTracer:
         try:
             provider.shutdown()
         except Exception:
-            uvicorn_logger.warning("Failed to shut down OTel span provider", exc_info=True)
+            logger.warning("Failed to shut down OTel span provider", exc_info=True)
 
     def _shutdown_meter_provider(self, provider: MeterProvider) -> None:
         """Shut down a `MeterProvider`, swallowing any exception it raises.
@@ -242,7 +241,7 @@ class InfraTracer:
         try:
             provider.shutdown(timeout_millis=_OTEL_SHUTDOWN_TIMEOUT_MILLIS)
         except Exception:
-            uvicorn_logger.warning("Failed to shut down OTel meter provider", exc_info=True)
+            logger.warning("Failed to shut down OTel meter provider", exc_info=True)
 
     def _get_tracer(self) -> Tracer:
         otlp_endpoint = self._get_config().otel_exporter_otlp_endpoint
@@ -335,7 +334,7 @@ class InfraTracer:
         try:
             return self._get_mcp_instruments()
         except Exception:
-            uvicorn_logger.warning("Failed to initialize MCP OTel instruments; continuing without metrics", exc_info=True)
+            logger.warning("Failed to initialize MCP OTel instruments; continuing without metrics", exc_info=True)
             return None
 
     @contextlib.contextmanager
@@ -359,7 +358,7 @@ class InfraTracer:
         try:
             tracer_obj = self._get_tracer()
         except Exception:
-            uvicorn_logger.warning("Failed to initialize OTel tracer for span %r; continuing without tracing", name, exc_info=True)
+            logger.warning("Failed to initialize OTel tracer for span %r; continuing without tracing", name, exc_info=True)
             yield None
             return
         with tracer_obj.start_as_current_span(

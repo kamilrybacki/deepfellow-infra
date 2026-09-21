@@ -4,7 +4,6 @@
 """Infra config API."""
 
 import asyncio
-import logging
 import typing
 from typing import Annotated, Any
 
@@ -27,12 +26,11 @@ from server.core.dependencies import (
 from server.dynamic_config import DynamicSettings
 from server.models.config import ConfigEntry, ConfigOut, ConfigRevealOut
 from server.task_manager import TaskManager
+from server.utils.logger import logger
 from server.utils.model_downloader import ModelDownloader
 from server.utils.tracing import OtlpLoggingManager, tracer
 from server.websockets.infra_websocket_server import InfraWebsocketServer
 from server.websockets.parent_infra_group import ParentInfraGroup
-
-logger = logging.getLogger("uvicorn.error")
 
 router = APIRouter(prefix="/admin/config", tags=["Config"])
 

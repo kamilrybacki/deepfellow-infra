@@ -5,7 +5,6 @@
 
 import asyncio
 import json
-import logging
 import random
 import time
 import uuid
@@ -54,7 +53,8 @@ from server.websockets.parent_infra_group import ParentInfraGroup
 if TYPE_CHECKING:
     from server.model_tester import ModelTester
 
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
+
 T = TypeVar("T")
 
 type EndpointCallback[T] = Callable[[T, Request | None], Awaitable[StarletteResponse]]
@@ -1188,9 +1188,9 @@ class EndpointRegistry:
                 )
                 continue
             if existing is None:
-                logger.info(f"Register new model origin={api_url} id={model.id} name={model.name} type={model.type}")  # noqa: G004
+                logger.info(f"Register new model origin={api_url} id={model.id} name={model.name} type={model.type}")
             elif key_changed:
-                logger.info(f"Refresh proxy credentials origin={api_url} id={model.id} name={model.name} type={model.type}")  # noqa: G004
+                logger.info(f"Refresh proxy credentials origin={api_url} id={model.id} name={model.name} type={model.type}")
                 existing.endpoint.remove_model(model_id=existing.model_id, registration_id=model.id, send_notification=False)
             else:
                 continue
@@ -1216,7 +1216,7 @@ class EndpointRegistry:
                 prev = self.registry.get(model.id, None)
                 if prev and prev.registered_model.owned_by == owned_by:
                     changed = True
-                    logger.info(f"Remove old model origin={api_url} id={model.id} name={model.name} type={model.type}")  # noqa: G004
+                    logger.info(f"Remove old model origin={api_url} id={model.id} name={model.name} type={model.type}")
                     prev.endpoint.remove_model(model_id=prev.model_id, registration_id=model.id, send_notification=False)
         if changed:
             self.parent_infra.send_models_list()
@@ -1321,7 +1321,7 @@ class EndpointRegistry:
                 registration_options=registration_options,
             )
         else:
-            logger.warning(f"Cannot register proxy with model_type={type}")  # noqa: G004
+            logger.warning(f"Cannot register proxy with model_type={type}")
 
     async def execute_messages(
         self,
@@ -1331,7 +1331,7 @@ class EndpointRegistry:
     ) -> StarletteResponse:
         """Process messages request."""
         if self.config.is_log_payloads_enabled():
-            logger.info(f"DUMP REQUEST PAYLOAD /v1/messages {body.model_dump_json(exclude_none=True)}")  # noqa: G004
+            logger.info(f"DUMP REQUEST PAYLOAD /v1/messages {body.model_dump_json(exclude_none=True)}")
 
         endpoint = self.chat_completion_endpoints.get_model(
             body.model,
@@ -1372,7 +1372,7 @@ class EndpointRegistry:
             body.input = [self._resolve_item_reference(item) for item in body.input]
 
         if self.config.is_log_payloads_enabled():
-            logger.info(f"DUMP REQUEST PAYLOAD /v1/responses {body.model_dump_json(exclude_none=True)}")  # noqa: G004
+            logger.info(f"DUMP REQUEST PAYLOAD /v1/responses {body.model_dump_json(exclude_none=True)}")
 
         endpoint = self.chat_completion_endpoints.get_model(
             body.model,
@@ -1423,7 +1423,7 @@ class EndpointRegistry:
     ) -> StarletteResponse:
         """Process chat completion request."""
         if self.config.is_log_payloads_enabled():
-            logger.info(f"DUMP REQUEST PAYLOAD /v1/chat/completions {body.model_dump_json(exclude_none=True)}")  # noqa: G004
+            logger.info(f"DUMP REQUEST PAYLOAD /v1/chat/completions {body.model_dump_json(exclude_none=True)}")
 
         endpoint = self.chat_completion_endpoints.get_model(
             body.model,
@@ -1551,7 +1551,7 @@ class EndpointRegistry:
     ) -> StarletteResponse:
         """Process images generations request."""
         if self.config.is_log_payloads_enabled():
-            logger.info(f"DUMP REQUEST PAYLOAD /v1/images/generations {body.model_dump_json(exclude_none=True)}")  # noqa: G004
+            logger.info(f"DUMP REQUEST PAYLOAD /v1/images/generations {body.model_dump_json(exclude_none=True)}")
         endpoint = self.images_generations_endpoints.get_model(body.model, registration_id=registration_id)
         if not endpoint:
             if not self.model_exists(body.model):
@@ -1571,7 +1571,7 @@ class EndpointRegistry:
     ) -> StarletteResponse:
         """Process audio speech request."""
         if self.config.is_log_payloads_enabled():
-            logger.info(f"DUMP REQUEST PAYLOAD /v1/audio/speech {body.model_dump_json(exclude_none=True)}")  # noqa: G004
+            logger.info(f"DUMP REQUEST PAYLOAD /v1/audio/speech {body.model_dump_json(exclude_none=True)}")
         endpoint = self.audio_speech_endpoints.get_model(body.model, registration_id=registration_id)
         if not endpoint:
             if not self.model_exists(body.model):
@@ -1609,7 +1609,7 @@ class EndpointRegistry:
     ) -> StarletteResponse:
         """Process rerank request."""
         if self.config.is_log_payloads_enabled():
-            logger.info(f"DUMP REQUEST PAYLOAD /v1/rerank {body.model_dump_json(exclude_none=True)}")  # noqa: G004
+            logger.info(f"DUMP REQUEST PAYLOAD /v1/rerank {body.model_dump_json(exclude_none=True)}")
         endpoint = self.rerank_endpoints.get_model(body.model, registration_id=registration_id)
         if not endpoint:
             if not self.model_exists(body.model):
@@ -1674,7 +1674,7 @@ class EndpointRegistry:
                         yield chunk
                 finally:
                     if log_payload:
-                        logger.info(f"DUMP RESPONSE PAYLOAD {b''.join(chunks).decode('utf-8')}")  # noqa: G004
+                        logger.info(f"DUMP RESPONSE PAYLOAD {b''.join(chunks).decode('utf-8')}")
                     duration = time.perf_counter() - start_time
                     self.metrics_registry.request_duration.labels(model_name=model.name, model_type=model.type).observe(duration)
                     self.metrics_registry.request_total.labels(model_name=model.name, model_type=model.type, status="success").inc()
@@ -1698,7 +1698,7 @@ class EndpointRegistry:
         self._refresh_usage(model)
 
     def _refresh_usage(self, model: RegisteredModel[Any]) -> None:
-        logger.debug(f"Model usage origin={model.origin} id={model.id} name={model.name} usage={model.usage}")  # noqa: G004
+        logger.debug(f"Model usage origin={model.origin} id={model.id} name={model.name} usage={model.usage}")
         self.parent_infra.send_usage(UsageChangeRequest(id=model.id, usage=model.usage))
 
     async def test_model(self, registration_id: RegistrationId) -> JsonSerializable:

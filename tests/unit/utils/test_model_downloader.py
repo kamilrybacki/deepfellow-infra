@@ -1000,7 +1000,7 @@ async def test_model_downloader_download_logs_progress_percentage(tmp_path: Path
 
     md.standard_downloader.download = mock_standard_download
 
-    with caplog.at_level("INFO", logger="uvicorn.error"):
+    with caplog.at_level("INFO", logger="uvicorn"):
         async for _ in md.download("https://example.com/model.gguf", model_dir):
             pass
 
@@ -1024,7 +1024,7 @@ async def test_model_downloader_download_does_not_log_progress_when_size_unknown
 
     md.standard_downloader.download = mock_standard_download
 
-    with caplog.at_level("INFO", logger="uvicorn.error"):
+    with caplog.at_level("INFO", logger="uvicorn"):
         async for _ in md.download("https://example.com/model.gguf", model_dir):
             pass
 

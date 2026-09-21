@@ -3,7 +3,6 @@
 
 """Infra Websocket Server."""
 
-import logging
 from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -15,6 +14,7 @@ from server.models.mesh import CheckMeshConnection, MeshInfo, MeshInfoInfra, Mes
 from server.utils.core import make_http_request
 from server.utils.exceptions import ApiError
 from server.utils.json_rpc_server import JsonRpcServer
+from server.utils.logger import logger
 from server.websockets.models import (
     AncestorInfo,
     AncestorsNotification,
@@ -28,7 +28,6 @@ from server.websockets.models import (
 from server.websockets.parent_infra_group import ParentInfraGroup
 from server.websockets.websocket_server import WebSocketContext, WebSocketServer
 
-logger = logging.getLogger("uvicorn.error")
 T = TypeVar("T")
 
 

@@ -3,11 +3,9 @@
 
 """Ollama library catalog client."""
 
-import logging
-
 import aiohttp
 
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 _CATALOG_URL = "https://ollama.com/api/tags"
 _CATALOG_TIMEOUT = 15

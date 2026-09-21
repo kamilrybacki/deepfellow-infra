@@ -900,7 +900,7 @@ async def test_cancel_model_install_logs_when_pending_setup_fails_independently(
     with pytest.raises(RuntimeError):
         await reservation.pending_task
 
-    with caplog.at_level("ERROR", logger="uvicorn.error"):
+    with caplog.at_level("ERROR", logger="uvicorn"):
         cancel_task = asyncio.create_task(base2_svc.cancel_model_install("default", "m1"))
         await asyncio.sleep(0)
 
@@ -921,7 +921,7 @@ async def test_cancel_model_install_does_not_log_on_genuine_cancellation(base2_s
         reached_slow_point.set()
         await asyncio.Event().wait()  # never completes on its own
 
-    with caplog.at_level("ERROR", logger="uvicorn.error"), patch.object(base2_svc, "_install_model", new=slow_install_model):
+    with caplog.at_level("ERROR", logger="uvicorn"), patch.object(base2_svc, "_install_model", new=slow_install_model):
         task = asyncio.create_task(base2_svc.install_model("default", "m1", InstallModelIn()))
         await reached_slow_point.wait()
 
@@ -1633,7 +1633,7 @@ async def test_cancel_instance_install_does_not_log_when_reservation_already_rej
     rejected.reject(asyncio.CancelledError())
     base2_svc.instances_info["default"].installing = rejected
 
-    with caplog.at_level("ERROR", logger="uvicorn.error"):
+    with caplog.at_level("ERROR", logger="uvicorn"):
         await base2_svc.cancel_instance_install("default")
 
     assert "install/update setup failed independently" not in caplog.text

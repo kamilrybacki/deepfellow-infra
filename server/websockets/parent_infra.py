@@ -4,7 +4,6 @@
 """Websocket Manager for subinfras."""
 
 import json
-import logging
 from typing import TYPE_CHECKING
 
 from server.config import AppSettings
@@ -31,7 +30,7 @@ if TYPE_CHECKING:
     from server.endpointregistry import EndpointRegistry
     from server.models.api import Model
 
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 
 class ParentInfra(WebSocketClient):

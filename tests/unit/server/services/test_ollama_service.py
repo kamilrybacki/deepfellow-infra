@@ -1326,7 +1326,7 @@ async def test_uninstall_model_logs_warning_when_unload_from_vram_raises(svc: Ol
 
     with (
         patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
-        caplog.at_level("WARNING", logger="uvicorn.error"),
+        caplog.at_level("WARNING", logger="uvicorn"),
     ):
         mock_fetch.side_effect = ConnectionError("boom")
         await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=False))  # pyright: ignore[reportPrivateUsage]
@@ -1349,7 +1349,7 @@ async def test_uninstall_model_logs_warning_when_unload_from_vram_fails(svc: Oll
 
     with (
         patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
-        caplog.at_level("WARNING", logger="uvicorn.error"),
+        caplog.at_level("WARNING", logger="uvicorn"),
     ):
         mock_fetch.return_value = FetchResult(status_code=500, data="boom")
         await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=False))  # pyright: ignore[reportPrivateUsage]
@@ -1375,7 +1375,7 @@ async def test_uninstall_model_logs_warning_when_delete_raises(svc: OllamaServic
     with (
         patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
         patch.object(svc, "remove_modelfile", new_callable=AsyncMock),
-        caplog.at_level("WARNING", logger="uvicorn.error"),
+        caplog.at_level("WARNING", logger="uvicorn"),
     ):
         mock_fetch.side_effect = [FetchResult(status_code=200, data=""), ConnectionError("boom")]
         await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=True))  # pyright: ignore[reportPrivateUsage]
@@ -1402,7 +1402,7 @@ async def test_uninstall_model_logs_warning_when_delete_fails(svc: OllamaService
     with (
         patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
         patch.object(svc, "remove_modelfile", new_callable=AsyncMock),
-        caplog.at_level("WARNING", logger="uvicorn.error"),
+        caplog.at_level("WARNING", logger="uvicorn"),
     ):
         mock_fetch.side_effect = [FetchResult(status_code=200, data=""), FetchResult(status_code=500, data="boom")]
         await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=True))  # pyright: ignore[reportPrivateUsage]
