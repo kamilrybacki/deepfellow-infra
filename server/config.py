@@ -3,16 +3,14 @@
 
 """Config."""
 
-import logging
 import os
 from pathlib import Path
 
 from pydantic import AliasChoices, Field, SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
+from server.utils.logger import logger
 from server.utils.validators import clamp_non_positive_to_one
-
-logger = logging.getLogger("uvicorn.error")
 
 
 class ConfigError(Exception):

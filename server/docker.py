@@ -5,7 +5,6 @@
 
 import asyncio
 import json
-import logging
 import os
 import platform
 import re
@@ -28,9 +27,7 @@ from server.utils.core import CommandResult2, Stream, StreamChunk, StreamChunkPr
 from server.utils.exceptions import AppError, DockerComposeStartError, DockerImageAuthorizationError, DockerImageDoesNotExistError
 from server.utils.hardware import HardwarePartInfo, IntelGpuInfo, NvidiaGpuInfo
 from server.utils.loading import Progress
-from server.utils.logger import uvicorn_logger
-
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 ARCH_ALIASES = {
     "x86_64": ("amd64", None),
@@ -890,7 +887,7 @@ class DockerService:
             # DockerError is raised for various API issues. A 404 status code
             # specifically means the resource (image) was not found.
             if e.status == 404:
-                uvicorn_logger.info(f"Image '{full_image_name}' not found locally.")
+                logger.info(f"Image '{full_image_name}' not found locally.")
 
         return False
 
@@ -990,7 +987,7 @@ class DockerService:
 
             health = container.get("Health", "").lower()
             if "unhealthy" in health:
-                uvicorn_logger.warning(f"Docker container {service_name} is unhealthy")
+                logger.warning(f"Docker container {service_name} is unhealthy")
                 return False
             if "healthy" in health:
                 return True
@@ -999,10 +996,10 @@ class DockerService:
             if state == "running":
                 return True
 
-            uvicorn_logger.info(f"Docker container {service_name} is in state {state}")
+            logger.info(f"Docker container {service_name} is in state {state}")
             return False  # noqa: TRY300
         except Exception as exc:
-            uvicorn_logger.warning(f"Error while checking health of docker container {service_name}. Error: {exc}")
+            logger.warning(f"Error while checking health of docker container {service_name}. Error: {exc}")
             return False
 
     async def _inspect_container(self, container_name: str) -> dict[str, Any]:

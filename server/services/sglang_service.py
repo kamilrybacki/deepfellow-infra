@@ -5,7 +5,6 @@
 
 import asyncio
 import json
-import logging
 import re
 import shutil
 from collections.abc import Sequence
@@ -70,10 +69,9 @@ from server.utils.core import (
 from server.utils.files import get_model_dir_context_window
 from server.utils.hardware import HardwarePartInfo
 from server.utils.loading import Progress
+from server.utils.logger import logger
 from server.utils.registry_client import image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fetch_huggingface_model_size
-
-logger = logging.getLogger("uvicorn.error")
 
 # Qwen3-Reranker-family models refuse to start with `--is-embedding`; every other reranker in the
 # registry is a cross-encoder, which accepts (and defaults to) it.

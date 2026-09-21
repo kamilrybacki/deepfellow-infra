@@ -463,7 +463,7 @@ async def test_stop_docker_does_not_call_stop_compose_when_file_missing(
         patch.object(docker_service, "get_docker_compose_file_path", return_value=compose_file),
         patch.object(docker_service, "stop_docker_compose", new_callable=AsyncMock) as mock_stop,
         patch.object(docker_service, "_stop_and_remove_container", new_callable=AsyncMock) as mock_stop_and_remove,
-        caplog.at_level("WARNING", logger="uvicorn.error"),
+        caplog.at_level("WARNING", logger="uvicorn"),
     ):
         await docker_service.stop_docker(options)
 
@@ -1833,7 +1833,7 @@ async def test_uninstall_docker_file_not_present_skips_unlink(
         patch.object(docker_service, "get_docker_compose_file_path", return_value=compose_file),
         patch("server.docker.Utils.run_command", new_callable=AsyncMock) as mock_run,
         patch.object(docker_service, "_stop_and_remove_container", new_callable=AsyncMock) as mock_stop_and_remove,
-        caplog.at_level("WARNING", logger="uvicorn.error"),
+        caplog.at_level("WARNING", logger="uvicorn"),
     ):
         mock_run.return_value = make_result()
 
@@ -1875,7 +1875,7 @@ async def test_uninstall_docker_tolerates_docker_error_from_fallback(
             new_callable=AsyncMock,
             side_effect=DockerError(status=500, message="daemon unreachable"),
         ),
-        caplog.at_level("WARNING", logger="uvicorn.error"),
+        caplog.at_level("WARNING", logger="uvicorn"),
     ):
         await docker_service.uninstall_docker(options)  # must not raise: uninstall is best-effort
 
@@ -2545,7 +2545,7 @@ async def test_inspect_container_for_adoption_missing_container_is_quiet(
     cm.__aenter__ = AsyncMock(return_value=instance)
     cm.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn.error"):
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn"):
         result = await docker_service._inspect_container_for_adoption("mymodel")  # type: ignore[reportPrivateUsage]
 
     assert result is None
@@ -2565,7 +2565,7 @@ async def test_inspect_container_for_adoption_non_404_docker_error_logs_warning(
     cm.__aenter__ = AsyncMock(return_value=instance)
     cm.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn.error"):
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn"):
         result = await docker_service._inspect_container_for_adoption("mymodel")  # type: ignore[reportPrivateUsage]
 
     assert result is None
@@ -2586,7 +2586,7 @@ async def test_inspect_container_for_adoption_unexpected_exception_logs_warning_
     cm.__aenter__ = AsyncMock(return_value=instance)
     cm.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn.error"):
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn"):
         result = await docker_service._inspect_container_for_adoption("mymodel")  # type: ignore[reportPrivateUsage]
 
     assert result is None
@@ -2607,7 +2607,7 @@ async def test_inspect_container_for_adoption_non_dict_response_logs_warning_and
     cm.__aenter__ = AsyncMock(return_value=instance)
     cm.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn.error"):
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn"):
         result = await docker_service._inspect_container_for_adoption("mymodel")  # type: ignore[reportPrivateUsage]
 
     assert result is None
@@ -2638,7 +2638,7 @@ async def test_resolve_image_id_for_adoption_missing_image_is_quiet(
     instance.images = MagicMock()
     instance.images.inspect = AsyncMock(side_effect=DockerError(status=404, message="no such image"))
 
-    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn.error"):
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn"):
         result = await docker_service._resolve_image_id_for_adoption("ubuntu:latest")  # type: ignore[reportPrivateUsage]
 
     assert result is None
@@ -2653,7 +2653,7 @@ async def test_resolve_image_id_for_adoption_non_404_docker_error_logs_warning(
     instance.images = MagicMock()
     instance.images.inspect = AsyncMock(side_effect=DockerError(status=500, message="internal server error"))
 
-    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn.error"):
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn"):
         result = await docker_service._resolve_image_id_for_adoption("ubuntu:latest")  # type: ignore[reportPrivateUsage]
 
     assert result is None
@@ -2668,7 +2668,7 @@ async def test_resolve_image_id_for_adoption_unexpected_exception_logs_warning_a
     instance.images = MagicMock()
     instance.images.inspect = AsyncMock(side_effect=ConnectionError("connection refused"))
 
-    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn.error"):
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn"):
         result = await docker_service._resolve_image_id_for_adoption("ubuntu:latest")  # type: ignore[reportPrivateUsage]
 
     assert result is None
@@ -2683,7 +2683,7 @@ async def test_resolve_image_id_for_adoption_non_dict_response_logs_warning_and_
     instance.images = MagicMock()
     instance.images.inspect = AsyncMock(return_value=["not", "a", "dict"])
 
-    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn.error"):
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("WARNING", logger="uvicorn"):
         result = await docker_service._resolve_image_id_for_adoption("ubuntu:latest")  # type: ignore[reportPrivateUsage]
 
     assert result is None
@@ -2714,7 +2714,7 @@ async def test_try_adopt_orphaned_container_logs_when_found_but_not_matched(
     options.container_name = "ollama"
     cm, _ = _mock_container_show({"Config": {"Image": "ubuntu:22.04", "Env": []}, "State": {"Status": "running"}, "Mounts": []})
 
-    with patch("server.docker.Docker", return_value=cm), caplog.at_level("INFO", logger="uvicorn.error"):
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("INFO", logger="uvicorn"):
         result = await docker_service._try_adopt_orphaned_container(options)  # type: ignore[reportPrivateUsage]
 
     assert result is None
@@ -2737,7 +2737,7 @@ async def test_try_adopt_orphaned_container_logs_on_successful_adoption(
         }
     )
 
-    with patch("server.docker.Docker", return_value=cm), caplog.at_level("INFO", logger="uvicorn.error"):
+    with patch("server.docker.Docker", return_value=cm), caplog.at_level("INFO", logger="uvicorn"):
         result = await docker_service._try_adopt_orphaned_container(options)  # type: ignore[reportPrivateUsage]
 
     assert result == 44444
@@ -3111,7 +3111,7 @@ async def test_ensure_compose_running_adoption_survives_compose_file_unlink_fail
             side_effect=DockerComposeStartError("", stderr),
         ),
         patch("server.docker.Docker", return_value=cm),
-        caplog.at_level("WARNING", logger="uvicorn.error"),
+        caplog.at_level("WARNING", logger="uvicorn"),
     ):
         start_output, port, adopted = await docker_service._ensure_compose_running(  # type: ignore[reportPrivateUsage]
             compose_file, options, is_running=False, has_difference=True, port=None
@@ -3247,7 +3247,7 @@ async def test_ensure_compose_running_short_message_but_logs_full_output(
             side_effect=DockerComposeStartError("out", "err"),
         ),
         patch.object(docker_service, "get_docker_compose_logs", new_callable=AsyncMock, return_value=long_logs),
-        caplog.at_level("ERROR", logger="uvicorn.error"),
+        caplog.at_level("ERROR", logger="uvicorn"),
         pytest.raises(AppError, match="Failed to start") as exc_info,
     ):
         await docker_service._ensure_compose_running(compose_file, options, is_running=False, has_difference=True, port=None)  # type: ignore[reportPrivateUsage]
@@ -3274,7 +3274,7 @@ async def test_ensure_compose_running_bounds_pathologically_large_logs_in_server
             side_effect=DockerComposeStartError("out", "err"),
         ),
         patch.object(docker_service, "get_docker_compose_logs", new_callable=AsyncMock, return_value=huge_logs),
-        caplog.at_level("ERROR", logger="uvicorn.error"),
+        caplog.at_level("ERROR", logger="uvicorn"),
         pytest.raises(AppError, match="Failed to start"),
     ):
         await docker_service._ensure_compose_running(compose_file, options, is_running=False, has_difference=True, port=None)  # type: ignore[reportPrivateUsage]
@@ -3327,7 +3327,7 @@ async def test_assert_compose_healthy_short_message_but_logs_full_output(
     with (
         patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock, return_value=False),
         patch.object(docker_service, "get_docker_compose_logs", new_callable=AsyncMock, return_value=long_logs),
-        caplog.at_level("ERROR", logger="uvicorn.error"),
+        caplog.at_level("ERROR", logger="uvicorn"),
         pytest.raises(AppError, match="failed to become healthy") as exc_info,
     ):
         await docker_service._assert_compose_healthy(compose_file, options, start_output=None)  # type: ignore[reportPrivateUsage]

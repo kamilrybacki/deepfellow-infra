@@ -3,7 +3,6 @@
 
 """Docker registry tag fetching clients for Docker Hub, GHCR, and ECR Public."""
 
-import logging
 import re
 from abc import ABC, abstractmethod
 from urllib.parse import urljoin
@@ -11,8 +10,7 @@ from urllib.parse import urljoin
 import aiohttp
 
 from server.docker import DockerImageNameInfo
-
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 _HUB_PAGE_SIZE = 100
 _HUB_MAX_TAGS = 200

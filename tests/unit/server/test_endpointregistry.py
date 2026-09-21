@@ -2108,7 +2108,7 @@ def test_register_proxy_llm_partial_v2_only():
 def test_register_proxy_unknown_type_logs_warning(caplog: pytest.LogCaptureFixture) -> None:
     reg = make_registry()
 
-    with caplog.at_level(logging.WARNING, logger="uvicorn.error"):
+    with caplog.at_level(logging.WARNING, logger="uvicorn"):
         reg._register_proxy(  # pyright: ignore[reportPrivateUsage]
             "x", "unknown-type", make_props(), "http://example.com/", "key", RegistrationOptions(origin="http://example.com/")
         )
@@ -4462,7 +4462,7 @@ async def test_post_json_responses_logs_and_passes_through_on_invalid_json(caplo
     opts = ProxyOptions(url="http://example.com/v1/responses")
 
     with (
-        caplog.at_level(logging.WARNING, logger="uvicorn.error"),
+        caplog.at_level(logging.WARNING, logger="uvicorn"),
         patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response),
     ):
         result = await post_json_responses(ResponsesRequest(model="gemma4:e4b", stream=False), opts, store)
@@ -4560,7 +4560,7 @@ async def test_post_json_rerank_sglang_logs_and_passes_through_on_malformed_body
     opts = ProxyOptions(url="http://example.com/v1/rerank")
 
     with (
-        caplog.at_level(logging.WARNING, logger="uvicorn.error"),
+        caplog.at_level(logging.WARNING, logger="uvicorn"),
         patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response),
     ):
         result = await post_json_rerank_sglang(RerankRequest(model="m", query="q", documents=[]), opts)

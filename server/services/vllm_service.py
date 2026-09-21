@@ -6,7 +6,6 @@
 import asyncio
 import contextlib
 import json
-import logging
 import re
 import shutil
 from collections.abc import Sequence
@@ -71,10 +70,9 @@ from server.utils.exceptions import AppError
 from server.utils.files import get_model_dir_context_window
 from server.utils.hardware import HardwarePartInfo
 from server.utils.loading import Progress
+from server.utils.logger import logger
 from server.utils.registry_client import image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fetch_huggingface_model_size, fmt_size, sum_siblings_size_bytes
-
-logger = logging.getLogger("uvicorn.error")
 
 # Mirrors the `just get-vllm-models` release recipe (see justfile): one fetch per model type,
 # each merged into its own registry key so a refresh reproduces exactly what the offline,

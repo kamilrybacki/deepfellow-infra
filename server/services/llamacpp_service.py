@@ -6,7 +6,6 @@
 import asyncio
 import contextlib
 import json
-import logging
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -66,12 +65,11 @@ from server.utils.core import (
 from server.utils.files import get_gguf_arch_params, get_gguf_context_window
 from server.utils.hardware import GpuInfo, HardwarePartInfo, IntelGpuInfo, NvidiaGpuInfo
 from server.utils.loading import Progress
+from server.utils.logger import logger
 from server.utils.registry_client import image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fetch_file_size_from_url
 from server.utils.validators import clamp_non_positive_to_one
 from server.utils.vram_calculator import estimate_vram_gb, parse_cache_type_bits
-
-logger = logging.getLogger("uvicorn.error")
 
 # Mirrors the `just get-llamacpp-models` release recipe (see justfile).
 _LLAMACPP_FETCH_PLAN = (200, 100, 50)  # top_by_downloads, top_by_likes, top_by_trending

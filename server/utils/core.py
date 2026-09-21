@@ -7,7 +7,6 @@ import asyncio
 import contextlib
 import errno
 import json
-import logging
 import platform
 import re
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -26,9 +25,7 @@ from multidict import CIMultiDictProxy
 from pydantic import BaseModel, ValidationError
 
 from server.models.common import JsonSerializable
-from server.utils.logger import uvicorn_logger
-
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 # Used by make_http_request only when a caller passes no timeout at all (e.g. the mesh websocket's
 # HTTP call) - proxy paths always pass an explicit timeout, so they never fall back to this. Mirrors
@@ -175,7 +172,7 @@ class Utils:
             local_path = dir / filename_out
 
             if not local_path.exists():
-                uvicorn_logger.info(f"Downloading {filename_out}...")
+                logger.info(f"Downloading {filename_out}...")
                 temp_path = temp_dir / str(uuid4())
                 temp_path.parent.mkdir(parents=True, exist_ok=True)
                 try:
@@ -203,7 +200,7 @@ class Utils:
                 local_path.parent.mkdir(parents=True, exist_ok=True)
                 temp_path.rename(local_path)
 
-                uvicorn_logger.info(f"Successfully downloaded {filename_out} ({local_path.stat().st_size} bytes)")
+                logger.info(f"Successfully downloaded {filename_out} ({local_path.stat().st_size} bytes)")
 
             yield SuccessDownloadPacket(local_path, filename_out)
 
@@ -371,7 +368,7 @@ def load_json_registry[T](path: Path, registry_name: str, builder: Callable[[Any
             data = json.loads(f.read())
         return builder(data)
     except Exception:
-        logger.exception(f"Failed to load {registry_name} registry from {path}")  # noqa: G004
+        logger.exception(f"Failed to load {registry_name} registry from {path}")
         return default
 
 

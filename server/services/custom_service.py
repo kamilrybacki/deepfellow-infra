@@ -4,7 +4,6 @@
 """Custom service."""
 
 import asyncio
-import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,13 +50,12 @@ from server.utils.core import (
 )
 from server.utils.docker_image_version import apply_image_version_override, docker_tags_model_field, split_image_repo_tag
 from server.utils.hardware import HardwarePartInfo, NvidiaGpuInfo
+from server.utils.logger import logger
 from server.utils.registry_client import RegistryUnavailableError, image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fmt_size
 
 # Token window accepted by BAAI/bge-m3, which the deepfellow-bge-m3 image serves unmodified.
 BGE_M3_CONTEXT_WINDOW = 8192
-
-logger = logging.getLogger("uvicorn.error")
 
 type SrvCustomModelX = Callable[["CustomService", str | None], SrvCustomModel]
 type DockerOptionsOrCallable = DockerOptions | Callable[[InstallModelOptions], DockerOptions]

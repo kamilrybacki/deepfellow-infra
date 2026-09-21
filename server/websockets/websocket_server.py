@@ -4,12 +4,11 @@
 """Websocket Manager."""
 
 import asyncio
-import logging
 from abc import abstractmethod
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 
 class WebSocketContext[T]:

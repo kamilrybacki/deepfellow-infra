@@ -2420,7 +2420,7 @@ async def test_healthcheck_model_docker_transport_mismatch_unregister_failure_is
     svc.endpoint_registry.register_mcp_sse_endpoint_as_proxy.return_value = "new-sse-reg-id"  # pyright: ignore[reportAttributeAccessIssue]
     svc.endpoint_registry.unregister_mcp_endpoint.side_effect = RuntimeError("registry notification failed")  # pyright: ignore[reportAttributeAccessIssue]
 
-    with caplog.at_level(logging.ERROR, logger="uvicorn.error"):
+    with caplog.at_level(logging.ERROR, logger="uvicorn"):
         result = await svc.healthcheck_model("default", "open-websearch")
 
     assert result.healthy is True
@@ -2447,7 +2447,7 @@ async def test_healthcheck_model_docker_transport_mismatch_register_failure_is_l
     mock_sse.return_value = McpHealthCheckResult(healthy=True, transport="sse", tools=[])
     svc.endpoint_registry.register_mcp_sse_endpoint_as_proxy.side_effect = RuntimeError("registry rejected registration")  # pyright: ignore[reportAttributeAccessIssue]
 
-    with caplog.at_level(logging.ERROR, logger="uvicorn.error"), pytest.raises(RuntimeError, match="registry rejected registration"):
+    with caplog.at_level(logging.ERROR, logger="uvicorn"), pytest.raises(RuntimeError, match="registry rejected registration"):
         await svc.healthcheck_model("default", "open-websearch")
 
     svc.endpoint_registry.unregister_mcp_endpoint.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]

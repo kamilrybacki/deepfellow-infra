@@ -5,15 +5,13 @@
 
 import asyncio
 import json
-import logging
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal, NotRequired, TypedDict, TypeGuard
 
 from pydantic import BaseModel
 
 from server.utils.exceptions import ApiError
-
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 
 class Pending:

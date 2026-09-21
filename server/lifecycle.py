@@ -4,7 +4,6 @@
 """Lifecycle."""
 
 import asyncio
-import logging
 import os
 import re
 import subprocess
@@ -46,13 +45,12 @@ from server.services_manager import ServicesManager
 from server.task_manager import TaskManager
 from server.utils.exceptions import AppStartError
 from server.utils.hardware import Hardware
+from server.utils.logger import logger
 from server.utils.model_downloader import ModelDownloader
 from server.utils.tracing import OtlpLoggingManager, tracer
 from server.websockets.infra_websocket_server import InfraWebsocketServer
 from server.websockets.parent_infra import ParentInfra
 from server.websockets.parent_infra_group import ParentInfraGroup
-
-logger = logging.getLogger("uvicorn.error")
 
 
 @asynccontextmanager
@@ -132,7 +130,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         await context.load_services()
         task_manager.add_task(parent_infra.run())
     except AppStartError as e:
-        logger.error(str(e))  # noqa: TRY400
+        logger.error(str(e))
         os._exit(1)
     yield
     # Shutdown: stop all services gracefully if enabled

@@ -5,7 +5,6 @@
 
 import asyncio
 import contextlib
-import logging
 import time
 from typing import Annotated
 
@@ -34,10 +33,9 @@ from server.models.services import (
 )
 from server.services_manager import ServicesManager
 from server.utils.core import convert_promise_with_progress_to_fastapi_response
+from server.utils.logger import logger
 from server.utils.registry_client import RegistryUnavailableError
 from server.utils.tracing import tracer
-
-logger = logging.getLogger("uvicorn.error")
 
 router = APIRouter(prefix="/admin/services", tags=["Services"])
 

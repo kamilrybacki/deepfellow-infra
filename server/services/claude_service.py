@@ -4,7 +4,6 @@
 """Claude service."""
 
 import json
-import logging
 from collections.abc import Sequence
 from urllib.parse import urljoin
 
@@ -12,8 +11,7 @@ import aiohttp
 
 from server.models.services import ServiceField, ServiceSpecification
 from server.services.remote_service import BaseServiceOptions, LiveModelEntry, RemoteConst, RemoteModel, RemoteService
-
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 _MAX_PAGES = 20
 _FETCH_TIMEOUT = aiohttp.ClientTimeout(total=15)

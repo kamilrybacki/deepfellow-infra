@@ -261,7 +261,7 @@ def test_build_legacy_defaults_returns_snapshot_of_config() -> None:
 def test_build_legacy_defaults_warns_when_non_default(caplog: pytest.LogCaptureFixture) -> None:
     config = _make_config(name="node-e")
 
-    with caplog.at_level("WARNING", logger="uvicorn.error"):
+    with caplog.at_level("WARNING", logger="uvicorn"):
         _build_legacy_defaults(config)
 
     assert "Seeding config.json from legacy .env values" in caplog.text
@@ -270,7 +270,7 @@ def test_build_legacy_defaults_warns_when_non_default(caplog: pytest.LogCaptureF
 def test_build_legacy_defaults_silent_when_all_default(caplog: pytest.LogCaptureFixture) -> None:
     config = _make_config()
 
-    with caplog.at_level("WARNING", logger="uvicorn.error"):
+    with caplog.at_level("WARNING", logger="uvicorn"):
         _build_legacy_defaults(config)
 
     assert "Seeding config.json" not in caplog.text

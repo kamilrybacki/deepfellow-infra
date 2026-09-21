@@ -4,7 +4,6 @@
 """Remote service."""
 
 import asyncio
-import logging
 from abc import abstractmethod
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
@@ -49,8 +48,7 @@ from server.utils.core import (
     positive_context_window_or_none,
     try_parse_pydantic,
 )
-
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 RemoteModelType = Literal["llm", "embedding", "stt", "tts", "txt2img"]
 

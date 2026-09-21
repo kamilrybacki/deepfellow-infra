@@ -10,7 +10,6 @@ file to stay in sync with its own writes.
 """
 
 import json
-import logging
 import tomllib
 from functools import lru_cache
 from pathlib import Path
@@ -19,8 +18,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
 from server.config import AppSettings, ConfigError, get_main_dir
-
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 CURRENT_SCHEMA_VERSION = 2
 

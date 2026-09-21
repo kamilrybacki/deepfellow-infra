@@ -5,7 +5,6 @@
 
 import asyncio
 import json
-import logging
 import os
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
@@ -17,9 +16,7 @@ import aiofiles
 
 from server.config import AppSettings
 from server.models.common import JsonSerializable
-
-logger = logging.getLogger("uvicorn.error")
-
+from server.utils.logger import logger
 
 FIRST_CONFIG_VERSION = "v1"
 ACTUAL_CONFIG_VERSION = "v4"

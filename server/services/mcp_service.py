@@ -6,7 +6,6 @@
 import asyncio
 import html
 import json
-import logging
 import secrets
 import shlex
 import shutil
@@ -65,6 +64,7 @@ from server.utils.core import (
     try_parse_pydantic,
 )
 from server.utils.docker_image_version import apply_image_version_override, docker_tags_model_field, split_image_repo_tag
+from server.utils.logger import logger
 from server.utils.mcp_oauth import (
     McpOAuthConfig,
     McpOAuthError,
@@ -305,8 +305,6 @@ class InstalledInfo:
 class DownloadedInfo:
     image: str
 
-
-logger = logging.getLogger("uvicorn.error")
 
 _MCP_INIT_PAYLOAD: dict[str, Any] = {
     "jsonrpc": "2.0",

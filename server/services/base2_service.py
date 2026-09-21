@@ -4,7 +4,6 @@
 """Base2 service."""
 
 import asyncio
-import logging
 import shutil
 import time
 import uuid
@@ -55,6 +54,7 @@ from server.utils.core import (
     is_own_cancellation,
 )
 from server.utils.hardware import GpuInfo, Hardware, HardwarePartInfo, NvidiaGpuInfo
+from server.utils.logger import logger
 from server.utils.model_downloader import ModelDownloader
 
 
@@ -113,9 +113,6 @@ class _HasModels(Protocol):
     """Structural view of every service's ``InstalledInfo``: it always carries a ``models`` mapping."""
 
     models: dict[str, Any]
-
-
-logger = logging.getLogger("uvicorn.error")
 
 
 class InstallingModel:
@@ -417,7 +414,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
                 try:
                     await self._reconcile_instance_models(instance, info.installed)
                 except Exception:
-                    logger.exception(f"{self.get_id(instance)} reconciliation tick failed")  # noqa: G004
+                    logger.exception(f"{self.get_id(instance)} reconciliation tick failed")
 
         self._reconciliation_tasks[instance] = asyncio.create_task(_reconcile_loop())
 
@@ -478,11 +475,11 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             except Exception:
                 # Keep bookkeeping intact and retry teardown on the next tick rather than releasing VRAM
                 # for a container we couldn't confirm is actually gone.
-                logger.exception(f"{self.get_id(instance)} failed to tear down dead container for model {model_id}, will retry")  # noqa: G004
+                logger.exception(f"{self.get_id(instance)} failed to tear down dead container for model {model_id}, will retry")
                 continue
 
             self._crash_poll_state.pop(key, None)
-            logger.warning(f"{self.get_id(instance)} model {model_id} container is dead, released VRAM bookkeeping")  # noqa: G004
+            logger.warning(f"{self.get_id(instance)} model {model_id} container is dead, released VRAM bookkeeping")
 
     async def _get_docker_logs(self, container_name: str) -> str:
         """Return raw docker logs output, with TTL caching per container.
@@ -678,9 +675,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             # an ordinary successful cancellation, and a real setup failure that happens to coincide
             # with someone clicking cancel would vanish without a trace.
             if not (isinstance(e, HTTPException) and e.status_code == 409):
-                logger.exception(
-                    f"{self.get_id(instance)} pending setup for model {model_id} failed independently of the cancel request"  # noqa: G004
-                )
+                logger.exception(f"{self.get_id(instance)} pending setup for model {model_id} failed independently of the cancel request")
             self._pop_installing_if_current(instance, installing, model_id=model_id)
             return
 
@@ -738,7 +733,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             # rejected (reject() already turns any CancelledError into a clean HTTPException(409)) -
             # either way, there's no real promise left to cancel.
             if not (isinstance(e, HTTPException) and e.status_code == 409):
-                logger.exception(f"{self.get_id(instance)} install/update setup failed independently of the cancel request")  # noqa: G004
+                logger.exception(f"{self.get_id(instance)} install/update setup failed independently of the cancel request")
             self._pop_installing_if_current(instance, installing)
             return
 
@@ -838,11 +833,11 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
 
     async def load_model(self, instance: str, model: ModelConfig) -> None:
         """Load single model."""
-        logger.info(f"{self.get_id(instance)} loading model {model.model_id}")  # noqa: G004
+        logger.info(f"{self.get_id(instance)} loading model {model.model_id}")
         try:
             if model.model_id not in self.models.get(instance, {}) and model.definition:
                 logger.warning(
-                    f"{self.get_id(instance)} model {model.model_id} missing from current registry, restoring from persisted definition"  # noqa: G004
+                    f"{self.get_id(instance)} model {model.model_id} missing from current registry, restoring from persisted definition"
                 )
                 self._restore_model_definition(instance, model.model_id, model.definition)
 
@@ -857,7 +852,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             promise = await self._reserve_and_install(instance, model.model_id, model.options, on_success, lambda _e: None)
             await promise.wait()
         except Exception as exc:
-            logger.exception(f"{self.get_id(instance)} get error while loading model {model.model_id}")  # noqa: G004
+            logger.exception(f"{self.get_id(instance)} get error while loading model {model.model_id}")
             self._failed_models.setdefault(instance, set()).add(model.model_id)
             try:
                 await self.service_provider.add_warning(
@@ -867,7 +862,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
                     model_id=model.model_id,
                 )
             except Exception:
-                logger.exception(f"{self.get_id(instance)} failed to record warning for model {model.model_id}")  # noqa: G004
+                logger.exception(f"{self.get_id(instance)} failed to record warning for model {model.model_id}")
             return
 
         if instance_failures := self._failed_models.get(instance):
@@ -875,7 +870,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         try:
             await self.service_provider.dismiss_warnings_matching(self.get_type(), instance=instance, model_id=model.model_id)
         except Exception:
-            logger.exception(f"{self.get_id(instance)} failed to dismiss warnings for model {model.model_id} after successful load")  # noqa: G004
+            logger.exception(f"{self.get_id(instance)} failed to dismiss warnings for model {model.model_id} after successful load")
 
     async def load_instance(self, instance: str, instance_data: InstanceConfig) -> None:
         """Load instance of service."""
@@ -894,7 +889,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
                     # load_service gathers all of a service's instances without return_exceptions=True,
                     # every other instance of this service too - down with it. Matches load_model's
                     # per-model warning-and-continue pattern just above.
-                    logger.exception(f"{self.get_id(instance)} failed to register custom model {model_id} while loading")  # noqa: G004
+                    logger.exception(f"{self.get_id(instance)} failed to register custom model {model_id} while loading")
                     try:
                         await self.service_provider.add_warning(
                             self.get_type(),
@@ -903,11 +898,11 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
                             model_id=model_id,
                         )
                     except Exception:
-                        logger.exception(f"{self.get_id(instance)} failed to record warning for custom model {model_id}")  # noqa: G004
+                        logger.exception(f"{self.get_id(instance)} failed to record warning for custom model {model_id}")
 
         promise = await self.install_instance(instance, instance_data.options, instance_data, save=False, run_after_install=False)
         await promise.wait()
-        logger.info(f"{self.get_id(instance)} service checked")  # noqa: G004
+        logger.info(f"{self.get_id(instance)} service checked")
         tasks = [asyncio.create_task(self.load_model(instance, model)) for model in instance_data.models or []]
         await asyncio.gather(*tasks)
         await self._after_install(instance)
@@ -927,7 +922,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             tasks = [asyncio.create_task(self.load_instance(name, instance)) for name, instance in cfg.instances.items()]
             await asyncio.gather(*tasks)
             if needs_backfill:
-                logger.info(f"{self.get_type()} backfilling model definitions into persisted config")  # noqa: G004
+                logger.info(f"{self.get_type()} backfilling model definitions into persisted config")
                 await self._save()
 
     @abstractmethod
@@ -1003,7 +998,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             try:
                 await self.service_provider.dismiss_warnings_matching_any(self.get_type(), [(None, None), (instance, None)])
             except Exception:
-                logger.exception(f"{self.get_id(instance)} failed to dismiss warnings after successful install")  # noqa: G004
+                logger.exception(f"{self.get_id(instance)} failed to dismiss warnings after successful install")
             return InstallServiceOut(status="OK")
 
         def on_error(e: Exception) -> None:
@@ -1128,7 +1123,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         try:
             await self.service_provider.dismiss_warnings_matching_any(self.get_type(), [(None, None), (instance, None)])
         except Exception:
-            logger.exception(f"{self.get_id(instance)} failed to dismiss warnings after successful {context}")  # noqa: G004
+            logger.exception(f"{self.get_id(instance)} failed to dismiss warnings after successful {context}")
 
     async def _rollback_after_failed_update(
         self, instance: str, previous_options: InstallServiceIn, preserved_models: list[ModelConfig], original_error: BaseException
@@ -1145,7 +1140,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         itself also failed - the caller uses this to tell the client which of the two actually happened
         (see `_append_rollback_outcome`).
         """
-        logger.warning(f"{self.get_id(instance)} update failed ({original_error}); attempting to restore the previous installation")  # noqa: G004
+        logger.warning(f"{self.get_id(instance)} update failed ({original_error}); attempting to restore the previous installation")
         try:
             promise = await self._install_instance(instance, previous_options)
             data = await promise.wait()
@@ -1156,7 +1151,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             self.instances_info[instance].installing = None
             raise
         except Exception as rollback_error:
-            logger.exception(f"{self.get_id(instance)} rollback after a failed update also failed; instance left fully uninstalled")  # noqa: G004
+            logger.exception(f"{self.get_id(instance)} rollback after a failed update also failed; instance left fully uninstalled")
             self.instances_info[instance].installing = None
             self._record_warning_in_background(
                 f"Service instance '{instance}' failed to update ({original_error}) and the automatic rollback to its previous "
@@ -1173,7 +1168,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             # configuration again) - only the bookkeeping after it failed. Distinguished from the
             # "rollback itself failed" case above since it's a much smaller problem: the caller still
             # gets told the instance was reverted, plus a heads-up that something needs a look.
-            logger.exception(f"{self.get_id(instance)} rollback reinstall succeeded but its post-install bookkeeping failed")  # noqa: G004
+            logger.exception(f"{self.get_id(instance)} rollback reinstall succeeded but its post-install bookkeeping failed")
             self._record_warning_in_background(
                 f"Service instance '{instance}' failed to update ({original_error}) and was reverted to its previous "
                 "installation, but finishing the restore ran into a problem afterwards - check the service's state.",
@@ -1423,13 +1418,13 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             try:
                 await self.update_custom_model(instance, custom_model_id, new_definition)
             except Exception:
-                logger.exception(f"{self.get_id(instance)} failed to apply new definition for model {model_id} while editing")  # noqa: G004
+                logger.exception(f"{self.get_id(instance)} failed to apply new definition for model {model_id} while editing")
                 if was_installed:
                     assert install_options is not None
                     try:
                         await self._install_model_and_wait(instance, model_id, install_options)
                     except Exception:
-                        logger.exception(f"{self.get_id(instance)} failed to roll back model {model_id} after a failed edit")  # noqa: G004
+                        logger.exception(f"{self.get_id(instance)} failed to roll back model {model_id} after a failed edit")
                 raise
 
             if not was_installed:
@@ -1461,12 +1456,12 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             try:
                 return await self._install_model_and_wait(instance, model_id, reinstall_options)
             except Exception:
-                logger.exception(f"{self.get_id(instance)} failed to reinstall model {model_id} while editing")  # noqa: G004
+                logger.exception(f"{self.get_id(instance)} failed to reinstall model {model_id} while editing")
                 try:
                     await self.update_custom_model(instance, custom_model_id, AddCustomModelIn(spec=old_data))
                     await self._install_model_and_wait(instance, model_id, install_options)
                 except Exception:
-                    logger.exception(f"{self.get_id(instance)} failed to roll back model {model_id} after a failed reinstall")  # noqa: G004
+                    logger.exception(f"{self.get_id(instance)} failed to roll back model {model_id} after a failed reinstall")
                 raise
 
     async def edit_model_install_options(
@@ -1499,14 +1494,14 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             try:
                 promise = await self._install_model_and_wait(instance, model_id, new_options)
             except Exception:
-                logger.exception(f"{self.get_id(instance)} failed to reinstall model {model_id} with new install options")  # noqa: G004
+                logger.exception(f"{self.get_id(instance)} failed to reinstall model {model_id} with new install options")
                 if was_installed:
                     assert old_options is not None
                     try:
                         await self._install_model_and_wait(instance, model_id, old_options)
                     except Exception:
                         logger.exception(
-                            f"{self.get_id(instance)} failed to roll back model {model_id} after a failed install-options edit"  # noqa: G004
+                            f"{self.get_id(instance)} failed to roll back model {model_id} after a failed install-options edit"
                         )
                 raise
             return was_installed, promise
@@ -1585,7 +1580,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             try:
                 await self.service_provider.dismiss_warnings_matching(self.get_type(), instance=instance, model_id=model_id)
             except Exception:
-                logger.exception(f"{self.get_id(instance)} failed to dismiss warnings for model {model_id} after successful install")  # noqa: G004
+                logger.exception(f"{self.get_id(instance)} failed to dismiss warnings for model {model_id} after successful install")
             msg = f"{model_id} model installed."
             logger.debug(msg)
             return data
@@ -1610,7 +1605,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         try:
             await self.service_provider.dismiss_warnings_matching(self.get_type(), instance=instance, model_id=model_id)
         except Exception:
-            logger.exception(f"{self.get_id(instance)} failed to dismiss warnings for model {model_id} after uninstall")  # noqa: G004
+            logger.exception(f"{self.get_id(instance)} failed to dismiss warnings for model {model_id} after uninstall")
         await self._save()
 
     @abstractmethod

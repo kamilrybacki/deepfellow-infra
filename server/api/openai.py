@@ -3,7 +3,6 @@
 
 """API endpoints for openai compatibile endpoints."""
 
-import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Form, Path, Query, Request
@@ -30,9 +29,6 @@ from server.models.api import (
 )
 from server.models.common import StarletteResponse
 from server.utils.validators import SafePath
-
-logger = logging.getLogger("uvicorn.error")
-
 
 router = APIRouter(prefix="", tags=["AI Endpoints"])
 
