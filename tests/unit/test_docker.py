@@ -1304,7 +1304,7 @@ async def test_install_and_run_docker_cancel_kills_up_subprocess_and_rollback_te
 case " $* " in
   *' up '*)
     echo $$ > {pid_file}
-    sleep 30
+    exec sleep 30
     ;;
   *' down '*)
     echo down >> {down_log}
