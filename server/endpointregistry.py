@@ -679,7 +679,14 @@ class EndpointRegistry:
 
     @property
     def _proxy_timeout(self) -> ClientTimeout:
-        """Default timeout for outbound proxy requests, driven by `DF_STANDARD_PROXY_TIMEOUT_SECONDS`."""
+        """Default timeout for outbound proxy requests, driven by `DF_STANDARD_PROXY_TIMEOUT_SECONDS`.
+
+        This is a total-duration cap (`ClientTimeout.total`) here - the value used for chat
+        completions, embeddings, audio, images, rerank, and MCP proxying. Custom-service proxying
+        (doc-chunker, GLiNER, etc.) reads the same setting but interprets it differently: as a
+        per-chunk idle-read window with no total cap - see `ProxyOptions.read_timeout_seconds`,
+        and `CustomService.get_proxy_timeout_field` for the per-service override.
+        """
         return ClientTimeout(total=self.config.standard_proxy_timeout_seconds, sock_connect=30)
 
     def get_models(self) -> ApiModels:
