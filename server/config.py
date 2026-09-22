@@ -36,6 +36,20 @@ class AppSettings(BaseSettings):
     container_name_prefix: str = ""
     compose_prefix: str = "df_"
 
+    docker_hub_token: str = ""
+
+    ollama_kv_cache_type: str = Field(default="f16", validation_alias=AliasChoices("OLLAMA_KV_CACHE_TYPE"))
+    ollama_num_parallel: int = Field(default=1, validation_alias=AliasChoices("OLLAMA_NUM_PARALLEL"))
+    ollama_vram_overhead_factor: float = Field(default=1.0, validation_alias=AliasChoices("OLLAMA_VRAM_OVERHEAD_FACTOR"))
+
+    @field_validator("ollama_num_parallel")
+    @classmethod
+    def _clamp_ollama_num_parallel(cls, value: int) -> int:
+        """Clamp non-positive values to 1 instead of rejecting them, since 0 ("auto") is a valid Ollama value."""
+        return clamp_non_positive_to_one(
+            value, logger, 'OLLAMA_NUM_PARALLEL=%r is non-positive; clamping to 1 instead of Ollama\'s real 0 ("auto", up to 4) behavior.'
+        )
+
     # --- Everything below is dynamic: populated from config.json, mutable at runtime. ---
 
     name: str = ""
@@ -55,8 +69,6 @@ class AppSettings(BaseSettings):
     log_payloads: str = ""
     stop_containers_on_shutdown: str = ""
 
-    docker_hub_token: str = ""
-
     mcp_sse_session_ttl_seconds: int = 300
     mcp_sse_max_sessions: int = 128
 
@@ -69,18 +81,6 @@ class AppSettings(BaseSettings):
     otel_exporter_otlp_endpoint: str = "http://localhost:4317"
     otel_tracing_enabled: bool = False
     otel_logging_enabled: bool = False
-
-    ollama_kv_cache_type: str = Field(default="f16", validation_alias=AliasChoices("OLLAMA_KV_CACHE_TYPE"))
-    ollama_num_parallel: int = Field(default=1, validation_alias=AliasChoices("OLLAMA_NUM_PARALLEL"))
-    ollama_vram_overhead_factor: float = Field(default=1.0, validation_alias=AliasChoices("OLLAMA_VRAM_OVERHEAD_FACTOR"))
-
-    @field_validator("ollama_num_parallel")
-    @classmethod
-    def _clamp_ollama_num_parallel(cls, value: int) -> int:
-        """Clamp non-positive values to 1 instead of rejecting them, since 0 ("auto") is a valid Ollama value."""
-        return clamp_non_positive_to_one(
-            value, logger, 'OLLAMA_NUM_PARALLEL=%r is non-positive; clamping to 1 instead of Ollama\'s real 0 ("auto", up to 4) behavior.'
-        )
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- `docker_hub_token` and the three `ollama_*` bootstrap settings in `server/config.py` are now grouped with the other env-only fields instead of sitting below the "everything below is dynamic" marker comment. They were never actually part of `DynamicSettings` and could never be changed via `PUT /admin/config`; the code now visually reflects that. No behavior change.
+
 ### Fixed
 
 - All app logging now goes through a single `logger` defined once in `server/utils/logger.py` and imported everywhere else, instead of ~45 modules each independently calling `logging.getLogger("uvicorn")` (and `tracing.py` doing it slightly differently from the rest) - both approaches reached the same handler, but only by relying on the same string literal being repeated correctly in every file.
