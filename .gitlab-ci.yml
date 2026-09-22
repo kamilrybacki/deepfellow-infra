@@ -69,6 +69,14 @@ check-auth:
   except:
     - tags
 
+check-example-env:
+  <<: *uv
+  stage: analysis
+  script:
+    - uv run python -m scripts.check_example_env
+  except:
+    - tags
+
 biome:
   stage: analysis
   image: node:24-alpine

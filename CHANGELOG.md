@@ -6,9 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-### Changed
+### Added
 
-- `docker_hub_token` and the three `ollama_*` bootstrap settings in `server/config.py` are now grouped with the other env-only fields instead of sitting below the "everything below is dynamic" marker comment. They were never actually part of `DynamicSettings` and could never be changed via `PUT /admin/config`; the code now visually reflects that. No behavior change.
+- `just check`/CI now verify that `example.env` documents every bootstrap-only `AppSettings` setting (a field not managed via `config.json`/`PUT /admin/config`), via a new `example-env-check` recipe and CI job. Fixed the drift it caught: `DF_DOCKER_SUBNET`, `DF_STORAGE_DIR`, `DF_STORAGE_SERVICES_DIR`, `DF_COMPOSE_PREFIX`, `DF_DOCKER_HUB_TOKEN`, and the three `OLLAMA_*` settings were missing from `example.env` entirely, and `DF_STANDARD_PROXY_TIMEOUT_SECONDS` was documented as a normal override even though it's dynamic config — setting it via the environment only has any effect once, before `config.json` first exists. The deleted comment's stated default (300) was also already stale — the real default has been 600 since `0.33.0`.
 
 ### Fixed
 

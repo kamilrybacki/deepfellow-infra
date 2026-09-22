@@ -39,7 +39,10 @@ todo:
 license-check *FLAGS:
     uv run scripts/check_license_header.py {{FLAGS}}
 
-check: license-check ruff ruff-format pyright auth-static auth-runtime
+example-env-check *FLAGS:
+    uv run python -m scripts.check_example_env {{FLAGS}}
+
+check: license-check ruff ruff-format pyright auth-static auth-runtime example-env-check
 
 ui-rebuild:
    (cd $(git rev-parse --show-toplevel)/webui && npm run buildx)
