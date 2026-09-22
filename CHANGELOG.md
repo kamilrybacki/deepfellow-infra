@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- `docker_hub_token` and the three `ollama_*` bootstrap settings in `server/config.py` are now grouped with the other env-only fields instead of sitting below the "everything below is dynamic" marker comment. They were never actually part of `DynamicSettings` and could never be changed via `PUT /admin/config`; the code now visually reflects that. No behavior change.
+
 ### Fixed
 
 - The DuckDuckGo MCP model catalog entry now pins `duckduckgo-mcp-server:0.6.1` (was `0.4.0`) and sets `DDG_ALLOWED_HOSTS=duckduckgo:8000`, fixing `tools/list` returning an empty tool list: the pinned version predated the MCP Python SDK's DNS-rebinding protection allow-list, so it rejected every request proxied over the internal Docker network (`Host: duckduckgo:8000`) with a silently-swallowed `421 Misdirected Request`.
