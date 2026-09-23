@@ -460,7 +460,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                 return None
             compose_filepath = self.docker_service.get_docker_compose_file_path(instance_info.installed.docker.name)
             service_name = instance_info.installed.docker.name
-            result = await self.docker_service.run_command_docker_compose(compose_filepath, service_name, f"stat -c%s {path}")
+            result = await self.docker_service.run_command_docker_compose(compose_filepath, service_name, ["stat", "-c%s", path])
             return int(result.strip())
         except Exception:
             return None
@@ -1101,8 +1101,8 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         """Send message to ollama to create model from Modelfile.."""
         compose_filepath = self.docker_service.get_docker_compose_file_path(info.docker.name)
         service_name = info.docker.name
-        quantization_param = f"-q {quantization} " if quantization else ""
-        cmd = f"ollama create {quantization_param}{model} -f {model_path}"
+        quantization_args = ["-q", quantization] if quantization else []
+        cmd = ["ollama", "create", *quantization_args, model, "-f", model_path]
         return await self.docker_service.run_command_docker_compose(compose_filepath, service_name, cmd)
 
     async def _download_with_downloader(
