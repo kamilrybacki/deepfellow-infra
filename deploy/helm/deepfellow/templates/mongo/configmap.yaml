@@ -1,0 +1,21 @@
+{{- if include "deepfellow.mongo.inChart" . }}
+{{- $fullname := include "deepfellow.componentName" (dict "context" . "component" "mongo") }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-init
+  labels:
+    {{- include "deepfellow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mongo
+data:
+  init-mongo.sh: |
+    #!/bin/bash
+    mongosh -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin <<EOF
+    db = db.getSiblingDB("admin");
+    db.createUser({
+      user: "$DF_MONGO_USER",
+      pwd: "$DF_MONGO_PASSWORD",
+      roles: [{ role: "readWrite", db: "$DF_MONGO_DB" }],
+    });
+    EOF
+{{- end }}
