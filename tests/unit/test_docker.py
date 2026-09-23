@@ -505,13 +505,11 @@ async def test_run_command_docker_compose_calls_exec_and_returns_stdout(docker_s
     with patch("server.docker.Utils.run_command_for_success", new_callable=AsyncMock) as mock_run:
         mock_run.return_value = make_result2(stdout="exec output")
 
-        result = await docker_service.run_command_docker_compose(compose_file, "myservice", "echo hello")
+        result = await docker_service.run_command_docker_compose(compose_file, "myservice", ["echo", "hello world"])
 
     assert result == "exec output"
     cmd = mock_run.call_args[0][0]
-    assert "exec" in cmd
-    assert "myservice" in cmd
-    assert "echo" in cmd
+    assert cmd[-4:] == ["exec", "myservice", "echo", "hello world"]
 
 
 @pytest.mark.asyncio

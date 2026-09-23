@@ -748,7 +748,7 @@ async def test_create_model_from_modelfile_calls_docker_compose_run(svc: OllamaS
     await svc.create_model_from_modelfile(installed, "my-model", "/root/.ollama/Modelfile", None)
 
     cmd = deps["docker_service"].run_command_docker_compose.call_args[0][2]
-    assert "ollama create" in cmd
+    assert cmd == ["ollama", "create", "my-model", "-f", "/root/.ollama/Modelfile"]
 
 
 @pytest.mark.asyncio
@@ -760,7 +760,19 @@ async def test_create_model_from_modelfile_includes_quantization_flag(svc: Ollam
     await svc.create_model_from_modelfile(installed, "my-model", "/root/.ollama/Modelfile", "q4_0")
 
     cmd = deps["docker_service"].run_command_docker_compose.call_args[0][2]
-    assert "-q q4_0" in cmd
+    assert cmd == ["ollama", "create", "-q", "q4_0", "my-model", "-f", "/root/.ollama/Modelfile"]
+
+
+@pytest.mark.asyncio
+async def test_create_model_from_modelfile_passes_model_name_as_single_argument(svc: OllamaService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info(svc)
+    deps["docker_service"].run_command_docker_compose = AsyncMock(return_value="")
+    deps["docker_service"].get_docker_compose_file_path.return_value = Path("/path/docker-compose.yml")
+
+    await svc.create_model_from_modelfile(installed, "evil -f /etc/passwd", "/root/.ollama/Modelfile", None)
+
+    cmd = deps["docker_service"].run_command_docker_compose.call_args[0][2]
+    assert cmd == ["ollama", "create", "evil -f /etc/passwd", "-f", "/root/.ollama/Modelfile"]
 
 
 @pytest.mark.asyncio
@@ -2449,9 +2461,11 @@ async def test_local_file_size_bytes_no_docker_path_but_installed_uses_docker_ex
     deps["docker_service"].run_command_docker_compose = AsyncMock(return_value="12345\n")
 
     with patch.object(svc, "_get_working_dir", return_value=tmp_path):  # pyright: ignore[reportPrivateUsage]
-        result = await svc._local_file_size_bytes("/other/path/model.bin", "default")  # pyright: ignore[reportPrivateUsage]
+        result = await svc._local_file_size_bytes("/other/path/my model.bin", "default")  # pyright: ignore[reportPrivateUsage]
 
     assert result == 12345
+    cmd = deps["docker_service"].run_command_docker_compose.call_args[0][2]
+    assert cmd == ["stat", "-c%s", "/other/path/my model.bin"]
 
 
 @pytest.mark.asyncio

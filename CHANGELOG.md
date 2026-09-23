@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - All app logging now goes through a single `logger` defined once in `server/utils/logger.py` and imported everywhere else, instead of ~45 modules each independently calling `logging.getLogger("uvicorn")` (and `tracing.py` doing it slightly differently from the rest) - both approaches reached the same handler, but only by relying on the same string literal being repeated correctly in every file.
 - The release tag pipeline no longer fails when a tag is pushed right after merging to `main`: `tag_docker_image` now retries pulling the release image for up to 20 minutes instead of failing immediately, so it doesn't race ahead of `main`'s own `build_and_publish_docker_image` job.
 - Retrying `PUT /admin/config` after a partial failure to reconnect the mesh, reconfigure OTLP log export, or disable tracing now actually retries what failed, instead of silently reporting success without reapplying it.
+- Commands run inside a service's container (e.g. creating a custom Ollama model) now pass each value as a single argument instead of splitting on spaces, so a model name can no longer smuggle extra flags into `ollama create`, and file paths containing spaces work.
 
 ## [0.34.0] - 2026-09-16
 
