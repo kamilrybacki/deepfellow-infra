@@ -2149,7 +2149,7 @@ _const = McpConst(
             repository_url="https://github.com/brave/brave-search-mcp-server",
         ),
         "web-search": lambda mcp_service, subnet: SrvMcpModel(
-            model_props=ModelProps(private=True, type="mcp", endpoints=["/mcp/web-search/mcp"], transport="streamable_http"),
+            model_props=ModelProps(private=True, type="mcp", endpoints=["/mcp/web-search/mcp"], transport="sse"),
             model_spec=mcp_service.get_default_model_spec("web-search"),
             model_type="mcp",
             default_prefix="web-search",
@@ -2162,6 +2162,7 @@ _const = McpConst(
                 env_vars={},
                 subnet=subnet,
             ),
+            proxy_transport="sse",
             description="Concurrent multi-engine web search with full-page content extraction — no API key required.",
             repository_url="https://github.com/mrkrsl/web-search-mcp",
         ),

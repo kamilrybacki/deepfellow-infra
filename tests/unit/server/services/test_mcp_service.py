@@ -138,6 +138,13 @@ def test_get_size_empty_string(svc: McpService) -> None:
     assert svc.get_size() == ""
 
 
+def test_load_default_models_web_search_uses_sse_transport(svc: McpService) -> None:
+    model = svc.models["default"]["web-search"]
+
+    assert model.proxy_transport == "sse"
+    assert model.model_props.transport == "sse"
+
+
 def test_get_spec_has_no_fields(svc: McpService) -> None:
     spec = svc.get_spec()
     assert spec.fields == []
