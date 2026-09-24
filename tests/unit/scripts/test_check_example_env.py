@@ -29,8 +29,6 @@ BOOTSTRAP_FIELD_NAMES = {
     "container_name_prefix",
     "compose_prefix",
     "docker_hub_token",
-    "ollama_kv_cache_type",
-    "ollama_num_parallel",
     "ollama_vram_overhead_factor",
 }
 
@@ -113,8 +111,6 @@ def test_get_expected_env_names_against_real_app_settings() -> None:
         "DF_CONTAINER_NAME_PREFIX",
         "DF_COMPOSE_PREFIX",
         "DF_DOCKER_HUB_TOKEN",
-        "OLLAMA_KV_CACHE_TYPE",
-        "OLLAMA_NUM_PARALLEL",
         "OLLAMA_VRAM_OVERHEAD_FACTOR",
     }
 
@@ -134,12 +130,12 @@ def test_parse_existing_keys_ignores_comments_and_values() -> None:
             "DF_FOO=bar",
             "# a comment",
             "# DF_COMMENTED_OUT=1",
-            "OLLAMA_KV_CACHE_TYPE=f16",
+            "OLLAMA_VRAM_OVERHEAD_FACTOR=1.0",
             "",
         ]
     )
 
-    assert parse_existing_keys(content) == {"DF_FOO", "OLLAMA_KV_CACHE_TYPE"}
+    assert parse_existing_keys(content) == {"DF_FOO", "OLLAMA_VRAM_OVERHEAD_FACTOR"}
 
 
 def test_parse_existing_keys_tolerates_whitespace_around_equals_and_key() -> None:

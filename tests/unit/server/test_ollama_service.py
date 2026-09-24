@@ -29,8 +29,6 @@ def _make_service() -> OllamaService:
     svc._log_cache = {}  # pyright: ignore[reportPrivateUsage]
     svc._ps_query_failing = set()  # pyright: ignore[reportPrivateUsage]
     svc.config = MagicMock()
-    svc.config.ollama_kv_cache_type = "f16"
-    svc.config.ollama_num_parallel = 1
     svc.config.ollama_vram_overhead_factor = 1.0
     return svc
 
@@ -244,10 +242,9 @@ async def test_get_vram_estimate_custom_cache_type(mock_arch: AsyncMock, mock_es
     mock_arch.return_value = _ARCH
     mock_estimate.return_value = 7.0
     svc = _make_service()
-    svc.config.ollama_kv_cache_type = "q8_0"
 
     await svc._get_vram_estimate(  # pyright: ignore[reportPrivateUsage]
-        "default", "http://localhost:11434", "llama3:latest", 8 * 1024**3, num_ctx=4096
+        "default", "http://localhost:11434", "llama3:latest", 8 * 1024**3, num_ctx=4096, kv_cache_type="q8_0"
     )
 
     assert mock_estimate.call_count == 1
@@ -257,28 +254,26 @@ async def test_get_vram_estimate_custom_cache_type(mock_arch: AsyncMock, mock_es
 @pytest.mark.asyncio
 @patch("server.services.ollama_service.estimate_vram_gb")
 @patch("server.services.ollama_service.OllamaService._get_arch_params", new_callable=AsyncMock)
-async def test_get_vram_estimate_num_parallel_from_env(mock_arch: AsyncMock, mock_estimate: MagicMock):
+async def test_get_vram_estimate_defaults_cache_type_and_num_parallel(mock_arch: AsyncMock, mock_estimate: MagicMock):
     mock_arch.return_value = _ARCH
     mock_estimate.return_value = 7.0
     svc = _make_service()
-    svc.config.ollama_num_parallel = 4
 
     await svc._get_vram_estimate(  # pyright: ignore[reportPrivateUsage]
         "default", "http://localhost:11434", "llama3:latest", 8 * 1024**3, num_ctx=4096
     )
 
     assert mock_estimate.call_count == 1
-    assert mock_estimate.call_args.args == (_ARCH, 8 * 1024**3, 4096, 16, 4, None, None)
+    assert mock_estimate.call_args.args == (_ARCH, 8 * 1024**3, 4096, 16, 1, None, None)
 
 
 @pytest.mark.asyncio
 @patch("server.services.ollama_service.estimate_vram_gb")
 @patch("server.services.ollama_service.OllamaService._get_arch_params", new_callable=AsyncMock)
-async def test_get_vram_estimate_explicit_num_parallel_overrides_env(mock_arch: AsyncMock, mock_estimate: MagicMock):
+async def test_get_vram_estimate_explicit_num_parallel_overrides_default(mock_arch: AsyncMock, mock_estimate: MagicMock):
     mock_arch.return_value = _ARCH
     mock_estimate.return_value = 7.0
     svc = _make_service()
-    svc.config.ollama_num_parallel = 4
 
     await svc._get_vram_estimate(  # pyright: ignore[reportPrivateUsage]
         "default", "http://localhost:11434", "llama3:latest", 8 * 1024**3, num_ctx=4096, num_parallel=2
@@ -459,7 +454,14 @@ async def test_resolve_vram_info_not_loaded_returns_false_none():
     svc = _make_service()
 
     result = await svc._resolve_vram_info(  # pyright: ignore[reportPrivateUsage]
-        "default", "llama3:latest", 4096, loaded_info={}, sizes={}, base_url="http://localhost:11434", num_parallel=None
+        "default",
+        "llama3:latest",
+        4096,
+        loaded_info={},
+        sizes={},
+        base_url="http://localhost:11434",
+        num_parallel=None,
+        kv_cache_type=None,
     )
 
     assert result == (False, None)
@@ -480,6 +482,7 @@ async def test_resolve_vram_info_prefers_fresh_measured_vram_over_stale_cache():
             sizes={},
             base_url="http://localhost:11434",
             num_parallel=None,
+            kv_cache_type=None,
         )
 
     assert result == (True, 4.7)
@@ -501,6 +504,7 @@ async def test_resolve_vram_info_measured_zero_is_used_not_treated_as_missing():
             sizes={},
             base_url="http://localhost:11434",
             num_parallel=None,
+            kv_cache_type=None,
         )
 
     assert result == (True, 0.0)
@@ -521,6 +525,7 @@ async def test_resolve_vram_info_uses_cached_estimate_when_no_fresh_measurement(
             sizes={},
             base_url="http://localhost:11434",
             num_parallel=None,
+            kv_cache_type=None,
         )
 
     assert result == (True, 4.7)
@@ -541,6 +546,7 @@ async def test_resolve_vram_info_falls_back_to_estimate_when_not_cached():
             sizes=sizes,
             base_url="http://localhost:11434",
             num_parallel=2,
+            kv_cache_type="q8_0",
         )
 
     assert result == (True, 9.5)
@@ -556,6 +562,7 @@ async def test_resolve_vram_info_falls_back_to_estimate_when_not_cached():
         2,
         "Q4_K_M",
     )
+    assert mock_estimate.call_args.kwargs == {"kv_cache_type": "q8_0"}
 
 
 @pytest.mark.asyncio
@@ -571,6 +578,7 @@ async def test_resolve_vram_info_uses_model_context_as_fallback():
             sizes={},
             base_url="http://localhost:11434",
             num_parallel=None,
+            kv_cache_type=None,
         )
 
     assert result == (True, 5.0)

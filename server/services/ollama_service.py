@@ -81,6 +81,9 @@ from server.utils.vram_calculator import (
 _PROGRESS_LOG_STEP = 0.1  # log every ~10% of progress so the console isn't flooded with updates
 _WARMTH_POLL_INTERVAL_SECONDS = 15  # matches the staleness already tolerated for the UI's loaded-model display
 
+_DEFAULT_KV_CACHE_TYPE = "f16"  # matches Ollama's own real default when an instance doesn't set one
+_DEFAULT_NUM_PARALLEL = 1  # conservative stand-in for Ollama's real "auto" (0) behavior, not a reproduction of it
+
 
 type Quantization = Literal[
     "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q3_K_S", "q3_K_M", "q3_K_L", "q4_K_S", "q4_K_M", "q5_K_S", "q5_K_M", "q6_K"
@@ -350,7 +353,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                     name="num_parallel",
                     description="Maximum number of parallel requests (OLLAMA_NUM_PARALLEL)",
                     required=False,
-                    default="1",
+                    default=str(_DEFAULT_NUM_PARALLEL),
                 ),
                 ServiceField(
                     type="text",
@@ -373,7 +376,8 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                 ServiceField(
                     type="text",
                     name="kv_cache_type",
-                    description="Quantization type for the K/V cache (default: f16, available: q4_0, q8_0) (OLLAMA_KV_CACHE_TYPE)",
+                    description=f"Quantization type for the K/V cache (default: {_DEFAULT_KV_CACHE_TYPE}, available: q4_0, q8_0) "
+                    "(OLLAMA_KV_CACHE_TYPE)",
                     required=False,
                 ),
                 ServiceField(
@@ -803,6 +807,8 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         bytes_weight: float | None = None,
         num_parallel: int | None = None,
         quantization_level: str | None = None,
+        *,
+        kv_cache_type: str | None = None,
     ) -> float | None:
         arch = await self._get_arch_params(instance, base_url, model_name)
 
@@ -810,8 +816,8 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             return None
 
         try:
-            cache_bit = parse_cache_type_bits(self.config.ollama_kv_cache_type)
-            num_parallel = num_parallel or self.config.ollama_num_parallel
+            cache_bit = parse_cache_type_bits(kv_cache_type or _DEFAULT_KV_CACHE_TYPE)
+            num_parallel = num_parallel or _DEFAULT_NUM_PARALLEL
             quant_overhead = get_quant_overhead(quantization_level)
             env_margin = self.config.ollama_vram_overhead_factor
             estimate = estimate_vram_gb(
@@ -924,6 +930,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         sizes: dict[str, ModelSize],
         base_url: str,
         num_parallel: int | None,
+        kv_cache_type: str | None,
     ) -> tuple[bool, float | None]:
         """Return (is_loaded, vram_estimate_gb) for a model.
 
@@ -936,7 +943,16 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             self._vram_cache.pop(cache_key, None)
             size_bytes, parameters, bpw, quantization_level = sizes.get(ollama_name, ModelSize(0, None, None, None))
             vram_estimate = await self._get_vram_estimate(
-                instance, base_url, ollama_name, size_bytes, model_context, parameters, bpw, num_parallel, quantization_level
+                instance,
+                base_url,
+                ollama_name,
+                size_bytes,
+                model_context,
+                parameters,
+                bpw,
+                num_parallel,
+                quantization_level,
+                kv_cache_type=kv_cache_type,
             )
             return False, vram_estimate
 
@@ -950,7 +966,16 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         num_ctx = loaded.context_length or model_context
         size_bytes, parameters, bpw, quantization_level = sizes.get(ollama_name, ModelSize(0, None, None, None))
         vram_estimate = await self._get_vram_estimate(
-            instance, base_url, ollama_name, size_bytes, num_ctx, parameters, bpw, num_parallel, quantization_level
+            instance,
+            base_url,
+            ollama_name,
+            size_bytes,
+            num_ctx,
+            parameters,
+            bpw,
+            num_parallel,
+            quantization_level,
+            kv_cache_type=kv_cache_type,
         )
 
         if vram_estimate is not None:
@@ -994,6 +1019,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                             sizes,
                             info.base_url,
                             info.parsed_options.num_parallel,
+                            info.parsed_options.kv_cache_type,
                         )
                     out_list.append(
                         RetrieveModelOut(
@@ -1039,6 +1065,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                 sizes,
                 info.base_url,
                 info.parsed_options.num_parallel,
+                info.parsed_options.kv_cache_type,
             )
         return RetrieveModelOut(
             id=model_id,
@@ -1378,20 +1405,19 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                     context_window = model_form_context_window or service_form_context_window or default_context_window
                     context_window = min(context_window, max_context_window)
                     # `or` (not `is not None`) is intentional here: Ollama's OLLAMA_NUM_PARALLEL=0 means
-                    # "auto", so an explicit 0 must fall through to the configured default just like None does.
+                    # "auto", so an explicit 0 must fall through to the fallback of 1 just like None does.
                     #
-                    # WARNING for reviewers: `self.config.ollama_num_parallel` is a *conservative
-                    # approximation* of "auto", not Ollama's real behavior. Ollama's own auto-scaling
-                    # picks up to 4 concurrent requests depending on available VRAM at load time; this
-                    # gateway has no visibility into that and cannot replicate it, so it substitutes its
-                    # own configured default (1 unless overridden) instead. Pros: never overcommits VRAM
-                    # by assuming a higher concurrency than what's actually available - safe by
-                    # construction. Cons: on hardware where Ollama would genuinely auto-scale to 2-4, this
-                    # under-reports capacity and causes earlier-than-necessary spillover to other
-                    # backends. If this is set to 4, the CHANGELOG default is now wrong, but treat this as
-                    # accepted routing-side conservatism, not a bug, unless the user explicitly wants
-                    # capacity to track Ollama's real auto behavior.
-                    capacity = info.parsed_options.num_parallel or self.config.ollama_num_parallel
+                    # WARNING for reviewers: the fallback of `1` is a *conservative approximation* of
+                    # "auto", not Ollama's real behavior. Ollama's own auto-scaling picks up to 4
+                    # concurrent requests depending on available VRAM at load time; this gateway has no
+                    # visibility into that and cannot replicate it, so it substitutes a fixed default
+                    # instead. Pros: never overcommits VRAM by assuming a higher concurrency than what's
+                    # actually available - safe by construction. Cons: on hardware where Ollama would
+                    # genuinely auto-scale to 2-4, this under-reports capacity and causes
+                    # earlier-than-necessary spillover to other backends. Treat this as accepted
+                    # routing-side conservatism, not a bug, unless the user explicitly wants capacity to
+                    # track Ollama's real auto behavior.
+                    capacity = info.parsed_options.num_parallel or _DEFAULT_NUM_PARALLEL
                     # Ollama lazily loads a model into memory on its first inference request, so a
                     # freshly-installed model is never warm yet - registering it as warm here would win
                     # ranking over an actually-warm instance and route the first requests into a cold load.
