@@ -57,8 +57,6 @@ def _make_installed_info(svc: OllamaService, instance: str = "default") -> Insta
 @pytest.fixture
 def deps() -> dict[str, Any]:
     config = MagicMock()
-    config.ollama_kv_cache_type = "f16"
-    config.ollama_num_parallel = 1
     config.ollama_vram_overhead_factor = 1.0
     return {
         "config": config,
@@ -2004,7 +2002,7 @@ async def test_install_model_registers_capacity_from_num_parallel(svc: OllamaSer
 
 
 @pytest.mark.asyncio
-async def test_install_model_registers_capacity_falls_back_to_config_default(svc: OllamaService, deps: dict[str, Any]) -> None:
+async def test_install_model_registers_capacity_falls_back_to_default(svc: OllamaService, deps: dict[str, Any]) -> None:
     installed = _make_installed_info(svc)
     svc.instances_info["default"].installed = installed
     svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm", hash="abc", context=4096, modelfile=None)
@@ -2014,11 +2012,11 @@ async def test_install_model_registers_capacity_falls_back_to_config_default(svc
         await promise.wait()
 
     call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
-    assert call_kwargs["registration_options"].capacity_state == deps["config"].ollama_num_parallel
+    assert call_kwargs["registration_options"].capacity_state == 1
 
 
 @pytest.mark.asyncio
-async def test_install_model_registers_capacity_falls_back_to_config_default_when_num_parallel_is_zero(
+async def test_install_model_registers_capacity_falls_back_to_default_when_num_parallel_is_zero(
     svc: OllamaService, deps: dict[str, Any]
 ) -> None:
     """`OLLAMA_NUM_PARALLEL=0` means "auto", not "zero concurrency" - it must not saturate the instance."""
@@ -2032,7 +2030,7 @@ async def test_install_model_registers_capacity_falls_back_to_config_default_whe
         await promise.wait()
 
     call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
-    assert call_kwargs["registration_options"].capacity_state == deps["config"].ollama_num_parallel
+    assert call_kwargs["registration_options"].capacity_state == 1
 
 
 @pytest.mark.asyncio
@@ -2567,7 +2565,7 @@ async def test_resolve_vram_info_cache_hit(svc: OllamaService) -> None:
     loaded_info = {"llama3": LoadedModelInfo(context_length=4096, vram_gb=None)}
 
     is_loaded, vram = await svc._resolve_vram_info(  # pyright: ignore[reportPrivateUsage]
-        "default", "llama3", None, loaded_info, {}, "http://localhost:11434", None
+        "default", "llama3", None, loaded_info, {}, "http://localhost:11434", None, None
     )
 
     assert is_loaded is True
@@ -2582,7 +2580,7 @@ async def test_resolve_vram_info_vram_estimate_none_not_cached(svc: OllamaServic
 
     with patch.object(svc, "_get_vram_estimate", new_callable=AsyncMock, return_value=None):
         is_loaded, vram = await svc._resolve_vram_info(  # pyright: ignore[reportPrivateUsage]
-            "default", "llama3", None, loaded_info, {}, "http://localhost:11434", None
+            "default", "llama3", None, loaded_info, {}, "http://localhost:11434", None, None
         )
 
     assert is_loaded is True
@@ -2599,7 +2597,7 @@ async def test_resolve_vram_info_not_loaded_returns_formula_estimate(svc: Ollama
 
     with patch.object(svc, "_get_vram_estimate", new_callable=AsyncMock, return_value=4.5) as mock_estimate:
         is_loaded, vram = await svc._resolve_vram_info(  # pyright: ignore[reportPrivateUsage]
-            "default", "llama3", 4096, loaded_info, {}, "http://localhost:11434", None
+            "default", "llama3", 4096, loaded_info, {}, "http://localhost:11434", None, None
         )
 
     assert is_loaded is False
@@ -2616,7 +2614,7 @@ async def test_resolve_vram_info_not_loaded_estimate_none(svc: OllamaService) ->
 
     with patch.object(svc, "_get_vram_estimate", new_callable=AsyncMock, return_value=None):
         is_loaded, vram = await svc._resolve_vram_info(  # pyright: ignore[reportPrivateUsage]
-            "default", "llama3", None, loaded_info, {}, "http://localhost:11434", None
+            "default", "llama3", None, loaded_info, {}, "http://localhost:11434", None, None
         )
 
     assert is_loaded is False
