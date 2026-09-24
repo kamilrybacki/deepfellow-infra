@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 - `just check`/CI now verify that `example.env` documents every bootstrap-only `AppSettings` setting (a field not managed via `config.json`/`PUT /admin/config`), via a new `example-env-check` recipe and CI job. Fixed the drift it caught: `DF_DOCKER_SUBNET`, `DF_STORAGE_DIR`, `DF_STORAGE_SERVICES_DIR`, `DF_COMPOSE_PREFIX`, `DF_DOCKER_HUB_TOKEN`, and the three `OLLAMA_*` settings were missing from `example.env` entirely, and `DF_STANDARD_PROXY_TIMEOUT_SECONDS` was documented as a normal override even though it's dynamic config — setting it via the environment only has any effect once, before `config.json` first exists. The deleted comment's stated default (300) was also already stale — the real default has been 600 since `0.33.0`.
+- WebUI unit tests now cover how install progress values are normalized for the progress bar: missing, `NaN`, infinite and non-numeric values are dropped, in-range values pass through unchanged, and out-of-range values are clamped to 0–1.
 
 ### Fixed
 

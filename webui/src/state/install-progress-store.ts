@@ -46,7 +46,7 @@ function setSnapshot(next: Snapshot) {
   emit();
 }
 
-function normalizeProgress(
+export function normalizeProgress(
   progress: InstallProgress | undefined,
 ): InstallProgress | undefined {
   if (!progress) return undefined;
