@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- The web-search MCP model catalog entry now sets `proxy_transport="sse"`, fixing `tools/list` returning an empty tool list through the toolbox proxy: the entry never set `proxy_transport`, so it defaulted to `streamable_http` and DF Infra registered the proxy against `base_url + "/mcp"` — a path the container (which speaks SSE only, via `supergateway`) doesn't expose.
 - The DuckDuckGo MCP model catalog entry now pins `duckduckgo-mcp-server:0.6.1` (was `0.4.0`) and sets `DDG_ALLOWED_HOSTS=duckduckgo:8000`, fixing `tools/list` returning an empty tool list: the pinned version predated the MCP Python SDK's DNS-rebinding protection allow-list, so it rejected every request proxied over the internal Docker network (`Host: duckduckgo:8000`) with a silently-swallowed `421 Misdirected Request`.
 - All app logging now goes through a single `logger` defined once in `server/utils/logger.py` and imported everywhere else, instead of ~45 modules each independently calling `logging.getLogger("uvicorn")` (and `tracing.py` doing it slightly differently from the rest) - both approaches reached the same handler, but only by relying on the same string literal being repeated correctly in every file.
 - The release tag pipeline no longer fails when a tag is pushed right after merging to `main`: `tag_docker_image` now retries pulling the release image for up to 20 minutes instead of failing immediately, so it doesn't race ahead of `main`'s own `build_and_publish_docker_image` job.
