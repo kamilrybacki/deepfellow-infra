@@ -117,6 +117,23 @@ class Utils:
         return f"{aa}/{bb}"
 
     @staticmethod
+    def join_versioned_url(base_url: str, version: str, *path_segments: str) -> str:
+        """Join a user-supplied base URL with an API version segment and further path segments.
+
+        Users commonly copy a provider's documented base URL including its version segment
+        (e.g. Ollama's OpenAI-compatible endpoint is documented as `http://host:11434/v1`), so a
+        `base_url` that already ends with `version` is treated as already-versioned instead of
+        appending it a second time.
+        """
+        base = base_url.rstrip("/")
+        version = version.strip("/")
+        if base != version and not base.endswith(f"/{version}"):
+            base = Utils.join_url(base, version)
+        for segment in path_segments:
+            base = Utils.join_url(base, segment)
+        return base
+
+    @staticmethod
     def save_file(file_path: Path, file_content: str) -> None:
         """Save given content under given path."""
         with file_path.open("w", encoding="utf-8") as f:

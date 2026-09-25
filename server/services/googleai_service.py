@@ -5,7 +5,6 @@
 
 import json
 from collections.abc import Sequence
-from urllib.parse import urljoin
 
 import aiohttp
 
@@ -17,6 +16,7 @@ from server.services.remote_service import (
     RemoteModelType,
     RemoteService,
 )
+from server.utils.core import Utils
 from server.utils.logger import logger
 
 _MAX_PAGES = 20
@@ -196,7 +196,7 @@ class GoogleAIService(RemoteService):
             # Google's native endpoint (unlike the OpenAI-compat proxy path this service uses for
             # chat) expects the key via x-goog-api-key, not an Authorization: Bearer header.
             headers = {"x-goog-api-key": info.parsed_options.api_key}
-            models_url = urljoin(f"{api_url}/", "v1beta/models")
+            models_url = Utils.join_versioned_url(api_url, "v1beta", "models")
 
             page_token: str | None = None
             async with aiohttp.ClientSession(timeout=_FETCH_TIMEOUT) as session:

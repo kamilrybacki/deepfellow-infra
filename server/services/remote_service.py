@@ -8,7 +8,6 @@ from abc import abstractmethod
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from typing import Any, Generic, Literal, TypeVar
-from urllib.parse import urljoin
 
 from fastapi import HTTPException
 from pydantic import BaseModel
@@ -45,6 +44,7 @@ from server.utils.core import (
     Stream,
     StreamChunk,
     StreamChunkProgress,
+    Utils,
     positive_context_window_or_none,
     try_parse_pydantic,
 )
@@ -365,7 +365,14 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
         """Provide the specification for the install service modal fields compatible with OpenAI."""
         return ServiceSpecification(
             fields=[
-                ServiceField(type="text", name="api_url", description="API URL", required=False, default=self.get_default_url()),
+                ServiceField(
+                    type="text",
+                    name="api_url",
+                    description="API URL",
+                    placeholder="https://api.example.com (with or without a trailing /v1)",
+                    required=False,
+                    default=self.get_default_url(),
+                ),
                 ServiceField(type="password", name="api_key", description="API Key", required=False),
             ]
         )
@@ -630,7 +637,7 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
                     registration_id="",
                 )
 
-                url_base = urljoin(info.parsed_options.api_url, self.api_version)
+                url_base = Utils.join_versioned_url(info.parsed_options.api_url, self.api_version)
                 props = get_model_props(model)
                 try:
                     if model.type == "llm":
@@ -638,28 +645,28 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
                             model=registered_name,
                             props=props,
                             messages=ProxyOptions(
-                                url=urljoin(url_base, "messages"),
+                                url=Utils.join_url(url_base, "messages"),
                                 rewrite_model_to=model.real_model_name or model_id,
                                 headers=headers,
                             )
                             if model.messages
                             else None,
                             responses=ProxyOptions(
-                                url=urljoin(url_base, "responses"),
+                                url=Utils.join_url(url_base, "responses"),
                                 rewrite_model_to=model.real_model_name or model_id,
                                 headers=headers,
                             )
                             if model.responses
                             else None,
                             chat_completions=ProxyOptions(
-                                url=urljoin(url_base, "chat/completions"),
+                                url=Utils.join_url(url_base, "chat/completions"),
                                 rewrite_model_to=model.real_model_name or model_id,
                                 headers=headers,
                             )
                             if model.completions
                             else None,
                             completions=ProxyOptions(
-                                url=urljoin(url_base, "completions"),
+                                url=Utils.join_url(url_base, "completions"),
                                 rewrite_model_to=model.real_model_name or model_id,
                                 headers=headers,
                             )
@@ -669,7 +676,7 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
                             registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
                     if model.type == "tts":
-                        url = urljoin(url_base, "audio/speech")
+                        url = Utils.join_url(url_base, "audio/speech")
                         model_info.registration_id = self.endpoint_registry.register_audio_speech_as_proxy(
                             model=registered_name,
                             props=props,
@@ -681,7 +688,7 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
                             registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
                     if model.type == "stt":
-                        url = urljoin(url_base, "audio/transcriptions")
+                        url = Utils.join_url(url_base, "audio/transcriptions")
                         model_info.registration_id = self.endpoint_registry.register_audio_transcriptions_as_proxy(
                             model=registered_name,
                             props=props,
@@ -693,7 +700,7 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
                             registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
                     if model.type == "txt2img":
-                        url = urljoin(url_base, "images/generations")
+                        url = Utils.join_url(url_base, "images/generations")
                         model_info.registration_id = self.endpoint_registry.register_image_generations_as_proxy(
                             model=registered_name,
                             props=props,
@@ -705,7 +712,7 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
                             registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
                         )
                     if model.type == "embedding":
-                        url = urljoin(url_base, "embeddings")
+                        url = Utils.join_url(url_base, "embeddings")
                         model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
                             model=registered_name,
                             props=props,
