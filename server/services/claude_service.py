@@ -5,12 +5,12 @@
 
 import json
 from collections.abc import Sequence
-from urllib.parse import urljoin
 
 import aiohttp
 
 from server.models.services import ServiceField, ServiceSpecification
 from server.services.remote_service import BaseServiceOptions, LiveModelEntry, RemoteConst, RemoteModel, RemoteService
+from server.utils.core import Utils
 from server.utils.logger import logger
 
 _MAX_PAGES = 20
@@ -175,7 +175,7 @@ class ClaudeService(RemoteService[ClaudeServiceOptions]):
             info = self.get_instance_installed_info(instance)
             api_url = info.parsed_options.api_url
             headers = info.parsed_options.headers
-            models_url = urljoin(urljoin(api_url, self.api_version), "models")
+            models_url = Utils.join_versioned_url(api_url, self.api_version, "models")
 
             after_id: str | None = None
             async with aiohttp.ClientSession(timeout=_FETCH_TIMEOUT) as session:
@@ -213,6 +213,7 @@ class ClaudeService(RemoteService[ClaudeServiceOptions]):
                     type="text",
                     name="api_url",
                     description="API URL",
+                    placeholder="https://api.anthropic.com (with or without a trailing /v1)",
                     required=False,
                     default=self.get_default_url(),
                 ),

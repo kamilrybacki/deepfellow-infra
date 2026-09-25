@@ -5,11 +5,11 @@
 
 import json
 from collections.abc import Sequence
-from urllib.parse import urljoin
 
 import aiohttp
 
 from server.services.remote_service import DefaultRemoteServiceOptions, LiveModelEntry, RemoteConst, RemoteModel, RemoteService
+from server.utils.core import Utils
 from server.utils.logger import logger
 
 _FETCH_TIMEOUT = aiohttp.ClientTimeout(total=15)
@@ -142,7 +142,7 @@ class OpenAIService(RemoteService):
             api_url = info.parsed_options.api_url
             api_key = info.parsed_options.api_key
             headers = {"Authorization": f"Bearer {api_key}"}
-            models_url = urljoin(urljoin(api_url, self.api_version), "models")
+            models_url = Utils.join_versioned_url(api_url, self.api_version, "models")
 
             async with (
                 aiohttp.ClientSession(timeout=_FETCH_TIMEOUT) as session,

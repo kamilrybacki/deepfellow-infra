@@ -743,6 +743,33 @@ async def test_install_model_registers_correct_endpoint(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "https://api.openai.com",
+        "https://api.openai.com/",
+        "https://api.openai.com/v1",
+        "https://api.openai.com/v1/",
+    ],
+)
+async def test_install_model_builds_correct_embeddings_url(
+    openai_svc: OpenAIService,
+    deps: dict[str, Any],
+    api_url: str,
+) -> None:
+    """The proxy URL must always land on `/v1/embeddings`, whether or not the user's api_url already
+    includes the `/v1` suffix or a trailing slash themselves.
+    """
+    openai_svc.instances_info["default"].installed = _make_installed(api_url=api_url)
+
+    promise = await openai_svc._install_model("default", "text-embedding-ada-002", InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+    await promise.wait()
+
+    options = deps["endpoint_registry"].register_embeddings_as_proxy.call_args.kwargs["options"]
+    assert options.url == "https://api.openai.com/v1/embeddings"
+
+
+@pytest.mark.asyncio
 async def test_install_model_with_alias_uses_alias_as_registered_name(
     openai_svc: OpenAIService,
     deps: dict[str, Any],
