@@ -819,6 +819,17 @@ def test_get_image_false_returns_cpu_image(svc: VllmService) -> None:
     assert image == _const.images["cpu"]
 
 
+def test_get_default_docker_image_name_no_gpu_returns_cpu_image(svc: VllmService) -> None:
+    assert svc.get_default_docker_image_name() == _const.images["cpu"].name
+
+
+def test_get_default_docker_image_name_with_gpu_returns_gpu_image(deps: dict[str, Any]) -> None:
+    deps["hardware"].gpus = [MagicMock(spec=NvidiaGpuInfo)]
+    svc = VllmService(**deps)
+
+    assert svc.get_default_docker_image_name() == _const.images["gpu"].name
+
+
 @pytest.mark.asyncio
 async def test_install_model_returns_already_installed(svc: VllmService) -> None:
     installed = _make_installed_info()

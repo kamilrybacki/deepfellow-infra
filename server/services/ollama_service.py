@@ -536,6 +536,10 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             return DockerImage(name=f"{base}:{image_version}", size=_const.image.size)
         return _const.image
 
+    def get_default_docker_image_name(self) -> str | None:
+        """Return the default docker image, for the upfront platform-compatibility check."""
+        return self._get_image().name
+
     async def get_docker_tags(self, hardware: str | None) -> list[str]:
         """Fetch available Docker image tags from Docker Hub for the Ollama image."""
         base_image = _const.image.name.split(":")[0]

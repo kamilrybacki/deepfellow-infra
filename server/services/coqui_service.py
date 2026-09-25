@@ -44,7 +44,7 @@ from server.models.services import (
     ServiceSpecification,
     UninstallServiceIn,
 )
-from server.services.base2_service import Base2Service, CustomModel, Instance, InstanceConfig, ModelConfig
+from server.services.base2_service import Base2Service, CustomModel, Instance, InstanceConfig, ModelConfig, default_gpu_cpu_image_name
 from server.utils.core import (
     PromiseWithProgress,
     Stream,
@@ -462,6 +462,10 @@ class CoquiService(Base2Service[InstalledInfo, DownloadedInfo]):
 
     def _get_image(self, gpu: bool) -> DockerImage:
         return _const.images["gpu"] if gpu else _const.images["cpu"]
+
+    def get_default_docker_image_name(self) -> str | None:
+        """Return the default docker image, for the upfront platform-compatibility check."""
+        return default_gpu_cpu_image_name(self._supported_gpus, self._get_image)
 
     def _get_working_output_dir(self) -> Path:
         path = self._get_working_dir() / "output"

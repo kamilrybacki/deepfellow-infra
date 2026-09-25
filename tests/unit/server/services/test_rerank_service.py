@@ -167,6 +167,17 @@ def test_get_image_no_gpu_returns_cpu_image(svc: RerankService) -> None:
     assert image == _const.images["cpu"]
 
 
+def test_get_default_docker_image_name_no_gpu_returns_cpu_image(svc: RerankService) -> None:
+    assert svc.get_default_docker_image_name() == _const.images["cpu"].name
+
+
+def test_get_default_docker_image_name_with_nvidia_gpu_returns_gpu_image(deps: dict[str, Any]) -> None:
+    deps["hardware"].gpus = [MagicMock(spec=NvidiaGpuInfo)]
+    svc = RerankService(**deps)
+
+    assert svc.get_default_docker_image_name() == _const.images["gpu"].name
+
+
 def test_get_image_non_nvidia_returns_cpu_image(svc: RerankService) -> None:
     non_nvidia = MagicMock()
 

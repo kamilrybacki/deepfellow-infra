@@ -253,6 +253,10 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
             return _const.images["gpu"]
         return _const.images["cpu"]
 
+    def get_default_docker_image_name(self) -> str | None:
+        """Return the default docker image, for the upfront platform-compatibility check."""
+        return self._get_image(self.get_specified_hardware_parts(None)).name
+
     def _load_download_info(self, data: dict[str, Any]) -> DownloadedInfo:
         return DownloadedInfo(**data)
 

@@ -1379,6 +1379,10 @@ def test_get_image_with_version_overrides_tag(svc: SglangService) -> None:
     assert image.size == _const.image.size
 
 
+def test_get_default_docker_image_name(svc: SglangService) -> None:
+    assert svc.get_default_docker_image_name() == _const.image.name
+
+
 def test_get_docker_image_repo(svc: SglangService) -> None:
     assert svc.get_docker_image_repo(None) == _const.image.name.split(":")[0]
 

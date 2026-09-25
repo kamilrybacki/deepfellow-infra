@@ -514,9 +514,19 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         """Return why vLLM can't run here, or None if it can."""
         if not self.hardware.cpu.avx512 and not self._supported_gpus:
             return (
-                "Your hardware doesn't support this service.\nCPU does not support AVX 512 instructions.\nThere are not any graphic cards"
+                "Your hardware doesn't support this service.\nCPU does not support AVX 512 instructions."
+                "\nThere are not any graphic cards. Restart Infra if this has changed."
             )
         return None
+
+    def get_default_docker_image_name(self) -> str | None:
+        """Return the default docker image, for the upfront platform-compatibility check.
+
+        Mirrors the default hardware selection in `is_given_hardware_support_gpu(None)`, without
+        going through that method - it raises when hardware is unsupported, which must not happen
+        here (this runs unconditionally at startup, before hardware support is even relevant).
+        """
+        return self._get_image(bool(self._supported_gpus)).name
 
     def _ensure_hardware_supported(self) -> None:
         if reason := self.get_hardware_unsupported_reason():

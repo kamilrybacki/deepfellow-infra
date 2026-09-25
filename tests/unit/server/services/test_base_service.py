@@ -41,6 +41,7 @@ from server.services.base2_service import (
 )
 from server.services.base_service import BaseService
 from server.utils.core import PromiseWithProgress, Stream, StreamChunk, StreamChunkProgress
+from server.utils.exceptions import DockerImageAuthorizationError, DockerImageDoesNotExistError
 from server.utils.hardware import NvidiaGpuInfo
 from server.utils.registry_client import RegistryUnavailableError
 
@@ -4011,3 +4012,169 @@ async def test_reconcile_hooks_default_to_not_implemented(base2_svc: _Base2Impl)
         base2_svc._reconcile_container_name("default", None, None)  # pyright: ignore[reportPrivateUsage]
     with pytest.raises(NotImplementedError):
         await base2_svc._release_dead_model("default", None, "m1", None)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_get_disabled_reason_default_delegates_to_hardware_reason(base_svc: _BaseImpl) -> None:
+    assert base_svc.get_disabled_reason() is None
+
+    with patch.object(base_svc, "get_hardware_unsupported_reason", return_value="no GPU"):
+        assert base_svc.get_disabled_reason() == "no GPU"
+
+
+def test_get_default_docker_image_name_default_none(base2_svc: _Base2Impl) -> None:
+    assert base2_svc.get_default_docker_image_name() is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_platform_compatibility_noop_without_default_image(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """No default image means no platform check is performed - the registry is never contacted."""
+    base2_deps["docker_service"].get_image_platforms = AsyncMock()
+
+    await base2_svc.resolve_platform_compatibility()
+
+    base2_deps["docker_service"].get_image_platforms.assert_not_called()
+    assert base2_svc._platform_unsupported_reason is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_resolve_platform_compatibility_noop_when_already_hardware_disabled(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any]
+) -> None:
+    """get_disabled_reason() prefers the hardware reason anyway, so resolving platform compatibility
+    on top of an already-hardware-disabled service would just be a wasted registry call."""
+    base2_deps["docker_service"].get_image_platforms = AsyncMock()
+
+    with (
+        patch.object(base2_svc, "get_hardware_unsupported_reason", return_value="no GPU"),
+        patch.object(base2_svc, "get_default_docker_image_name", return_value="example/image:latest"),
+    ):
+        await base2_svc.resolve_platform_compatibility()
+
+    base2_deps["docker_service"].get_image_platforms.assert_not_called()
+    assert base2_svc._platform_unsupported_reason is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_resolve_platform_compatibility_no_reason_when_compatible(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    base2_deps["docker_service"].get_image_platforms = AsyncMock(return_value=["linux/amd64"])
+    base2_deps["docker_service"].host_platform = "linux/amd64"
+
+    with patch.object(base2_svc, "get_default_docker_image_name", return_value="example/image:latest"):
+        await base2_svc.resolve_platform_compatibility()
+
+    assert base2_svc._platform_unsupported_reason is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_resolve_platform_compatibility_no_reason_when_platforms_unknown(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """An empty platform list means "couldn't determine it" (e.g. a local, unpublished image) - not
+    "incompatible with every platform"."""
+    base2_deps["docker_service"].get_image_platforms = AsyncMock(return_value=[])
+    base2_deps["docker_service"].host_platform = "linux/arm64"
+
+    with patch.object(base2_svc, "get_default_docker_image_name", return_value="example/image:latest"):
+        await base2_svc.resolve_platform_compatibility()
+
+    assert base2_svc._platform_unsupported_reason is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_resolve_platform_compatibility_sets_reason_on_mismatch(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    base2_deps["docker_service"].get_image_platforms = AsyncMock(return_value=["linux/amd64"])
+    base2_deps["docker_service"].host_platform = "linux/arm64"
+
+    with patch.object(base2_svc, "get_default_docker_image_name", return_value="example/image:latest"):
+        await base2_svc.resolve_platform_compatibility()
+
+    # A clean, user-facing summary - not the raw image name/digest/platform list, which would read
+    # as an unreadable wall of technical detail in the webui tooltip (DFINFRA-365).
+    assert (
+        base2_svc._platform_unsupported_reason  # pyright: ignore[reportPrivateUsage]
+        == "This service is incompatible with your machine (arm64 is not supported). Restart Infra if this has changed."
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_platform_compatibility_fails_open_on_registry_error(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    """A registry lookup failure at startup must not raise (it would abort the whole gather across
+    services) and must leave the service treated as compatible, matching how GPU-detection failures
+    already degrade gracefully instead of blocking startup."""
+    base2_deps["docker_service"].get_image_platforms = AsyncMock(side_effect=RuntimeError("registry unreachable"))
+
+    with (
+        patch.object(base2_svc, "get_default_docker_image_name", return_value="example/image:latest"),
+        caplog.at_level("ERROR", logger="uvicorn"),
+    ):
+        await base2_svc.resolve_platform_compatibility()
+
+    assert base2_svc._platform_unsupported_reason is None  # pyright: ignore[reportPrivateUsage]
+    assert "example/image:latest" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_resolve_platform_compatibility_fails_open_on_missing_image(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    """An image that doesn't exist (yet) or a registry auth failure is unrelated to platform
+    compatibility - it must not be reported as a hardware/architecture mismatch."""
+    base2_deps["docker_service"].get_image_platforms = AsyncMock(side_effect=DockerImageDoesNotExistError("example/image:latest"))
+
+    with (
+        patch.object(base2_svc, "get_default_docker_image_name", return_value="example/image:latest"),
+        caplog.at_level("WARNING", logger="uvicorn"),
+    ):
+        await base2_svc.resolve_platform_compatibility()
+
+    assert base2_svc._platform_unsupported_reason is None  # pyright: ignore[reportPrivateUsage]
+    assert "example/image:latest" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_resolve_platform_compatibility_fails_open_on_auth_error(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    base2_deps["docker_service"].get_image_platforms = AsyncMock(side_effect=DockerImageAuthorizationError("example/image:latest"))
+
+    with patch.object(base2_svc, "get_default_docker_image_name", return_value="example/image:latest"):
+        await base2_svc.resolve_platform_compatibility()
+
+    assert base2_svc._platform_unsupported_reason is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_resolve_platform_compatibility_fails_open_on_timeout(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """A registry call that hangs instead of erroring must not block startup forever - it's bounded
+    by _PLATFORM_CHECK_TIMEOUT_SECONDS and then treated the same as any other lookup failure."""
+
+    async def hang(_image: str) -> list[str]:
+        await asyncio.Event().wait()  # never completes on its own
+        return []
+
+    base2_deps["docker_service"].get_image_platforms = hang
+
+    with (
+        patch.object(base2_svc, "get_default_docker_image_name", return_value="example/image:latest"),
+        patch("server.services.base2_service._PLATFORM_CHECK_TIMEOUT_SECONDS", 0.01),
+    ):
+        await asyncio.wait_for(base2_svc.resolve_platform_compatibility(), timeout=1)
+
+    assert base2_svc._platform_unsupported_reason is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_get_disabled_reason_prefers_hardware_reason_over_platform(base2_svc: _Base2Impl) -> None:
+    base2_svc._platform_unsupported_reason = "platform mismatch"  # pyright: ignore[reportPrivateUsage]
+
+    with patch.object(base2_svc, "get_hardware_unsupported_reason", return_value="no GPU"):
+        assert base2_svc.get_disabled_reason() == "no GPU"
+
+
+def test_get_disabled_reason_falls_back_to_platform_reason(base2_svc: _Base2Impl) -> None:
+    base2_svc._platform_unsupported_reason = "platform mismatch"  # pyright: ignore[reportPrivateUsage]
+
+    with patch.object(base2_svc, "get_hardware_unsupported_reason", return_value=None):
+        assert base2_svc.get_disabled_reason() == "platform mismatch"
+
+
+def test_get_disabled_reason_none_when_both_checks_pass(base2_svc: _Base2Impl) -> None:
+    with patch.object(base2_svc, "get_hardware_unsupported_reason", return_value=None):
+        assert base2_svc.get_disabled_reason() is None

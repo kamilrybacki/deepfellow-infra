@@ -158,6 +158,23 @@ def normalize_docker_platform(platform_str: str) -> str:
     return f"{os_part}/{arch_normalized}/{variant_normalized}" if variant_normalized else f"{os_part}/{arch_normalized}"
 
 
+def _strip_tag_keep_digest(image: str) -> str:
+    """For a `repo[:tag]@digest` reference, drop the tag component and return `repo@digest`.
+
+    `docker manifest inspect` rejects a combined tag+digest reference for a single-platform image,
+    so it must be reduced to `repo@digest` first - the digest alone is already unambiguous. A colon
+    before the last "/" segment is a registry host:port, not a tag separator, so only a colon in the
+    final path segment (before the "@") counts as one.
+    """
+    if "@" not in image:
+        return image
+    left, digest = image.split("@", 1)
+    repo, sep, tag = left.rpartition(":")
+    if sep and "/" not in tag:
+        left = repo
+    return f"{left}@{digest}"
+
+
 def get_docker_auths() -> dict[str, str]:
     """Get docker auth."""
     config_path = Path.home() / ".docker" / "config.json"
@@ -727,6 +744,36 @@ class DockerService:
         except Exception:
             return None
 
+    async def _get_single_platform(self, image: str) -> list[str]:
+        """Resolve a single-platform (non-manifest-list) image's platform via `docker manifest inspect -v`.
+
+        `get_docker_manifest()` (`docker buildx imagetools inspect`) can only read a *manifest* by
+        digest, not a *blob* by digest - so it cannot be used to fetch a single-platform image's
+        config blob (which is where `os`/`architecture` actually live) even though the blob's own
+        digest is easy to read off the outer manifest. `docker manifest inspect -v` resolves the
+        platform directly, in one call, without that indirection.
+        """
+        ref = _strip_tag_keep_digest(image)
+        result = await Utils.run_command(["docker", "manifest", "inspect", "-v", ref])
+        if result.exit_code != 0:
+            logger.warning("docker manifest inspect -v %s failed (exit %d): %s", ref, result.exit_code, result.stderr)
+            return []
+        try:
+            data = json.loads(result.stdout)
+            descriptor = data[0] if isinstance(data, list) else data
+            platform_info = descriptor.get("Descriptor", {}).get("platform") if isinstance(descriptor, dict) else None
+        except (json.JSONDecodeError, IndexError) as err:
+            logger.warning("Could not parse docker manifest inspect -v output for %s: %s", ref, err)
+            return []
+        if not platform_info:
+            return []
+        os_type = platform_info.get("os", "")
+        architecture = platform_info.get("architecture", "")
+        if not architecture:
+            return []
+        variant = platform_info.get("variant", "")
+        return [normalize_docker_platform(f"{os_type}/{architecture}{'/' + variant if variant else ''}")]
+
     async def get_image_platforms(self, image: str) -> list[str]:
         """Get platform of a Docker image in format 'os/architecture'.
 
@@ -749,24 +796,7 @@ class DockerService:
             main_manifest = await self.get_docker_manifest(image)
             manifests = main_manifest.get("manifests", [])
             if not manifests:
-                if (
-                    main_manifest.get("mediaType") == "application/vnd.docker.distribution.manifest.v2+json"
-                    and (config := main_manifest.get("config"))
-                    and isinstance(config, dict)
-                    and (digest := config.get("digest"))  # type: ignore
-                    and isinstance(digest, str)
-                ):
-                    new_image = image.split("@")[0] + "@" + digest
-                    try:
-                        image_manifest = await self.get_docker_manifest(new_image)
-                        os = image_manifest.get("os", "")
-                        architecture = image_manifest.get("architecture", "")
-                        variant = image_manifest.get("variant", "")
-                    except RuntimeError:
-                        return []
-                    return [normalize_docker_platform(f"{os}/{architecture}{'/' + variant if variant else ''}")]
-
-                return []
+                return await self._get_single_platform(image)
             platforms = set[str]()
             for manifest in manifests:
                 platform_info = manifest.get("platform")

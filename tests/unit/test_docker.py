@@ -36,6 +36,7 @@ from server.docker import (
     _matches_for_adoption,  # type: ignore[reportPrivateUsage]
     _parse_bind_volume,  # type: ignore[reportPrivateUsage]
     _parse_byte_size,  # type: ignore[reportPrivateUsage]
+    _strip_tag_keep_digest,  # type: ignore[reportPrivateUsage]
     create_docker_service,
     get_docker_auths,
     normalize_docker_platform,
@@ -1593,73 +1594,163 @@ async def test_get_image_platforms_no_arch_returns_empty(docker_service: DockerS
 
 
 @pytest.mark.asyncio
-async def test_get_image_platforms_manifest_no_manifests_v2_with_config(docker_service: DockerService) -> None:
-    config_digest = "sha256:configdigest"
-    main_manifest = {
-        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
-        "config": {"digest": config_digest},
-    }
-    image_manifest = {"os": "linux", "architecture": "amd64", "variant": ""}
-
-    call_count = 0
-
-    async def fake_manifest(image: str) -> dict[str, Any]:
-        nonlocal call_count
-        call_count += 1
-        return image_manifest if call_count > 1 else main_manifest
+async def test_get_image_platforms_single_manifest_resolves_via_manifest_inspect(docker_service: DockerService) -> None:
+    """A single-platform (non-manifest-list) image falls back to `docker manifest inspect -v`,
+    since `get_docker_manifest()` (imagetools inspect) can read a manifest by digest but not a
+    config blob by digest."""
+    main_manifest: dict[str, Any] = {}  # no "manifests" list -> single-platform image
+    inspect_output = {"Descriptor": {"platform": {"os": "linux", "architecture": "amd64"}}}
 
     with (
-        patch("server.docker.Utils.run_command_for_success", new_callable=AsyncMock) as mock_run,
-        patch.object(docker_service, "get_docker_manifest", side_effect=fake_manifest),
-    ):
-        mock_run.side_effect = RuntimeError("not local")
-
-        result = await docker_service.get_image_platforms("ubuntu:latest")
-
-    assert "linux/amd64" in result
-
-
-@pytest.mark.asyncio
-async def test_get_image_platforms_manifest_no_manifests_v2_manifest_error_returns_empty(docker_service: DockerService) -> None:
-    config_digest = "sha256:configdigest"
-    main_manifest = {
-        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
-        "config": {"digest": config_digest},
-    }
-
-    call_count = 0
-
-    async def fake_manifest(image: str) -> dict[str, Any]:
-        nonlocal call_count
-        call_count += 1
-        if call_count > 1:
-            raise RuntimeError("failed")
-        return main_manifest
-
-    with (
-        patch("server.docker.Utils.run_command_for_success", new_callable=AsyncMock) as mock_run,
-        patch.object(docker_service, "get_docker_manifest", side_effect=fake_manifest),
-    ):
-        mock_run.side_effect = RuntimeError("not local")
-
-        result = await docker_service.get_image_platforms("ubuntu:latest")
-
-    assert result == []
-
-
-@pytest.mark.asyncio
-async def test_get_image_platforms_fallback_no_manifests_no_v2_returns_empty(docker_service: DockerService) -> None:
-    main_manifest: dict[str, Any] = {}  # no manifests, no mediaType
-
-    with (
-        patch("server.docker.Utils.run_command_for_success", new_callable=AsyncMock) as mock_run,
+        patch("server.docker.Utils.run_command_for_success", new_callable=AsyncMock) as mock_run_success,
+        patch("server.docker.Utils.run_command", new_callable=AsyncMock) as mock_run,
         patch.object(docker_service, "get_docker_manifest", new_callable=AsyncMock, return_value=main_manifest),
     ):
-        mock_run.side_effect = RuntimeError("not local")
+        mock_run_success.side_effect = RuntimeError("not local")
+        mock_run.return_value = make_result(stdout=json.dumps(inspect_output))
+
+        result = await docker_service.get_image_platforms("vladmandic/sdnext-cuda:latest@sha256:digest")
+
+    assert result == ["linux/amd64"]
+    mock_run.assert_awaited_once_with(["docker", "manifest", "inspect", "-v", "vladmandic/sdnext-cuda@sha256:digest"])
+
+
+@pytest.mark.asyncio
+async def test_get_image_platforms_single_manifest_command_failure_returns_empty(
+    docker_service: DockerService, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed `docker manifest inspect -v` must be logged (with stderr), not swallowed silently -
+    otherwise a missing image, a 401, a DNS blip, and a missing buildx/manifest plugin all look the
+    same as "compatible", with no trace anywhere."""
+    main_manifest: dict[str, Any] = {}
+
+    with (
+        patch("server.docker.Utils.run_command_for_success", new_callable=AsyncMock) as mock_run_success,
+        patch("server.docker.Utils.run_command", new_callable=AsyncMock) as mock_run,
+        patch.object(docker_service, "get_docker_manifest", new_callable=AsyncMock, return_value=main_manifest),
+        caplog.at_level("WARNING", logger="uvicorn"),
+    ):
+        mock_run_success.side_effect = RuntimeError("not local")
+        mock_run.return_value = make_result(exit_code=1, stderr="manifest unknown")
 
         result = await docker_service.get_image_platforms("ubuntu:latest")
 
     assert result == []
+    assert "manifest unknown" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_get_image_platforms_single_manifest_malformed_json_returns_empty(
+    docker_service: DockerService, caplog: pytest.LogCaptureFixture
+) -> None:
+    main_manifest: dict[str, Any] = {}
+
+    with (
+        patch("server.docker.Utils.run_command_for_success", new_callable=AsyncMock) as mock_run_success,
+        patch("server.docker.Utils.run_command", new_callable=AsyncMock) as mock_run,
+        patch.object(docker_service, "get_docker_manifest", new_callable=AsyncMock, return_value=main_manifest),
+        caplog.at_level("WARNING", logger="uvicorn"),
+    ):
+        mock_run_success.side_effect = RuntimeError("not local")
+        mock_run.return_value = make_result(stdout="not json")
+
+        result = await docker_service.get_image_platforms("ubuntu:latest")
+
+    assert result == []
+    assert "ubuntu:latest" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_get_image_platforms_single_manifest_empty_list_returns_empty(
+    docker_service: DockerService, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`docker manifest inspect -v` printing an empty JSON array (`[]`) must not crash with an
+    IndexError on `data[0]` - it must be treated the same as any other unparseable result."""
+    main_manifest: dict[str, Any] = {}
+
+    with (
+        patch("server.docker.Utils.run_command_for_success", new_callable=AsyncMock) as mock_run_success,
+        patch("server.docker.Utils.run_command", new_callable=AsyncMock) as mock_run,
+        patch.object(docker_service, "get_docker_manifest", new_callable=AsyncMock, return_value=main_manifest),
+        caplog.at_level("WARNING", logger="uvicorn"),
+    ):
+        mock_run_success.side_effect = RuntimeError("not local")
+        mock_run.return_value = make_result(stdout="[]")
+
+        result = await docker_service.get_image_platforms("ubuntu:latest")
+
+    assert result == []
+    assert "ubuntu:latest" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_get_image_platforms_single_manifest_no_architecture_returns_empty(docker_service: DockerService) -> None:
+    main_manifest: dict[str, Any] = {}
+    inspect_output = {"Descriptor": {"platform": {"os": "linux", "architecture": ""}}}
+
+    with (
+        patch("server.docker.Utils.run_command_for_success", new_callable=AsyncMock) as mock_run_success,
+        patch("server.docker.Utils.run_command", new_callable=AsyncMock) as mock_run,
+        patch.object(docker_service, "get_docker_manifest", new_callable=AsyncMock, return_value=main_manifest),
+    ):
+        mock_run_success.side_effect = RuntimeError("not local")
+        mock_run.return_value = make_result(stdout=json.dumps(inspect_output))
+
+        result = await docker_service.get_image_platforms("ubuntu:latest")
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_get_image_platforms_single_manifest_no_platform_returns_empty(docker_service: DockerService) -> None:
+    main_manifest: dict[str, Any] = {}
+
+    with (
+        patch("server.docker.Utils.run_command_for_success", new_callable=AsyncMock) as mock_run_success,
+        patch("server.docker.Utils.run_command", new_callable=AsyncMock) as mock_run,
+        patch.object(docker_service, "get_docker_manifest", new_callable=AsyncMock, return_value=main_manifest),
+    ):
+        mock_run_success.side_effect = RuntimeError("not local")
+        mock_run.return_value = make_result(stdout=json.dumps({"Descriptor": {}}))
+
+        result = await docker_service.get_image_platforms("ubuntu:latest")
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_get_image_platforms_single_manifest_list_shape_uses_first_entry(docker_service: DockerService) -> None:
+    """`docker manifest inspect -v` returns a JSON array (not a single object) for a multi-arch
+    tag - defensively handled even though get_image_platforms() only reaches this fallback when
+    the top-level imagetools inspect already reported no manifest list."""
+    main_manifest: dict[str, Any] = {}
+    inspect_output = [{"Descriptor": {"platform": {"os": "linux", "architecture": "arm64", "variant": "v8"}}}]
+
+    with (
+        patch("server.docker.Utils.run_command_for_success", new_callable=AsyncMock) as mock_run_success,
+        patch("server.docker.Utils.run_command", new_callable=AsyncMock) as mock_run,
+        patch.object(docker_service, "get_docker_manifest", new_callable=AsyncMock, return_value=main_manifest),
+    ):
+        mock_run_success.side_effect = RuntimeError("not local")
+        mock_run.return_value = make_result(stdout=json.dumps(inspect_output))
+
+        result = await docker_service.get_image_platforms("ubuntu:latest")
+
+    assert result == ["linux/arm64/v8"]
+
+
+@pytest.mark.parametrize(
+    ("image", "expected"),
+    [
+        ("repo@sha256:digest", "repo@sha256:digest"),
+        ("repo:tag@sha256:digest", "repo@sha256:digest"),
+        ("registry.local:5000/repo:tag@sha256:digest", "registry.local:5000/repo@sha256:digest"),
+        ("registry.local:5000/repo@sha256:digest", "registry.local:5000/repo@sha256:digest"),
+        ("repo:tag", "repo:tag"),
+    ],
+)
+def test_strip_tag_keep_digest(image: str, expected: str) -> None:
+    assert _strip_tag_keep_digest(image) == expected
 
 
 @pytest.mark.asyncio

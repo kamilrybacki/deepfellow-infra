@@ -756,6 +756,10 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
             return DockerImage(name=f"{base_name}:{image_version}", size=base.size)
         return base
 
+    def get_default_docker_image_name(self) -> str | None:
+        """Return the default docker image, for the upfront platform-compatibility check."""
+        return self._get_image(self.get_specified_hardware_parts(None)).name
+
     def _image_variant_for_hardware(self, hardware: str | None) -> ImageTypes:
         """Return the `_const.images` key matching the given hardware string."""
         hw = str(hardware).lower() if hardware else ""

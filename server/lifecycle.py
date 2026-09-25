@@ -126,6 +126,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         services_manager.register_service(StableDiffusionService(*model_input))
         services_manager.register_service(VllmService(*model_input))
 
+        await services_manager.resolve_platform_compatibility()
+
         # Load functions
         await context.load_services()
         task_manager.add_task(parent_infra.run())
