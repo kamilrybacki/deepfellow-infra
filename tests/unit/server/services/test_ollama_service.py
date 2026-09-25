@@ -440,6 +440,10 @@ def test_get_image_returns_const_image(svc: OllamaService) -> None:
     assert svc._get_image() == _const.image  # pyright: ignore[reportPrivateUsage]
 
 
+def test_get_default_docker_image_name(svc: OllamaService) -> None:
+    assert svc.get_default_docker_image_name() == _const.image.name
+
+
 def test_load_download_info_returns_dataclass(svc: OllamaService) -> None:
     result = svc._load_download_info({})  # pyright: ignore[reportPrivateUsage]
 

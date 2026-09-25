@@ -508,8 +508,12 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
     def get_hardware_unsupported_reason(self) -> str | None:
         """Return why SGLang can't run here. SGLang is GPU-only: no supported GPU means it can't run at all."""
         if not self._supported_gpus:
-            return "Your hardware doesn't support this service.\nThere are not any graphic cards."
+            return "Your hardware doesn't support this service.\nThere are not any graphic cards. Restart Infra if this has changed."
         return None
+
+    def get_default_docker_image_name(self) -> str | None:
+        """Return the default docker image, for the upfront platform-compatibility check."""
+        return _const.image.name
 
     def is_given_hardware_support_gpu(self, hardware_specification: str | bool | None) -> bool:
         """Return is gpu will be used. SGLang is GPU-only: no supported GPU means the service can't run at all."""

@@ -53,6 +53,7 @@ from server.utils.core import (
     convert_size_to_bytes,
     is_own_cancellation,
 )
+from server.utils.exceptions import DockerImageAuthorizationError, DockerImageDoesNotExistError
 from server.utils.hardware import GpuInfo, Hardware, HardwarePartInfo, NvidiaGpuInfo
 from server.utils.logger import logger
 from server.utils.model_downloader import ModelDownloader
@@ -312,6 +313,11 @@ _RECONCILE_DEAD_THRESHOLD = 3
 # awaited separately once a promise exists. A generous bound for setup work specifically, so a
 # genuinely hung service doesn't leave every caller waiting forever with no way to notice or recover.
 _INSTALL_STATUS_WAIT_TIMEOUT_SECONDS = 30
+# Bounds resolve_platform_compatibility()'s registry lookup at app startup. A single lookup normally
+# takes ~1-1.5s; this is generous headroom for a slow registry, not a normal-case budget - without it,
+# a hung connection (rather than an outright error) would block the whole app from ever starting, since
+# lifecycle.py awaits every service's check before accepting requests.
+_PLATFORM_CHECK_TIMEOUT_SECONDS = 20
 _CANCEL_WAIT_TIMEOUT_SECONDS = 30
 # Bounds how long a caller waits for install_instance()'s pre-promise setup work (Docker
 # image/registry checks) to settle - not the install itself, which can legitimately run far longer
@@ -339,6 +345,14 @@ _INSTANCE_UPDATE_STATUS_WAIT_TIMEOUT_SECONDS = 120
 _INSTANCE_CANCEL_ROLLBACK_WAIT_TIMEOUT_SECONDS = 300
 
 
+def default_gpu_cpu_image_name(supported_gpus: Sequence[GpuInfo], get_image: Callable[[bool], DockerImage]) -> str:
+    """Shared `get_default_docker_image_name()` body for services whose `_get_image(gpu: bool)` picks a fixed GPU/CPU image pair.
+
+    Selects the GPU image whenever a GPU is supported.
+    """
+    return get_image(bool(supported_gpus)).name
+
+
 class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  # noqa: UP046
     config: AppSettings
     endpoint_registry: EndpointRegistry
@@ -358,6 +372,10 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
     _crash_poll_state: dict[tuple[str, str], int]
     _failed_models: dict[str, set[str]]
     _warning_tasks: set["asyncio.Task[None]"]
+    _platform_unsupported_reason: str | None
+    """Cached result of `resolve_platform_compatibility()`, run once at app startup. `None` means
+    either the check hasn't found an incompatibility, or `get_default_docker_image_name()` returns
+    `None` (no check performed for this service), or the check couldn't complete (fails open)."""
 
     _persists_model_definitions: bool = True
     """Override to False for services whose ``_generate_instance_config`` never populates ``ModelConfig.definition``
@@ -391,6 +409,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         self._failed_models = {}
         self._warning_tasks = set()
         self._edit_locks = {}
+        self._platform_unsupported_reason = None
         self._after_init()
 
     def _after_init(self) -> None:
@@ -1766,6 +1785,57 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         warnings = await self.docker_service.get_image_warnings(docker_image)
         if len(warnings) > 0 and not ignore_warning:
             raise HTTPException(400, {"warnings": warnings})
+
+    def get_default_docker_image_name(self) -> str | None:
+        """Return the docker image this service would install by default, or None to skip the upfront platform check.
+
+        Used once at app startup by `resolve_platform_compatibility()` to check whether the image is
+        published for the host's OS/architecture. Override per service with the same image already
+        used (with no I/O) to pick the default install target, e.g. `_get_image(...).name`.
+        """
+        return None
+
+    async def resolve_platform_compatibility(self) -> None:
+        """Resolve, once, whether this service's default docker image supports the host platform.
+
+        Called during app startup, before the server accepts requests. Populates
+        `_platform_unsupported_reason`, read synchronously by `get_disabled_reason()` afterwards.
+        A registry lookup that fails, or times out, is logged and swallowed - the service is then
+        treated as compatible, matching how GPU-detection failures already degrade gracefully
+        rather than blocking startup. Skipped entirely when hardware already disables the service,
+        since `get_disabled_reason()` would discard the platform result anyway.
+        """
+        if self.get_hardware_unsupported_reason():
+            return
+        image = self.get_default_docker_image_name()
+        if not image:
+            return
+        try:
+            platforms = await asyncio.wait_for(self.docker_service.get_image_platforms(image), timeout=_PLATFORM_CHECK_TIMEOUT_SECONDS)
+        except (DockerImageDoesNotExistError, DockerImageAuthorizationError) as err:
+            # Unrelated to platform compatibility (a missing/inaccessible image) - nothing useful
+            # to report as a hardware mismatch, so leave the service looking compatible.
+            logger.warning("Could not resolve platform compatibility for %s (%s): %s; treating as compatible", self.get_type(), image, err)
+            return
+        except Exception:
+            logger.exception("Could not resolve platform compatibility for %s (%s); treating as compatible", self.get_type(), image)
+            return
+        if platforms and self.docker_service.host_platform not in platforms:
+            # A clean, user-facing summary - deliberately not the raw warning text (image name,
+            # digest, full platform list), which reads as an unreadable wall of technical detail
+            # in the webui tooltip (DFINFRA-365).
+            arch = (
+                self.docker_service.host_platform.split("/")[1]
+                if "/" in self.docker_service.host_platform
+                else self.docker_service.host_platform
+            )
+            self._platform_unsupported_reason = (
+                f"This service is incompatible with your machine ({arch} is not supported). Restart Infra if this has changed."
+            )
+
+    def get_disabled_reason(self) -> str | None:
+        """Return why this service can't be installed here, combining hardware and platform checks."""
+        return self.get_hardware_unsupported_reason() or self._platform_unsupported_reason
 
     @property
     def _supported_gpus(self) -> list[GpuInfo]:

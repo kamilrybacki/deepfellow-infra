@@ -52,7 +52,7 @@ from server.models.services import (
     ServiceSpecification,
     UninstallServiceIn,
 )
-from server.services.base2_service import Base2Service, CustomModel, Instance, InstanceConfig, ModelConfig
+from server.services.base2_service import Base2Service, CustomModel, Instance, InstanceConfig, ModelConfig, default_gpu_cpu_image_name
 from server.utils.core import (
     DownloadedPacket,
     PreDownloadPacket,
@@ -346,6 +346,16 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
     def _get_image(self, gpu: bool) -> DockerImage:
         return _const.images["gpu"] if gpu else _const.images["cpu"]
 
+    def get_default_docker_image_name(self) -> str | None:
+        """Return the default docker image, for the upfront platform-compatibility check."""
+        return default_gpu_cpu_image_name(self._supported_gpus, self._get_image)
+
+    def get_hardware_unsupported_reason(self) -> str | None:
+        """Return why Stable Diffusion Next can't run here. It is not supported on macOS at all."""
+        if platform.system() == "Darwin":
+            return "This service is incompatible with your machine (not supported on macOS)."
+        return None
+
     def _load_download_info(self, data: dict[str, Any]) -> DownloadedInfo:
         return DownloadedInfo(**data)
 
@@ -356,8 +366,8 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
         if "hardware" not in options.spec:
             options.spec["hardware"] = options.spec.get("gpu", self.docker_service.has_gpu_support)
         options.spec["hardware"] = self.canonicalize_hardware_spec(options.spec["hardware"])
-        if platform.system() == "Darwin":
-            raise HTTPException(400, "Stable Diffusion Next is not supported on macOS")
+        if reason := self.get_hardware_unsupported_reason():
+            raise HTTPException(400, reason)
         parsed_options = try_parse_pydantic(SDOptions, options.spec)
         volumes = [
             f"{self._get_working_models_dir()}:/mnt/models",

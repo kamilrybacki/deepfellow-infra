@@ -161,6 +161,10 @@ def test_get_image_gpu_false_returns_cpu_image(svc: CoquiService) -> None:
     assert image == _const.images["cpu"]
 
 
+def test_get_default_docker_image_name_no_gpu_returns_cpu_image(svc: CoquiService) -> None:
+    assert svc.get_default_docker_image_name() == _const.images["cpu"].name
+
+
 def test_build_coqui_command_uses_model_name(svc: CoquiService) -> None:
     cmd = svc._build_coqui_command(  # pyright: ignore[reportPrivateUsage]
         CoquiCmdOptions(model_name="tts_models/en/vctk/vits", model_path=None, cuda=False, language=None)

@@ -181,6 +181,10 @@ def test_get_image_gpu_false_returns_cpu_image(svc: SpeachesAIService) -> None:
     assert image == _const.images["cpu"]
 
 
+def test_get_default_docker_image_name_no_gpu_returns_cpu_image(svc: SpeachesAIService) -> None:
+    assert svc.get_default_docker_image_name() == _const.images["cpu"].name
+
+
 def test_srv_speaches_custom_model_valid() -> None:
     m = SrvSpeachesCustomModel(id="my-custom", default_model="speaches-ai/piper-en_US-john-medium")
 

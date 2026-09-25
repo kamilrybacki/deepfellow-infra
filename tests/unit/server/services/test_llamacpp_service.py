@@ -1291,6 +1291,17 @@ def test_get_image_with_intel_gpu_and_version_overrides_tag(svc: LLamacppService
     assert image.size == _const.images["vulkan"].size
 
 
+def test_get_default_docker_image_name_no_gpu_returns_cpu_image(svc: LLamacppService) -> None:
+    assert svc.get_default_docker_image_name() == _const.images["cpu"].name
+
+
+def test_get_default_docker_image_name_with_nvidia_gpu_returns_gpu_image(deps: dict[str, Any]) -> None:
+    deps["hardware"].gpus = [MagicMock(spec=NvidiaGpuInfo)]
+    svc = LLamacppService(**deps)
+
+    assert svc.get_default_docker_image_name() == _const.images["gpu"].name
+
+
 @pytest.mark.asyncio
 async def test_install_model_registration_failure_rolls_back_model(svc: LLamacppService, deps: dict[str, Any], tmp_path: Path) -> None:
     installed = _setup_install_mocks(svc, deps)

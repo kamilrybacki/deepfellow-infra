@@ -135,6 +135,7 @@ def _apply_base_patches(active_patches: dict[str, Mock], *, config: MagicMock | 
     svc_mgr = active_patches["server.lifecycle.ServicesManager"].return_value
     svc_mgr.stop_all_services = AsyncMock()
     svc_mgr.drain_warning_tasks = AsyncMock()
+    svc_mgr.resolve_platform_compatibility = AsyncMock()
 
     otlp_logging = active_patches["server.lifecycle.OtlpLoggingManager"].return_value
     otlp_logging.teardown = AsyncMock()

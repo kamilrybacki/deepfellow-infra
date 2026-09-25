@@ -216,6 +216,32 @@ def test_get_image_gpu_false_returns_cpu_image(svc: StableDiffusionService) -> N
     assert image == _const.images["cpu"]
 
 
+def test_get_default_docker_image_name(svc: StableDiffusionService) -> None:
+    assert svc.get_default_docker_image_name() == _const.images["cpu"].name
+
+
+def test_get_hardware_unsupported_reason_none_on_linux(svc: StableDiffusionService) -> None:
+    with patch("server.services.stable_diffusion_service.platform.system", return_value="Linux"):
+        assert svc.get_hardware_unsupported_reason() is None
+
+
+def test_get_hardware_unsupported_reason_set_on_macos(svc: StableDiffusionService) -> None:
+    with patch("server.services.stable_diffusion_service.platform.system", return_value="Darwin"):
+        reason = svc.get_hardware_unsupported_reason()
+
+    assert reason is not None
+    assert "macOS" in reason
+
+
+def test_disabled_reason_surfaced_upfront_on_macos(svc: StableDiffusionService) -> None:
+    """DFINFRA-365: the macOS block must be visible before any install attempt, via get_info()."""
+    with patch("server.services.stable_diffusion_service.platform.system", return_value="Darwin"):
+        info = svc.get_info("default")
+
+    assert info.disabled_reason is not None
+    assert "macOS" in info.disabled_reason
+
+
 def test_add_custom_model_stores_model(svc: StableDiffusionService) -> None:
     svc._add_custom_model("default", _make_sd_custom())  # pyright: ignore[reportPrivateUsage]
 
