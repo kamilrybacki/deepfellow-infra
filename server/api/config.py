@@ -159,8 +159,6 @@ async def update_dynamic_config(
         downloaders_changed = (
             new_settings.hugging_face_token.get_secret_value() != current.hugging_face_token.get_secret_value()
             or new_settings.civitai_token.get_secret_value() != current.civitai_token.get_secret_value()
-            or new_settings.adapter_registry_url != current.adapter_registry_url
-            or new_settings.adapter_registry_secret.get_secret_value() != current.adapter_registry_secret.get_secret_value()
         )
 
         # Persist before mutating in-memory state: the file is the source of truth.

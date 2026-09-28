@@ -24,7 +24,6 @@ from server.services.custom_service import (
     _const,  # pyright: ignore[reportPrivateUsage]
     create_bge_m3_model,
     create_doc_chunker_model,
-    create_finetune_model,
     create_gliner_model,
     create_lemmatizer_model,
 )
@@ -54,6 +53,7 @@ def deps() -> dict[str, Any]:
         "model_downloader": MagicMock(),
         "docker_service": docker_svc,
         "hardware": MagicMock(gpus=[]),
+        "services_manager": MagicMock(),
     }
 
 
@@ -88,6 +88,117 @@ def test_const_models_not_empty() -> None:
     assert len(_const.models) > 0
 
 
+@pytest.mark.asyncio
+async def test_load_service_strips_retired_finetune_model_entry(svc: CustomService) -> None:
+    """A `services.json` written before deepfellow-finetune moved to its own service must not
+    resurface it as a "failed to load" warning on every future startup."""
+    raw_config = {
+        "instances": {
+            "default": {
+                "options": {"spec": {}},
+                "models": [
+                    {"model_id": "deepfellow-finetune", "options": {"spec": {}}},
+                    {"model_id": "gliner", "options": {"spec": {}}},
+                ],
+            }
+        }
+    }
+
+    with (
+        patch("server.services.base2_service.Base2Service.load_service", new=AsyncMock()) as mock_super_load,
+        patch.object(svc, "_remove_retired_model_container", new=AsyncMock()),
+        patch.object(svc, "_save", new=AsyncMock()),
+    ):
+        await svc.load_service(raw_config)
+
+    loaded_config = mock_super_load.call_args.args[0]
+    model_ids = [m["model_id"] for m in loaded_config["instances"]["default"]["models"]]
+    assert model_ids == ["gliner"]
+
+
+@pytest.mark.asyncio
+async def test_load_service_removes_retired_model_container_and_saves_pruned_config(svc: CustomService) -> None:
+    """The dropped entry's container is still running and holding its GPU/port; the pruned config is
+    saved right away so the teardown happens only once instead of on every startup."""
+    raw_config = {
+        "instances": {
+            "default": {"options": {"spec": {}}, "models": [{"model_id": "deepfellow-finetune", "options": {"spec": {}}}]},
+            "other": {"options": {"spec": {}}, "models": [{"model_id": "deepfellow-finetune", "options": {"spec": {}}}]},
+        }
+    }
+
+    with (
+        patch("server.services.base2_service.Base2Service.load_service", new=AsyncMock()),
+        patch.object(svc, "_remove_retired_model_container", new=AsyncMock()) as mock_remove,
+        patch.object(svc, "_save", new=AsyncMock()) as mock_save,
+    ):
+        await svc.load_service(raw_config)
+
+    assert mock_remove.call_args_list == [call("deepfellow-finetune")]
+    mock_save.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_load_service_without_retired_entries_neither_removes_nor_saves(svc: CustomService) -> None:
+    raw_config = {"instances": {"default": {"options": {"spec": {}}, "models": [{"model_id": "gliner", "options": {"spec": {}}}]}}}
+
+    with (
+        patch("server.services.base2_service.Base2Service.load_service", new=AsyncMock()),
+        patch.object(svc, "_remove_retired_model_container", new=AsyncMock()) as mock_remove,
+        patch.object(svc, "_save", new=AsyncMock()) as mock_save,
+    ):
+        await svc.load_service(raw_config)
+
+    mock_remove.assert_not_called()
+    mock_save.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_remove_retired_model_container_uninstalls_its_docker(svc: CustomService, deps: dict[str, Any]) -> None:
+    deps["docker_service"].uninstall_docker = AsyncMock()
+
+    await svc._remove_retired_model_container("deepfellow-finetune")  # pyright: ignore[reportPrivateUsage]
+
+    docker_options = deps["docker_service"].uninstall_docker.call_args.args[0]
+    assert docker_options.name == "deepfellow-finetune"
+    assert docker_options.container_name == "df-deepfellow-finetune"
+
+
+@pytest.mark.asyncio
+async def test_remove_retired_model_container_logs_and_continues_on_failure(
+    svc: CustomService, deps: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    deps["docker_service"].uninstall_docker = AsyncMock(side_effect=RuntimeError("docker down"))
+
+    with caplog.at_level(logging.WARNING):
+        await svc._remove_retired_model_container("deepfellow-finetune")  # pyright: ignore[reportPrivateUsage]
+
+    assert "Failed to remove container 'df-deepfellow-finetune'" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_load_service_without_instances_key_still_calls_super(svc: CustomService) -> None:
+    raw_config: dict[str, Any] = {}
+
+    with patch("server.services.base2_service.Base2Service.load_service", new=AsyncMock()) as mock_super_load:
+        await svc.load_service(raw_config)
+
+    assert mock_super_load.call_count == 1
+    assert mock_super_load.call_args == call(raw_config)
+
+
+@pytest.mark.asyncio
+async def test_load_service_skips_instance_entries_without_a_models_list(svc: CustomService) -> None:
+    raw_config = {"instances": {"default": "not-a-dict", "other": {"options": {"spec": {}}}}}
+
+    with patch("server.services.base2_service.Base2Service.load_service", new=AsyncMock()) as mock_super_load:
+        await svc.load_service(raw_config)
+
+    loaded_config = mock_super_load.call_args.args[0]
+    assert loaded_config["instances"]["default"] == "not-a-dict"
+    assert "models" not in loaded_config["instances"]["other"]
+
+
 def test_service_has_docker(svc: CustomService) -> None:
     assert svc.service_has_docker() is False
 
@@ -111,7 +222,7 @@ def test_get_default_model_spec_contains_proxy_timeout_field_exactly_once(svc: C
 
 @pytest.mark.parametrize(
     "create_model",
-    [create_bge_m3_model, create_lemmatizer_model, create_gliner_model, create_doc_chunker_model, create_finetune_model],
+    [create_bge_m3_model, create_lemmatizer_model, create_gliner_model, create_doc_chunker_model],
 )
 def test_create_model_spec_contains_proxy_timeout_field_exactly_once(
     svc: CustomService, create_model: Callable[[CustomService, str | None], SrvCustomModel]
@@ -1369,33 +1480,6 @@ async def test_get_docker_tags_for_model_bge_m3_filters_by_token_not_substring(d
         cpu_tags = await svc_gpu.get_docker_tags_for_model("deepfellow-bge-m3", "CPU")
 
     assert cpu_tags == ["1.12.8-cpu"]
-
-
-def test_create_finetune_model_returns_docker_options(svc: CustomService) -> None:
-    model = create_finetune_model(svc, "172.20.0.0/16")
-
-    assert callable(model.options)
-    docker_opts = model.options({})  # pyright: ignore[reportCallIssue]
-    assert docker_opts.image_port == 8333
-    assert docker_opts.image == "hub.simplito.com/deepfellow/deepfellow-finetune:0.0.1"
-
-
-def test_loaded_finetune_model_has_docker_tags_field(svc: CustomService) -> None:
-    model = svc.models["default"]["deepfellow-finetune"]
-
-    field = next(f for f in model.model_spec.fields if f.name == "image_version")
-    assert field.type == "docker-tags"
-    assert field.docker_image == "hub.simplito.com/deepfellow/deepfellow-finetune"
-
-
-@pytest.mark.asyncio
-async def test_get_docker_tags_for_model_finetune_uses_identity_filter(svc: CustomService) -> None:
-    client = MagicMock()
-    client.get_tags = AsyncMock(return_value=["0.0.1", "0.0.3", "0.0.4", "0.0.6"])
-    with patch("server.services.custom_service.registry_for", return_value=client):
-        tags = await svc.get_docker_tags_for_model("deepfellow-finetune", None)
-
-    assert tags == ["0.0.1", "0.0.3", "0.0.4", "0.0.6"]
 
 
 @pytest.mark.asyncio

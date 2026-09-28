@@ -16,12 +16,12 @@ from server.utils.model_downloader import AdapterRegistryDownloader
 
 @pytest.fixture
 def downloader() -> AdapterRegistryDownloader:
-    return AdapterRegistryDownloader(url="http://registry.local:5000", secret="test-secret")
+    return AdapterRegistryDownloader(secret="test-secret")
 
 
 @pytest.fixture
 def downloader_no_secret() -> AdapterRegistryDownloader:
-    return AdapterRegistryDownloader(url="http://registry.local:5000", secret="")
+    return AdapterRegistryDownloader(secret="")
 
 
 async def _fake_download_file(url: str, file_path: Path, headers: dict[str, str]):
@@ -192,54 +192,9 @@ async def test_download_cleans_temp_on_error(downloader: AdapterRegistryDownload
         assert list(temp_dir.iterdir()) == []
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("url", "expected"),
-    [
-        ("http://registry.local:5000/my-model/adapter.gguf", True),
-        ("http://registry.local:5000/", True),
-        ("https://huggingface.co/model", False),
-        ("http://other-host:5000/model", False),
-    ],
+    "url",
+    ["http://registry.local:5000/my-model/adapter.gguf", "https://huggingface.co/model"],
 )
-async def test_check_url(downloader: AdapterRegistryDownloader, url: str, expected: bool) -> None:
-    assert downloader.check_url(url) is expected
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("registry_url", "check_url"),
-    [
-        ("http://localhost:8333", "http://127.0.0.1:8333/pirate-llama"),
-        ("http://127.0.0.1:8333", "http://localhost:8333/pirate-llama"),
-    ],
-)
-async def test_check_url_localhost_normalization(registry_url: str, check_url: str) -> None:
-    dl = AdapterRegistryDownloader(url=registry_url, secret="s")
-
-    assert dl.check_url(check_url) is True
-
-
-@pytest.mark.asyncio
-async def test_download_localhost_normalization(tmp_path: Path) -> None:
-    """Verify download works when registry uses 127.0.0.1 but Modelfile URL uses localhost."""
-    dl = AdapterRegistryDownloader(url="http://127.0.0.1:8333", secret="s")
-    model_dir = tmp_path / "models"
-    model_dir.mkdir()
-    temp_dir = tmp_path / "temp"
-
-    captured_url = None
-
-    async def capture_download(url: str, file_path: Path, headers: dict[str, str]):
-        nonlocal captured_url
-        captured_url = url
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_bytes(b"data")
-        yield PreDownloadPacket(4)
-
-    with patch("server.utils.model_downloader.download_file", side_effect=capture_download):
-        async for _ in dl.download("http://localhost:8333/pirate-llama/adapter.gguf", model_dir, temp_dir):
-            pass
-
-    # URL is passed through as-is (localhost is fine — it's the same host)
-    assert captured_url == "http://localhost:8333/pirate-llama/adapter.gguf"
+def test_check_url_always_false(downloader: AdapterRegistryDownloader, url: str) -> None:
+    assert downloader.check_url(url) is False

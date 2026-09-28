@@ -39,6 +39,7 @@ from server.models.services import (
     ServiceSpecification,
     UninstallServiceIn,
 )
+from server.serviceprovider import ServiceRawConfig
 from server.services.base2_service import Base2Service, CustomModel, Instance, InstanceConfig, ModelConfig
 from server.utils.core import (
     PromiseWithProgress,
@@ -160,6 +161,14 @@ class DownloadedInfo:
     image: str
 
 
+#: Built-in model ids that used to live in this service's catalog and have since moved to their own
+#: dedicated service, mapped to that service's id. A `services.json` written before the move can still
+#: list one as installed; without filtering it out here, `load_model` would treat it as a real failure
+#: (it's no longer in `_const.models`) and raise a permanent "failed to load" warning on every future
+#: startup instead of just quietly reflecting that it's gone from this catalog.
+_RETIRED_MODEL_IDS: dict[str, str] = {"deepfellow-finetune": "finetune"}
+
+
 class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
     models: dict[str, dict[str, "SrvCustomModel"]]
     _installing: set[tuple[str, str]]
@@ -168,6 +177,51 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
     def _after_init(self) -> None:
         self.load_default_models("default")
         self._installing = set()
+
+    async def load_service(self, config: ServiceRawConfig) -> None:
+        """Load service using the config, dropping any persisted entry for a retired model id.
+
+        A dropped entry's container keeps running (`restart: unless-stopped`), holding its GPU and host
+        port with nothing tracking it anymore, so it's torn down too, and the pruned config is saved
+        right away so that happens only once.
+        """
+        retired: set[str] = set()
+        instances = config.get("instances")
+        if isinstance(instances, dict):
+            for instance in instances.values():
+                if isinstance(instance, dict) and isinstance(instance.get("models"), list):
+                    kept: list[Any] = []
+                    for m in instance["models"]:
+                        if isinstance(m, dict) and m.get("model_id") in _RETIRED_MODEL_IDS:
+                            retired.add(m["model_id"])
+                        else:
+                            kept.append(m)
+                    instance["models"] = kept
+        await super().load_service(config)
+        if retired:
+            for model_id in sorted(retired):
+                await self._remove_retired_model_container(model_id)
+            await self._save()
+
+    async def _remove_retired_model_container(self, model_id: str) -> None:
+        """Best-effort teardown of a retired model's container; a failure must not abort startup.
+
+        The replacement service names its containers after its own service id (e.g. `finetune`, not
+        `deepfellow-finetune`), so this container is never one of its own. Data volumes are always
+        left in place.
+        """
+        container_name = self.docker_service.get_docker_container_name(model_id)
+        try:
+            await self.docker_service.uninstall_docker(DockerOptions(name=model_id, container_name=container_name, image="", image_port=0))
+        except Exception:
+            logger.warning("Failed to remove container %r of retired custom model %r", container_name, model_id, exc_info=True)
+            return
+        logger.info(
+            "Removed container %r of retired custom model %r; install the %r service instead",
+            container_name,
+            model_id,
+            _RETIRED_MODEL_IDS[model_id],
+        )
 
     def load_default_models(self, instance: str) -> None:
         """Load default models to instance."""
@@ -1050,63 +1104,6 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
     )
 
 
-def create_finetune_model(custom_service: CustomService, subnet: str | None) -> SrvCustomModel:
-    """Create finetune model."""
-    fields: list[ModelField] = custom_service.add_hardware_field_to_model_spec()
-    fields.extend(
-        [
-            ModelField(
-                type="text",
-                name="prefix",
-                description="Endpoint prefix",
-                required=True,
-                placeholder="deepfellow-finetune",
-                default="deepfellow-finetune",
-            ),
-            custom_service.get_proxy_timeout_field(),
-        ]
-    )
-
-    def generate_docker_options(model_fields: InstallModelOptions) -> DockerOptions:
-        hardware_parts = custom_service.get_specified_hardware_parts(model_fields.get("hardware"))
-        return DockerOptions(
-            image_port=8333,
-            name="deepfellow-finetune",
-            container_name=custom_service.docker_service.get_docker_container_name("deepfellow-finetune"),
-            image="hub.simplito.com/deepfellow/deepfellow-finetune:0.0.1",
-            restart="unless-stopped",
-            volumes=[
-                f"{custom_service.get_working_dir()}/deepfellow-finetune/models:/workspace/models",
-                f"{custom_service.get_working_dir()}/deepfellow-finetune/configs:/workspace/configs",
-                f"{custom_service.get_working_dir()}/deepfellow-finetune/data:/workspace/data",
-                f"{custom_service.get_working_dir()}/deepfellow-finetune/adapters:/workspace/adapters",
-            ],
-            hardware=hardware_parts,
-            subnet=subnet,
-            env_vars={
-                "HF_TOKEN": custom_service.config.hugging_face_token.get_secret_value(),
-            },
-            healthcheck={
-                "test": "wget -q --spider http://localhost:8333/health",
-                "interval": "30s",
-                "timeout": "10s",
-                "retries": "3",
-                "start_period": "30s",
-            },
-        )
-
-    return SrvCustomModel(
-        model_props=ModelProps(private=True, type="custom", endpoints=["/custom/deepfellow-finetune"]),
-        model_spec=ModelSpecification(fields=fields),
-        model_type="custom",
-        default_prefix="deepfellow-finetune",
-        size="8.56GB",
-        options=generate_docker_options,
-        description="LLM LoRA fine-tuning framework with an OpenAI-compatible fine-tuning job queue.",
-        repository_url="https://gitlab2.simplito.com/df/df-finetune",
-    )
-
-
 _const = CustomConst(
     models={
         "bentoml/example-summarization": lambda custom_service, subnet: SrvCustomModel(
@@ -1147,7 +1144,6 @@ _const = CustomConst(
         "lemmatizer": create_lemmatizer_model,
         "gliner": create_gliner_model,
         "doc_chunker": create_doc_chunker_model,
-        "deepfellow-finetune": create_finetune_model,
         "deepfellow-bge-m3": create_bge_m3_model,
     }
 )

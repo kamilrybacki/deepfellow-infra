@@ -142,6 +142,22 @@ export interface ServiceModelsResponse {
   list: ServiceModel[];
 }
 
+export interface FinetuneAdapter {
+  id: string;
+  object: string;
+  created: number; // Unix timestamp (seconds)
+  owned_by: string;
+  base_model: string;
+  formats: string[];
+  lora?: Record<string, unknown> | null;
+  gguf?: Record<string, unknown> | null;
+}
+
+export interface FinetuneAdapterListResponse {
+  object: string;
+  data: FinetuneAdapter[];
+}
+
 export interface TestResult {
   result?: boolean; // true if test passed
   error?: boolean; // true if test failed

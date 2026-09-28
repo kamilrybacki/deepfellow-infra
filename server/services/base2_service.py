@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Generic, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar, cast
 
 from fastapi import HTTPException
 from pydantic import BaseModel
@@ -57,6 +57,9 @@ from server.utils.exceptions import DockerImageAuthorizationError, DockerImageDo
 from server.utils.hardware import GpuInfo, Hardware, HardwarePartInfo, NvidiaGpuInfo
 from server.utils.logger import logger
 from server.utils.model_downloader import ModelDownloader
+
+if TYPE_CHECKING:
+    from server.services_manager import ServicesManager
 
 
 class ModelConfig(BaseModel):
@@ -359,6 +362,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
     service_provider: ServiceProvider
     model_downloader: ModelDownloader
     docker_service: DockerService
+    services_manager: "ServicesManager"
     models: dict[str, dict[str, Any]]
     models_downloaded: dict[str, DownloadInfoType]
     service_downloaded: bool
@@ -391,6 +395,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         model_downloader: ModelDownloader,
         docker_service: DockerService,
         hardware: Hardware,
+        services_manager: "ServicesManager",
     ):
         super().__init__()
         self.config = config
@@ -399,6 +404,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         self.model_downloader = model_downloader
         self.docker_service = docker_service
         self.hardware = hardware
+        self.services_manager = services_manager
         self.models = {}
         self.models_downloaded = {}
         self.service_downloaded = False

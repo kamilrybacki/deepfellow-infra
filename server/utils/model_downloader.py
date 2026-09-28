@@ -396,30 +396,24 @@ class CivitaiModelDownloader(BaseDownloader):
 
 
 class AdapterRegistryDownloader(BaseDownloader):
-    """Downloader for adapter registry with Bearer token authentication."""
+    """Downloader for adapter registry with Bearer token authentication.
 
-    def __init__(self, url: str, secret: str):
-        self.registry_url = url
+    Not registered in `ModelDownloader.custom_downloaders` - built ad hoc and `.download()` called directly.
+    """
+
+    def __init__(self, secret: str):
         self.headers = Utils.create_bearer_header(secret)
         self.error_msg_modifiers = [
             (
                 "401",
-                "Adapter registry authentication failed. Check DF_ADAPTER_REGISTRY_SECRET env variable. If set, the token may be wrong.",
+                "Adapter registry authentication failed. Check the adapter_registry_secret setting "
+                "(Settings page or PUT /admin/config). If set, it may be wrong.",
             ),
         ]
 
-    @staticmethod
-    def _normalize_host(url: str) -> str:
-        """Normalize localhost to 127.0.0.1 for comparison."""
-        return url.replace("://localhost", "://127.0.0.1")
-
-    def check_url(self, url: str) -> bool:
+    def check_url(self, url: str) -> bool:  # noqa: ARG002
         """Check is url handled by this downloader."""
-        normalized_url = self._normalize_host(url)
-        normalized_registry = self._normalize_host(self.registry_url)
-        match = bool(normalized_registry and normalized_url.startswith(normalized_registry))
-        logger.debug("AdapterRegistryDownloader.check_url: url=%s, registry_url=%s, match=%s", url, self.registry_url, match)
-        return match
+        return False
 
     async def download(
         self,
@@ -475,7 +469,6 @@ class ModelDownloader:
         self.temp_dir: Path = config.get_storage_dir() / "temp"
         self.standard_downloader = StandardModelDownloader()
         self.custom_downloaders: list[BaseDownloader] = [
-            AdapterRegistryDownloader(config.adapter_registry_url, config.adapter_registry_secret.get_secret_value()),
             HuggingFaceRepoDownloader(self.get_hugging_face_token(config)),
             HuggingFaceModelDownloader(self.get_hugging_face_token(config)),
             CivitaiModelDownloader(self.get_civitai_token(config)),

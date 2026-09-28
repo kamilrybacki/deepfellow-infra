@@ -4,11 +4,12 @@
 import asyncio
 import json
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
+import aiohttp
 import pytest
 from fastapi import HTTPException
 
@@ -17,8 +18,10 @@ from server.docker import ContainerStatus
 from server.models.models import AddCustomModelIn, InstallModelIn, ListModelsFilters, UninstallModelIn
 from server.models.services import GpuStats, InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import CustomModel, Instance, InstanceConfig, ModelConfig
+from server.services.finetune_service import FinetuneService
 from server.services.model_catalog_refresh import huggingface_refresh_guard
 from server.services.vllm_service import (
+    AdapterMetadata,
     DownloadedInfo,
     InstalledInfo,
     ModelInstalledInfo,
@@ -27,6 +30,7 @@ from server.services.vllm_service import (
     VllmOptions,
     VllmService,
     _const,  # pyright: ignore[reportPrivateUsage]
+    _round_up_lora_rank,  # pyright: ignore[reportPrivateUsage]
 )
 from server.utils.core import (
     CommandResult,
@@ -48,6 +52,10 @@ def deps() -> dict[str, Any]:
     hw.gpus = []
     hw.nvidia_gpus = []
     hw.intel_gpus = []
+    finetune_service = MagicMock(spec=FinetuneService)
+    finetune_service.get_installed_base_url.return_value = "http://df-finetune:8333"
+    services_manager = MagicMock()
+    services_manager.services = {"finetune": finetune_service}
     return {
         "config": MagicMock(),
         "endpoint_registry": MagicMock(),
@@ -55,6 +63,7 @@ def deps() -> dict[str, Any]:
         "model_downloader": MagicMock(),
         "docker_service": MagicMock(),
         "hardware": hw,
+        "services_manager": services_manager,
     }
 
 
@@ -93,6 +102,23 @@ def _make_model_installed_info(
         gpu_memory_utilization=gpu_memory_utilization,
         model_type=model_type,  # type: ignore[arg-type]
     )
+
+
+def _mock_adapter_registry_session_cls(status: int, json_data: dict[str, Any] | None = None) -> MagicMock:
+    """Build a mock `aiohttp.ClientSession` class whose `session.get(url)` yields a mock response."""
+    mock_response = AsyncMock()
+    mock_response.status = status
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = AsyncMock(return_value=json_data or {})
+    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+    mock_response.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session = AsyncMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    mock_session.get = MagicMock(return_value=mock_response)
+
+    return MagicMock(return_value=mock_session)
 
 
 def _setup_install_mocks(svc: VllmService, deps: dict[str, Any], hardware: str | bool | None = False) -> InstalledInfo:
@@ -266,6 +292,8 @@ def test_generate_instance_config_embeds_definition_when_in_registry(svc: VllmSe
         "size": "1 GB",
         "custom": None,
         "model_type": "llm",
+        "adapter_id": None,
+        "lora_rank": None,
         "supports_vision": None,
         "supports_audio": None,
     }
@@ -434,6 +462,24 @@ def test_add_custom_model_registers_revision(svc: VllmService) -> None:
     svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
 
     assert svc.models["default"]["my-model-rev"].revision == "quantized-awq"
+
+
+def test_add_custom_model_registers_adapter_fields(svc: VllmService) -> None:
+    custom = CustomModel(
+        id="c-1c",
+        data={
+            "id": "pirate-bot",
+            "hf_id": "Qwen/Qwen3-8B",
+            "size": "16GB",
+            "adapter_id": "pirate-llama",
+            "lora_rank": 16,
+        },
+    )
+
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    assert svc.models["default"]["pirate-bot"].adapter_id == "pirate-llama"
+    assert svc.models["default"]["pirate-bot"].lora_rank == 16
 
 
 def test_add_custom_model_duplicate_raises_400(svc: VllmService) -> None:
@@ -966,6 +1012,77 @@ async def test_install_model_dedups_download_by_revision_aware_key(svc: VllmServ
     assert download_key == "google-gemma-3-270m-it--quantized_awq"
 
 
+@pytest.mark.asyncio
+async def test_install_model_downloads_and_mounts_lora_adapter(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """A model with `adapter_id` set must fetch the two safetensors files from the adapter registry,
+    mount them into the container, and pass the resolved rank/path to the vLLM command."""
+    _setup_install_mocks(svc, deps)
+    svc.models["default"]["pirate-bot"] = VllmModel(hf_id="Qwen/Qwen3-8B", size="16GB", adapter_id="pirate-llama", lora_rank=16)
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = "http://df-finetune:8333"
+    download_calls: list[tuple[str, str | None]] = []
+
+    def mock_adapter_downloader_cls(secret: str) -> MagicMock:
+        downloader = MagicMock()
+
+        async def mock_download(  # type: ignore[misc]
+            download_url: str, model_dir: Path, temp_dir: Path, filename: str | None = None, revision: str | None = None
+        ):
+            download_calls.append((download_url, filename))
+            yield SuccessDownloadPacket(local_path=model_dir / (filename or "file"), filename=filename or "file")
+
+        downloader.download = mock_download
+        return downloader
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch("server.services.vllm_service.AdapterRegistryDownloader", side_effect=mock_adapter_downloader_cls),
+        patch.object(
+            svc,
+            "_fetch_adapter_metadata",
+            new_callable=AsyncMock,
+            return_value=AdapterMetadata(base_model="Qwen/Qwen3-8B", rank=16, created=1_700_000_000),
+        ),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", "pirate-bot", InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    urls = {url for url, _ in download_calls}
+    assert urls == {
+        "http://df-finetune:8333/v1/adapters/pirate-llama/safetensors/adapter_config.json",
+        "http://df-finetune:8333/v1/adapters/pirate-llama/safetensors/adapter_model.safetensors",
+    }
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert any("adapter-pirate_llama" in volume and "/mnt/hf/loras/pirate_llama" in volume for volume in docker_options.volumes)
+    assert "--enable-lora" in docker_options.command
+    assert "--lora-modules pirate-bot=/mnt/hf/loras/pirate_llama" in docker_options.command
+    assert "--max-lora-rank 16" in docker_options.command
+    assert svc.models_downloaded["pirate-bot"].adapter_path is not None
+
+
+@pytest.mark.asyncio
+async def test_install_model_raises_400_when_adapter_registry_not_configured(
+    svc: VllmService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    _setup_install_mocks(svc, deps)
+    svc.models["default"]["pirate-bot"] = VllmModel(hf_id="Qwen/Qwen3-8B", size="16GB", adapter_id="pirate-llama", lora_rank=16)
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = None
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+    ):
+        promise = await svc._install_model("default", "pirate-bot", InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(HTTPException) as exc_info:
+            await promise.wait()
+
+    assert exc_info.value.status_code == 400
+
+
 def test_purge_stale_download_removes_old_directory_when_path_changed(svc: VllmService, tmp_path: Path) -> None:
     old_dir = tmp_path / "old-model"
     old_dir.mkdir()
@@ -989,6 +1106,31 @@ def test_purge_stale_download_keeps_directory_when_path_unchanged(svc: VllmServi
 
 def test_purge_stale_download_noop_when_nothing_downloaded_yet(svc: VllmService, tmp_path: Path) -> None:
     svc._purge_stale_download("custom-model", tmp_path / "model")  # pyright: ignore[reportPrivateUsage]
+
+
+def test_purge_stale_download_removes_old_adapter_directory_when_adapter_changed(svc: VllmService, tmp_path: Path) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    old_adapter_dir = tmp_path / "adapter-old"
+    old_adapter_dir.mkdir()
+    new_adapter_dir = tmp_path / "adapter-new"
+    svc.models_downloaded["custom-model"] = DownloadedInfo(model_path=str(model_dir), adapter_path=str(old_adapter_dir))
+
+    svc._purge_stale_download("custom-model", model_dir, new_adapter_dir)  # pyright: ignore[reportPrivateUsage]
+
+    assert not old_adapter_dir.exists()
+
+
+def test_purge_stale_download_keeps_adapter_directory_when_unchanged(svc: VllmService, tmp_path: Path) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    svc.models_downloaded["custom-model"] = DownloadedInfo(model_path=str(model_dir), adapter_path=str(adapter_dir))
+
+    svc._purge_stale_download("custom-model", model_dir, adapter_dir)  # pyright: ignore[reportPrivateUsage]
+
+    assert adapter_dir.exists()
 
 
 @pytest.mark.asyncio
@@ -1690,6 +1832,26 @@ async def test_uninstall_model_purges_files_and_downloaded_entry(svc: VllmServic
 
 
 @pytest.mark.asyncio
+async def test_uninstall_model_purges_adapter_directory(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    installed = _make_installed_info()
+    model_dir = tmp_path / "model-dir"
+    model_dir.mkdir()
+    adapter_dir = tmp_path / "adapter-dir"
+    adapter_dir.mkdir()
+    model_info = _make_model_installed_info("pirate-bot")
+    model_info.model_path = model_dir
+    installed.models["pirate-bot"] = model_info
+    svc.instances_info["default"].installed = installed
+    svc.models_downloaded["pirate-bot"] = DownloadedInfo(model_path=str(model_dir), adapter_path=str(adapter_dir))
+    deps["docker_service"].uninstall_docker = AsyncMock()
+
+    await svc._uninstall_model("default", "pirate-bot", UninstallModelIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert not adapter_dir.exists()
+    assert "pirate-bot" not in svc.models_downloaded
+
+
+@pytest.mark.asyncio
 async def test_uninstall_model_reranker_calls_unregister_rerank(svc: VllmService, deps: dict[str, Any]) -> None:
     installed = _make_installed_info()
     installed.models["reranker-model"] = _make_model_installed_info("reranker-model", "reg-rerank", model_type="reranker")
@@ -2051,6 +2213,68 @@ def test_build_vllm_command_no_gpu_with_model_length(svc: VllmService, tmp_path:
     assert "2048" in cmd
 
 
+def test_build_vllm_command_adds_lora_flags_when_adapter_given(svc: VllmService, tmp_path: Path) -> None:
+    opts = VllmModelOptions.model_construct(extra_args={})
+    adapter_path = tmp_path / "adapter"
+
+    cmd = svc._build_vllm_command(  # pyright: ignore[reportPrivateUsage]
+        docker_model_path=tmp_path / "model",
+        model_id="pirate-bot",
+        opts=opts,
+        quantization=None,
+        gpu_memory_utilization=None,
+        user_model_length=None,
+        use_gpu=True,
+        docker_adapter_path=adapter_path,
+        lora_rank=16,
+    )
+
+    assert "--enable-lora" in cmd
+    assert "--lora-modules" in cmd
+    assert f"pirate-bot={adapter_path}" in cmd
+    assert "--max-lora-rank" in cmd
+    assert "16" in cmd
+
+
+def test_build_vllm_command_adds_lora_flags_without_rank_when_adapter_given_but_no_rank(svc: VllmService, tmp_path: Path) -> None:
+    opts = VllmModelOptions.model_construct(extra_args={})
+    adapter_path = tmp_path / "adapter"
+
+    cmd = svc._build_vllm_command(  # pyright: ignore[reportPrivateUsage]
+        docker_model_path=tmp_path / "model",
+        model_id="pirate-bot",
+        opts=opts,
+        quantization=None,
+        gpu_memory_utilization=None,
+        user_model_length=None,
+        use_gpu=True,
+        docker_adapter_path=adapter_path,
+        lora_rank=None,
+    )
+
+    assert "--enable-lora" in cmd
+    assert "--lora-modules" in cmd
+    assert "--max-lora-rank" not in cmd
+
+
+def test_build_vllm_command_omits_lora_flags_when_no_adapter(svc: VllmService, tmp_path: Path) -> None:
+    opts = VllmModelOptions.model_construct(extra_args={})
+
+    cmd = svc._build_vllm_command(  # pyright: ignore[reportPrivateUsage]
+        docker_model_path=tmp_path / "model",
+        model_id="google/test",
+        opts=opts,
+        quantization=None,
+        gpu_memory_utilization=None,
+        user_model_length=None,
+        use_gpu=True,
+    )
+
+    assert "--enable-lora" not in cmd
+    assert "--lora-modules" not in cmd
+    assert "--max-lora-rank" not in cmd
+
+
 @pytest.mark.asyncio
 async def test_download_model_raises_500_when_no_success_packet(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
     model = VllmModel(hf_id="google/test", size="100MB")
@@ -2282,11 +2506,138 @@ async def test_resolve_custom_model_size_returns_none_on_exception(svc: VllmServ
 
 
 @pytest.mark.asyncio
-async def test_validate_custom_model_skips_when_no_hf_id(svc: VllmService, deps: dict[str, Any]) -> None:
-    with patch("server.services.vllm_service.validate_model_compatibility", new=AsyncMock()) as mock_validate:
+async def test_validate_custom_model_raises_when_neither_hf_id_nor_adapter_id(svc: VllmService, deps: dict[str, Any]) -> None:
+    with (
+        patch("server.services.vllm_service.validate_model_compatibility", new=AsyncMock()) as mock_validate,
+        pytest.raises(HTTPException) as exc_info,
+    ):
         await svc._validate_custom_model({})  # pyright: ignore[reportPrivateUsage]
 
+    assert exc_info.value.status_code == 400
     mock_validate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_validate_custom_model_resolves_hf_id_and_rank_from_adapter_registry(svc: VllmService, deps: dict[str, Any]) -> None:
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = "http://df-finetune:8333"
+    deps["config"].adapter_registry_secret.get_secret_value.return_value = "secret-token"
+    mock_session_cls = _mock_adapter_registry_session_cls(
+        200, {"base_model": "Qwen/Qwen3-8B", "formats": ["safetensors"], "lora": {"rank": 16}}
+    )
+    spec: dict[str, Any] = {"adapter_id": "pirate-llama", "skip_validation": True}
+
+    with patch("server.services.vllm_service.aiohttp.ClientSession", mock_session_cls):
+        await svc._validate_custom_model(spec)  # pyright: ignore[reportPrivateUsage]
+
+    assert spec["hf_id"] == "Qwen/Qwen3-8B"
+    assert spec["lora_rank"] == 16
+    mock_session_cls.return_value.get.assert_called_once_with("http://df-finetune:8333/v1/adapters/pirate-llama")
+
+
+@pytest.mark.asyncio
+async def test_validate_custom_model_returns_when_adapter_resolution_leaves_hf_id_unset(svc: VllmService) -> None:
+    spec: dict[str, Any] = {"adapter_id": "pirate-llama"}
+
+    with patch.object(svc, "_resolve_adapter_metadata", new=AsyncMock()):
+        await svc._validate_custom_model(spec)  # pyright: ignore[reportPrivateUsage]
+
+    assert spec == {"adapter_id": "pirate-llama"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [aiohttp.ClientError("connection refused"), TimeoutError()])
+async def test_resolve_adapter_metadata_raises_on_client_error(svc: VllmService, deps: dict[str, Any], error: Exception) -> None:
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = "http://df-finetune:8333"
+    mock_session_cls = MagicMock()
+    mock_session = AsyncMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    mock_session.get = MagicMock(side_effect=error)
+    mock_session_cls.return_value = mock_session
+
+    with (
+        patch("server.services.vllm_service.aiohttp.ClientSession", mock_session_cls),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc._resolve_adapter_metadata({}, "pirate-llama")  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_resolve_adapter_metadata_raises_when_finetune_not_installed(svc: VllmService, deps: dict[str, Any]) -> None:
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = None
+
+    with pytest.raises(HTTPException) as exc_info:
+        await svc._resolve_adapter_metadata({}, "pirate-llama")  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_resolve_adapter_metadata_raises_on_404(svc: VllmService, deps: dict[str, Any]) -> None:
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = "http://df-finetune:8333"
+    mock_session_cls = _mock_adapter_registry_session_cls(404)
+
+    with (
+        patch("server.services.vllm_service.aiohttp.ClientSession", mock_session_cls),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc._resolve_adapter_metadata({}, "missing-adapter")  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_resolve_adapter_metadata_raises_when_no_safetensors_format(svc: VllmService, deps: dict[str, Any]) -> None:
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = "http://df-finetune:8333"
+    mock_session_cls = _mock_adapter_registry_session_cls(200, {"base_model": "Qwen/Qwen3-8B", "formats": ["gguf"], "lora": {"rank": 16}})
+
+    with (
+        patch("server.services.vllm_service.aiohttp.ClientSession", mock_session_cls),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc._resolve_adapter_metadata({}, "gguf-only-adapter")  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"formats": ["safetensors"], "lora": {}},
+        {"base_model": "Qwen/Qwen3-8B", "formats": ["safetensors"], "lora": {"rank": "16"}},
+        {"base_model": "Qwen/Qwen3-8B", "formats": ["safetensors"], "lora": {"rank": True}},
+        {"base_model": "Qwen/Qwen3-8B", "formats": ["safetensors"], "lora": {"rank": 0}},
+    ],
+)
+async def test_resolve_adapter_metadata_raises_when_missing_base_model_or_invalid_rank(
+    svc: VllmService, deps: dict[str, Any], payload: dict[str, Any]
+) -> None:
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = "http://df-finetune:8333"
+    mock_session_cls = _mock_adapter_registry_session_cls(200, payload)
+
+    with (
+        patch("server.services.vllm_service.aiohttp.ClientSession", mock_session_cls),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc._resolve_adapter_metadata({}, "incomplete-adapter")  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_validate_custom_model_does_not_call_adapter_registry_when_adapter_id_absent(svc: VllmService, deps: dict[str, Any]) -> None:
+    mock_session_cls = _mock_adapter_registry_session_cls(200, {})
+
+    with (
+        patch("server.services.vllm_service.aiohttp.ClientSession", mock_session_cls),
+        patch("server.services.vllm_service.validate_model_compatibility", new=AsyncMock(return_value=None)),
+    ):
+        await svc._validate_custom_model({"hf_id": "org/model"})  # pyright: ignore[reportPrivateUsage]
+
+    mock_session_cls.return_value.get.assert_not_called()
 
 
 @pytest.mark.parametrize("skip_validation", [True, "true", "True", "1", "yes"])
@@ -3410,3 +3761,264 @@ async def test_sync_models_logs_warning_when_background_refresh_fails(svc: VllmS
         await asyncio.sleep(0)  # let the fire-and-forget task run
 
     mock_logger.warning.assert_called_once()
+
+
+def _write_cached_adapter(tmp_path: Path, created: str | None = None) -> Path:
+    adapter_dir = tmp_path / "adapter-pirate_llama"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text("{}")
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"old-weights")
+    if created is not None:
+        (adapter_dir / ".registry_created").write_text(created)
+    return adapter_dir
+
+
+def _mock_adapter_downloader(download_calls: list[str]) -> Callable[..., AsyncIterator[SuccessDownloadPacket]]:
+    async def mock_download(  # type: ignore[misc]
+        download_url: str, model_dir: Path, temp_dir: Path, filename: str | None = None, revision: str | None = None
+    ) -> AsyncIterator[SuccessDownloadPacket]:
+        download_calls.append(download_url)
+        yield SuccessDownloadPacket(local_path=model_dir / (filename or "file"), filename=filename or "file")
+
+    return mock_download
+
+
+def _adapter_model(lora_rank: int = 16) -> VllmModel:
+    return VllmModel(hf_id="Qwen/Qwen3-8B", size="16GB", adapter_id="pirate-llama", lora_rank=lora_rank)
+
+
+_ADAPTER_BASE_URL = "http://df-finetune:8333/v1/adapters/pirate-llama/safetensors"
+
+
+@pytest.mark.asyncio
+async def test_download_adapter_uses_on_disk_copy_when_registry_unavailable(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """A reload at startup can run before the Finetune service has loaded - it must not need it."""
+    adapter_dir = _write_cached_adapter(tmp_path, created="1700000000")
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = None
+    model = _adapter_model()
+
+    with patch("server.services.vllm_service.AdapterRegistryDownloader") as downloader_cls:
+        local_dir, docker_dir = await svc._download_adapter(model, "pirate-llama", tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    assert local_dir == adapter_dir
+    assert docker_dir == Path(svc.hugging_face_cache_path) / "loras" / "pirate_llama"
+    assert (adapter_dir / "adapter_model.safetensors").read_bytes() == b"old-weights"
+    assert model.lora_rank == 16
+    downloader_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_download_adapter_keeps_on_disk_copy_when_registry_created_matches(svc: VllmService, tmp_path: Path) -> None:
+    _write_cached_adapter(tmp_path, created="1700000000")
+    metadata = AdapterMetadata(base_model="Qwen/Qwen3-8B", rank=16, created=1_700_000_000)
+
+    with (
+        patch.object(svc, "_fetch_adapter_metadata", new_callable=AsyncMock, return_value=metadata),
+        patch("server.services.vllm_service.AdapterRegistryDownloader") as downloader_cls,
+    ):
+        await svc._download_adapter(_adapter_model(), "pirate-llama", tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    downloader_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_download_adapter_redownloads_all_files_and_refreshes_rank_when_registry_created_differs(
+    svc: VllmService, tmp_path: Path
+) -> None:
+    """An adapter retrained under the same id must not be served from stale weights with a stale rank."""
+    adapter_dir = _write_cached_adapter(tmp_path, created="1700000000")
+    metadata = AdapterMetadata(base_model="Qwen/Qwen3-8B", rank=64, created=1_800_000_000)
+    download_calls: list[str] = []
+    model = _adapter_model(lora_rank=16)
+
+    with (
+        patch.object(svc, "_fetch_adapter_metadata", new_callable=AsyncMock, return_value=metadata),
+        patch("server.services.vllm_service.AdapterRegistryDownloader") as downloader_cls,
+    ):
+        downloader_cls.return_value.download = _mock_adapter_downloader(download_calls)
+        await svc._download_adapter(model, "pirate-llama", tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    assert download_calls == [f"{_ADAPTER_BASE_URL}/adapter_config.json", f"{_ADAPTER_BASE_URL}/adapter_model.safetensors"]
+    # the real downloader skips existing files, so the stale ones must be removed before downloading
+    assert not (adapter_dir / "adapter_model.safetensors").exists()
+    assert not (adapter_dir / "adapter_config.json").exists()
+    assert (adapter_dir / ".registry_created").read_text() == "1800000000"
+    assert model.lora_rank == 64
+
+
+@pytest.mark.asyncio
+async def test_download_adapter_redownloads_when_marker_missing(svc: VllmService, tmp_path: Path) -> None:
+    adapter_dir = _write_cached_adapter(tmp_path)
+    metadata = AdapterMetadata(base_model="Qwen/Qwen3-8B", rank=16, created=1_700_000_000)
+    download_calls: list[str] = []
+
+    with (
+        patch.object(svc, "_fetch_adapter_metadata", new_callable=AsyncMock, return_value=metadata),
+        patch("server.services.vllm_service.AdapterRegistryDownloader") as downloader_cls,
+    ):
+        downloader_cls.return_value.download = _mock_adapter_downloader(download_calls)
+        await svc._download_adapter(_adapter_model(), "pirate-llama", tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    assert len(download_calls) == 2
+    assert (adapter_dir / ".registry_created").read_text() == "1700000000"
+
+
+@pytest.mark.asyncio
+async def test_download_adapter_trusts_on_disk_copy_when_registry_created_unknown(svc: VllmService, tmp_path: Path) -> None:
+    adapter_dir = _write_cached_adapter(tmp_path)
+    metadata = AdapterMetadata(base_model="Qwen/Qwen3-8B", rank=16, created=None)
+
+    with (
+        patch.object(svc, "_fetch_adapter_metadata", new_callable=AsyncMock, return_value=metadata),
+        patch("server.services.vllm_service.AdapterRegistryDownloader") as downloader_cls,
+    ):
+        await svc._download_adapter(_adapter_model(), "pirate-llama", tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    downloader_cls.assert_not_called()
+    assert not (adapter_dir / ".registry_created").exists()
+
+
+@pytest.mark.asyncio
+async def test_download_adapter_fetches_only_missing_files(svc: VllmService, tmp_path: Path) -> None:
+    adapter_dir = tmp_path / "adapter-pirate_llama"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text("{}")
+    (adapter_dir / ".registry_created").write_text("1700000000")
+    metadata = AdapterMetadata(base_model="Qwen/Qwen3-8B", rank=16, created=1_700_000_000)
+    download_calls: list[str] = []
+
+    with (
+        patch.object(svc, "_fetch_adapter_metadata", new_callable=AsyncMock, return_value=metadata),
+        patch("server.services.vllm_service.AdapterRegistryDownloader") as downloader_cls,
+    ):
+        downloader_cls.return_value.download = _mock_adapter_downloader(download_calls)
+        await svc._download_adapter(_adapter_model(), "pirate-llama", tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    assert download_calls == [f"{_ADAPTER_BASE_URL}/adapter_model.safetensors"]
+
+
+@pytest.mark.asyncio
+async def test_download_adapter_raises_when_files_missing_and_registry_unavailable(
+    svc: VllmService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = None
+
+    with pytest.raises(HTTPException) as exc_info:
+        await svc._download_adapter(_adapter_model(), "pirate-llama", tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_download_adapter_raises_when_base_model_changed(svc: VllmService, tmp_path: Path) -> None:
+    _write_cached_adapter(tmp_path, created="1700000000")
+    metadata = AdapterMetadata(base_model="meta-llama/Llama-3.1-8B", rank=16, created=1_800_000_000)
+
+    with (
+        patch.object(svc, "_fetch_adapter_metadata", new_callable=AsyncMock, return_value=metadata),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc._download_adapter(_adapter_model(), "pirate-llama", tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+    assert "meta-llama/Llama-3.1-8B" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("created", "expected"), [(1_700_000_000, 1_700_000_000), (0, None), (None, None), (True, None)])
+async def test_fetch_adapter_metadata_normalizes_created(
+    svc: VllmService, deps: dict[str, Any], created: object, expected: int | None
+) -> None:
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = "http://df-finetune:8333"
+    payload = {"formats": ["safetensors"], "base_model": "Qwen/Qwen3-8B", "lora": {"rank": 16}, "created": created}
+    mock_session_cls = _mock_adapter_registry_session_cls(200, payload)
+
+    with patch("server.services.vllm_service.aiohttp.ClientSession", mock_session_cls):
+        metadata = await svc._fetch_adapter_metadata("pirate-llama")  # pyright: ignore[reportPrivateUsage]
+
+    assert metadata == AdapterMetadata(base_model="Qwen/Qwen3-8B", rank=16, created=expected)
+
+
+def test_purge_stale_download_keeps_old_adapter_directory_used_by_another_model(svc: VllmService, tmp_path: Path) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    shared_adapter_dir = tmp_path / "adapter-shared"
+    shared_adapter_dir.mkdir()
+    svc.models_downloaded["custom-model"] = DownloadedInfo(model_path=str(model_dir), adapter_path=str(shared_adapter_dir))
+    svc.models_downloaded["other-model"] = DownloadedInfo(model_path=str(model_dir), adapter_path=str(shared_adapter_dir))
+
+    svc._purge_stale_download("custom-model", model_dir, tmp_path / "adapter-new")  # pyright: ignore[reportPrivateUsage]
+
+    assert shared_adapter_dir.exists()
+
+
+def test_purge_stale_download_keeps_old_model_directory_used_by_another_model(svc: VllmService, tmp_path: Path) -> None:
+    shared_model_dir = tmp_path / "shared-model"
+    shared_model_dir.mkdir()
+    svc.models_downloaded["custom-model"] = DownloadedInfo(model_path=str(shared_model_dir))
+    svc.models_downloaded["other-model"] = DownloadedInfo(model_path=str(shared_model_dir))
+
+    svc._purge_stale_download("custom-model", tmp_path / "new-model")  # pyright: ignore[reportPrivateUsage]
+
+    assert shared_model_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_uninstall_model_purge_keeps_directories_used_by_another_model(
+    svc: VllmService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    """Two adapters on the same base model share its weights; purging one must not break the other."""
+    shared_model_dir = tmp_path / "model-dir"
+    shared_model_dir.mkdir()
+    shared_adapter_dir = tmp_path / "adapter-dir"
+    shared_adapter_dir.mkdir()
+    svc.instances_info["default"].installed = _make_installed_info()
+    svc.models_downloaded["pirate-bot"] = DownloadedInfo(model_path=str(shared_model_dir), adapter_path=str(shared_adapter_dir))
+    svc.models_downloaded["pirate-bot-2"] = DownloadedInfo(model_path=str(shared_model_dir), adapter_path=str(shared_adapter_dir))
+    deps["docker_service"].uninstall_docker = AsyncMock()
+
+    await svc._uninstall_model("default", "pirate-bot", UninstallModelIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert shared_model_dir.exists()
+    assert shared_adapter_dir.exists()
+    assert "pirate-bot" not in svc.models_downloaded
+    assert "pirate-bot-2" in svc.models_downloaded
+
+
+@pytest.mark.parametrize(
+    ("rank", "expected"),
+    [(1, 1), (4, 8), (8, 8), (12, 16), (16, 16), (300, 320), (512, 512), (1024, 1024)],
+)
+def test_round_up_lora_rank(rank: int, expected: int) -> None:
+    assert _round_up_lora_rank(rank) == expected
+
+
+def test_build_vllm_command_rounds_lora_rank_up_to_vllm_allowed_value(svc: VllmService, tmp_path: Path) -> None:
+    cmd = svc._build_vllm_command(  # pyright: ignore[reportPrivateUsage]
+        docker_model_path=tmp_path / "model",
+        model_id="pirate-bot",
+        opts=VllmModelOptions.model_construct(extra_args={}),
+        quantization=None,
+        gpu_memory_utilization=None,
+        user_model_length=None,
+        use_gpu=True,
+        docker_adapter_path=tmp_path / "adapter",
+        lora_rank=12,
+    )
+
+    assert cmd[cmd.index("--max-lora-rank") + 1] == "16"
+
+
+@pytest.mark.asyncio
+async def test_resolve_adapter_metadata_raises_when_rank_above_vllm_maximum(svc: VllmService) -> None:
+    mock_session_cls = _mock_adapter_registry_session_cls(
+        200, {"base_model": "Qwen/Qwen3-8B", "formats": ["safetensors"], "lora": {"rank": 1024}}
+    )
+
+    with (
+        patch("server.services.vllm_service.aiohttp.ClientSession", mock_session_cls),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc._resolve_adapter_metadata({}, "huge-adapter")  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400

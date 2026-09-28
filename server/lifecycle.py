@@ -27,6 +27,7 @@ from server.services.coqui_service import CoquiService
 from server.services.custom_service import CustomService
 from server.services.deepseek_service import DeepSeekService
 from server.services.docker_model_runner_service import DockerModelRunnerService
+from server.services.finetune_service import FinetuneService
 from server.services.googleai_service import GoogleAIService
 from server.services.kimi_service import KimiService
 from server.services.llamacpp_service import LLamacppService
@@ -104,7 +105,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         app.state.docker_service = docker_service = await create_docker_service(port_service, config)
         app.state.model_downloader = model_downloader = ModelDownloader(app.state.config)
 
-        model_input = (config, endpoint_registry, service_provider, model_downloader, docker_service, hardware)
+        model_input = (config, endpoint_registry, service_provider, model_downloader, docker_service, hardware, services_manager)
 
         # Register services
         services_manager.register_service(ClaudeService(*model_input))
@@ -112,6 +113,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         services_manager.register_service(CustomService(*model_input))
         services_manager.register_service(DeepSeekService(*model_input))
         services_manager.register_service(DockerModelRunnerService(*model_input))
+        services_manager.register_service(FinetuneService(*model_input))
         services_manager.register_service(GoogleAIService(*model_input))
         services_manager.register_service(KimiService(*model_input))
         services_manager.register_service(LLamacppService(*model_input))

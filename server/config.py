@@ -51,7 +51,6 @@ class AppSettings(BaseSettings):
 
     hugging_face_token: SecretStr = SecretStr("")
     civitai_token: SecretStr = SecretStr("")
-    adapter_registry_url: str = ""
     adapter_registry_secret: SecretStr = SecretStr("")
     log_payloads: str = ""
     stop_containers_on_shutdown: str = ""
