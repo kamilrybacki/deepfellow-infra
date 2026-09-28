@@ -15,6 +15,7 @@ from scripts.get_huggingface_models import (
     EMBEDDING_TAGS,
     RERANKER_TAGS,
     ModelIncompatibleError,
+    classify_modality_support,
     collect_embedding_models,
     collect_llm_models,
     collect_reranker_models,
@@ -141,6 +142,27 @@ def test_is_reranker(input_dict: dict[str, str], expected: bool):
 )
 def test_is_supported_cross_encoder(architectures: list[str], expected: bool) -> None:
     assert is_supported_cross_encoder(architectures) is expected
+
+
+@pytest.mark.parametrize(
+    ("architectures", "expected"),
+    [
+        (["Qwen2_5_VLForConditionalGeneration"], (True, None)),
+        (["SomeNewQwen3VLForConditionalGeneration"], (True, None)),
+        (["Qwen2AudioForConditionalGeneration"], (None, True)),
+        (["Qwen3ForCausalLM"], (None, None)),
+        ([], (None, None)),
+    ],
+    ids=[
+        "exact_allowlist_match",
+        "vl_substring_match",
+        "audio_allowlist_match",
+        "unlisted_architecture_is_unknown_not_false",
+        "empty_architectures_is_unknown_not_false",
+    ],
+)
+def test_classify_modality_support(architectures: list[str], expected: tuple[bool | None, bool | None]) -> None:
+    assert classify_modality_support(architectures) == expected
 
 
 @pytest.mark.asyncio
@@ -1199,7 +1221,7 @@ async def test_main_output_writes_file_and_preserves_other_key(tmp_path: Path) -
         await main(10, 0, 0, raw=True, model_type="llm", output=str(output_path))
 
     data = json.loads(output_path.read_text())
-    assert data["llms"] == [{"name": "org/llama", "size": "4GB"}]
+    assert data["llms"] == [{"name": "org/llama", "size": "4GB", "supports_vision": None, "supports_audio": None}]
     assert data["rerankers"] == [{"name": "org/existing-reranker", "size": "1GB"}]
 
 
@@ -1227,7 +1249,7 @@ async def test_main_output_overwrites_same_key(tmp_path: Path) -> None:
         await main(10, 0, 0, raw=True, model_type="llm", output=str(output_path))
 
     data = json.loads(output_path.read_text())
-    assert data["llms"] == [{"name": "org/new-model", "size": "2GB"}]
+    assert data["llms"] == [{"name": "org/new-model", "size": "2GB", "supports_vision": None, "supports_audio": None}]
 
 
 @pytest.mark.asyncio

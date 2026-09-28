@@ -201,6 +201,34 @@ def test_build_entries_skips_mmproj_files() -> None:
     assert names == ["org/model-q4-k-m"]
 
 
+def test_build_entries_records_mmproj_presence_as_hint_not_supports_vision() -> None:
+    """A companion mmproj file is a catalog hint only - llama.cpp installs don't wire it up.
+
+    `supports_vision` must stay None (never a wrong "vision works" guess); the presence signal
+    is instead carried separately as `has_mmproj`.
+    """
+    siblings = [
+        {"rfilename": "mmproj-F16.gguf", "size": 1024**3},
+        {"rfilename": "model-Q4_K_M.gguf", "size": 1024**3},
+    ]
+
+    entries = build_entries("org/model", siblings)
+
+    assert len(entries) == 1
+    assert entries[0].supports_vision is None
+    assert entries[0].has_mmproj is True
+
+
+def test_build_entries_has_mmproj_none_when_no_mmproj_file() -> None:
+    siblings = [{"rfilename": "model-Q4_K_M.gguf", "size": 1024**3}]
+
+    entries = build_entries("org/model", siblings)
+
+    assert len(entries) == 1
+    assert entries[0].supports_vision is None
+    assert entries[0].has_mmproj is None
+
+
 def test_build_entries_skips_subdirectory_files() -> None:
     siblings = [
         {"rfilename": "unet/Model-Q4_K_M.gguf", "size": 1024**3},
@@ -600,6 +628,8 @@ async def test_main_output_writes_file_and_preserves_other_key(tmp_path: Path) -
             "url": "https://huggingface.co/org/model-GGUF/resolve/main/model-Q4_K_M.gguf",
             "size": "1.1GB",
             "jinja": False,
+            "supports_vision": None,
+            "has_mmproj": None,
         }
     ]
     assert data["other_key"] == ["unrelated"]
@@ -646,6 +676,8 @@ async def test_main_output_preserves_jinja_flag_for_reappearing_entry(tmp_path: 
             "url": "https://huggingface.co/org/model-GGUF/resolve/main/model-Q4_K_M.gguf",
             "size": "1.1GB",
             "jinja": True,
+            "supports_vision": None,
+            "has_mmproj": None,
         }
     ]
 

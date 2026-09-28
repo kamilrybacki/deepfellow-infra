@@ -63,6 +63,8 @@ def make_props(
     endpoints: list[str] | None = None,
     context_window: int | None = None,
     max_context_window: int | None = None,
+    supports_vision: bool | None = None,
+    supports_audio: bool | None = None,
 ) -> ModelProps:
     return ModelProps(
         private=private,
@@ -70,6 +72,8 @@ def make_props(
         endpoints=endpoints or ["chat"],
         context_window=context_window,
         max_context_window=max_context_window,
+        supports_vision=supports_vision,
+        supports_audio=supports_audio,
     )
 
 
@@ -1095,6 +1099,115 @@ def test_get_max_context_window_ignores_registrations_without_a_window():
     assert ep.get_max_context_window(ep.models["gpt-4"]) == 16000
 
 
+def test_get_model_supports_vision_true_when_any_registration_true():
+    ep = make_endpoint()
+    ep.add_model(
+        "vlm",
+        make_props(supports_vision=None),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-1"),
+    )
+    ep.add_model(
+        "vlm",
+        make_props(supports_vision=True),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-2"),
+    )
+
+    assert ep.get_model_supports_vision(ep.models["vlm"]) is True
+
+
+def test_get_model_supports_vision_false_when_all_registrations_false():
+    ep = make_endpoint()
+    ep.add_model(
+        "text-only",
+        make_props(supports_vision=False),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-1"),
+    )
+    ep.add_model(
+        "text-only",
+        make_props(supports_vision=False),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-2"),
+    )
+
+    assert ep.get_model_supports_vision(ep.models["text-only"]) is False
+
+
+def test_get_model_supports_vision_none_when_mixed_none_and_false():
+    ep = make_endpoint()
+    ep.add_model(
+        "unknown-model",
+        make_props(supports_vision=None),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-1"),
+    )
+    ep.add_model(
+        "unknown-model",
+        make_props(supports_vision=False),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-2"),
+    )
+
+    assert ep.get_model_supports_vision(ep.models["unknown-model"]) is None
+
+
+def test_get_model_supports_vision_none_when_undeclared():
+    ep = make_endpoint()
+    ep.add_model(
+        "custom-model",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "custom",
+        RegistrationOptions(origin="local", id="id-1"),
+    )
+
+    assert ep.get_model_supports_vision(ep.models["custom-model"]) is None
+
+
+def test_get_model_supports_audio_true_when_any_registration_true():
+    ep = make_endpoint()
+    ep.add_model(
+        "alm",
+        make_props(supports_audio=None),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-1"),
+    )
+    ep.add_model(
+        "alm",
+        make_props(supports_audio=True),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-2"),
+    )
+
+    assert ep.get_model_supports_audio(ep.models["alm"]) is True
+
+
+def test_build_api_model_includes_modality_support():
+    ep = make_endpoint()
+    ep.add_model(
+        "vlm",
+        make_props(supports_vision=True, supports_audio=False),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-1"),
+    )
+
+    api_model = ep._build_api_model("vlm", ep.models["vlm"])  # pyright: ignore[reportPrivateUsage]
+
+    assert api_model.props.supports_vision is True
+    assert api_model.props.supports_audio is False
+
+
 def test_get_models_returns_api_model_list():
     ep = make_endpoint()
     ep.add_model("gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local"))
@@ -1932,6 +2045,38 @@ def test_update_warm_does_not_propagate_when_unchanged():
     reg.update_warm(rid, True)
 
     assert reg.parent_infra.send_warm.call_count == 0  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_update_modality_support_updates_props_in_place():
+    reg = make_registry()
+    ep = make_chat_endpoint()
+    rid = reg.register_chat_completion(
+        "gpt-4", make_props(supports_vision=None, supports_audio=None), ep, RegistrationOptions(origin="local")
+    )
+
+    reg.update_modality_support(rid, supports_vision=True, supports_audio=False)
+
+    props = reg.registry[rid].registered_model.props
+    assert props.supports_vision is True
+    assert props.supports_audio is False
+
+
+def test_update_modality_support_no_op_for_unknown_id():
+    reg = make_registry()
+    reg.update_modality_support("nonexistent", supports_vision=True, supports_audio=True)  # must not raise
+
+
+def test_update_modality_support_is_no_op_when_unchanged():
+    reg = make_registry()
+    ep = make_chat_endpoint()
+    rid = reg.register_chat_completion(
+        "gpt-4", make_props(supports_vision=True, supports_audio=None), ep, RegistrationOptions(origin="local")
+    )
+    original_props = reg.registry[rid].registered_model.props
+
+    reg.update_modality_support(rid, supports_vision=True, supports_audio=None)
+
+    assert reg.registry[rid].registered_model.props is original_props
 
 
 def test_update_models_sends_models_list_when_changed():

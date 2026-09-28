@@ -382,6 +382,28 @@ class Endpoint[T]:
                 return item.props.tools
         return []
 
+    @staticmethod
+    def _aggregate_modality_support(values: list[bool | None]) -> bool | None:
+        """Aggregate a modality flag (`supports_vision`/`supports_audio`) across a model's registrations.
+
+        `True` if any registration reports `True` (the model can do it on at least one backend),
+        `False` if every registration explicitly reports `False` (confirmed unsupported everywhere),
+        otherwise `None` (unknown, or a mix of `None` and `False` with no confirmed `True`).
+        """
+        if any(v is True for v in values):
+            return True
+        if values and all(v is False for v in values):
+            return False
+        return None
+
+    def get_model_supports_vision(self, model: dict[RegistrationId, RegisteredModel[T]]) -> bool | None:
+        """Aggregate `supports_vision` across a model's registrations. See `_aggregate_modality_support`."""
+        return self._aggregate_modality_support([item.props.supports_vision for item in model.values()])
+
+    def get_model_supports_audio(self, model: dict[RegistrationId, RegisteredModel[T]]) -> bool | None:
+        """Aggregate `supports_audio` across a model's registrations. See `_aggregate_modality_support`."""
+        return self._aggregate_modality_support([item.props.supports_audio for item in model.values()])
+
     def _build_api_model(self, model_id: ModelId, model: dict[RegistrationId, RegisteredModel[T]]) -> ApiModel:
         """Build an ApiModel from a model's registrations."""
         return ApiModel(
@@ -398,6 +420,8 @@ class Endpoint[T]:
                 prefix=self.get_model_prefix(model),
                 transport=self.get_model_transport(model),
                 tools=self.get_model_tools(model),
+                supports_vision=self.get_model_supports_vision(model),
+                supports_audio=self.get_model_supports_audio(model),
             ),
         )
 
@@ -1154,6 +1178,23 @@ class EndpointRegistry:
         if entry and entry.registered_model.warm != warm:
             entry.registered_model.warm = warm
             self.parent_infra.send_warm(WarmChangeRequest(id=registration_id, warm=warm))
+
+    def update_modality_support(
+        self, registration_id: RegistrationId, *, supports_vision: bool | None, supports_audio: bool | None
+    ) -> None:
+        """Update a registration's resolved `supports_vision`/`supports_audio` in place.
+
+        Lets a service keep an already-registered model's props in sync when its catalog is
+        refreshed after install (e.g. a `classify_modality_support` fix or a regenerated static
+        catalog correcting a previously-unknown or wrong value), without unregistering and losing
+        the registration's id, usage counters, or warm/health state.
+        """
+        entry = self.registry.get(registration_id, None)
+        if entry is None:
+            return
+        props = entry.registered_model.props
+        if props.supports_vision != supports_vision or props.supports_audio != supports_audio:
+            entry.registered_model.props = props.model_copy(update={"supports_vision": supports_vision, "supports_audio": supports_audio})
 
     def update_models(self, prev_list: list[Model], new_list: list[Model], api_url: str, api_key: str, owned_by: str = "mesh") -> None:
         """Update models, it remove old models and add new ones.

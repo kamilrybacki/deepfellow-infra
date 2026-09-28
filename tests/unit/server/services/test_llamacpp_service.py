@@ -296,6 +296,7 @@ def test_generate_instance_config_embeds_definition_when_in_registry(svc: LLamac
         "size": "1 GB",
         "custom": None,
         "jinja": False,
+        "supports_vision": None,
     }
 
 
@@ -611,6 +612,51 @@ async def test_install_model_registers_endpoint(svc: LLamacppService, deps: dict
         await promise.wait()
 
     assert deps["endpoint_registry"].register_chat_completion_as_proxy.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_install_model_supports_vision_defaults_to_none(svc: LLamacppService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """A catalog entry with no confirmed capability must register with `supports_vision=None`.
+
+    `LlamacppModel` has no `has_mmproj` field - the catalog's mmproj presence hint never reaches
+    installed-model registration - so this pins that an unresolved catalog value never turns into
+    a wrong "vision works" guess here.
+    """
+    _setup_install_mocks(svc, deps)
+    model_id = "vision-candidate"
+    svc.models["default"][model_id] = LlamacppModel(url="https://example.com/model.gguf", size="1 GB", supports_vision=None)
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=(tmp_path / "model.gguf", "model.gguf")),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.llamacpp_service.get_gguf_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.llamacpp_service.get_base_url", return_value="http://localhost:8080"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
+    assert call_kwargs["props"].supports_vision is None
+
+
+@pytest.mark.asyncio
+async def test_install_model_forwards_confirmed_supports_vision(svc: LLamacppService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """A catalog entry with a confirmed `supports_vision` value is still forwarded as-is."""
+    _setup_install_mocks(svc, deps)
+    model_id = "known-vision-model"
+    svc.models["default"][model_id] = LlamacppModel(url="https://example.com/model.gguf", size="1 GB", supports_vision=True)
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=(tmp_path / "model.gguf", "model.gguf")),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.llamacpp_service.get_gguf_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.llamacpp_service.get_base_url", return_value="http://localhost:8080"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
+    assert call_kwargs["props"].supports_vision is True
 
 
 @pytest.mark.asyncio
@@ -1524,7 +1570,9 @@ async def test_refresh_catalog_writes_registry_and_reloads_const(svc: LLamacppSe
         assert "old-model" not in _const.models
         written = json.loads((tmp_path / "static" / "llamacpp-min.json").read_text(encoding="utf-8"))
         # jinja flag carried forward because the URL matches the previous entry
-        assert written["llms"] == [{"name": "new-model", "url": "https://old", "size": "2GB", "jinja": True}]
+        assert written["llms"] == [
+            {"name": "new-model", "url": "https://old", "size": "2GB", "jinja": True, "supports_vision": None, "has_mmproj": None}
+        ]
         assert set(svc.models["default"].keys()) == set(_const.models.keys())
     finally:
         _const.models = original_models

@@ -21,6 +21,7 @@ from server.services.ollama_service import (
     DownloadedInfo,
     InstalledInfo,
     LoadedModelInfo,
+    ModelCapabilities,
     ModelInstalledInfo,
     OllamaModel,
     OllamaModelFile,
@@ -1122,6 +1123,30 @@ async def test_install_model_registers_llm_endpoint(svc: OllamaService, deps: di
 
 
 @pytest.mark.asyncio
+async def test_install_model_registers_llm_endpoint_with_resolved_capabilities(svc: OllamaService, deps: dict[str, Any]) -> None:
+    """The model is already pulled by install time, so `/api/show` can resolve real capabilities
+    instead of registering with permanently-unknown `supports_vision`/`supports_audio`."""
+    installed = _make_installed_info(svc)
+    svc.instances_info["default"].installed = installed
+    svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm", hash="abc", context=4096)
+
+    with (
+        patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
+        patch.object(
+            svc, "_get_capabilities", new_callable=AsyncMock, return_value=ModelCapabilities(supports_vision=True, supports_audio=None)
+        ) as mock_capabilities,
+    ):
+        mock_fetch.return_value = FetchResult(status_code=200, data="")
+        promise = await svc._install_model("default", "test-llm", InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    mock_capabilities.assert_called_once()
+    call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
+    assert call_kwargs["props"].supports_vision is True
+    assert call_kwargs["props"].supports_audio is None
+
+
+@pytest.mark.asyncio
 async def test_install_model_registers_embedding_endpoint(svc: OllamaService, deps: dict[str, Any]) -> None:
     installed = _make_installed_info(svc)
     svc.instances_info["default"].installed = installed
@@ -1194,6 +1219,67 @@ async def test_install_model_generates_context_modelfile_for_llm_with_custom_con
     modelfile_recipe: str = mock_install.call_args.args[2]
     assert "num_ctx 8192" in modelfile_recipe
     assert "FROM test-llm" in modelfile_recipe
+
+
+@pytest.mark.asyncio
+async def test_install_model_evicts_cache_under_previous_internal_name(svc: OllamaService, deps: dict[str, Any]) -> None:
+    """Re-installing a model previously installed with a custom-context internal name must evict
+    the cache entry actually written under that internal name, not just under `model_id`."""
+    installed = _make_installed_info(svc)
+    installed.models["test-llm"] = ModelInstalledInfo(
+        id="test-llm",
+        registered_name="test-llm",
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+        internal_name="test-llm-customcontextlength",
+    )
+    svc.instances_info["default"].installed = installed
+    svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm", hash="abc", context=4096)
+    svc._arch_cache[("default", "test-llm-customcontextlength")] = ArchParams(  # pyright: ignore[reportPrivateUsage]
+        hidden_size=4096, num_attention_heads=32, num_key_value_heads=8, num_hidden_layers=32
+    )
+    svc._capabilities_cache[("default", "test-llm-customcontextlength")] = ModelCapabilities(  # pyright: ignore[reportPrivateUsage]
+        supports_vision=True
+    )
+
+    with patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=200, data="")
+        promise = await svc._install_model("default", "test-llm", InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    assert ("default", "test-llm-customcontextlength") not in svc._arch_cache  # pyright: ignore[reportPrivateUsage]
+    assert ("default", "test-llm-customcontextlength") not in svc._capabilities_cache  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_uninstall_model_evicts_cache_under_internal_name(svc: OllamaService) -> None:
+    """A custom-context install's cache entry is written under its internal name, not `model_id` -
+    uninstalling it must evict that same key so a later reinstall doesn't serve stale capabilities."""
+    installed = _make_installed_info(svc)
+    installed.models["test-llm"] = ModelInstalledInfo(
+        id="test-llm",
+        registered_name="test-llm",
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+        internal_name="test-llm-customcontextlength",
+    )
+    svc.instances_info["default"].installed = installed
+    svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm", hash="abc", context=4096)
+    svc._arch_cache[("default", "test-llm-customcontextlength")] = ArchParams(  # pyright: ignore[reportPrivateUsage]
+        hidden_size=4096, num_attention_heads=32, num_key_value_heads=8, num_hidden_layers=32
+    )
+    svc._capabilities_cache[("default", "test-llm-customcontextlength")] = ModelCapabilities(  # pyright: ignore[reportPrivateUsage]
+        supports_vision=True
+    )
+
+    with patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=200, data="")
+        await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=False))  # pyright: ignore[reportPrivateUsage]
+
+    assert ("default", "test-llm-customcontextlength") not in svc._arch_cache  # pyright: ignore[reportPrivateUsage]
+    assert ("default", "test-llm-customcontextlength") not in svc._capabilities_cache  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
@@ -2880,6 +2966,83 @@ async def test_get_model_resolves_vram_when_loaded_info_available(svc: OllamaSer
 
     assert result.id == model_id
     assert result.is_loaded is False
+
+
+@pytest.mark.asyncio
+async def test_get_model_resolves_capabilities_when_registered(svc: OllamaService) -> None:
+    installed = _make_installed_info(svc)
+    model_id = next(iter(svc.models["default"]))
+    installed.models[model_id] = ModelInstalledInfo(
+        id=model_id,
+        registered_name=model_id,
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+        internal_name=None,
+    )
+    svc.instances_info["default"].installed = installed
+
+    with (
+        patch.object(svc, "_get_loaded_models", new_callable=AsyncMock, return_value={}),
+        patch.object(svc, "_get_model_sizes", new_callable=AsyncMock, return_value={}),
+        patch.object(svc, "_get_capabilities", new_callable=AsyncMock, return_value=ModelCapabilities(supports_vision=True)),
+    ):
+        result = await svc.get_model("default", model_id)
+
+    assert result.supports_vision is True
+
+
+@pytest.mark.asyncio
+async def test_get_model_skips_capabilities_when_loaded_info_unavailable(svc: OllamaService) -> None:
+    """A failed `/api/ps` for this call must not still trigger a slow `/api/show` lookup."""
+    installed = _make_installed_info(svc)
+    model_id = next(iter(svc.models["default"]))
+    installed.models[model_id] = ModelInstalledInfo(
+        id=model_id,
+        registered_name=model_id,
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+        internal_name=None,
+    )
+    svc.instances_info["default"].installed = installed
+
+    with (
+        patch.object(svc, "_get_loaded_models", new_callable=AsyncMock, return_value=None),
+        patch.object(svc, "_get_model_sizes", new_callable=AsyncMock, return_value={}),
+        patch.object(svc, "_get_capabilities", new_callable=AsyncMock) as mock_capabilities,
+    ):
+        result = await svc.get_model("default", model_id)
+
+    mock_capabilities.assert_not_called()
+    assert result.supports_vision is None
+
+
+@pytest.mark.asyncio
+async def test_list_models_skips_capabilities_when_loaded_info_unavailable(svc: OllamaService) -> None:
+    """A failed `/api/ps` for this call must not still trigger a slow `/api/show` lookup."""
+    installed = _make_installed_info(svc)
+    model_id = next(iter(svc.models["default"]))
+    installed.models[model_id] = ModelInstalledInfo(
+        id=model_id,
+        registered_name=model_id,
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+        internal_name=None,
+    )
+    svc.instances_info["default"].installed = installed
+
+    with (
+        patch.object(svc, "_get_loaded_models", new_callable=AsyncMock, return_value=None),
+        patch.object(svc, "_get_model_sizes", new_callable=AsyncMock, return_value={}),
+        patch.object(svc, "_get_capabilities", new_callable=AsyncMock) as mock_capabilities,
+    ):
+        result = await svc.list_models("default", ListModelsFilters())
+
+    mock_capabilities.assert_not_called()
+    resolved = next(m for m in result.list if m.id == model_id)
+    assert resolved.supports_vision is None
 
 
 @pytest.mark.asyncio

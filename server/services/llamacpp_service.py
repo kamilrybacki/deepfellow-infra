@@ -80,6 +80,9 @@ class LlamacppModel(BaseModel):
     size: str
     custom: CustomModelId | None = None
     jinja: bool = False
+    # Presence-only signal from `scripts/get_llamacpp_models.py` (a companion mmproj GGUF found
+    # alongside this file in its HF repo listing). None means unresolved.
+    supports_vision: bool | None = None
 
 
 class LlamacppCustomModel(BaseModel):
@@ -101,7 +104,10 @@ def _read_models() -> dict[str, LlamacppModel]:
     llamacpp_path = get_main_dir() / "./static/llamacpp-min.json"
     with llamacpp_path.open(encoding="utf-8") as f:
         registry = LlamacppRegistry.model_validate_json(f.read())
-        return {entry.name: LlamacppModel(url=entry.url, size=entry.size, jinja=entry.jinja) for entry in registry.llms}
+        return {
+            entry.name: LlamacppModel(url=entry.url, size=entry.size, jinja=entry.jinja, supports_vision=entry.supports_vision)
+            for entry in registry.llms
+        }
 
 
 _const = LlamacppConst(
@@ -550,6 +556,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
                             has_docker=True,
                             is_loaded=is_loaded,
                             vram_estimate_gb=vram_estimate_gb,
+                            supports_vision=model.supports_vision,
                         )
                     )
 
@@ -577,6 +584,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
             has_docker=True,
             is_loaded=is_loaded,
             vram_estimate_gb=vram_estimate_gb,
+            supports_vision=model.supports_vision,
         )
 
     async def _download_model(self, stream: Stream[StreamChunk], model: LlamacppModel) -> tuple[Path | None, str]:
@@ -720,6 +728,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
                         endpoints=LLM_ENDPOINTS,
                         context_window=context_window,
                         max_context_window=max_context_window,
+                        supports_vision=model.supports_vision,
                     ),
                     chat_completions=ProxyOptions(url=f"{model_info.base_url}/v1/chat/completions", rewrite_model_to=model_id),
                     completions=ProxyOptions(url=f"{model_info.base_url}/v1/completions", rewrite_model_to=model_id),

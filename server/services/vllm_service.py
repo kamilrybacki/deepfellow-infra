@@ -110,6 +110,11 @@ class VllmModel(BaseModel):
     size: str
     custom: CustomModelId | None = None
     model_type: Literal["llm", "reranker", "embedding"] = "llm"
+    # Best-effort, derived from the HF repo's `config.architectures` at catalog-build time (see
+    # `classify_modality_support`). None means unresolved (e.g. a hand-added custom model, or a
+    # non-"llm" registry entry, for which modality support isn't computed).
+    supports_vision: bool | None = None
+    supports_audio: bool | None = None
 
 
 class VllmCustomModel(BaseModel):
@@ -129,8 +134,13 @@ class VllmRegistryEntry(TypedDict):
     size: str
 
 
+class VllmLlmRegistryEntry(VllmRegistryEntry, total=False):
+    supports_vision: bool
+    supports_audio: bool
+
+
 class VllmRegistry(TypedDict, total=False):
-    llms: list[VllmRegistryEntry]
+    llms: list[VllmLlmRegistryEntry]
     rerankers: list[VllmRegistryEntry]
     embeddings: list[VllmRegistryEntry]
 
@@ -150,6 +160,8 @@ def _read_models() -> dict[str, VllmModel]:
                 hf_id=entry["name"],
                 size=entry["size"],
                 model_type="llm",
+                supports_vision=entry.get("supports_vision"),
+                supports_audio=entry.get("supports_audio"),
             )
         for entry in registry.get("rerankers", []):
             map[entry["name"]] = VllmModel(
@@ -317,6 +329,19 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         for model_id in installed_ids:
             if model_id not in self.models[instance] and (definition := self._get_persisted_model_definition(instance, model_id)):
                 self._restore_model_definition(instance, model_id, definition)
+
+        # An installed model's registration keeps the supports_vision/supports_audio it was
+        # registered with at install time; a catalog refresh (e.g. a `classify_modality_support`
+        # fix, or a regenerated static catalog) can correct those values in the catalog without
+        # anything else re-registering the model, so re-sync them here.
+        if installed:
+            for model_id in installed_ids:
+                model_info = installed.models.get(model_id)
+                model = self.models[instance].get(model_id)
+                if model_info and model and model_info.registration_id:
+                    self.endpoint_registry.update_modality_support(
+                        model_info.registration_id, supports_vision=model.supports_vision, supports_audio=model.supports_audio
+                    )
 
     async def sync_models(self, instance: str) -> None:  # noqa: ARG002
         """Trigger a background catalog refresh (fire-and-forget; matches the base no-blocking sync contract)."""
@@ -681,6 +706,8 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                             has_docker=True,
                             is_loaded=is_loaded,
                             vram_estimate_gb=vram_estimate_gb,
+                            supports_vision=model.supports_vision,
+                            supports_audio=model.supports_audio,
                         )
                     )
 
@@ -709,6 +736,8 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             has_docker=True,
             is_loaded=is_loaded,
             vram_estimate_gb=vram_estimate_gb,
+            supports_vision=model.supports_vision,
+            supports_audio=model.supports_audio,
         )
 
     async def _download_model(self, stream: Stream[StreamChunk], model: VllmModel, model_dir: Path) -> Path | None:
@@ -898,6 +927,8 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                 endpoints=LLM_ENDPOINTS,
                 context_window=context_window,
                 max_context_window=max_context_window,
+                supports_vision=model.supports_vision,
+                supports_audio=model.supports_audio,
             ),
             chat_completions=ProxyOptions(url=f"{model_info.base_url}/v1/chat/completions", rewrite_model_to=model_id),
             completions=ProxyOptions(url=f"{model_info.base_url}/v1/completions", rewrite_model_to=model_id),

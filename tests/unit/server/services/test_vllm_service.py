@@ -266,6 +266,8 @@ def test_generate_instance_config_embeds_definition_when_in_registry(svc: VllmSe
         "size": "1 GB",
         "custom": None,
         "model_type": "llm",
+        "supports_vision": None,
+        "supports_audio": None,
     }
 
 
@@ -284,6 +286,38 @@ def test_restore_model_definition_reinstates_model(svc: VllmService) -> None:
     svc._restore_model_definition("default", "ghost-model", definition)  # pyright: ignore[reportPrivateUsage]
 
     assert svc.models["default"]["ghost-model"] == VllmModel(hf_id="ghost-model", size="2 GB")
+
+
+def test_reload_instance_models_syncs_installed_registration_modality_support(svc: VllmService, deps: dict[str, Any]) -> None:
+    """A catalog refresh must re-sync an already-installed model's registered modality support.
+
+    Otherwise a fix that corrects `classify_modality_support`'s output (or a regenerated static
+    catalog) never reaches a model that was already installed before the refresh - it would keep
+    whatever was captured at install time forever.
+    """
+    installed = _make_installed_info()
+    model_id = next(iter(svc.models["default"]))
+    installed.models[model_id] = _make_model_installed_info(model_id, registration_id="reg-1")
+    svc.instances_info["default"].installed = installed
+
+    refreshed_model = svc.models["default"][model_id].model_copy(update={"supports_vision": True, "supports_audio": True})
+
+    with patch.dict(_const.models, {model_id: refreshed_model}):
+        svc._reload_instance_models("default")  # pyright: ignore[reportPrivateUsage]
+
+    deps["endpoint_registry"].update_modality_support.assert_called_once_with("reg-1", supports_vision=True, supports_audio=True)
+
+
+def test_reload_instance_models_skips_sync_when_not_registered(svc: VllmService, deps: dict[str, Any]) -> None:
+    """No registration id (e.g. a model mid-install) means nothing to update yet."""
+    installed = _make_installed_info()
+    model_id = next(iter(svc.models["default"]))
+    installed.models[model_id] = _make_model_installed_info(model_id, registration_id="")
+    svc.instances_info["default"].installed = installed
+
+    svc._reload_instance_models("default")  # pyright: ignore[reportPrivateUsage]
+
+    deps["endpoint_registry"].update_modality_support.assert_not_called()
 
 
 def test_load_download_info(svc: VllmService) -> None:
@@ -731,6 +765,25 @@ def test_register_model_endpoint_llm_calls_chat_completion_proxy(svc: VllmServic
 
     assert deps["endpoint_registry"].register_chat_completion_as_proxy.call_count == 1
     assert deps["endpoint_registry"].register_rerank_as_proxy.call_count == 0
+
+
+def test_register_model_endpoint_forwards_modality_support(svc: VllmService, deps: dict[str, Any]) -> None:
+    model = VllmModel(hf_id="org/vlm", size="1GB", model_type="llm", supports_vision=True, supports_audio=None)
+    model_info = _make_model_installed_info("org/vlm", model_type="llm")
+
+    svc._register_model_endpoint(  # pyright: ignore[reportPrivateUsage]
+        model_info=model_info,
+        model=model,
+        registered_name="org/vlm",
+        model_id="org/vlm",
+        context_window=4096,
+        max_context_window=4096,
+        capacity=None,
+    )
+
+    call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
+    assert call_kwargs["props"].supports_vision is True
+    assert call_kwargs["props"].supports_audio is None
 
 
 def test_register_model_endpoint_reranker_calls_rerank_proxy(svc: VllmService, deps: dict[str, Any]) -> None:
