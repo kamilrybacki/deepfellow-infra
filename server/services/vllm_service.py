@@ -52,6 +52,7 @@ from server.models.services import (
 )
 from server.services import model_catalog_refresh
 from server.services.base2_service import Base2Service, CustomModel, Instance, InstanceConfig, ModelConfig
+from server.services.finetune_service import FinetuneService
 from server.services.model_catalog_refresh import huggingface_refresh_guard
 from server.utils.core import (
     DownloadedPacket,
@@ -71,6 +72,7 @@ from server.utils.files import get_model_dir_context_window
 from server.utils.hardware import HardwarePartInfo
 from server.utils.loading import Progress
 from server.utils.logger import logger
+from server.utils.model_downloader import AdapterRegistryDownloader
 from server.utils.registry_client import image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fetch_huggingface_model_size, fmt_size, sum_siblings_size_bytes
 
@@ -82,6 +84,67 @@ _VLLM_FETCH_PLAN: list[tuple[int, int, int, str, bool]] = [
     (10, 0, 10, "reranker", False),
     (10, 0, 10, "embedding", False),
 ]
+
+# vLLM's `--quantization` engine argument choices, as reported by this pinned image's own
+# `ModelConfig` validation error (differs from vLLM's public docs, which lag this build).
+# Left unset (empty string, not omitted - see the `default=""` on the fields using this list,
+# needed so the webui's oneof-field auto-select-first-value-when-no-default behavior doesn't
+# silently pick "awq" here instead of leaving quantization unset), vLLM auto-detects it from
+# the model config.
+# Kept as a plain tuple (not a shared list constant) since `ModelField.values` and
+# `CustomModelField.values` declare incompatible (invariant) list element types.
+_VLLM_QUANTIZATION_METHODS = (
+    "awq",
+    "auto_awq",
+    "fp8",
+    "fbgemm_fp8",
+    "fp_quant",
+    "modelopt",
+    "modelopt_fp4",
+    "modelopt_mxfp8",
+    "modelopt_mixed",
+    "auto_gptq",
+    "gptq",
+    "gptq_marlin",
+    "awq_marlin",
+    "humming",
+    "compressed-tensors",
+    "bitsandbytes",
+    "experts_int8",
+    "quark",
+    "moe_wna16",
+    "torchao",
+    "inc",
+    "mxfp4",
+    "gpt_oss_mxfp4",
+    "deepseek_v4_fp8",
+    "online",
+    "fp8_per_tensor",
+    "fp8_per_block",
+    "fp8_per_channel",
+    "int8_per_channel_weight_only",
+    "nvfp4_per_token",
+    "mxfp8",
+)
+
+#: The two files vLLM's static `--lora-modules` loader reads from a LoRA adapter directory.
+_ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
+
+#: File in a downloaded adapter directory holding the registry's `created` timestamp of the downloaded weights.
+_ADAPTER_CREATED_MARKER = ".registry_created"
+
+#: The only `--max-lora-rank` values vLLM accepts; any other value makes the container fail to start.
+_VLLM_ALLOWED_LORA_RANKS = (1, 8, 16, 32, 64, 128, 256, 320, 512)
+
+
+def _round_up_lora_rank(rank: int) -> int:
+    """Round a LoRA adapter's rank up to the smallest `--max-lora-rank` value vLLM accepts.
+
+    `--max-lora-rank` is an upper bound, so rounding up still serves the adapter at its real rank.
+    Ranks above vLLM's maximum are rejected when the model is added; one that got persisted anyway is
+    passed through unchanged so vLLM reports it rather than silently serving a truncated bound.
+    """
+    return next((allowed for allowed in _VLLM_ALLOWED_LORA_RANKS if allowed >= rank), rank)
 
 
 def _is_truthy_flag(value: Any) -> bool:  # noqa: ANN401
@@ -110,6 +173,10 @@ class VllmModel(BaseModel):
     size: str
     custom: CustomModelId | None = None
     model_type: Literal["llm", "reranker", "embedding"] = "llm"
+    adapter_id: str | None = None
+    """df-finetune adapter id this model serves as a LoRA on top of `hf_id`, if any."""
+    lora_rank: int | None = None
+    """LoRA rank resolved from the df-finetune adapter registry; required when `adapter_id` is set."""
     # Best-effort, derived from the HF repo's `config.architectures` at catalog-build time (see
     # `classify_modality_support`). None means unresolved (e.g. a hand-added custom model, or a
     # non-"llm" registry entry, for which modality support isn't computed).
@@ -124,6 +191,9 @@ class VllmCustomModel(BaseModel):
     size: str
     model_type: Literal["llm", "reranker", "embedding"] = "llm"
     skip_validation: bool = False
+    adapter_id: str | None = None
+    lora_rank: int | None = None
+    quantization: str | None = None
 
 
 type ImageTypes = Literal["cpu", "gpu"]
@@ -232,6 +302,16 @@ class InstalledInfo:
 @dataclass
 class DownloadedInfo:
     model_path: str | None
+    adapter_path: str | None = None
+
+
+@dataclass(frozen=True)
+class AdapterMetadata:
+    """A df-finetune adapter's registry metadata; `created` is None when the registry doesn't know it."""
+
+    base_model: str
+    rank: int
+    created: int | None
 
 
 class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
@@ -411,7 +491,14 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         fields.extend(
             [
                 ModelField(type="number", name="max_model_length", description="Max model length ex. 4096", required=False),
-                ModelField(type="text", name="quantization", description="Quantization", required=False),
+                ModelField(
+                    type="oneof",
+                    name="quantization",
+                    description="Quantization",
+                    values=[*_VLLM_QUANTIZATION_METHODS],
+                    default="",
+                    required=False,
+                ),
                 ModelField(
                     type="map",
                     name="extra_args",
@@ -437,7 +524,20 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         return CustomModelSpecification(
             fields=[
                 CustomModelField(type="text", name="id", description="Model ID", placeholder="my-custom-model"),
-                CustomModelField(type="text", name="hf_id", description="Hugging face model ID", placeholder="google/gemma-3-270m-it"),
+                CustomModelField(
+                    type="text",
+                    name="adapter_id",
+                    description="df-finetune adapter ID (leave blank to install a plain base model via hf_id instead)",
+                    placeholder="pirate-llama",
+                    required=False,
+                ),
+                CustomModelField(
+                    type="text",
+                    name="hf_id",
+                    description="Hugging face model ID (ignored if adapter_id is set - resolved automatically from the adapter)",
+                    placeholder="google/gemma-3-270m-it",
+                    required=False,
+                ),
                 CustomModelField(
                     type="text",
                     name="revision",
@@ -452,6 +552,14 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     description="Model type",
                     values=["llm", "reranker", "embedding"],
                     default="llm",
+                    required=False,
+                ),
+                CustomModelField(
+                    type="oneof",
+                    name="quantization",
+                    description="Quantization",
+                    values=[*_VLLM_QUANTIZATION_METHODS],
+                    default="",
                     required=False,
                 ),
                 CustomModelField(
@@ -489,7 +597,16 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         Sends the configured HuggingFace token, if any, so a gated repo (e.g. Llama, Gemma) that
         `add_custom_model` can already download validates the same way it downloads, instead of
         being wrongly rejected as missing/incompatible when accessed anonymously.
+
+        If `adapter_id` is set, this is a df-finetune LoRA adapter install rather than a plain HF
+        model: `hf_id`/`lora_rank` are resolved from the adapter registry (overwriting whatever was
+        submitted) before the usual HF-compatibility check runs against the resolved `hf_id`.
         """
+        adapter_id = spec.get("adapter_id")
+        if adapter_id:
+            await self._resolve_adapter_metadata(spec, adapter_id)
+        elif not spec.get("hf_id"):
+            raise HTTPException(400, "Either 'hf_id' or 'adapter_id' must be provided.")
         if _is_truthy_flag(spec.get("skip_validation")):
             return
         hf_id = spec.get("hf_id")
@@ -505,6 +622,53 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             total = sum_siblings_size_bytes(data.get("siblings", []))
             if total:
                 spec["size"] = fmt_size(total)
+
+    def _get_adapter_registry_base_url(self) -> str:
+        """Live base URL of the running `deepfellow-finetune` container.
+
+        Resolved from `FinetuneService`'s installed-model bookkeeping instead of a static config
+        value - the container's host port is assigned dynamically by `PortService` at install
+        time and isn't guaranteed to stay the same across reinstalls.
+        """
+        finetune_service = self.services_manager.services.get("finetune")
+        base_url = finetune_service.get_installed_base_url() if isinstance(finetune_service, FinetuneService) else None
+        if not base_url:
+            raise HTTPException(400, "deepfellow-finetune is not installed. Install the Finetune service before referencing an adapter_id.")
+        return base_url
+
+    async def _resolve_adapter_metadata(self, spec: dict[str, Any], adapter_id: str) -> None:
+        """Resolve base `hf_id` and LoRA `rank` from the df-finetune adapter registry, mutating `spec` in place."""
+        metadata = await self._fetch_adapter_metadata(adapter_id)
+        spec["hf_id"] = metadata.base_model
+        spec["lora_rank"] = metadata.rank
+
+    async def _fetch_adapter_metadata(self, adapter_id: str) -> AdapterMetadata:
+        """Fetch and validate an adapter's metadata from the df-finetune adapter registry."""
+        base_url = self._get_adapter_registry_base_url()
+        url = f"{base_url.rstrip('/')}/v1/adapters/{Utils.str_encode(adapter_id)}"
+        headers = Utils.create_bearer_header(self.config.adapter_registry_secret.get_secret_value())
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), headers=headers) as session:
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 404:
+                        raise HTTPException(400, f"Adapter {adapter_id!r} not found in adapter registry.")
+                    resp.raise_for_status()
+                    data = await resp.json()
+            except (aiohttp.ClientError, TimeoutError) as exc:
+                raise HTTPException(400, f"Could not reach adapter registry at {base_url}: {exc!r}") from exc
+        if "safetensors" not in (data.get("formats") or []):
+            raise HTTPException(400, f"Adapter {adapter_id!r} has no safetensors LoRA files available.")
+        rank = (data.get("lora") or {}).get("rank")
+        base_model = data.get("base_model")
+        if not base_model or not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0:
+            raise HTTPException(400, f"Adapter {adapter_id!r} is missing base_model or has invalid lora.rank metadata: {rank!r}.")
+        max_rank = _VLLM_ALLOWED_LORA_RANKS[-1]
+        if rank > max_rank:
+            raise HTTPException(400, f"Adapter {adapter_id!r} has LoRA rank {rank}, above vLLM's maximum of {max_rank}.")
+        created = data.get("created")
+        # df-finetune reports 0 when it has no creation timestamp for the adapter
+        known_created = created if isinstance(created, int) and not isinstance(created, bool) and created > 0 else None
+        return AdapterMetadata(base_model=base_model, rank=rank, created=known_created)
 
     def get_installed_info(self, instance: str) -> bool | InstallServiceProgress | ServiceOptions:
         """Get service installed info."""
@@ -660,7 +824,14 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             raise HTTPException(400, "Model with given id already exists.")
 
         self.models[instance][parsed.id] = VllmModel(
-            hf_id=parsed.hf_id, revision=parsed.revision, size=parsed.size, custom=model.id, model_type=parsed.model_type
+            hf_id=parsed.hf_id,
+            revision=parsed.revision,
+            size=parsed.size,
+            custom=model.id,
+            model_type=parsed.model_type,
+            adapter_id=parsed.adapter_id,
+            lora_rank=parsed.lora_rank,
+            quantization=parsed.quantization,
         )
 
     def _remove_custom_model(self, instance: str, model: CustomModel) -> None:
@@ -759,16 +930,92 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             raise HTTPException(500, f"Downloader doesn't return filepath in {model_dir} of {model.hf_id} model")
         return local_model_path
 
-    def _purge_stale_download(self, model_id: str, local_model_path: Path) -> None:
-        """Delete the previous download directory for `model_id` if this install now points at a different one.
+    def _purge_stale_download(self, model_id: str, local_model_path: Path, local_adapter_path: Path | None = None) -> None:
+        """Delete the previous download/adapter directories for `model_id` if this install now points at different ones.
 
-        An edit that changes hf_id/revision reinstalls the model into a new directory but leaves the old
-        one on disk with nothing referencing it anymore (`models_downloaded[model_id]` is about to be
-        overwritten) - clean it up here rather than leaking it forever.
+        An edit that changes hf_id/revision (or adapter_id) reinstalls the model into new directories but
+        leaves the old ones on disk with nothing referencing them anymore (`models_downloaded[model_id]` is
+        about to be overwritten) - clean them up here rather than leaking them forever.
         """
         old_downloaded = self.models_downloaded.get(model_id)
-        if old_downloaded and old_downloaded.model_path and old_downloaded.model_path != str(local_model_path):
-            shutil.rmtree(Path(old_downloaded.model_path), ignore_errors=True)
+        if not old_downloaded:
+            return
+        if old_downloaded.model_path and old_downloaded.model_path != str(local_model_path):
+            self._remove_download_dir(old_downloaded.model_path, model_id, ignore_errors=True)
+        new_adapter_path = str(local_adapter_path) if local_adapter_path else None
+        if old_downloaded.adapter_path and old_downloaded.adapter_path != new_adapter_path:
+            self._remove_download_dir(old_downloaded.adapter_path, model_id, ignore_errors=True)
+
+    def _is_path_used_by_other_model(self, path: str, model_id: str) -> bool:
+        """Whether any model other than `model_id` has `path` as its downloaded base-model or adapter directory.
+
+        Download directories are keyed by hf_id/revision and adapter_id, not by model id, so several
+        models can share one - e.g. two adapters trained on the same base model share its weights.
+        """
+        return any(
+            path in (downloaded.model_path, downloaded.adapter_path)
+            for other_id, downloaded in self.models_downloaded.items()
+            if other_id != model_id
+        )
+
+    def _remove_download_dir(self, path: str, model_id: str, ignore_errors: bool = False) -> None:
+        """Delete a download directory of `model_id`, unless another model still uses it."""
+        if not self._is_path_used_by_other_model(path, model_id):
+            shutil.rmtree(Path(path), ignore_errors=ignore_errors)
+
+    async def _download_adapter(self, model: VllmModel, adapter_id: str, models_dir: Path) -> tuple[Path, Path]:
+        """Download a LoRA adapter's safetensors files from the df-finetune registry.
+
+        Returns (local_dir, docker_dir). Fetches the two files vLLM's static `--lora-modules`
+        loader reads (`adapter_config.json`, `adapter_model.safetensors`) directly via a freshly
+        built `AdapterRegistryDownloader`, from the finetune container's current base URL.
+
+        An adapter id normally keeps pointing at the same weights, but df-finetune can rewrite them
+        (e.g. a job retrained under the same id, or `run.py` writing into an existing adapter
+        directory). So the registry's `created` timestamp is stored next to the downloaded files, and
+        when it no longer matches, all files are downloaded again. `model.lora_rank` is refreshed
+        from the registry too, so `--max-lora-rank` always matches the served weights.
+
+        If both files are already on disk and the registry can't be reached, the on-disk copy is used
+        as-is - services load concurrently at startup, so a reload of an adapter model can run before
+        the Finetune service has registered its container, and requiring it here would fail a reload
+        that needs nothing from it.
+        """
+        adapter_dir = models_dir / f"adapter-{normalize_name(adapter_id)}"
+        docker_adapter_path = Path(self.hugging_face_cache_path) / "loras" / normalize_name(adapter_id)
+        marker = adapter_dir / _ADAPTER_CREATED_MARKER
+        missing = [filename for filename in _ADAPTER_FILES if not (adapter_dir / filename).exists()]
+        try:
+            metadata = await self._fetch_adapter_metadata(adapter_id)
+        except HTTPException as exc:
+            if missing:
+                raise
+            logger.warning("Adapter registry unavailable (%s), using on-disk copy of adapter %r", exc.detail, adapter_id)
+            return adapter_dir, docker_adapter_path
+        if metadata.base_model != model.hf_id:
+            msg = f"Adapter {adapter_id!r} is now trained on {metadata.base_model!r}, not {model.hf_id!r}. Add it as a new model instead."
+            raise HTTPException(400, msg)
+        cached_created = marker.read_text().strip() if marker.exists() else None
+        is_current = metadata.created is None or cached_created == str(metadata.created)
+        to_fetch = missing if is_current else list(_ADAPTER_FILES)
+        if to_fetch:
+            if not is_current and not missing:
+                logger.info("Adapter %r changed in the registry, downloading it again", adapter_id)
+            marker.unlink(missing_ok=True)
+            adapter_dir.mkdir(parents=True, exist_ok=True)
+            base_url = self._get_adapter_registry_base_url()
+            adapter_base_url = f"{base_url.rstrip('/')}/v1/adapters/{Utils.str_encode(adapter_id)}/safetensors"
+            downloader = AdapterRegistryDownloader(self.config.adapter_registry_secret.get_secret_value())
+            temp_dir = self.model_downloader.temp_dir
+            for filename in to_fetch:
+                # The downloader skips files already on disk, so a stale copy must go first
+                (adapter_dir / filename).unlink(missing_ok=True)
+                async for _packet in downloader.download(f"{adapter_base_url}/{filename}", adapter_dir, temp_dir, filename):
+                    pass
+        if metadata.created is not None:
+            marker.write_text(str(metadata.created))
+        model.lora_rank = metadata.rank
+        return adapter_dir, docker_adapter_path
 
     async def _download_model_or_set_progress(
         self, stream: Stream[StreamChunk], download_key: str, model: VllmModel, model_dir: Path
@@ -859,6 +1106,8 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         gpu_memory_utilization: float | None,
         user_model_length: int | None,
         use_gpu: bool,
+        docker_adapter_path: Path | None = None,
+        lora_rank: int | None = None,
     ) -> list[str]:
         cmd = [
             str(docker_model_path),
@@ -882,6 +1131,11 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             cmd.extend(["--max-model-len", str(user_model_length)])
         elif not use_gpu:
             cmd.extend(["--max-model-len", str(user_model_length)] if user_model_length else ["--disable-sliding-window"])
+
+        if docker_adapter_path is not None:
+            cmd.extend(["--enable-lora", "--lora-modules", f"{model_id}={docker_adapter_path}"])
+            if lora_rank is not None:
+                cmd.extend(["--max-lora-rank", str(_round_up_lora_rank(lora_rank))])
 
         for flag, value in opts.extra_args.items():
             if value:
@@ -948,6 +1202,8 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         gpu_memory_utilization: float | None,
         user_model_length: int | None,
         use_gpu: bool,
+        docker_adapter_path: Path | None = None,
+        lora_rank: int | None = None,
     ) -> tuple[int, int | None, bool, bool]:
         """Start the vLLM container, tearing it down on any failure.
 
@@ -983,6 +1239,8 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                 gpu_memory_utilization=gpu_memory_utilization,
                 user_model_length=user_model_length,
                 use_gpu=use_gpu,
+                docker_adapter_path=docker_adapter_path,
+                lora_rank=lora_rank,
             )
             docker_options.command = " ".join(vllm_command)
             try:
@@ -1041,6 +1299,11 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                 model_dir.mkdir(parents=True, exist_ok=True)
                 local_model_path: Path | None = await self._download_model_or_set_progress(stream, model_id_fixed, model, model_dir)
 
+                local_adapter_path: Path | None = None
+                docker_adapter_path: Path | None = None
+                if model.adapter_id:
+                    local_adapter_path, docker_adapter_path = await self._download_adapter(model, model.adapter_id, models_dir)
+
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
                 docker_model_path = Path(self.hugging_face_cache_path) / "hub" / model_id_fixed
                 compile_cache_dir = model_dir / "compile_cache"
@@ -1052,6 +1315,8 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     f"{compile_cache_dir}:/root/.cache/vllm",
                     f"{model_cache_dir}:{docker_model_path}/.cache",
                 ]
+                if local_adapter_path is not None:
+                    volumes.append(f"{local_adapter_path}:{docker_adapter_path}")
 
                 vllm_command = self._build_vllm_command(
                     docker_model_path=docker_model_path,
@@ -1061,6 +1326,8 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     gpu_memory_utilization=gpu_memory_utilization,
                     user_model_length=user_model_length,
                     use_gpu=use_gpu,
+                    docker_adapter_path=docker_adapter_path,
+                    lora_rank=model.lora_rank,
                 )
 
                 env_vars = dict(model.env_vars or {})
@@ -1105,6 +1372,8 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                         gpu_memory_utilization=gpu_memory_utilization,
                         user_model_length=user_model_length,
                         use_gpu=use_gpu,
+                        docker_adapter_path=docker_adapter_path,
+                        lora_rank=model.lora_rank,
                     )
                 except Exception:
                     docker_stopped = True
@@ -1147,8 +1416,10 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     capacity=capacity,
                 )
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
-                self._purge_stale_download(model_id, local_model_path)
-                self.models_downloaded[model_id] = DownloadedInfo(str(local_model_path))
+                self._purge_stale_download(model_id, local_model_path, local_adapter_path)
+                self.models_downloaded[model_id] = DownloadedInfo(
+                    str(local_model_path), str(local_adapter_path) if local_adapter_path else None
+                )
                 return InstallModelOut(status="OK", details="Installed")
             except BaseException:
                 self._release_gpu_utilization(gpu_memory_utilization)
@@ -1214,7 +1485,9 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         if options.purge and model_id in self.models_downloaded:
             model = self.models_downloaded[model_id]
             if model_path := model.model_path:
-                shutil.rmtree(Path(model_path))
+                self._remove_download_dir(model_path, model_id)
+            if adapter_path := model.adapter_path:
+                self._remove_download_dir(adapter_path, model_id, ignore_errors=True)
             del self.models_downloaded[model_id]
 
     @staticmethod

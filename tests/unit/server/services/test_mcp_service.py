@@ -110,6 +110,7 @@ def deps() -> dict[str, Any]:
         "model_downloader": MagicMock(),
         "docker_service": docker_svc,
         "hardware": MagicMock(gpus=[], nvidia_gpus=[]),
+        "services_manager": MagicMock(),
     }
 
 

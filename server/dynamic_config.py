@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 from server.config import AppSettings, ConfigError, get_main_dir
 from server.utils.logger import logger
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 @lru_cache(maxsize=1)
@@ -52,7 +52,6 @@ class DynamicSettings(BaseModel):
 
     hugging_face_token: SecretStr = SecretStr("")
     civitai_token: SecretStr = SecretStr("")
-    adapter_registry_url: str = ""
     adapter_registry_secret: SecretStr = SecretStr("")
     log_payloads: str = ""
     stop_containers_on_shutdown: str = ""
@@ -112,6 +111,11 @@ def _migrate(raw: dict[str, Any]) -> dict[str, Any]:
     config.json written by an unreleased build in the interim could still have it on disk, and
     `DynamicSettings`'s `extra="forbid"` would otherwise reject it outright.
 
+    v2 -> v3: drops `adapter_registry_url`. The df-finetune adapter registry's address is now
+    resolved live from the installed `deepfellow-finetune` Finetune-service container instead of a
+    manually configured URL (which drifted from the container's actual, dynamically assigned host
+    port) - same `extra="forbid"` concern as above for any config.json still carrying the old key.
+
     Raises `ConfigError` if `schema_version` is present but not an int, e.g. a hand-edited config.json.
     """
     schema_version = raw.get("schema_version", 1)
@@ -123,6 +127,11 @@ def _migrate(raw: dict[str, Any]) -> dict[str, Any]:
         if isinstance(settings, dict):
             settings.pop("custom_endpoint_read_timeout_seconds", None)
         raw["schema_version"] = 2
+    if schema_version < 3:
+        settings = raw.get("settings")
+        if isinstance(settings, dict):
+            settings.pop("adapter_registry_url", None)
+        raw["schema_version"] = 3
     return raw
 
 

@@ -253,6 +253,7 @@ def base2_deps() -> dict[str, Any]:
         "model_downloader": MagicMock(),
         "docker_service": MagicMock(),
         "hardware": MagicMock(),
+        "services_manager": MagicMock(),
     }
 
 

@@ -42,7 +42,6 @@ def _make_config(storage_dir: Path | None = None, **overrides: object) -> MagicM
     mock.share_models_downstream = True
     mock.hugging_face_token = SecretStr("")
     mock.civitai_token = SecretStr("")
-    mock.adapter_registry_url = ""
     mock.adapter_registry_secret = SecretStr("")
     mock.log_payloads = ""
     mock.stop_containers_on_shutdown = ""
@@ -92,6 +91,16 @@ def test_migrate_drops_retired_custom_endpoint_read_timeout_seconds_key() -> Non
 
     assert "custom_endpoint_read_timeout_seconds" not in migrated["settings"]
     assert migrated["settings"]["name"] == "node-a"
+
+
+def test_migrate_drops_retired_adapter_registry_url_key() -> None:
+    raw = {"schema_version": 2, "settings": {"name": "node-a", "adapter_registry_url": "http://localhost:8333"}}
+
+    migrated = _migrate(raw)
+
+    assert "adapter_registry_url" not in migrated["settings"]
+    assert migrated["settings"]["name"] == "node-a"
+    assert migrated["schema_version"] == CURRENT_SCHEMA_VERSION
 
 
 def test_migrate_is_noop_when_already_at_current_schema_version() -> None:

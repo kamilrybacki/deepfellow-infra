@@ -13,6 +13,7 @@ import type {
   ConfigOut,
   ConfigRevealOut,
   ConvertedMcpConfig,
+  FinetuneAdapterListResponse,
   GpuStats,
   InfraSettings,
   ListWarningsOut,
@@ -288,6 +289,14 @@ export class DeepFellowClient {
   ): Promise<ServiceModel> {
     return this.makeRequest<ServiceModel>(
       `/admin/services/${serviceId}/models/_?model_id=${encodeURIComponent(modelId)}`,
+    );
+  }
+
+  async listFinetuneAdapters(
+    serviceId: string,
+  ): Promise<FinetuneAdapterListResponse> {
+    return this.makeRequest<FinetuneAdapterListResponse>(
+      `/admin/services/${serviceId}/adapters`,
     );
   }
 

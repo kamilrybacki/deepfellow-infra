@@ -49,6 +49,7 @@ def deps() -> dict[str, Any]:
         "model_downloader": MagicMock(),
         "docker_service": MagicMock(get_user_for_docker=AsyncMock(return_value="1000:1000")),
         "hardware": MagicMock(gpus=[], nvidia_gpus=[]),
+        "services_manager": MagicMock(),
     }
 
 

@@ -41,7 +41,6 @@ def config() -> MagicMock:
     mock.storage_services_dir = ""
     mock.hugging_face_token = SecretStr("")
     mock.civitai_token = SecretStr("")
-    mock.adapter_registry_url = ""
     mock.adapter_registry_secret = SecretStr("")
     mock.log_payloads = ""
     mock.container_name_prefix = ""
@@ -375,14 +374,14 @@ def test_update_config_hugging_face_token_change_refreshes_downloaders(
     model_downloader.create_downloaders.assert_called_once_with(config)
 
 
-def test_update_config_adapter_registry_change_refreshes_downloaders(
-    client: TestClient, config: MagicMock, model_downloader: MagicMock, auth_header: dict[str, str]
+def test_update_config_adapter_registry_secret_change_does_not_refresh_downloaders(
+    client: TestClient, model_downloader: MagicMock, auth_header: dict[str, str]
 ) -> None:
     with patch("server.api.config.dynamic_config.persist_settings"):
-        resp = client.put("/admin/config", json={"adapter_registry_url": "http://new-registry"}, headers=auth_header)
+        resp = client.put("/admin/config", json={"adapter_registry_secret": "new-secret"}, headers=auth_header)
 
     assert resp.status_code == 200
-    model_downloader.create_downloaders.assert_called_once_with(config)
+    model_downloader.create_downloaders.assert_not_called()
 
 
 def test_update_config_reconfigure_failure_returns_502(
