@@ -114,6 +114,9 @@ export interface ServiceModel {
   // True when this entry was previously seen (and possibly installed) but is no longer present
   // in the most recent live provider listing.
   stale?: boolean;
+  // null/undefined means the capability is unknown/not yet resolved for this backend; true/false means resolved.
+  supports_vision?: boolean | null;
+  supports_audio?: boolean | null;
 }
 
 export interface GpuCardStats {

@@ -127,6 +127,46 @@ def is_supported_cross_encoder(architectures: list[str]) -> bool:
     return any(a.endswith("ForSequenceClassification") for a in architectures)
 
 
+# Best-effort allowlist of known vision-language / audio-language model architecture class names
+# (and name substrings) reported in a HF repo's `config.architectures`. Not exhaustive - new VLM/ALM
+# architectures show up in HF constantly - just covers the common families well enough to flag
+# vision/audio support in the catalog without any extra network calls.
+_VISION_ARCHITECTURE_SUBSTRINGS = ("VL",)
+_VISION_ARCHITECTURES = {
+    "LlavaForConditionalGeneration",
+    "LlavaNextForConditionalGeneration",
+    "Qwen2VLForConditionalGeneration",
+    "Qwen2_5_VLForConditionalGeneration",
+    "MllamaForConditionalGeneration",
+    "Idefics2ForConditionalGeneration",
+    "PaliGemmaForConditionalGeneration",
+    "InternVLChatModel",
+    "MiniCPMV",
+}
+_AUDIO_ARCHITECTURES = {
+    "Qwen2AudioForConditionalGeneration",
+    "UltravoxModel",
+    "Qwen2_5OmniModel",
+    "Qwen2AudioModel",
+}
+
+
+def classify_modality_support(architectures: list[str]) -> tuple[bool | None, bool | None]:
+    """Best-effort (supports_vision, supports_audio) from a HF repo's `config.architectures`.
+
+    Matches against a short, known-incomplete allowlist of vision-language/audio-language model
+    architecture class names. A match is a confident `True`; anything else - no match, or an
+    empty/missing `architectures` list - is `None` (unknown), never `False`: this allowlist is
+    known-incomplete, so a miss doesn't mean the model actually lacks the capability, only that
+    it couldn't be confirmed from data already fetched for the catalog (no extra HTTP requests).
+    """
+    supports_vision = (
+        True if any(a in _VISION_ARCHITECTURES or any(sub in a for sub in _VISION_ARCHITECTURE_SUBSTRINGS) for a in architectures) else None
+    )
+    supports_audio = True if any(a in _AUDIO_ARCHITECTURES for a in architectures) else None
+    return supports_vision, supports_audio
+
+
 async def has_chat_template(
     session: aiohttp.ClientSession,
     model_id: str,
@@ -445,6 +485,10 @@ async def fetch_registry_entries(
         entry: dict[str, Any] = {"name": mid, "size": size}
         if registry_key == "rerankers":
             entry["is_generative"] = not is_supported_cross_encoder(architectures.get(mid) or [])
+        if registry_key == "llms":
+            supports_vision, supports_audio = classify_modality_support(architectures.get(mid) or [])
+            entry["supports_vision"] = supports_vision
+            entry["supports_audio"] = supports_audio
         entries.append(entry)
     entries.sort(key=lambda e: e["name"].casefold())
     return registry_key, entries

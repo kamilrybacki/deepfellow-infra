@@ -190,6 +190,13 @@ def build_entries(model_id: str, siblings: list[dict[str, Any]]) -> list[Llamacp
     suffixes = [quant_suffix(f.get("rfilename", "")) for f in files]
     suffix_counts = Counter(suffixes)
 
+    # Presence-only catalog hint: a companion mmproj GGUF anywhere in the same repo listing means
+    # every base model file from this repo *could* be loaded with it for vision - but llama.cpp
+    # installs never download or wire up the mmproj file today, so this is only carried as
+    # `has_mmproj`, never as `supports_vision` (which must stay None: a wrong "vision supported"
+    # guess is worse than an unknown).
+    has_mmproj = any(is_mmproj_file(f.get("rfilename", "")) for f in siblings)
+
     entries: list[LlamacppRegistryEntry] = []
     for f, suffix in zip(files, suffixes, strict=True):
         filename = f.get("rfilename", "")
@@ -201,6 +208,8 @@ def build_entries(model_id: str, siblings: list[dict[str, Any]]) -> list[Llamacp
                 name=f"{model_id}-{suffix}",
                 url=f"https://huggingface.co/{model_id}/resolve/main/{filename}",
                 size=fmt_size_compact(fmt_size(size)) if size else "N/A",
+                supports_vision=None,
+                has_mmproj=has_mmproj or None,
             )
         )
     return entries

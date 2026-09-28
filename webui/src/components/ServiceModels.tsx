@@ -84,7 +84,14 @@ import type { ProgressEvent } from "@/utils/sse-stream";
 import { getStageLabel } from "@/utils/sse-stream";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { AlertCircle, ExternalLink, Info, MoreVertical } from "lucide-react";
+import {
+  AlertCircle,
+  AudioLines,
+  ExternalLink,
+  Eye,
+  Info,
+  MoreVertical,
+} from "lucide-react";
 import {
   type RefObject,
   memo,
@@ -2364,6 +2371,38 @@ const ModelRow = memo(function ModelRow({
             {isInstalled && model.is_loaded === true && (
               <Badge variant="outline">
                 {isCpuOnly ? "In RAM" : "In VRAM"}
+              </Badge>
+            )}
+            {model.supports_vision != null && (
+              <Badge
+                variant={model.supports_vision ? "outline" : "secondary"}
+                className={
+                  model.supports_vision ? undefined : "text-muted-foreground"
+                }
+                title={
+                  model.supports_vision
+                    ? "This model supports image input."
+                    : "This model does not support image input."
+                }
+              >
+                <Eye className="h-3 w-3" />
+                Vision
+              </Badge>
+            )}
+            {model.supports_audio != null && (
+              <Badge
+                variant={model.supports_audio ? "outline" : "secondary"}
+                className={
+                  model.supports_audio ? undefined : "text-muted-foreground"
+                }
+                title={
+                  model.supports_audio
+                    ? "This model supports audio input."
+                    : "This model does not support audio input."
+                }
+              >
+                <AudioLines className="h-3 w-3" />
+                Audio
               </Badge>
             )}
             {oauthEnabled && oauthStatusQuery.data && (

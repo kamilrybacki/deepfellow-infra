@@ -108,6 +108,8 @@ class ModelInstalledInfo:
     type: str
     options: InstallModelIn
     registration_id: RegistrationId
+    supports_vision: bool | None = None
+    supports_audio: bool | None = None
 
     def get_info(self) -> ModelInfo:
         """Get info."""
@@ -401,7 +403,14 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
             return None
 
     def _register_synced_model(
-        self, instance: str, installed_info: InstalledInfo, model_id: str, size_bytes: int, context_length: int | None = None
+        self,
+        instance: str,
+        installed_info: InstalledInfo,
+        model_id: str,
+        size_bytes: int,
+        context_length: int | None = None,
+        supports_vision: bool | None = None,
+        supports_audio: bool | None = None,
     ) -> None:
         model_type = self._determine_model_type(model_id, instance)
         size_str = fmt_size(size_bytes) if size_bytes else ""
@@ -416,6 +425,8 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
             registered_name=model_id,
             options=InstallModelIn(),
             registration_id="",
+            supports_vision=supports_vision,
+            supports_audio=supports_audio,
         )
         if model_type == "llm":
             model_info.registration_id = self.endpoint_registry.register_chat_completion_as_proxy(
@@ -426,6 +437,8 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                     endpoints=self.get_supported_endpoints(),
                     context_window=context_length,
                     max_context_window=context_length,
+                    supports_vision=supports_vision,
+                    supports_audio=supports_audio,
                 ),
                 chat_completions=ProxyOptions(url=f"{installed_info.base_url}/v1/chat/completions", rewrite_model_to=model_id),
                 completions=ProxyOptions(url=f"{installed_info.base_url}/v1/completions", rewrite_model_to=model_id),
@@ -457,7 +470,13 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
             )
         installed_info.models[model_id] = model_info
 
-    async def _fetch_context_length(self, base_url: str, model_id: str) -> int | None:
+    async def _fetch_show_info(self, base_url: str, model_id: str) -> tuple[int | None, bool | None, bool | None]:
+        """Fetch `/api/show` once, returning `(context_length, supports_vision, supports_audio)`.
+
+        `supports_audio` stays unresolved (`None`) when the response doesn't report it - Ollama does
+        not publicly document an "audio" capability tag, so its absence must not be read as "no
+        audio support".
+        """
         try:
             result = await fetch_from(f"{base_url}/api/show", "POST", {"name": model_id})
             if result.status_code == 200:
@@ -465,11 +484,42 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                 info = data.get("model_info", {})
                 arch = info.get("general.architecture", "")
                 context_length = info.get(f"{arch}.context_length")
-                if isinstance(context_length, int) and context_length > 0:
-                    return context_length
+                context_length = context_length if isinstance(context_length, int) and context_length > 0 else None
+
+                supports_vision: bool | None = None
+                supports_audio: bool | None = None
+                capabilities = data.get("capabilities")
+                if isinstance(capabilities, list):
+                    supports_vision = "vision" in capabilities
+                    supports_audio = True if "audio" in capabilities else None
+
+                return context_length, supports_vision, supports_audio
         except Exception:
             pass
-        return None
+        return None, None, None
+
+    async def _retry_unresolved_capabilities(self, installed_info: InstalledInfo, model_id: str) -> None:
+        """Retry `/api/show` for an already-registered model whose capabilities are still unknown.
+
+        A model already in `installed_info.models` is otherwise skipped on every sync - fine for
+        settled fields, but if `/api/show` failed (or returned no `capabilities` list) on first
+        sync, `supports_vision`/`supports_audio` would stay `None` forever without this retry, and
+        a tag re-pulled under the same name would never pick up newly-resolved values either.
+        Models with at least one already-resolved value are left alone: only "never determined"
+        (both still `None`) is retried, so this doesn't re-hit the network for every synced model.
+        """
+        model_info = installed_info.models[model_id]
+        if model_info.supports_vision is not None or model_info.supports_audio is not None:
+            return
+        _, supports_vision, supports_audio = await self._fetch_show_info(installed_info.base_url, model_id)
+        if supports_vision is None and supports_audio is None:
+            return
+        model_info.supports_vision = supports_vision
+        model_info.supports_audio = supports_audio
+        if model_info.registration_id:
+            self.endpoint_registry.update_modality_support(
+                model_info.registration_id, supports_vision=supports_vision, supports_audio=supports_audio
+            )
 
     def _remove_stale_models(self, installed_info: InstalledInfo, stale_ids: set[str]) -> None:
         for removed_id in stale_ids:
@@ -497,12 +547,15 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
             current_model_ids.add(model_id)
 
             if model_id in installed_info.models:
+                await self._retry_unresolved_capabilities(installed_info, model_id)
                 continue
             if not is_initial_sync and model_id in self.models_downloaded:
                 continue
 
-            context_length = await self._fetch_context_length(installed_info.base_url, model_id)
-            self._register_synced_model(instance, installed_info, model_id, entry.get("size", 0), context_length)
+            context_length, supports_vision, supports_audio = await self._fetch_show_info(installed_info.base_url, model_id)
+            self._register_synced_model(
+                instance, installed_info, model_id, entry.get("size", 0), context_length, supports_vision, supports_audio
+            )
 
         self._remove_stale_models(installed_info, (set(installed_info.models) | saved_model_ids) - current_model_ids)
 
@@ -558,8 +611,12 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
 
             info = self.get_instance_installed_info(instance_name)
             for model_id, model in instance_models.items():
+                supports_vision: bool | None = None
+                supports_audio: bool | None = None
                 if model_id in info.models:
                     installed = info.models[model_id].get_info()
+                    supports_vision = info.models[model_id].supports_vision
+                    supports_audio = info.models[model_id].supports_audio
                 else:
                     installed = self._get_model_installed_info(instance_name, model_id)
 
@@ -575,6 +632,8 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                             custom=model.custom,
                             spec=self.get_model_spec(),
                             has_docker=False,
+                            supports_vision=supports_vision,
+                            supports_audio=supports_audio,
                         )
                     )
         return ListModelsOut(list=out_list)
@@ -587,7 +646,14 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
             raise HTTPException(status_code=400, detail="Model not found")
 
         model = self.models[instance][model_id]
-        installed = info.models[model_id].get_info() if model_id in info.models else self._get_model_installed_info(instance, model_id)
+        supports_vision: bool | None = None
+        supports_audio: bool | None = None
+        if model_id in info.models:
+            installed = info.models[model_id].get_info()
+            supports_vision = info.models[model_id].supports_vision
+            supports_audio = info.models[model_id].supports_audio
+        else:
+            installed = self._get_model_installed_info(instance, model_id)
         return RetrieveModelOut(
             id=model_id,
             service=self.get_id(instance),
@@ -596,6 +662,8 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
             downloaded=model_id in self.models_downloaded,
             size=model.size,
             custom=model.custom,
+            supports_vision=supports_vision,
+            supports_audio=supports_audio,
             spec=self.get_model_spec(),
             has_docker=False,
         )
@@ -676,7 +744,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                         {"model": model_id, "keep_alive": parsed_model_options.alive_time},
                     )
 
-                context_length = await self._fetch_context_length(info.base_url, model_id)
+                context_length, supports_vision, supports_audio = await self._fetch_show_info(info.base_url, model_id)
                 registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
@@ -684,6 +752,8 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                     registered_name=registered_name,
                     options=options,
                     registration_id="",
+                    supports_vision=supports_vision,
+                    supports_audio=supports_audio,
                 )
                 try:
                     if model.type == "llm":
@@ -695,6 +765,8 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 endpoints=self.get_supported_endpoints(),
                                 context_window=context_length,
                                 max_context_window=context_length,
+                                supports_vision=supports_vision,
+                                supports_audio=supports_audio,
                             ),
                             chat_completions=ProxyOptions(url=f"{info.base_url}/v1/chat/completions", rewrite_model_to=model_id),
                             completions=ProxyOptions(url=f"{info.base_url}/v1/completions", rewrite_model_to=model_id),

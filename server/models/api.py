@@ -422,6 +422,9 @@ class ModelProps(BaseModel):
     prefix: str | None = None
     transport: str | None = None
     tools: list[McpToolInfo] = []
+    # `None` means the capability is unknown/not yet resolved for this backend; `True`/`False` means resolved.
+    supports_vision: bool | None = None
+    supports_audio: bool | None = None
 
 
 type ModelType = Literal["llm", "embedding", "tts", "stt", "rerank", "txt2img", "mcp", "custom"]
