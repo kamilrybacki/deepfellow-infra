@@ -15,7 +15,7 @@ from typing import Any, Literal, TypedDict
 
 import aiohttp
 from fastapi import HTTPException
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel, Field
 
 from scripts.get_huggingface_models import fetch_registry_entries
 from server.applicationcontext import get_base_url
@@ -65,6 +65,7 @@ from server.utils.core import (
     convert_size_to_bytes,
     normalize_name,
     try_parse_pydantic,
+    with_legacy_key_migrated,
 )
 from server.utils.files import get_model_dir_context_window
 from server.utils.hardware import HardwarePartInfo
@@ -233,7 +234,7 @@ class ModelInstalledInfo:
 
     def get_info(self) -> ModelInfo:
         """Get info."""
-        return ModelInfo(spec=self.options.spec, registration_id=self.registration_id)
+        return ModelInfo(spec=with_legacy_key_migrated(self.options.spec, "alias", "rename"), registration_id=self.registration_id)
 
 
 class SglangOptions(BaseModel):
@@ -241,7 +242,7 @@ class SglangOptions(BaseModel):
 
 
 class SglangModelOptions(BaseModel):
-    alias: str | None = None
+    rename: str | None = Field(default=None, validation_alias=AliasChoices("rename", "alias"))
     gpu_memory_utilization: float | None = None
     max_model_length: int | None = None
     quantization: str | None = None
@@ -430,7 +431,7 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
     def get_model_spec(self, instance: str, model_type: str) -> ModelSpecification:
         """Return the model specification."""
         fields = [
-            ModelField(type="text", name="alias", description="Model alias", required=False),
+            ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
         ]
         if options := self.instances_info[instance].config.options:
             if "hardware" not in options.spec:
@@ -1138,7 +1139,7 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                     instance, model_id, "SGLang", docker_options.container_name or "", restarted, self._parse_max_concurrency
                 )
 
-                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
                 container_host = self.docker_service.get_container_host(subnet, docker_options.name)
                 container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
                 if model.model_type == "llm":

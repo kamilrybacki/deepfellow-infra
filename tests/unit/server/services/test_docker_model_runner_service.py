@@ -119,7 +119,7 @@ def test_get_spec_other_platform_selects_none(svc: DockerModelRunnerService) -> 
 def test_get_model_spec(svc: DockerModelRunnerService) -> None:
     spec = svc.get_model_spec()
     names = {f.name for f in spec.fields}
-    assert "alias" in names
+    assert "rename" in names
 
 
 def test_get_custom_model_spec_returns_none(svc: DockerModelRunnerService) -> None:
@@ -147,6 +147,13 @@ def test_model_installed_info_get_info() -> None:
     info = _make_model_installed_info(reg_id="reg-abc")
     result = info.get_info()
     assert result.registration_id == "reg-abc"
+
+
+def test_model_installed_info_get_info_migrates_legacy_alias_key() -> None:
+    info = _make_model_installed_info(reg_id="reg-abc")
+    info.options = InstallModelIn(spec={"alias": "my-alias"})
+    result = info.get_info()
+    assert result.spec == {"rename": "my-alias"}
 
 
 # ─── DmrRegistry / Pydantic models ───────────────────────────────────────────
@@ -404,7 +411,7 @@ async def test_sync_models_removes_stale(mock_fetch: AsyncMock, svc: DockerModel
 
 @pytest.mark.asyncio
 @patch("server.services.docker_model_runner_service.fetch_from", new_callable=AsyncMock)
-async def test_sync_models_restores_alias_on_initial_sync(
+async def test_sync_models_restores_rename_on_initial_sync(
     mock_fetch: AsyncMock, svc: DockerModelRunnerService, deps: dict[str, Any]
 ) -> None:
     installed = _make_installed_info()
@@ -412,7 +419,7 @@ async def test_sync_models_restores_alias_on_initial_sync(
         installed=None,
         installing=None,
         installing_model_progress={},
-        config=InstanceConfig(models=[ModelConfig(model_id="ai/llama3.2", options=InstallModelIn(spec={"alias": "my-alias"}))]),
+        config=InstanceConfig(models=[ModelConfig(model_id="ai/llama3.2", options=InstallModelIn(spec={"rename": "my-alias"}))]),
     )
     deps["endpoint_registry"].register_chat_completion_as_proxy.return_value = "reg-1"
     mock_fetch.return_value = FetchResult(
@@ -1085,7 +1092,7 @@ async def test_install_model_embedding_registers_embeddings(svc: DockerModelRunn
 
 
 @pytest.mark.asyncio
-async def test_install_model_alias_is_used_as_registered_name(svc: DockerModelRunnerService, deps: dict[str, Any]) -> None:
+async def test_install_model_rename_is_used_as_registered_name(svc: DockerModelRunnerService, deps: dict[str, Any]) -> None:
     model_id = next(mid for mid, m in svc.models["default"].items() if m.type == "llm")
     installed = _make_installed_info()
     svc.instances_info["default"].installed = installed
@@ -1095,7 +1102,7 @@ async def test_install_model_alias_is_used_as_registered_name(svc: DockerModelRu
         patch.object(svc, "_pull_model", new_callable=AsyncMock),
         patch.object(svc, "_save", new_callable=AsyncMock),
     ):
-        promise = await svc._install_model("default", model_id, InstallModelIn(spec={"alias": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={"rename": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
         await promise.wait()
 
     call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args

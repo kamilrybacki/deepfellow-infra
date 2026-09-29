@@ -19,7 +19,7 @@ import aiofiles
 from aiohttp import ClientSession
 from fastapi import HTTPException, Request
 from PIL import Image
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import AliasChoices, BaseModel, Field, ValidationError
 
 from server.applicationcontext import get_base_url
 from server.config import get_main_dir
@@ -64,6 +64,7 @@ from server.utils.core import (
     convert_size_to_bytes,
     load_json_registry,
     try_parse_pydantic,
+    with_legacy_key_migrated,
 )
 from server.utils.loading import Progress
 from server.utils.size_fetcher import fetch_file_size_from_url
@@ -191,7 +192,7 @@ class ModelInstalledInfo(BaseModel):
 
     def get_info(self) -> ModelInfo:
         """Get info."""
-        return ModelInfo(spec=self.options.spec, registration_id=self.registration_id)
+        return ModelInfo(spec=with_legacy_key_migrated(self.options.spec, "alias", "rename"), registration_id=self.registration_id)
 
 
 class SDOptions(BaseModel):
@@ -200,7 +201,7 @@ class SDOptions(BaseModel):
 
 
 class SDModelOptions(BaseModel):
-    alias: str | None = None
+    rename: str | None = Field(default=None, validation_alias=AliasChoices("rename", "alias"))
 
 
 @dataclass
@@ -267,7 +268,7 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
         """Return the model specification."""
         return ModelSpecification(
             fields=[
-                ModelField(type="text", name="alias", description="Model alias", required=False),
+                ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
             ]
         )
 
@@ -668,7 +669,7 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
 
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
 
-                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
                 model_path = local_model_path.absolute()
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,

@@ -35,6 +35,16 @@ def _make_installed_info(base_url: str = "http://localhost:11434") -> InstalledI
     )
 
 
+def _make_model_installed_info(model_id: str = "my-llm", registration_id: str = "reg-1") -> ModelInstalledInfo:
+    return ModelInstalledInfo(
+        id=model_id,
+        registered_name=model_id,
+        type="llm",
+        options=InstallModelIn(),
+        registration_id=registration_id,
+    )
+
+
 @pytest.fixture
 def deps() -> dict[str, Any]:
     service_provider = MagicMock()
@@ -123,11 +133,11 @@ def test_get_size_returns_empty_string(svc: OllamaExternalService) -> None:
     assert svc.get_size() == ""
 
 
-def test_get_model_spec_has_alias_and_alive_time(svc: OllamaExternalService) -> None:
+def test_get_model_spec_has_rename_and_alive_time(svc: OllamaExternalService) -> None:
     spec = svc.get_model_spec()
 
     names = {f.name for f in spec.fields}
-    assert {"alias", "alive_time"} <= names
+    assert {"rename", "alive_time"} <= names
 
 
 def test_get_custom_model_spec_has_required_fields(svc: OllamaExternalService) -> None:
@@ -139,17 +149,20 @@ def test_get_custom_model_spec_has_required_fields(svc: OllamaExternalService) -
 
 
 def test_model_installed_info_get_info() -> None:
-    model = ModelInstalledInfo(
-        id="my-llm",
-        registered_name="my-llm",
-        type="llm",
-        options=InstallModelIn(),
-        registration_id="reg-42",
-    )
+    model = _make_model_installed_info(registration_id="reg-42")
 
     info = model.get_info()
 
     assert info.registration_id == "reg-42"
+
+
+def test_model_installed_info_get_info_migrates_legacy_alias_key() -> None:
+    model = _make_model_installed_info(registration_id="reg-42")
+    model.options = InstallModelIn(spec={"alias": "my-alias"})
+
+    info = model.get_info()
+
+    assert info.spec == {"rename": "my-alias"}
 
 
 def test_load_download_info_returns_downloaded_info(svc: OllamaExternalService) -> None:
@@ -696,14 +709,14 @@ async def test_install_model_registers_embedding_endpoint(
 
 
 @pytest.mark.asyncio
-async def test_install_model_uses_alias_as_registered_name(svc: OllamaExternalService, installed: InstalledInfo) -> None:
+async def test_install_model_uses_rename_as_registered_name(svc: OllamaExternalService, installed: InstalledInfo) -> None:
     svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm")
 
     with (
         patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
         patch.object(svc, "_sync_models_from_external_ollama", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
     ):
-        promise = await svc._install_model("default", "test-llm", InstallModelIn(spec={"alias": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
+        promise = await svc._install_model("default", "test-llm", InstallModelIn(spec={"rename": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
         await promise.wait()
 
     assert installed.models["test-llm"].registered_name == "my-alias"

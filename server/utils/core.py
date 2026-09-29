@@ -318,6 +318,13 @@ def try_parse_pydantic[T](cls: type[T], data: Any) -> T:  # noqa: ANN401
         raise HTTPException(400, format_pydantic_errors(e) if isinstance(e, ValidationError) else "Unknown") from e
 
 
+def with_legacy_key_migrated(spec: dict[str, Any] | None, old_key: str, new_key: str) -> dict[str, Any] | None:
+    """Return `spec` with `old_key` renamed to `new_key`, so a value persisted under a field's old name still surfaces under the new one."""
+    if not spec or old_key not in spec or new_key in spec:
+        return spec
+    return {**{k: v for k, v in spec.items() if k != old_key}, new_key: spec[old_key]}
+
+
 def convert_size_to_bytes(size_str: str) -> None | int:
     """Convert a string representation of a size (e.g., "46MB", "1.2GB", "512K") into an integer number of bytes.
 

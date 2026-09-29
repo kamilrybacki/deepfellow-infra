@@ -121,18 +121,18 @@ def test_get_spec_has_hardware_field(svc: SpeachesAIService) -> None:
     assert "hardware" in field_names
 
 
-def test_get_model_spec_has_alias(svc: SpeachesAIService) -> None:
+def test_get_model_spec_has_rename(svc: SpeachesAIService) -> None:
     spec = svc.get_model_spec()
 
     field_names = [f.name for f in spec.fields]
-    assert "alias" in field_names
+    assert "rename" in field_names
 
 
-def test_get_model_spec_alias_is_optional(svc: SpeachesAIService) -> None:
+def test_get_model_spec_rename_is_optional(svc: SpeachesAIService) -> None:
     spec = svc.get_model_spec()
 
-    alias_field = next(f for f in spec.fields if f.name == "alias")
-    assert alias_field.required is False
+    rename_field = next(f for f in spec.fields if f.name == "rename")
+    assert rename_field.required is False
 
 
 def test_get_custom_model_spec_not_none(svc: SpeachesAIService) -> None:
@@ -269,6 +269,15 @@ def test_model_installed_info_get_info() -> None:
     info = model.get_info()
 
     assert info.registration_id == "reg-42"
+
+
+def test_model_installed_info_get_info_migrates_legacy_alias_key() -> None:
+    model = _make_model_installed_info("my-tts")
+    model.options = InstallModelIn(spec={"alias": "my-alias"})
+
+    info = model.get_info()
+
+    assert info.spec == {"rename": "my-alias"}
 
 
 def test_get_size_returns_cpu_size(svc: SpeachesAIService) -> None:
@@ -813,7 +822,7 @@ async def test_install_model_registers_stt_proxy(svc: SpeachesAIService, deps: d
 
 
 @pytest.mark.asyncio
-async def test_install_model_uses_alias_as_registered_name(svc: SpeachesAIService, tmp_path: Path) -> None:
+async def test_install_model_uses_rename_as_registered_name(svc: SpeachesAIService, tmp_path: Path) -> None:
     installed = _make_installed_info()
     svc.instances_info["default"].installed = installed
     tts_model_id = next(m.id for m in svc.models["default"].values() if m.type == "tts")
@@ -822,7 +831,7 @@ async def test_install_model_uses_alias_as_registered_name(svc: SpeachesAIServic
         patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
         patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
     ):
-        promise = await svc._install_model("default", tts_model_id, InstallModelIn(spec={"alias": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
+        promise = await svc._install_model("default", tts_model_id, InstallModelIn(spec={"rename": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
         await promise.wait()
 
     assert installed.models[tts_model_id].registered_name == "my-alias"

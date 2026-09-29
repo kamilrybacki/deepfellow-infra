@@ -31,7 +31,7 @@ from server.services.ollama_service import (
     OllamaService,
     _const,  # pyright: ignore[reportPrivateUsage]
 )
-from server.utils.core import DownloadedPacket, FetchResult, PreDownloadPacket, Stream, StreamChunkProgress
+from server.utils.core import DownloadedPacket, FetchResult, PreDownloadPacket, Stream, StreamChunkProgress, try_parse_pydantic
 from server.utils.hardware import IntelGpuInfo, NvidiaGpuInfo
 from server.utils.vram_calculator import ArchParams
 
@@ -52,6 +52,17 @@ def _make_installed_info(svc: OllamaService, instance: str = "default") -> Insta
         container_port=11434,
         docker_exposed_port=11434,
         base_url="http://localhost:11434",
+    )
+
+
+def _make_model_installed_info(model_id: str = "my-llm", registration_id: str = "reg-1") -> ModelInstalledInfo:
+    return ModelInstalledInfo(
+        id=model_id,
+        registered_name=model_id,
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id=registration_id,
+        internal_name=None,
     )
 
 
@@ -124,11 +135,11 @@ def test_spec_all_optional_fields_not_required(svc: OllamaService) -> None:
             assert field.required is False, f"Field {field.name!r} should be optional"
 
 
-def test_model_spec_has_alias_alive_time_context(svc: OllamaService) -> None:
+def test_model_spec_has_rename_alive_time_context(svc: OllamaService) -> None:
     spec = svc.get_model_spec()
 
     field_names = {f.name for f in spec.fields}
-    assert {"alias", "alive_time", "context_length"} <= field_names
+    assert {"rename", "alive_time", "context_length"} <= field_names
 
 
 def test_custom_model_spec_not_none(svc: OllamaService) -> None:
@@ -162,10 +173,16 @@ def test_model_options_invalid_alive_time_raises(bad_value: str) -> None:
         OllamaModelOptions(alive_time=bad_value)
 
 
-def test_model_options_alias_defaults_none() -> None:
+def test_model_options_rename_defaults_none() -> None:
     opts = OllamaModelOptions()
 
-    assert opts.alias is None
+    assert opts.rename is None
+
+
+def test_model_options_rename_accepts_legacy_alias_key() -> None:
+    opts = try_parse_pydantic(OllamaModelOptions, {"alias": "old-config-value"})
+
+    assert opts.rename == "old-config-value"
 
 
 def test_model_options_context_length_defaults_none() -> None:
@@ -527,18 +544,20 @@ def test_restore_model_definition_reinstates_model(svc: OllamaService) -> None:
 
 
 def test_model_installed_info_get_info() -> None:
-    model = ModelInstalledInfo(
-        id="my-llm",
-        registered_name="my-llm",
-        type="llm",
-        options=InstallModelIn(spec={}),
-        registration_id="reg-42",
-        internal_name=None,
-    )
+    model = _make_model_installed_info(registration_id="reg-42")
 
     info = model.get_info()
 
     assert info.registration_id == "reg-42"
+
+
+def test_model_installed_info_get_info_migrates_legacy_alias_key() -> None:
+    model = _make_model_installed_info(registration_id="reg-42")
+    model.options = InstallModelIn(spec={"alias": "my-alias"})
+
+    info = model.get_info()
+
+    assert info.spec == {"rename": "my-alias"}
 
 
 def test_get_local_modelfile_path(svc: OllamaService) -> None:
@@ -1190,7 +1209,7 @@ async def test_install_model_marks_model_as_downloaded(svc: OllamaService) -> No
 
 
 @pytest.mark.asyncio
-async def test_install_model_uses_alias_as_registered_name(svc: OllamaService) -> None:
+async def test_install_model_uses_rename_as_registered_name(svc: OllamaService) -> None:
     installed = _make_installed_info(svc)
     svc.instances_info["default"].installed = installed
     svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm", hash="abc", context=4096)
@@ -1198,7 +1217,7 @@ async def test_install_model_uses_alias_as_registered_name(svc: OllamaService) -
     with patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
         mock_fetch.return_value = FetchResult(status_code=200, data="")
         promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
-            "default", "test-llm", InstallModelIn(spec={"alias": "my-alias"})
+            "default", "test-llm", InstallModelIn(spec={"rename": "my-alias"})
         )
         await promise.wait()
 

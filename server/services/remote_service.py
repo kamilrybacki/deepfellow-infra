@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Generic, Literal, TypeVar
 
 from fastapi import HTTPException
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel, Field
 
 from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
 from server.models.api import ModelProps
@@ -47,6 +47,7 @@ from server.utils.core import (
     Utils,
     positive_context_window_or_none,
     try_parse_pydantic,
+    with_legacy_key_migrated,
 )
 from server.utils.logger import logger
 
@@ -147,7 +148,7 @@ class ModelInstalledInfo:
 
     def get_info(self) -> ModelInfo:
         """Get info."""
-        return ModelInfo(spec=self.options.spec, registration_id=self.registration_id)
+        return ModelInfo(spec=with_legacy_key_migrated(self.options.spec, "alias", "rename"), registration_id=self.registration_id)
 
 
 class BaseServiceOptions(BaseModel):
@@ -179,7 +180,7 @@ T_Options = TypeVar("T_Options", bound=BaseServiceOptions, default=DefaultRemote
 
 
 class RemoteModelOptions(BaseModel):
-    alias: str | None = None
+    rename: str | None = Field(default=None, validation_alias=AliasChoices("rename", "alias"))
 
 
 @dataclass
@@ -381,7 +382,7 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
         """Return the model specification."""
         return ModelSpecification(
             fields=[
-                ModelField(type="text", name="alias", description="Model alias", required=False),
+                ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
             ]
         )
 
@@ -626,7 +627,7 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
             try:
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
-                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
                     type=model.type or "unknown",

@@ -21,6 +21,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - The `adapter_registry_url` setting (`DF_ADAPTER_REGISTRY_URL`, `PUT /admin/config`). The df-finetune adapter registry's address is now resolved live from the installed Finetune service, since the manually configured URL drifted from the container's dynamically assigned host port. An existing `config.json` is migrated automatically (schema version 2 → 3) and the key dropped. `adapter_registry_secret` is unchanged.
 - The `deepfellow-finetune` model of the Custom service, superseded by the Finetune service. On the first startup after upgrading, an installed one is dropped from the Custom service's config and its container is removed. Its data under the Custom service's working directory is left in place but not migrated; install the Finetune service instead.
 
+### Changed
+
+- The per-model `alias` option (available on every model-serving service except Custom and MCP) is now called `rename`, better reflecting that it fully replaces the model's registered name rather than adding a second one alongside it. Configs that already set `alias` keep working unchanged - it's still accepted as an alternate spelling when parsing.
+
 ### Fixed
 
 - Remote/OpenAI-compatible service instances (OpenAI, Claude, Google AI and OpenAI-compatible custom endpoints) now build correct request URLs regardless of whether the configured API URL includes a trailing slash or an explicit `/v1` (or provider-specific) version suffix. Previously a trailing slash on the API URL could silently double up the version segment (e.g. `/v1/v1/embeddings`), producing failed requests to the provider.

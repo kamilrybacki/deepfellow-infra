@@ -87,6 +87,17 @@ def _make_sd_custom(custom_id: str = "uuid-1", model_id: str = "my-sd-model") ->
 # --- Fixtures ---
 
 
+def _make_model_installed_info(model_id: str = "model-1", registration_id: str = "reg-1") -> ModelInstalledInfo:
+    return ModelInstalledInfo(
+        id=model_id,
+        type="txt2img",
+        registered_name=model_id,
+        options=InstallModelIn(spec={}),
+        model_path=Path("/some/path"),
+        registration_id=registration_id,
+    )
+
+
 @pytest.fixture
 def deps() -> dict[str, Any]:
     hw = MagicMock()
@@ -159,10 +170,10 @@ def test_sd_options_valid_prefix(good_prefix: str) -> None:
     assert opts.expose_api_at_prefix == good_prefix
 
 
-def test_sd_model_options_alias_defaults_none() -> None:
+def test_sd_model_options_rename_defaults_none() -> None:
     opts = SDModelOptions()
 
-    assert opts.alias is None
+    assert opts.rename is None
 
 
 def test_get_spec_has_hardware_field(svc: StableDiffusionService) -> None:
@@ -186,11 +197,11 @@ def test_get_spec_expose_api_at_prefix_is_optional(svc: StableDiffusionService) 
     assert field.required is False
 
 
-def test_get_model_spec_has_alias(svc: StableDiffusionService) -> None:
+def test_get_model_spec_has_rename(svc: StableDiffusionService) -> None:
     spec = svc.get_model_spec()
 
     field_names = [f.name for f in spec.fields]
-    assert "alias" in field_names
+    assert "rename" in field_names
 
 
 def test_get_custom_model_spec_not_none(svc: StableDiffusionService) -> None:
@@ -295,19 +306,21 @@ def test_default_models_loaded(svc: StableDiffusionService) -> None:
 
 
 def test_model_installed_info_get_info() -> None:
-    mi = ModelInstalledInfo(
-        id="model-1",
-        type="txt2img",
-        registered_name="my-model",
-        options=InstallModelIn(spec={}),
-        model_path=Path("/some/path"),
-        registration_id="reg-123",
-    )
+    mi = _make_model_installed_info(registration_id="reg-123")
 
     info = mi.get_info()
 
     assert info.registration_id == "reg-123"
     assert info.spec == {}
+
+
+def test_model_installed_info_get_info_migrates_legacy_alias_key() -> None:
+    mi = _make_model_installed_info(registration_id="reg-123")
+    mi.options = InstallModelIn(spec={"alias": "my-alias"})
+
+    info = mi.get_info()
+
+    assert info.spec == {"rename": "my-alias"}
 
 
 def test_get_size_returns_cpu_size(svc: StableDiffusionService) -> None:
@@ -926,7 +939,7 @@ async def test_install_model_lora_does_not_register_image_endpoint(svc: StableDi
 
 
 @pytest.mark.asyncio
-async def test_install_model_uses_alias_as_registered_name(svc: StableDiffusionService) -> None:
+async def test_install_model_uses_rename_as_registered_name(svc: StableDiffusionService) -> None:
     installed = _make_installed_info()
     svc.instances_info["default"].installed = installed
     model_id = "Plant Milk Walnut"
@@ -936,7 +949,7 @@ async def test_install_model_uses_alias_as_registered_name(svc: StableDiffusionS
         patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=path),  # pyright: ignore[reportPrivateUsage]
         patch.object(svc, "refresh_models", new_callable=AsyncMock),
     ):
-        promise = await svc._install_model("default", model_id, InstallModelIn(spec={"alias": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={"rename": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
         await promise.wait()
 
     assert installed.models[model_id].registered_name == "my-alias"

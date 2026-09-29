@@ -34,7 +34,7 @@ Installing any SGLang model SHALL launch a Docker container running `python3 -m 
 
 #### Scenario: Installing an LLM model
 - **WHEN** a user installs an `llm`-type model on the SGLang service with GPU hardware
-- **THEN** the resulting Docker container's command starts with `python3 -m sglang.launch_server`, includes `--model-path` pointing at the downloaded checkpoint, `--served-model-name` set to the model id (or alias), `--host 0.0.0.0`, and `--port 30000`
+- **THEN** the resulting Docker container's command starts with `python3 -m sglang.launch_server`, includes `--model-path` pointing at the downloaded checkpoint, `--served-model-name` set to the model id (or its rename, if set), `--host 0.0.0.0`, and `--port 30000`
 
 #### Scenario: GPU memory utilization option applied
 - **WHEN** a user sets `gpu_memory_utilization` on a model's install options
