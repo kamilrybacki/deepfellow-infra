@@ -26,6 +26,18 @@ from server.services.remote_service import (
 )
 
 
+def _make_model_installed_info(model_id: str = "gpt-4o", registration_id: str = "reg-1") -> ModelInstalledInfo:
+    return ModelInstalledInfo(
+        id=model_id,
+        registered_name=model_id,
+        type="llm",
+        options=InstallModelIn(spec={}),
+        completions=True,
+        legacy_completions=True,
+        registration_id=registration_id,
+    )
+
+
 @pytest.fixture
 def deps() -> dict[str, Any]:
     return {
@@ -275,21 +287,23 @@ def test_base_service_options_headers_raises_not_implemented() -> None:
 
 
 def test_model_installed_info_get_info_returns_model_info() -> None:
-    options = InstallModelIn(spec={"alias": "test"})
-    info = ModelInstalledInfo(
-        id="gpt-4o",
-        registered_name="gpt-4o",
-        type="llm",
-        options=options,
-        completions=True,
-        legacy_completions=True,
-        registration_id="reg-1",
-    )
+    options = InstallModelIn(spec={"rename": "test"})
+    info = _make_model_installed_info()
+    info.options = options
 
     result = info.get_info()
 
     assert result.spec == options.spec
     assert result.registration_id == "reg-1"
+
+
+def test_model_installed_info_get_info_migrates_legacy_alias_key() -> None:
+    info = _make_model_installed_info()
+    info.options = InstallModelIn(spec={"alias": "my-alias"})
+
+    result = info.get_info()
+
+    assert result.spec == {"rename": "my-alias"}
 
 
 def test_openai_get_spec_has_api_url_and_api_key_fields(openai_svc: OpenAIService) -> None:
@@ -300,11 +314,11 @@ def test_openai_get_spec_has_api_url_and_api_key_fields(openai_svc: OpenAIServic
     assert "api_key" in field_names
 
 
-def test_openai_get_model_spec_has_alias_field(openai_svc: OpenAIService) -> None:
+def test_openai_get_model_spec_has_rename_field(openai_svc: OpenAIService) -> None:
     spec = openai_svc.get_model_spec()
 
     field_names = [f.name for f in spec.fields]
-    assert "alias" in field_names
+    assert "rename" in field_names
 
 
 def test_openai_get_custom_model_spec_not_none_and_has_id_field(openai_svc: OpenAIService) -> None:
@@ -771,13 +785,13 @@ async def test_install_model_builds_correct_embeddings_url(
 
 
 @pytest.mark.asyncio
-async def test_install_model_with_alias_uses_alias_as_registered_name(
+async def test_install_model_with_rename_uses_rename_as_registered_name(
     openai_svc: OpenAIService,
     deps: dict[str, Any],
 ) -> None:
     openai_svc.instances_info["default"].installed = _make_installed()
 
-    promise = await openai_svc._install_model("default", "gpt-4o", InstallModelIn(spec={"alias": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
+    promise = await openai_svc._install_model("default", "gpt-4o", InstallModelIn(spec={"rename": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
     await promise.wait()
 
     installed_info = openai_svc.instances_info["default"].installed

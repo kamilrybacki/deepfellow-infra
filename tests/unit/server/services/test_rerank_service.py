@@ -40,6 +40,16 @@ def _make_installed_info(instance: str = "default") -> InstalledInfo:
     )
 
 
+def _make_model_installed_info(model_id: str = "cross-encoder/ms-marco-MiniLM-L6-v2", registration_id: str = "reg-1") -> ModelInstalledInfo:
+    return ModelInstalledInfo(
+        id=model_id,
+        registered_name=model_id,
+        type="rerank",
+        options=InstallModelIn(spec={}),
+        registration_id=registration_id,
+    )
+
+
 @pytest.fixture
 def deps() -> dict[str, Any]:
     return {
@@ -113,11 +123,11 @@ def test_get_spec_keep_alive_is_optional(svc: RerankService) -> None:
     assert field.required is False
 
 
-def test_get_model_spec_has_alias_alive_time_preload(svc: RerankService) -> None:
+def test_get_model_spec_has_rename_alive_time_preload(svc: RerankService) -> None:
     spec = svc.get_model_spec()
 
     field_names = {f.name for f in spec.fields}
-    assert {"alias", "alive_time", "preload"} <= field_names
+    assert {"rename", "alive_time", "preload"} <= field_names
 
 
 def test_get_model_spec_all_fields_optional(svc: RerankService) -> None:
@@ -149,7 +159,7 @@ def test_rerank_options_defaults() -> None:
 def test_rerank_model_options_defaults() -> None:
     opts = RerankModelOptions()
 
-    assert opts.alias is None
+    assert opts.rename is None
     assert opts.alive_time is None
     assert opts.preload is None
 
@@ -198,17 +208,20 @@ def test_default_models_match_const(svc: RerankService) -> None:
 
 
 def test_model_installed_info_get_info() -> None:
-    model = ModelInstalledInfo(
-        id="cross-encoder/ms-marco-MiniLM-L6-v2",
-        registered_name="cross-encoder/ms-marco-MiniLM-L6-v2",
-        type="rerank",
-        options=InstallModelIn(spec={}),
-        registration_id="reg-42",
-    )
+    model = _make_model_installed_info(registration_id="reg-42")
 
     info = model.get_info()
 
     assert info.registration_id == "reg-42"
+
+
+def test_model_installed_info_get_info_migrates_legacy_alias_key() -> None:
+    model = _make_model_installed_info(registration_id="reg-42")
+    model.options = InstallModelIn(spec={"alias": "my-alias"})
+
+    info = model.get_info()
+
+    assert info.spec == {"rename": "my-alias"}
 
 
 # --- get_size ---
@@ -658,7 +671,7 @@ async def test_install_model_marks_model_as_downloaded(svc: RerankService, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_install_model_uses_alias_as_registered_name(svc: RerankService, tmp_path: Path) -> None:
+async def test_install_model_uses_rename_as_registered_name(svc: RerankService, tmp_path: Path) -> None:
     installed = _make_installed_info()
     svc.instances_info["default"].installed = installed
     model_id = next(iter(_const.models))
@@ -667,7 +680,7 @@ async def test_install_model_uses_alias_as_registered_name(svc: RerankService, t
         patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
         patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
     ):
-        promise = await svc._install_model("default", model_id, InstallModelIn(spec={"alias": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={"rename": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
         await promise.wait()
 
     assert installed.models[model_id].registered_name == "my-alias"

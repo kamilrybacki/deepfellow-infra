@@ -190,11 +190,11 @@ def test_get_spec_has_hardware_field(svc: LLamacppService) -> None:
     assert "hardware" in field_names
 
 
-def test_get_model_spec_has_alias_field(svc: LLamacppService) -> None:
+def test_get_model_spec_has_rename_field(svc: LLamacppService) -> None:
     spec = svc.get_model_spec()
 
     field_names = [f.name for f in spec.fields]
-    assert "alias" in field_names
+    assert "rename" in field_names
 
 
 def test_get_model_spec_has_max_model_length_field(svc: LLamacppService) -> None:
@@ -214,6 +214,15 @@ def test_model_installed_info_get_info() -> None:
     info = model.get_info()
 
     assert info.registration_id == "reg-42"
+
+
+def test_model_installed_info_get_info_migrates_legacy_alias_key() -> None:
+    model = _make_model_installed_info(registration_id="reg-42")
+    model.options = InstallModelIn(spec={"alias": "my-alias"})
+
+    info = model.get_info()
+
+    assert info.spec == {"rename": "my-alias"}
 
 
 def test_get_size_cpu_only(deps: dict[str, Any]) -> None:
@@ -697,7 +706,7 @@ async def test_install_model_records_model_as_downloaded(svc: LLamacppService, d
 
 
 @pytest.mark.asyncio
-async def test_install_model_uses_alias_as_registered_name(svc: LLamacppService, deps: dict[str, Any], tmp_path: Path) -> None:
+async def test_install_model_uses_rename_as_registered_name(svc: LLamacppService, deps: dict[str, Any], tmp_path: Path) -> None:
     installed = _setup_install_mocks(svc, deps)
     model_id = next(iter(svc.models["default"]))
     with (
@@ -706,7 +715,7 @@ async def test_install_model_uses_alias_as_registered_name(svc: LLamacppService,
         patch("server.services.llamacpp_service.get_base_url", return_value="http://localhost:8080"),
         patch.object(svc, "get_specified_hardware_parts", return_value=[]),
     ):
-        promise = await svc._install_model("default", model_id, InstallModelIn(spec={"alias": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={"rename": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
         await promise.wait()
 
     assert installed.models[model_id].registered_name == "my-alias"

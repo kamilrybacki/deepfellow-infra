@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from fastapi import HTTPException
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel, Field
 
 from server.config import get_main_dir
 from server.endpointregistry import ProxyOptions, RegistrationId
@@ -47,6 +47,7 @@ from server.utils.core import (
     fetch_from,
     stream_fetch_from,
     try_parse_pydantic,
+    with_legacy_key_migrated,
 )
 from server.utils.loading import Progress
 from server.utils.logger import logger
@@ -100,7 +101,7 @@ class ModelInstalledInfo:
 
     def get_info(self) -> ModelInfo:
         """Get info."""
-        return ModelInfo(spec=self.options.spec, registration_id=self.registration_id)
+        return ModelInfo(spec=with_legacy_key_migrated(self.options.spec, "alias", "rename"), registration_id=self.registration_id)
 
 
 class DockerModelRunnerOptions(BaseModel):
@@ -109,7 +110,7 @@ class DockerModelRunnerOptions(BaseModel):
 
 
 class DockerModelRunnerModelOptions(BaseModel):
-    alias: str | None = None
+    rename: str | None = Field(default=None, validation_alias=AliasChoices("rename", "alias"))
 
 
 @dataclass
@@ -186,7 +187,7 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
         """Return the model specification."""
         return ModelSpecification(
             fields=[
-                ModelField(type="text", name="alias", description="Model alias", required=False),
+                ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
             ]
         )
 
@@ -251,7 +252,7 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
         parsed_options = (
             try_parse_pydantic(DockerModelRunnerModelOptions, options.spec) if options and options.spec else DockerModelRunnerModelOptions()
         )
-        registered_name = parsed_options.alias if parsed_options.alias else model_id
+        registered_name = parsed_options.rename if parsed_options.rename else model_id
 
         model_info = ModelInstalledInfo(
             id=model_id,
@@ -565,7 +566,7 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
             await self._pull_model(stream, model, model_id, info.base_url)
 
             stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
-            registered_name = parsed_options.alias if parsed_options.alias else model_id
+            registered_name = parsed_options.rename if parsed_options.rename else model_id
 
             model_info = ModelInstalledInfo(
                 id=model_id,

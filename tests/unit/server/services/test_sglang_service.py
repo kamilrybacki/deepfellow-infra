@@ -155,7 +155,7 @@ def test_get_model_spec_baseline_fields(svc: SglangService) -> None:
     spec = svc.get_model_spec("default", "llm")
 
     field_names = [f.name for f in spec.fields]
-    for expected in ("alias", "max_model_length", "quantization", "extra_args", "extra_envs"):
+    for expected in ("rename", "max_model_length", "quantization", "extra_args", "extra_envs"):
         assert expected in field_names
 
 
@@ -1619,6 +1619,15 @@ def test_model_installed_info_get_info() -> None:
     info = model.get_info()
 
     assert info.registration_id == "reg-42"
+
+
+def test_model_installed_info_get_info_migrates_legacy_alias_key() -> None:
+    model = _make_model_installed_info(registration_id="reg-42")
+    model.options = InstallModelIn(spec={"alias": "my-alias"})
+
+    info = model.get_info()
+
+    assert info.spec == {"rename": "my-alias"}
 
 
 def test_generate_instance_config_none_info(svc: SglangService) -> None:

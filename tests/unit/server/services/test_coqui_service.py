@@ -95,18 +95,18 @@ def test_get_spec_has_hardware_field(svc: CoquiService) -> None:
     assert "hardware" in field_names
 
 
-def test_get_model_spec_has_alias_field(svc: CoquiService) -> None:
+def test_get_model_spec_has_rename_field(svc: CoquiService) -> None:
     spec = svc.get_model_spec()
 
     field_names = [f.name for f in spec.fields]
-    assert "alias" in field_names
+    assert "rename" in field_names
 
 
-def test_get_model_spec_alias_is_optional(svc: CoquiService) -> None:
+def test_get_model_spec_rename_is_optional(svc: CoquiService) -> None:
     spec = svc.get_model_spec()
 
-    alias_field = next(f for f in spec.fields if f.name == "alias")
-    assert alias_field.required is False
+    rename_field = next(f for f in spec.fields if f.name == "rename")
+    assert rename_field.required is False
 
 
 def test_get_custom_model_spec_is_none(svc: CoquiService) -> None:
@@ -248,6 +248,15 @@ def test_model_installed_info_get_info() -> None:
     info = model.get_info()
 
     assert info.registration_id == "reg-42"
+
+
+def test_model_installed_info_get_info_migrates_legacy_alias_key() -> None:
+    model = _make_model_installed_info(registration_id="reg-42")
+    model.options = InstallModelIn(spec={"alias": "my-alias"})
+
+    info = model.get_info()
+
+    assert info.spec == {"rename": "my-alias"}
 
 
 def test_model_installed_info_base_url_set() -> None:
@@ -628,7 +637,7 @@ async def test_install_model_registers_endpoint_and_returns_ok(svc: CoquiService
 
 
 @pytest.mark.asyncio
-async def test_install_model_uses_alias_as_registered_name(svc: CoquiService, deps: dict[str, Any]) -> None:
+async def test_install_model_uses_rename_as_registered_name(svc: CoquiService, deps: dict[str, Any]) -> None:
     installed = _make_installed_info()
     installed.parsed_options = CoquiOptions(hardware=False)
     svc.instances_info["default"].installed = installed
@@ -640,7 +649,7 @@ async def test_install_model_uses_alias_as_registered_name(svc: CoquiService, de
     deps["docker_service"].get_container_port.return_value = 5002
     deps["endpoint_registry"].register_audio_speech.return_value = "reg-1"
 
-    await (await svc._install_model("default", model_id, InstallModelIn(spec={"alias": "my-voice"}))).wait()  # pyright: ignore[reportPrivateUsage]
+    await (await svc._install_model("default", model_id, InstallModelIn(spec={"rename": "my-voice"}))).wait()  # pyright: ignore[reportPrivateUsage]
 
     assert installed.models[model_id].registered_name == "my-voice"
 

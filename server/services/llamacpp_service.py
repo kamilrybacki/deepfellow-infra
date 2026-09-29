@@ -14,7 +14,7 @@ from typing import Any, Literal, NoReturn
 
 import aiohttp
 from fastapi import HTTPException
-from pydantic import BaseModel, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 from scripts.get_llamacpp_models import DegradedFetchError, fetch_llamacpp_entries, preserve_jinja_flags
 from server.applicationcontext import get_base_url
@@ -61,6 +61,7 @@ from server.utils.core import (
     convert_size_to_bytes,
     normalize_name,
     try_parse_pydantic,
+    with_legacy_key_migrated,
 )
 from server.utils.files import get_gguf_arch_params, get_gguf_context_window
 from server.utils.hardware import GpuInfo, HardwarePartInfo, IntelGpuInfo, NvidiaGpuInfo
@@ -142,7 +143,7 @@ class ModelInstalledInfo:
 
     def get_info(self) -> ModelInfo:
         """Get info."""
-        return ModelInfo(spec=self.options.spec, registration_id=self.registration_id)
+        return ModelInfo(spec=with_legacy_key_migrated(self.options.spec, "alias", "rename"), registration_id=self.registration_id)
 
 
 class LLamacppOptions(BaseModel):
@@ -158,7 +159,7 @@ class LLamacppOptions(BaseModel):
 
 
 class LLamacppModelOptions(BaseModel):
-    alias: str | None = None
+    rename: str | None = Field(default=None, validation_alias=AliasChoices("rename", "alias"))
     max_model_length: int | None = None
 
 
@@ -312,7 +313,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
         """Return the model specification."""
         return ModelSpecification(
             fields=[
-                ModelField(type="text", name="alias", description="Model alias", required=False),
+                ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
                 ModelField(type="number", name="max_model_length", description="Max model length ex. 4096", required=False),
             ]
         )
@@ -704,7 +705,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
                 )
                 docker_exposed_port, _, adopted = await self.docker_service.install_and_run_docker(docker_options)
                 self._log_cache.pop(docker_options.container_name or "", None)
-                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
                 container_host = self.docker_service.get_container_host(subnet, docker_options.name)
                 container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
                 installed.models[model_id] = model_info = ModelInstalledInfo(

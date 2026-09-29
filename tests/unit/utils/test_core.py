@@ -33,6 +33,7 @@ from server.utils.core import (
     make_http_request,
     positive_context_window_or_none,
     stream_fetch_from,
+    with_legacy_key_migrated,
 )
 
 
@@ -1001,3 +1002,20 @@ async def test_sse_generator_reraises_cancellation_when_task_cancelling():
 def test_positive_context_window_or_none(value: int | None, expected: int | None) -> None:
     """A zero or negative window is an unknown window, not a small one."""
     assert positive_context_window_or_none(value) == expected
+
+
+def test_with_legacy_key_migrated_renames_old_key() -> None:
+    assert with_legacy_key_migrated({"alias": "x", "other": 1}, "alias", "rename") == {"rename": "x", "other": 1}
+
+
+def test_with_legacy_key_migrated_leaves_new_key_alone_when_already_present() -> None:
+    assert with_legacy_key_migrated({"rename": "x", "alias": "y"}, "alias", "rename") == {"rename": "x", "alias": "y"}
+
+
+def test_with_legacy_key_migrated_leaves_spec_alone_when_old_key_absent() -> None:
+    assert with_legacy_key_migrated({"other": 1}, "alias", "rename") == {"other": 1}
+
+
+def test_with_legacy_key_migrated_handles_none_and_empty_spec() -> None:
+    assert with_legacy_key_migrated(None, "alias", "rename") is None
+    assert with_legacy_key_migrated({}, "alias", "rename") == {}

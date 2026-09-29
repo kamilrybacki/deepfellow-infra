@@ -10,7 +10,7 @@ from typing import Annotated, Any, Literal
 
 from fastapi import HTTPException
 from packaging import version
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import AliasChoices, BaseModel, Field, StringConstraints
 
 from server.config import get_main_dir
 from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
@@ -47,6 +47,7 @@ from server.utils.core import (
     fetch_from,
     stream_fetch_from,
     try_parse_pydantic,
+    with_legacy_key_migrated,
 )
 from server.utils.loading import Progress
 from server.utils.logger import logger
@@ -113,7 +114,7 @@ class ModelInstalledInfo:
 
     def get_info(self) -> ModelInfo:
         """Get info."""
-        return ModelInfo(spec=self.options.spec, registration_id=self.registration_id)
+        return ModelInfo(spec=with_legacy_key_migrated(self.options.spec, "alias", "rename"), registration_id=self.registration_id)
 
 
 class OllamaExternalOptions(BaseModel):
@@ -122,7 +123,7 @@ class OllamaExternalOptions(BaseModel):
 
 
 class OllamaModelOptions(BaseModel):
-    alias: str | None = None
+    rename: str | None = Field(default=None, validation_alias=AliasChoices("rename", "alias"))
     alive_time: int | Annotated[str, StringConstraints(pattern=r"^(\d+[smh])?$", strict=True)] = ""
 
 
@@ -184,7 +185,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
         """Return the model specification."""
         return ModelSpecification(
             fields=[
-                ModelField(type="text", name="alias", description="Model alias", required=False),
+                ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
                 ModelField(
                     type="text",
                     name="alive_time",
@@ -745,7 +746,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                     )
 
                 context_length, supports_vision, supports_audio = await self._fetch_show_info(info.base_url, model_id)
-                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
                     type=model.type,

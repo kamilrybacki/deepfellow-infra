@@ -17,7 +17,7 @@ from typing import Annotated, Any, Literal, NamedTuple, TypedDict
 import aiofiles
 import aiohttp
 from fastapi import HTTPException
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import AliasChoices, BaseModel, Field, StringConstraints
 
 from server.applicationcontext import get_base_url
 from server.config import get_main_dir
@@ -60,6 +60,7 @@ from server.utils.core import (
     positive_context_window_or_none,
     stream_fetch_from,
     try_parse_pydantic,
+    with_legacy_key_migrated,
 )
 from server.utils.files import detect_context_window_from_path
 from server.utils.hardware import GpuInfo, HardwarePartInfo, IntelGpuInfo
@@ -187,7 +188,7 @@ class ModelInstalledInfo:
 
     def get_info(self) -> ModelInfo:
         """Get info."""
-        return ModelInfo(spec=self.options.spec, registration_id=self.registration_id)
+        return ModelInfo(spec=with_legacy_key_migrated(self.options.spec, "alias", "rename"), registration_id=self.registration_id)
 
 
 class OllamaOptions(BaseModel):
@@ -201,7 +202,7 @@ class OllamaOptions(BaseModel):
 
 
 class OllamaModelOptions(BaseModel):
-    alias: str | None = None
+    rename: str | None = Field(default=None, validation_alias=AliasChoices("rename", "alias"))
     alive_time: int | Annotated[str, StringConstraints(pattern=r"^(\d+[smh])?$", strict=True)] = ""
     context_length: int | None = None
 
@@ -427,7 +428,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         """Return the model specification."""
         return ModelSpecification(
             fields=[
-                ModelField(type="text", name="alias", description="Model alias", required=False),
+                ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
                 ModelField(
                     type="text",
                     name="alive_time",
@@ -1473,7 +1474,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                         {"model": model_id, "keep_alive": parsed_model_options.alive_time},
                     )
 
-                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
                     type=model.type,
