@@ -23,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- The doc-chunker custom service now installs the `v2.0.0` image by default (GPU and CPU, was `v1.0.3`), the version df-server expects. A fresh install with default settings now provides the document-conversion endpoint df-server calls.
 - The per-model `alias` option (available on every model-serving service except Custom and MCP) is now called `rename`, better reflecting that it fully replaces the model's registered name rather than adding a second one alongside it. Configs that already set `alias` keep working unchanged - it's still accepted as an alternate spelling when parsing.
 
 ### Fixed

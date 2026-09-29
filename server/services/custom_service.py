@@ -1059,9 +1059,9 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
     def generate_docker_options(model_fields: InstallModelOptions) -> DockerOptions:
         hardware_parts = custom_service.get_specified_hardware_parts(model_fields.get("hardware"))
         image = (
-            "hub.simplito.com/deepfellow/doc-chunker-gpu:v1.0.3"
+            "hub.simplito.com/deepfellow/doc-chunker-gpu:v2.0.0"
             if _is_gpu_hardware(hardware_parts)
-            else "hub.simplito.com/deepfellow/doc-chunker-cpu:v1.0.3"
+            else "hub.simplito.com/deepfellow/doc-chunker-cpu:v2.0.0"
         )
         return DockerOptions(
             image_port=8000,
