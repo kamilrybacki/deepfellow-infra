@@ -3032,7 +3032,7 @@ async def test_get_duplicate_spec_catalog_model_uses_installed_envs_and_headers(
 
     spec = await svc.get_duplicate_spec("default", "brave-search")
 
-    assert spec["envs"] == {"BRAVE_API_KEY": "secret-key"}
+    assert spec["envs"] == {"BRAVE_MCP_TRANSPORT": "http", "BRAVE_API_KEY": "secret-key"}
     assert spec["headers"] == {"X-Custom": "value"}
 
 

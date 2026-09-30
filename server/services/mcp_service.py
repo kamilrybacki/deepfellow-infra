@@ -2141,7 +2141,7 @@ _const = McpConst(
                 name="brave-search",
                 container_name=mcp_service.docker_service.get_docker_container_name("brave-search"),
                 image="hub.simplito.com/deepfellow/brave-search-mcp-server:v2.0.72",
-                env_vars={},
+                env_vars={"BRAVE_MCP_TRANSPORT": "http"},
                 subnet=subnet,
             ),
             required_envs=["BRAVE_API_KEY"],
