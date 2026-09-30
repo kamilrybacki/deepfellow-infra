@@ -28,6 +28,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- The brave-search MCP model catalog entry now sets `BRAVE_MCP_TRANSPORT=http`, fixing installation always failing: `brave-search-mcp-server` defaults to `stdio` transport, so the container exited immediately (exit code 0, no logs) instead of serving the `streamable_http` endpoint DF Infra expects on port 8080.
 - Remote/OpenAI-compatible service instances (OpenAI, Claude, Google AI and OpenAI-compatible custom endpoints) now build correct request URLs regardless of whether the configured API URL includes a trailing slash or an explicit `/v1` (or provider-specific) version suffix. Previously a trailing slash on the API URL could silently double up the version segment (e.g. `/v1/v1/embeddings`), producing failed requests to the provider.
 - Stable Diffusion Next's "not supported on macOS" restriction is now shown upfront in the services list (as a disabled reason), instead of only after clicking Install and getting a raw error.
 - The web-search MCP model catalog entry now sets `proxy_transport="sse"`, fixing `tools/list` returning an empty tool list through the toolbox proxy: the entry never set `proxy_transport`, so it defaulted to `streamable_http` and DF Infra registered the proxy against `base_url + "/mcp"` — a path the container (which speaks SSE only, via `supergateway`) doesn't expose.
