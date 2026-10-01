@@ -11,29 +11,16 @@ file to stay in sync with its own writes.
 
 import json
 import secrets
-import tomllib
-from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
-from server.config import AppSettings, ConfigError, get_main_dir, get_services_json_path
+from server.config import AppSettings, ConfigError, get_services_json_path
 from server.utils.logger import logger
+from server.utils.version import get_infra_version
 
 CURRENT_SCHEMA_VERSION = 3
-
-
-@lru_cache(maxsize=1)
-def get_infra_version() -> str:
-    """App version reported in config.json, for future migrations/diagnostics.
-
-    Read from `pyproject.toml` lazily (rather than at import time) and cached, since it never
-    changes for the lifetime of the process.
-    """
-    pyproject = get_main_dir() / "pyproject.toml"
-    with pyproject.open("rb") as f:
-        return tomllib.load(f)["project"]["version"]
 
 
 class DynamicSettings(BaseModel):

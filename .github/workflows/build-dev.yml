@@ -27,5 +27,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          build-args: |
+            DF_BUILD_COMMIT=${{ github.sha }}
           push: false
           load: false
