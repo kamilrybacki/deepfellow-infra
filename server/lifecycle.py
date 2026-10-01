@@ -23,7 +23,6 @@ from server.model_tester import ModelTester
 from server.portservice import PortService
 from server.serviceprovider import ServiceProvider
 from server.services.claude_service import ClaudeService
-from server.services.coqui_service import CoquiService
 from server.services.custom_service import CustomService
 from server.services.deepseek_service import DeepSeekService
 from server.services.docker_model_runner_service import DockerModelRunnerService
@@ -109,7 +108,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
         # Register services
         services_manager.register_service(ClaudeService(*model_input))
-        services_manager.register_service(CoquiService(*model_input))
         services_manager.register_service(CustomService(*model_input))
         services_manager.register_service(DeepSeekService(*model_input))
         services_manager.register_service(DockerModelRunnerService(*model_input))

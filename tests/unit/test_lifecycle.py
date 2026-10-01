@@ -67,7 +67,6 @@ def test_check_subnet_network_not_found(mock_subprocess_run: Mock, subnet: str) 
 
 SERVICE_CLASSES = [
     "ClaudeService",
-    "CoquiService",
     "CustomService",
     "GoogleAIService",
     "LLamacppService",
