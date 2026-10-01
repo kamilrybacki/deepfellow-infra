@@ -8,7 +8,7 @@ import copy
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Final
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
@@ -58,6 +58,7 @@ from server.utils.size_fetcher import fmt_size
 
 # Token window accepted by BAAI/bge-m3, which the deepfellow-bge-m3 image serves unmodified.
 BGE_M3_CONTEXT_WINDOW = 8192
+DOC_CHUNKER_PROXY_TIMEOUT_SECONDS: Final = 7200
 
 type SrvCustomModelX = Callable[["CustomService", str | None], SrvCustomModel]
 type DockerOptionsOrCallable = DockerOptions | Callable[[InstallModelOptions], DockerOptions]
@@ -105,6 +106,9 @@ class SrvCustomModel:
     custom: CustomModelId | None = None
     description: str = ""
     repository_url: str | None = None
+    # Proxy read timeout used when the install leaves `proxy_timeout_seconds` empty; None falls back to
+    # the global `standard_proxy_timeout_seconds`. For services that answer only once a long job is done.
+    default_proxy_timeout_seconds: int | None = None
 
 
 class SrvCustomCustomModel(BaseModel):
@@ -285,17 +289,18 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
             ]
         )
 
-    def get_proxy_timeout_field(self) -> ModelField:
+    def get_proxy_timeout_field(self, default: int | None = None) -> ModelField:
         """Field for the per-install proxy read timeout.
 
-        Left unset, it falls back to the global admin default as of install time — a later change to the
-        global default does not affect already-installed services.
+        Left unset, it falls back to `default` (the model's `default_proxy_timeout_seconds`) or, without
+        one, to the global admin default as of install time — a later change to the global default does
+        not affect already-installed services.
         """
+        fallback = f"{default}s" if default is not None else "the global default"
         return ModelField(
             type="number",
             name="proxy_timeout_seconds",
-            description="Seconds the proxy waits for a response from this service before timing out. "
-            "Leave empty to use the global default.",
+            description=f"Seconds the proxy waits for a response from this service before timing out. Leave empty to use {fallback}.",
             required=False,
         )
 
@@ -714,10 +719,14 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
                     prefix=parsed_model_options.prefix,
                     base_url=get_base_url(container_host, container_port),
                 )
-                proxy_timeout_seconds = (
-                    parsed_model_options.proxy_timeout_seconds
-                    if parsed_model_options.proxy_timeout_seconds is not None
-                    else self.config.standard_proxy_timeout_seconds
+                proxy_timeout_seconds = next(
+                    timeout
+                    for timeout in (
+                        parsed_model_options.proxy_timeout_seconds,
+                        model.default_proxy_timeout_seconds,
+                        self.config.standard_proxy_timeout_seconds,
+                    )
+                    if timeout is not None
                 )
                 try:
                     model_info.registration_id = self.endpoint_registry.register_custom_endpoint_as_proxy(
@@ -1003,8 +1012,8 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
                 name="document_timeout",
                 description="Timeout in seconds for a single document conversion",
                 required=False,
-                placeholder="600",
-                default="600",
+                placeholder="3600",
+                default="3600",
             ),
             ModelField(
                 type="number",
@@ -1073,7 +1082,7 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
                 placeholder="2",
                 default="2",
             ),
-            custom_service.get_proxy_timeout_field(),
+            custom_service.get_proxy_timeout_field(DOC_CHUNKER_PROXY_TIMEOUT_SECONDS),
         ]
     )
 
@@ -1095,7 +1104,7 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
             subnet=subnet,
             env_vars={
                 "MAX_CONCURRENT": model_fields.get("max_concurrent", 2),
-                "DOCUMENT_TIMEOUT": model_fields.get("document_timeout", 600),
+                "DOCUMENT_TIMEOUT": model_fields.get("document_timeout", 3600),
                 "LIBREOFFICE_TIMEOUT": model_fields.get("libreoffice_timeout", 120),
                 "INFRA_API_URL": model_fields.get("infra_api_url", ""),
                 "INFRA_API_KEY": model_fields.get("infra_api_key", ""),
@@ -1122,6 +1131,7 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
         size="15GB",
         options=generate_docker_options,
         description="Converts many data types (pdf, xlxs, mp3, etc.) into text chunks suitable for vector search.",
+        default_proxy_timeout_seconds=DOC_CHUNKER_PROXY_TIMEOUT_SECONDS,
     )
 
 

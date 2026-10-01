@@ -16,6 +16,7 @@ from server.models.models import AddCustomModelIn, InstallModelIn, ListModelsFil
 from server.models.services import InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import CustomModel, Instance, InstanceConfig
 from server.services.custom_service import (
+    DOC_CHUNKER_PROXY_TIMEOUT_SECONDS,
     CustomService,
     DownloadedInfo,
     InstalledInfo,
@@ -888,6 +889,64 @@ async def test_install_model_uses_configured_standard_proxy_timeout(svc: CustomS
 
     registered_options = deps["endpoint_registry"].register_custom_endpoint_as_proxy.call_args.kwargs["options"]
     assert registered_options.read_timeout_seconds == 1800
+
+
+def _mock_successful_install(deps: dict[str, Any]) -> None:
+    deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
+    deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True, False))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.1"
+    deps["docker_service"].get_container_port.return_value = 8090
+    deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
+
+
+@pytest.mark.asyncio
+async def test_install_model_uses_the_models_default_proxy_timeout_over_the_standard_one(svc: CustomService, deps: dict[str, Any]) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    _mock_successful_install(deps)
+
+    with patch.object(svc, "validate_docker_image_version_for_model", new_callable=AsyncMock):
+        promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+            "default", "doc_chunker", InstallModelIn(spec={"prefix": "doc_chunker", "hardware": "CPU"})
+        )
+    await promise.wait()
+
+    registered_options = deps["endpoint_registry"].register_custom_endpoint_as_proxy.call_args.kwargs["options"]
+    assert registered_options.read_timeout_seconds == DOC_CHUNKER_PROXY_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_install_model_prefers_the_install_proxy_timeout_over_the_models_default(svc: CustomService, deps: dict[str, Any]) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    _mock_successful_install(deps)
+
+    with patch.object(svc, "validate_docker_image_version_for_model", new_callable=AsyncMock):
+        promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+            "default",
+            "doc_chunker",
+            InstallModelIn(spec={"prefix": "doc_chunker", "hardware": "CPU", "proxy_timeout_seconds": 42}),
+        )
+    await promise.wait()
+
+    registered_options = deps["endpoint_registry"].register_custom_endpoint_as_proxy.call_args.kwargs["options"]
+    assert registered_options.read_timeout_seconds == 42
+
+
+def test_doc_chunker_defaults_to_an_hour_per_document_conversion(svc: CustomService) -> None:
+    model = svc.models["default"]["doc_chunker"]
+
+    docker_options = model.options({"hardware": "CPU"})  # pyright: ignore[reportCallIssue]
+
+    assert docker_options.env_vars["DOCUMENT_TIMEOUT"] == 3600  # pyright: ignore[reportOptionalSubscript]
+    assert DOC_CHUNKER_PROXY_TIMEOUT_SECONDS > 3600
+
+
+def test_doc_chunker_proxy_timeout_field_names_its_own_default(svc: CustomService) -> None:
+    fields = svc.models["default"]["doc_chunker"].model_spec.fields
+
+    proxy_field = next(field for field in fields if field.name == "proxy_timeout_seconds")
+
+    assert f"{DOC_CHUNKER_PROXY_TIMEOUT_SECONDS}s" in proxy_field.description
 
 
 @pytest.mark.asyncio
