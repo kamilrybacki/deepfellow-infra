@@ -157,13 +157,15 @@ class _Base2ImplWithCustom(Base2Service):  # pyright: ignore[reportMissingTypeAr
     def _generate_instance_config(self, instance: Any, info: Any, custom: Any) -> InstanceConfig:
         return InstanceConfig()
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> Any:
+    async def _install_instance(self, instance: str, options: InstallServiceIn, container_name_override: str | None = None) -> Any:
         raise NotImplementedError
 
     async def _uninstall_instance(self, instance: str, options: UninstallServiceIn) -> None:
         pass
 
-    async def _install_model(self, instance: str, model_id: str, options: InstallModelIn) -> Any:
+    async def _install_model(
+        self, instance: str, model_id: str, options: InstallModelIn, container_name_override: str | None = None
+    ) -> Any:
         raise NotImplementedError
 
     async def _uninstall_model(self, instance: str, model_id: str, options: UninstallModelIn) -> None:
@@ -212,13 +214,15 @@ class _Base2Impl(Base2Service):  # pyright: ignore[reportMissingTypeArgument]
     def _generate_instance_config(self, instance: Any, info: Any, custom: Any) -> InstanceConfig:
         return InstanceConfig()
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> Any:
+    async def _install_instance(self, instance: str, options: InstallServiceIn, container_name_override: str | None = None) -> Any:
         raise NotImplementedError
 
     async def _uninstall_instance(self, instance: str, options: UninstallServiceIn) -> None:
         pass
 
-    async def _install_model(self, instance: str, model_id: str, options: InstallModelIn) -> Any:
+    async def _install_model(
+        self, instance: str, model_id: str, options: InstallModelIn, container_name_override: str | None = None
+    ) -> Any:
         raise NotImplementedError
 
     async def _uninstall_model(self, instance: str, model_id: str, options: UninstallModelIn) -> None:
@@ -795,7 +799,9 @@ async def test_cancel_model_install_during_pre_promise_setup_interrupts_it(base2
     reached_slow_point = asyncio.Event()
     was_cancelled = False
 
-    async def slow_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+    async def slow_install_model(
+        _instance: str, _model_id: str, _options: InstallModelIn, _container_name_override: str | None = None
+    ) -> Any:
         nonlocal was_cancelled
         reached_slow_point.set()
         try:
@@ -831,7 +837,9 @@ async def test_cancel_model_install_propagates_its_own_cancellation_instead_of_s
     """
     reached_slow_point = asyncio.Event()
 
-    async def slow_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+    async def slow_install_model(
+        _instance: str, _model_id: str, _options: InstallModelIn, _container_name_override: str | None = None
+    ) -> Any:
         reached_slow_point.set()
         await asyncio.Event().wait()  # never completes on its own
 
@@ -919,7 +927,9 @@ async def test_cancel_model_install_does_not_log_on_genuine_cancellation(base2_s
     """A genuine, successful cancellation must not be logged as if it were an unrelated failure."""
     reached_slow_point = asyncio.Event()
 
-    async def slow_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+    async def slow_install_model(
+        _instance: str, _model_id: str, _options: InstallModelIn, _container_name_override: str | None = None
+    ) -> Any:
         reached_slow_point.set()
         await asyncio.Event().wait()  # never completes on its own
 
@@ -1032,7 +1042,9 @@ async def test_cancel_model_install_unblocks_concurrent_progress_watcher(base2_s
     """
     reached_slow_point = asyncio.Event()
 
-    async def slow_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+    async def slow_install_model(
+        _instance: str, _model_id: str, _options: InstallModelIn, _container_name_override: str | None = None
+    ) -> Any:
         reached_slow_point.set()
         await asyncio.Event().wait()  # never completes on its own
 
@@ -1190,7 +1202,7 @@ async def test_cancel_instance_update_waits_for_triggered_rollback_to_settle(bas
     rollback_release = asyncio.Event()
     install_call_count = 0
 
-    async def install_side_effect(_instance: str, _options: Any) -> Any:
+    async def install_side_effect(_instance: str, _options: Any, _container_name_override: str | None = None) -> Any:
         nonlocal install_call_count
         install_call_count += 1
         if install_call_count == 1:
@@ -1261,7 +1273,7 @@ async def test_cancel_instance_update_waits_for_triggered_rollback_that_also_fai
     rollback_release = asyncio.Event()
     install_call_count = 0
 
-    async def install_side_effect(_instance: str, _options: Any) -> Any:
+    async def install_side_effect(_instance: str, _options: Any, _container_name_override: str | None = None) -> Any:
         nonlocal install_call_count
         install_call_count += 1
         if install_call_count == 1:
@@ -1325,7 +1337,7 @@ async def test_cancel_instance_update_times_out_waiting_for_stuck_rollback(base2
     stuck_release = asyncio.Event()
     install_call_count = 0
 
-    async def install_side_effect(_instance: str, _options: Any) -> Any:
+    async def install_side_effect(_instance: str, _options: Any, _container_name_override: str | None = None) -> Any:
         nonlocal install_call_count
         install_call_count += 1
         if install_call_count == 1:
@@ -1392,7 +1404,7 @@ async def test_cancel_instance_install_timeout_does_not_poison_shared_future_for
     rollback_release = asyncio.Event()
     install_call_count = 0
 
-    async def install_side_effect(_instance: str, _options: Any) -> Any:
+    async def install_side_effect(_instance: str, _options: Any, _container_name_override: str | None = None) -> Any:
         nonlocal install_call_count
         install_call_count += 1
         if install_call_count == 1:
@@ -1467,7 +1479,7 @@ async def test_cancel_instance_install_propagates_own_cancellation_while_waiting
     stuck_release = asyncio.Event()
     install_call_count = 0
 
-    async def install_side_effect(_instance: str, _options: Any) -> Any:
+    async def install_side_effect(_instance: str, _options: Any, _container_name_override: str | None = None) -> Any:
         nonlocal install_call_count
         install_call_count += 1
         if install_call_count == 1:
@@ -1539,7 +1551,7 @@ async def test_cancel_instance_install_during_pre_promise_setup_waits_then_cance
     reached = asyncio.Event()
     release = asyncio.Event()
 
-    async def slow_install_instance(_instance: str, _options: InstallServiceIn) -> Any:
+    async def slow_install_instance(_instance: str, _options: InstallServiceIn, _container_name_override: str | None = None) -> Any:
         reached.set()
         await release.wait()
 
@@ -1576,7 +1588,7 @@ async def test_cancel_instance_install_times_out_and_leaves_reservation_untouche
     reached = asyncio.Event()
     release = asyncio.Event()
 
-    async def slow_install_instance(_instance: str, _options: InstallServiceIn) -> Any:
+    async def slow_install_instance(_instance: str, _options: InstallServiceIn, _container_name_override: str | None = None) -> Any:
         reached.set()
         await release.wait()
         return PromiseWithProgress(value=InstallServiceOut(status="OK"))
@@ -1604,7 +1616,7 @@ async def test_cancel_instance_install_clears_reservation_when_setup_fails(base2
     """A reservation rejected because setup failed on its own (not via cancellation) must still be
     cleared by cancel_instance_install(), not left stuck looking installed forever."""
 
-    async def failing_install_instance(_instance: str, _options: InstallServiceIn) -> Any:
+    async def failing_install_instance(_instance: str, _options: InstallServiceIn, _container_name_override: str | None = None) -> Any:
         raise RuntimeError("setup failed")
 
     with (
@@ -1688,6 +1700,49 @@ async def test_load_model_happy_path(base2_svc: _Base2Impl) -> None:
 
     with patch.object(base2_svc, "_install_model", new=AsyncMock(return_value=promise)):
         await base2_svc.load_model("default", model)
+
+
+@pytest.mark.asyncio
+async def test_load_model_passes_persisted_container_name_as_override(base2_svc: _Base2Impl) -> None:
+    """Restart reuses the persisted container name, not a live re-derive."""
+    value = InstallModelOut(status="OK", details="done")
+    promise: PromiseWithProgress[InstallModelOut, StreamChunk] = PromiseWithProgress(value=value)
+    model = ModelConfig(model_id="m1", options=InstallModelIn(), container_name="pinned-name")
+
+    install_model_mock = AsyncMock(return_value=promise)
+    with patch.object(base2_svc, "_install_model", new=install_model_mock):
+        await base2_svc.load_model("default", model)
+
+    install_model_mock.assert_awaited_once_with("default", "m1", model.options, "pinned-name")
+
+
+@pytest.mark.asyncio
+async def test_load_model_with_derive_container_name_ignores_pinned_name(base2_svc: _Base2Impl) -> None:
+    """An explicit reinstall's reload of a preserved model re-derives the name, like a fresh install_model()."""
+    value = InstallModelOut(status="OK", details="done")
+    promise: PromiseWithProgress[InstallModelOut, StreamChunk] = PromiseWithProgress(value=value)
+    model = ModelConfig(model_id="m1", options=InstallModelIn(), container_name="pinned-name")
+
+    install_model_mock = AsyncMock(return_value=promise)
+    with patch.object(base2_svc, "_install_model", new=install_model_mock):
+        await base2_svc.load_model("default", model, derive_container_name=True)
+
+    install_model_mock.assert_awaited_once_with("default", "m1", model.options, None)
+
+
+@pytest.mark.asyncio
+async def test_install_model_does_not_pass_a_container_name_override(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """Explicit install always re-derives the name from the live suffix."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    value = InstallModelOut(status="OK", details="done")
+    promise: PromiseWithProgress[InstallModelOut, StreamChunk] = PromiseWithProgress(value=value)
+    options = InstallModelIn()
+
+    install_model_mock = AsyncMock(return_value=promise)
+    with patch.object(base2_svc, "_install_model", new=install_model_mock):
+        await base2_svc.install_model("default", "m1", options)
+
+    install_model_mock.assert_awaited_once_with("default", "m1", options, None)
 
 
 @pytest.mark.asyncio
@@ -1788,6 +1843,57 @@ async def test_load_instance_installs_service(base2_svc: _Base2Impl, base2_deps:
         await base2_svc.load_instance("default", instance_data)
 
     assert base2_svc.instances_info["default"].installed is installed_value
+
+
+@pytest.mark.asyncio
+async def test_load_instance_passes_persisted_container_name_as_override(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """Restart reuses the persisted instance-level container name."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value={})
+    options = InstallServiceIn(spec={})
+    instance_data = InstanceConfig(options=options, models=[], custom=None, container_name="pinned-name")
+
+    install_instance_mock = AsyncMock(return_value=promise)
+    with patch.object(base2_svc, "_install_instance", new=install_instance_mock):
+        await base2_svc.load_instance("default", instance_data)
+
+    install_instance_mock.assert_awaited_once_with("default", options, "pinned-name")
+
+
+@pytest.mark.asyncio
+async def test_load_instance_passes_persisted_model_container_names_as_override(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """Restart reuses each model's persisted container name too, instead of re-deriving it from the live suffix."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value={})
+    model_options = InstallModelIn()
+    instance_data = InstanceConfig(
+        options=InstallServiceIn(spec={}),
+        models=[ModelConfig(model_id="m1", options=model_options, container_name="pinned-model-name")],
+        custom=None,
+    )
+
+    install_model_mock = AsyncMock(return_value=promise)
+    with (
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(return_value=promise)),
+        patch.object(base2_svc, "_install_model", new=install_model_mock),
+    ):
+        await base2_svc.load_instance("default", instance_data)
+
+    install_model_mock.assert_awaited_once_with("default", "m1", model_options, "pinned-model-name")
+
+
+@pytest.mark.asyncio
+async def test_install_instance_does_not_pass_a_container_name_override(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    """Fresh install always re-derives the name from the live suffix."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value={})
+    options = InstallServiceIn(spec={})
+
+    install_instance_mock = AsyncMock(return_value=promise)
+    with patch.object(base2_svc, "_install_instance", new=install_instance_mock):
+        await base2_svc.install_instance("default", options)
+
+    install_instance_mock.assert_awaited_once_with("default", options, None)
 
 
 @pytest.mark.asyncio
@@ -2025,6 +2131,116 @@ async def test_load_service_skips_backfill_when_definitions_present(base2_svc: _
     assert base2_svc.instances_info["default"].installed is installed_value
 
 
+def _load_service_config(instance_container_name: str | None, model_container_name: str | None) -> ServiceRawConfig:
+    """A persisted config with model definitions present, so only container-name pinning can trigger a backfill save."""
+    return {
+        "downloaded": None,
+        "service_downloaded": False,
+        "instances": {
+            "default": {
+                "options": {"stream": False, "ignore_warnings": False, "spec": {}},
+                "models": [{"model_id": "m1", "options": {}, "definition": {"hf_id": "m1"}, "container_name": model_container_name}],
+                "custom": None,
+                "container_name": instance_container_name,
+            }
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("persisted_instance_name", "persisted_model_name"),
+    [(None, "m1-ct"), ("instance-ct", None), (None, None)],
+)
+async def test_load_service_backfills_unpinned_container_names(
+    base2_svc: _Base2Impl, persisted_instance_name: str | None, persisted_model_name: str | None
+) -> None:
+    """A services.json from before container names were pinned gets them saved right after startup."""
+    promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value={})
+    live_config = InstanceConfig(
+        container_name="instance-ct", models=[ModelConfig(model_id="m1", options=InstallModelIn(), container_name="m1-ct")]
+    )
+
+    with (
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(return_value=promise)),
+        patch.object(base2_svc, "_install_model", new=AsyncMock(return_value=promise)),
+        patch.object(base2_svc, "_generate_instance_config", return_value=live_config),
+        patch.object(base2_svc, "_save", new=AsyncMock()) as save_mock,
+    ):
+        await base2_svc.load_service(_load_service_config(persisted_instance_name, persisted_model_name))
+
+    save_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_load_service_container_name_backfill_save_failure_warns_instead_of_failing_load(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any]
+) -> None:
+    """The service did load - a failed backfill save gets its own per-instance warning, not "failed to load"."""
+    promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value={})
+    live_config = InstanceConfig(container_name="instance-ct")
+    base2_deps["service_provider"].add_warning = AsyncMock(side_effect=[None, RuntimeError("warnings store down")])
+    config = _load_service_config(None, None)
+    config["instances"]["second"] = config["instances"]["default"]
+
+    with (
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(return_value=promise)),
+        patch.object(base2_svc, "_install_model", new=AsyncMock(return_value=promise)),
+        patch.object(base2_svc, "_generate_instance_config", return_value=live_config),
+        patch.object(base2_svc, "_save", new=AsyncMock(side_effect=OSError("disk full"))),
+    ):
+        await base2_svc.load_service(config)
+
+    warned = [c.kwargs["instance"] for c in base2_deps["service_provider"].add_warning.await_args_list]
+    assert sorted(warned) == ["default", "second"]
+    assert "disk full" in base2_deps["service_provider"].add_warning.await_args_list[0].args[1]
+
+
+@pytest.mark.asyncio
+async def test_load_service_skips_container_name_backfill_when_already_pinned(base2_svc: _Base2Impl) -> None:
+    promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value={})
+    live_config = InstanceConfig(
+        container_name="instance-ct", models=[ModelConfig(model_id="m1", options=InstallModelIn(), container_name="m1-ct")]
+    )
+
+    with (
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(return_value=promise)),
+        patch.object(base2_svc, "_install_model", new=AsyncMock(return_value=promise)),
+        patch.object(base2_svc, "_generate_instance_config", return_value=live_config),
+        patch.object(base2_svc, "_save", new=AsyncMock()) as save_mock,
+    ):
+        await base2_svc.load_service(_load_service_config("instance-ct", "m1-ct"))
+
+    save_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_load_service_skips_container_name_backfill_for_service_without_containers(base2_svc: _Base2Impl) -> None:
+    """A service that never has a container name mustn't re-save on every startup."""
+    promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value={})
+    live_config = InstanceConfig(models=[ModelConfig(model_id="m1", options=InstallModelIn())])
+
+    with (
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(return_value=promise)),
+        patch.object(base2_svc, "_install_model", new=AsyncMock(return_value=promise)),
+        patch.object(base2_svc, "_generate_instance_config", return_value=live_config),
+        patch.object(base2_svc, "_save", new=AsyncMock()) as save_mock,
+    ):
+        await base2_svc.load_service(_load_service_config(None, None))
+
+    save_mock.assert_not_called()
+
+
+def test_instances_with_unpinned_container_names_ignores_instances_that_did_not_load(base2_svc: _Base2Impl) -> None:
+    persisted = {"default": InstanceConfig(), "missing": InstanceConfig()}
+    base2_svc.instances_info["default"].installed = None
+
+    with patch.object(base2_svc, "_generate_instance_config", return_value=InstanceConfig(container_name="ct")) as generate_mock:
+        assert base2_svc._instances_with_unpinned_container_names(persisted) == []  # pyright: ignore[reportPrivateUsage]
+
+    generate_mock.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_save_calls_service_provider(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
     base2_deps["service_provider"].save_service_config = AsyncMock()
@@ -2159,7 +2375,7 @@ async def test_install_instance_rejects_concurrent_call_during_slow_setup(base2_
     entered_setup = asyncio.Event()
     release_setup = asyncio.Event()
 
-    async def slow_install_instance(_instance: str, _options: InstallServiceIn) -> Any:
+    async def slow_install_instance(_instance: str, _options: InstallServiceIn, _container_name_override: str | None = None) -> Any:
         entered_setup.set()
         await release_setup.wait()
         return PromiseWithProgress(value={})
@@ -2182,7 +2398,7 @@ async def test_install_instance_clears_reservation_when_setup_fails(base2_svc: _
     """A failure in `_install_instance` itself (before any promise exists) must not leave `installing`
     stuck permanently truthy - otherwise every later install attempt would be rejected forever."""
 
-    async def failing_install_instance(_instance: str, _options: InstallServiceIn) -> Any:
+    async def failing_install_instance(_instance: str, _options: InstallServiceIn, _container_name_override: str | None = None) -> Any:
         raise RuntimeError("setup failed")
 
     with patch.object(base2_svc, "_install_instance", new=failing_install_instance), pytest.raises(RuntimeError):
@@ -2201,7 +2417,7 @@ async def test_get_instance_install_progress_waits_for_slow_setup_instead_of_404
     release_setup = asyncio.Event()
     real_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value={})
 
-    async def slow_install_instance(_instance: str, _options: InstallServiceIn) -> Any:
+    async def slow_install_instance(_instance: str, _options: InstallServiceIn, _container_name_override: str | None = None) -> Any:
         entered_setup.set()
         await release_setup.wait()
         return real_promise
@@ -2229,7 +2445,7 @@ async def test_get_instance_install_progress_times_out_on_hung_setup(base2_svc: 
     entered_setup = asyncio.Event()
     release_setup = asyncio.Event()
 
-    async def hung_install_instance(_instance: str, _options: InstallServiceIn) -> Any:
+    async def hung_install_instance(_instance: str, _options: InstallServiceIn, _container_name_override: str | None = None) -> Any:
         entered_setup.set()
         await release_setup.wait()
         return PromiseWithProgress(value={})
@@ -2262,7 +2478,7 @@ async def test_install_instance_reservation_converts_cancelled_error_for_other_w
     entered_setup = asyncio.Event()
     release_setup = asyncio.Event()
 
-    async def cancelled_install_instance(_instance: str, _options: InstallServiceIn) -> Any:
+    async def cancelled_install_instance(_instance: str, _options: InstallServiceIn, _container_name_override: str | None = None) -> Any:
         entered_setup.set()
         await release_setup.wait()
         raise asyncio.CancelledError
@@ -2295,7 +2511,7 @@ async def test_update_instance_rejects_concurrent_call_during_slow_setup(base2_s
     entered_setup = asyncio.Event()
     release_setup = asyncio.Event()
 
-    async def slow_install_instance(_instance: str, _options: InstallServiceIn) -> Any:
+    async def slow_install_instance(_instance: str, _options: InstallServiceIn, _container_name_override: str | None = None) -> Any:
         entered_setup.set()
         await release_setup.wait()
         return PromiseWithProgress(value={})
@@ -2605,7 +2821,9 @@ async def test_install_model_second_call_during_slow_install_reattaches_instead_
     call_count = 0
     resume = asyncio.Event()
 
-    async def slow_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+    async def slow_install_model(
+        _instance: str, _model_id: str, _options: InstallModelIn, _container_name_override: str | None = None
+    ) -> Any:
         nonlocal call_count
         call_count += 1
         await resume.wait()
@@ -2643,7 +2861,9 @@ async def test_load_model_reservation_prevents_concurrent_install_model_from_dup
     call_count = 0
     resume = asyncio.Event()
 
-    async def slow_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+    async def slow_install_model(
+        _instance: str, _model_id: str, _options: InstallModelIn, _container_name_override: str | None = None
+    ) -> Any:
         nonlocal call_count
         call_count += 1
         await resume.wait()
@@ -2776,7 +2996,9 @@ async def test_get_model_install_progress_times_out_when_setup_hangs(base2_svc: 
     """
     reached = asyncio.Event()
 
-    async def hanging_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+    async def hanging_install_model(
+        _instance: str, _model_id: str, _options: InstallModelIn, _container_name_override: str | None = None
+    ) -> Any:
         reached.set()
         await asyncio.Event().wait()  # never completes
 
@@ -2804,7 +3026,9 @@ async def test_install_model_join_branch_times_out_when_setup_hangs(base2_svc: _
     """
     reached = asyncio.Event()
 
-    async def hanging_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+    async def hanging_install_model(
+        _instance: str, _model_id: str, _options: InstallModelIn, _container_name_override: str | None = None
+    ) -> Any:
         reached.set()
         await asyncio.Event().wait()  # never completes
 
@@ -2834,7 +3058,9 @@ async def test_cancel_model_install_times_out_and_leaves_reservation_untouched(b
     """
     reached = asyncio.Event()
 
-    async def stubborn_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+    async def stubborn_install_model(
+        _instance: str, _model_id: str, _options: InstallModelIn, _container_name_override: str | None = None
+    ) -> Any:
         reached.set()
         # Swallow exactly one cancellation to simulate setup that doesn't respond within the
         # timeout window - but still respond to a second cancel, so the test can clean up its task.
@@ -2867,7 +3093,9 @@ async def test_install_model_reservation_removed_when_install_model_raises_befor
     """If `_install_model()` itself raises before ever producing a promise, the model must not get stuck as installing."""
     base2_deps["service_provider"].save_service_config = AsyncMock()
 
-    async def raising_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+    async def raising_install_model(
+        _instance: str, _model_id: str, _options: InstallModelIn, _container_name_override: str | None = None
+    ) -> Any:
         raise HTTPException(400, "bad request")
 
     with patch.object(base2_svc, "_install_model", new=raising_install_model), pytest.raises(HTTPException):
@@ -2893,7 +3121,9 @@ async def test_install_model_concurrent_waiter_gets_error_instead_of_hanging_whe
     reached_slow_point = asyncio.Event()
     fail_now = asyncio.Event()
 
-    async def slow_failing_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+    async def slow_failing_install_model(
+        _instance: str, _model_id: str, _options: InstallModelIn, _container_name_override: str | None = None
+    ) -> Any:
         reached_slow_point.set()
         await fail_now.wait()
         raise RuntimeError("install blew up")
@@ -2927,7 +3157,9 @@ async def test_install_model_concurrent_waiter_gets_error_instead_of_hanging_whe
     reached_slow_point = asyncio.Event()
     fail_now = asyncio.Event()
 
-    async def slow_failing_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+    async def slow_failing_install_model(
+        _instance: str, _model_id: str, _options: InstallModelIn, _container_name_override: str | None = None
+    ) -> Any:
         reached_slow_point.set()
         await fail_now.wait()
         raise RuntimeError("install blew up")
@@ -2953,7 +3185,9 @@ async def test_install_model_reservation_cleaned_up_when_install_model_cancelled
     """A cancelled `_install_model()` call (e.g. client disconnect) must clean up its reservation too, not just ordinary exceptions."""
     started = asyncio.Event()
 
-    async def hanging_install_model(_instance: str, _model_id: str, _options: InstallModelIn) -> Any:
+    async def hanging_install_model(
+        _instance: str, _model_id: str, _options: InstallModelIn, _container_name_override: str | None = None
+    ) -> Any:
         started.set()
         await asyncio.Event().wait()  # never completes on its own - must be cancelled to end
 
@@ -3539,7 +3773,7 @@ async def test_update_instance_reloads_preserved_models(base2_svc: _Base2Impl, b
         result_promise = await base2_svc.update_instance("default", InstallServiceIn(spec={}))
         await result_promise.wait()
 
-    load_model_mock.assert_awaited_once_with("default", preserved)
+    load_model_mock.assert_awaited_once_with("default", preserved, derive_container_name=True)
 
 
 @pytest.mark.asyncio
@@ -3580,7 +3814,7 @@ async def test_update_instance_retries_previously_failed_model(base2_svc: _Base2
         result_promise = await base2_svc.update_instance("default", InstallServiceIn(spec={}))
         await result_promise.wait()
 
-    load_model_mock.assert_awaited_once_with("default", persisted_model)
+    load_model_mock.assert_awaited_once_with("default", persisted_model, derive_container_name=True)
 
 
 @pytest.mark.asyncio
@@ -3659,8 +3893,8 @@ async def test_update_instance_rollback_restores_previous_installation_on_async_
             await result_promise.wait()
         await base2_svc.drain_warning_tasks()
 
-    assert install_mock.await_args_list[1].args == ("default", previous_options)
-    load_model_mock.assert_awaited_once_with("default", preserved)
+    assert install_mock.await_args_list[1].args == ("default", previous_options, None)
+    load_model_mock.assert_awaited_once_with("default", preserved, derive_container_name=False)
     assert base2_svc.instances_info["default"].installed is new_installed
     assert base2_svc.instances_info["default"].installing is None
 
@@ -3711,8 +3945,8 @@ async def test_update_instance_rollback_triggered_by_cancelled_reinstall(base2_s
         await base2_svc.drain_warning_tasks()
 
     # The rollback attempt actually happened - same as a normal failure - not just a stuck-safe bailout.
-    assert install_mock.await_args_list[1].args == ("default", previous_options)
-    load_model_mock.assert_awaited_once_with("default", preserved)
+    assert install_mock.await_args_list[1].args == ("default", previous_options, None)
+    load_model_mock.assert_awaited_once_with("default", preserved, derive_container_name=False)
     assert base2_svc.instances_info["default"].installed is new_installed
     assert base2_svc.instances_info["default"].installing is None
 
@@ -3896,6 +4130,68 @@ async def test_update_instance_sync_failure_after_uninstall_triggers_rollback(ba
 
 
 @pytest.mark.asyncio
+async def test_update_instance_rollback_restores_pinned_container_name_on_async_failure(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any]
+) -> None:
+    """The update itself re-derives the instance container name, but a rollback must restore the pre-update one."""
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_svc.instances_info["default"].installed = object()
+    previous_options = InstallServiceIn(spec={"key": "old"})
+    new_options = InstallServiceIn(spec={"key": "new"})
+
+    async def fail_func(stream: Any) -> Any:
+        raise RuntimeError("update failed")
+
+    fail_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(func=fail_func)
+    rollback_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value=object())
+
+    async def clear_installed(_instance: str, _options: Any) -> None:
+        base2_svc.instances_info["default"].installed = None
+
+    with (
+        patch.object(base2_svc, "_uninstall_instance", new=clear_installed),
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(side_effect=[fail_promise, rollback_promise])) as install_mock,
+        patch.object(
+            base2_svc,
+            "_generate_instance_config",
+            return_value=InstanceConfig(options=previous_options, models=[], container_name="pinned-name"),
+        ),
+    ):
+        result_promise = await base2_svc.update_instance("default", new_options)
+        with pytest.raises(RuntimeError):
+            await result_promise.wait()
+        await base2_svc.drain_warning_tasks()
+
+    assert install_mock.await_args_list[0].args == ("default", new_options)
+    assert install_mock.await_args_list[1].args == ("default", previous_options, "pinned-name")
+
+
+@pytest.mark.asyncio
+async def test_update_instance_rollback_restores_pinned_container_name_on_sync_failure(
+    base2_svc: _Base2Impl, base2_deps: dict[str, Any]
+) -> None:
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_svc.instances_info["default"].installed = object()
+    previous_options = InstallServiceIn(spec={"key": "old"})
+    rollback_promise: PromiseWithProgress[Any, StreamChunk] = PromiseWithProgress(value=object())
+
+    with (
+        patch.object(base2_svc, "_uninstall_instance", new=AsyncMock()),
+        patch.object(base2_svc, "_install_instance", new=AsyncMock(side_effect=[RuntimeError("boom"), rollback_promise])) as install_mock,
+        patch.object(
+            base2_svc,
+            "_generate_instance_config",
+            return_value=InstanceConfig(options=previous_options, models=[], container_name="pinned-name"),
+        ),
+    ):
+        with pytest.raises(RuntimeError):
+            await base2_svc.update_instance("default", InstallServiceIn(spec={"key": "new"}))
+        await base2_svc.drain_warning_tasks()
+
+    assert install_mock.await_args_list[1].args == ("default", previous_options, "pinned-name")
+
+
+@pytest.mark.asyncio
 async def test_update_instance_rollback_outcome_appended_to_http_exception_detail_not_message(
     base2_svc: _Base2Impl, base2_deps: dict[str, Any]
 ) -> None:
@@ -3940,7 +4236,7 @@ async def test_rollback_after_failed_update_clears_installing_on_cancellation(ba
     with patch.object(base2_svc, "_install_instance", new=AsyncMock(side_effect=asyncio.CancelledError())):
         with pytest.raises(asyncio.CancelledError):
             await base2_svc._rollback_after_failed_update(  # pyright: ignore[reportPrivateUsage]
-                "default", previous_options, [], RuntimeError("update failed")
+                "default", previous_options, [], RuntimeError("update failed"), previous_container_name=None
             )
         await base2_svc.drain_warning_tasks()
 
@@ -3968,7 +4264,7 @@ async def test_update_instance_rollback_blocks_concurrent_calls_until_settled(ba
         # the rollback guard needs to see it as None to recognise the reinstall never actually completed.
         base2_svc.instances_info["default"].installed = None
 
-    async def fake_install_instance(_instance: str, _options: Any) -> Any:
+    async def fake_install_instance(_instance: str, _options: Any, _container_name_override: str | None = None) -> Any:
         nonlocal call_count
         call_count += 1
         if call_count == 1:

@@ -88,6 +88,7 @@ def _make_model_installed_info(
 ) -> ModelInstalledInfo:
     docker = MagicMock()
     docker.name = f"df-vllm-{model_id}"
+    docker.container_name = f"df-vllm-{model_id}"
     return ModelInstalledInfo(
         id=model_id,
         registered_name=model_id,
@@ -279,6 +280,17 @@ def test_generate_instance_config_with_info(svc: VllmService) -> None:
 
     assert config.options == info.options
     assert len(config.models or []) == 1
+
+
+def test_generate_instance_config_persists_resolved_container_name(svc: VllmService) -> None:
+    """Resolved container name round-trips into the persisted ModelConfig."""
+    info = _make_installed_info()
+    info.models["m1"] = _make_model_installed_info("m1")
+    info.models["m1"].docker.container_name = "pinned-container-name"
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert (config.models or [])[0].container_name == "pinned-container-name"
 
 
 def test_generate_instance_config_embeds_definition_when_in_registry(svc: VllmService) -> None:
@@ -1019,6 +1031,43 @@ async def test_install_model_dedups_download_by_revision_aware_key(svc: VllmServ
 
     download_key = mock_download.call_args.args[1]
     assert download_key == "google-gemma-3-270m-it--quantized_awq"
+
+
+@pytest.mark.asyncio
+async def test_install_model_uses_container_name_override_when_given(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    _setup_install_mocks(svc, deps)
+    model_id = next(iter(svc.models["default"]))
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}), "pinned-name")  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "pinned-name"
+    deps["docker_service"].get_docker_container_name.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_install_model_falls_back_to_generated_container_name(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    _setup_install_mocks(svc, deps)
+    model_id = next(iter(svc.models["default"]))
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == deps["docker_service"].get_docker_container_name.return_value
 
 
 @pytest.mark.asyncio

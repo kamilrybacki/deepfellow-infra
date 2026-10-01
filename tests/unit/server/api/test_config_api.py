@@ -44,6 +44,7 @@ def config() -> MagicMock:
     mock.adapter_registry_secret = SecretStr("")
     mock.log_payloads = ""
     mock.container_name_prefix = ""
+    mock.container_name_suffix = ""
     mock.compose_prefix = "df_"
     mock.stop_containers_on_shutdown = ""
     mock.metrics_username = ""
@@ -243,6 +244,58 @@ def test_update_config_invalid_value_returns_400(client: TestClient, auth_header
 
     assert resp.status_code == 400
     assert mock_persist.call_count == 0
+
+
+@pytest.mark.parametrize("suffix", ["bad/name", "a" * 33, "_Prod"])
+def test_update_config_rejects_container_name_suffix_docker_disallows(client: TestClient, auth_header: dict[str, str], suffix: str) -> None:
+    with patch("server.api.config.dynamic_config.persist_settings") as mock_persist:
+        resp = client.put("/admin/config", json={"container_name_suffix": suffix}, headers=auth_header)
+
+    assert resp.status_code == 400
+    assert mock_persist.call_count == 0
+
+
+def test_update_config_rejects_new_container_name_suffix_while_legacy_prefix_set(
+    client: TestClient, config: MagicMock, auth_header: dict[str, str]
+) -> None:
+    """The legacy prefix wins in get_docker_container_name(), so the suffix would be silently ignored."""
+    config.container_name_prefix = "df_"
+
+    with patch("server.api.config.dynamic_config.persist_settings") as mock_persist:
+        resp = client.put("/admin/config", json={"container_name_suffix": "_myinstance"}, headers=auth_header)
+
+    assert resp.status_code == 400
+    assert "DF_CONTAINER_NAME_PREFIX" in resp.json()["detail"]
+    assert mock_persist.call_count == 0
+
+
+@pytest.mark.parametrize(("current_suffix", "new_suffix"), [("_mine", ""), ("_mine", "_mine")])
+def test_update_config_allows_clearing_or_resending_suffix_while_legacy_prefix_set(
+    client: TestClient, config: MagicMock, auth_header: dict[str, str], current_suffix: str, new_suffix: str
+) -> None:
+    config.container_name_prefix = "df_"
+    config.container_name_suffix = current_suffix
+
+    with patch("server.api.config.dynamic_config.persist_settings") as mock_persist:
+        resp = client.put("/admin/config", json={"container_name_suffix": new_suffix}, headers=auth_header)
+
+    assert resp.status_code == 200
+    assert mock_persist.call_count == 1
+
+
+def test_update_config_container_name_suffix_persists_and_applies_change(
+    client: TestClient, config: MagicMock, auth_header: dict[str, str]
+) -> None:
+    with patch("server.api.config.dynamic_config.persist_settings") as mock_persist:
+        resp = client.put("/admin/config", json={"container_name_suffix": "_myinstance"}, headers=auth_header)
+
+    assert resp.status_code == 200
+    assert mock_persist.call_count == 1
+    assert mock_persist.call_args[0][1].container_name_suffix == "_myinstance"
+    assert config.container_name_suffix == "_myinstance"
+
+    entries = {e["key"]: e for e in resp.json()["entries"]}
+    assert entries["DF_CONTAINER_NAME_SUFFIX"]["value"] == "_myinstance"
 
 
 def test_update_config_persists_and_applies_change(client: TestClient, config: MagicMock, auth_header: dict[str, str]) -> None:

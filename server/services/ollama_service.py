@@ -489,7 +489,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             if not instance_info.installed:
                 return None
             compose_filepath = self.docker_service.get_docker_compose_file_path(instance_info.installed.docker.name)
-            service_name = instance_info.installed.docker.name
+            service_name = instance_info.installed.docker.service_name
             result = await self.docker_service.run_command_docker_compose(compose_filepath, service_name, ["stat", "-c%s", path])
             return int(result.strip())
         except Exception:
@@ -551,6 +551,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             if info
             else [],
             custom=custom,
+            container_name=info.docker.container_name if info else None,
         )
 
     def _restore_model_definition(self, instance: str, model_id: str, definition: dict[str, Any]) -> None:
@@ -609,7 +610,9 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         await self.validate_docker_image_version(options.spec.get("image_version"), options.spec.get("hardware"))
         try_parse_pydantic(OllamaOptions, options.spec)
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
+    async def _install_instance(
+        self, instance: str, options: InstallServiceIn, container_name_override: str | None = None
+    ) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self.load_default_models(instance)
 
@@ -631,7 +634,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             service_name = f"{self.get_service_id(instance)}"
             docker_options = DockerOptions(
                 name=service_name,
-                container_name=self.docker_service.get_docker_container_name(service_name),
+                container_name=container_name_override or self.docker_service.get_docker_container_name(service_name),
                 image=image.name,
                 image_port=11434,
                 hardware=hardware,
@@ -648,7 +651,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                 },
             )
             docker_exposed_port, _, _ = await self.docker_service.install_and_run_docker(docker_options)
-            container_host = self.docker_service.get_container_host(subnet, docker_options.name)
+            container_host = self.docker_service.get_container_host(subnet, docker_options)
             container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
             info = InstalledInfo(
                 instance_name=instance,
@@ -1205,7 +1208,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
     async def create_model_from_modelfile(self, info: InstalledInfo, model: str, model_path: str, quantization: str | None) -> str:
         """Send message to ollama to create model from Modelfile.."""
         compose_filepath = self.docker_service.get_docker_compose_file_path(info.docker.name)
-        service_name = info.docker.name
+        service_name = info.docker.service_name
         quantization_args = ["-q", quantization] if quantization else []
         cmd = ["ollama", "create", *quantization_args, model, "-f", model_path]
         return await self.docker_service.run_command_docker_compose(compose_filepath, service_name, cmd)
@@ -1406,7 +1409,11 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         return min(model_context, service_context) if model_context else service_context
 
     async def _install_model(  # noqa: C901
-        self, instance: str, model_id: str, options: InstallModelIn
+        self,
+        instance: str,
+        model_id: str,
+        options: InstallModelIn,
+        container_name_override: str | None = None,  # noqa: ARG002
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_model_options = try_parse_pydantic(OllamaModelOptions, options.spec) if options.spec else OllamaModelOptions()
         info = self.get_instance_installed_info(instance)

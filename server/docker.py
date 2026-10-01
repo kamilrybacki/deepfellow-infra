@@ -95,6 +95,9 @@ def _diagnose_gpu_error(text: str) -> str | None:
 # misclassified as a name conflict and routed into orphan-adoption.
 _CONTAINER_NAME_CONFLICT_RE = re.compile(r"container name .*is already in use", re.IGNORECASE)
 
+# A DNS label's limit - with docker_subnet a suffixed container name is the hostname DF Infra connects to (get_container_host).
+_MAX_HOSTNAME_LENGTH = 63
+
 
 def _short_log_snippet(logs: str) -> str:
     """Return the last _SHORT_LOG_CHARS characters of *logs*, for a bounded user-facing message."""
@@ -260,7 +263,6 @@ class DockerOptions:
         self.image_port = image_port
         self.env_vars = env_vars or {}
         self.api_endpoint = api_endpoint
-        self.service_name = Utils.sanitize_service_name(name)
         self.container_name = container_name
         self.restart = restart
         self.volumes = volumes
@@ -271,6 +273,28 @@ class DockerOptions:
         self.healthcheck = healthcheck
         self.user = user
         self.subnet = subnet
+
+    @property
+    def service_name(self) -> str:
+        """Compose service key, which Compose also registers as a DNS alias on the network.
+
+        A suffixed container uses its own name here too: the unsuffixed one is shared with every other DF Infra
+        instance's container for the same service, so an instance reaching its (unsuffixed) container by that
+        name would otherwise get answers from this one as well.
+        """
+        return Utils.sanitize_service_name(_suffixed_container_name(self) or self.name)
+
+
+def _suffixed_container_name(options: DockerOptions) -> str | None:
+    """Return options.container_name if it carries a container_name_suffix, else None.
+
+    Suffixed means the name extends options.name; unsuffixed and legacy-prefixed names (which don't start with
+    options.name) keep behaving as before this suffix existed.
+    """
+    container_name = options.container_name
+    if not container_name or container_name == options.name or not container_name.startswith(options.name):
+        return None
+    return container_name
 
 
 class DockerNotInstalledError(Exception):
@@ -319,6 +343,7 @@ class DockerComposeNetwork(TypedDict):
 
 
 class DockerComposeContent(TypedDict):
+    name: NotRequired[str]
     services: dict[str, DockerComposeService]
     networks: NotRequired[dict[str, DockerComposeNetwork]]
 
@@ -1153,7 +1178,11 @@ class DockerService:
                     service["group_add"] = sorted(gids)
         if options.subnet:
             service["networks"] = [options.subnet]
-        docker_compose_content: DockerComposeContent = {"services": {options.service_name: service}}
+        services = {options.service_name: service}
+        project_name = self.get_compose_project_name(options)
+        docker_compose_content: DockerComposeContent = (
+            {"name": project_name, "services": services} if project_name else {"services": services}
+        )
         if options.subnet:
             docker_compose_content["networks"] = {options.subnet: {"external": True}}
         return docker_compose_content
@@ -1189,6 +1218,27 @@ class DockerService:
         except Exception:
             logger.exception("Error during checking docker compose differences")
             return True, None
+
+    def _compose_project_changed(self, docker_compose_file_path: Path, options: DockerOptions) -> bool:
+        """Whether the existing compose file belongs to a different compose project or service than options would now get.
+
+        The project name and service key both follow the (suffixed) container name - see get_compose_project_name
+        and DockerOptions.service_name - so a container re-derived under a new name lands in a new project, or a
+        new service, that Compose never reconciles with the old one. For any file this version writes, both change
+        together; the service-key check on its own only catches files from pre-release builds of the suffix change.
+        """
+        if not docker_compose_file_path.is_file():
+            return False
+        try:
+            current_config = yaml.safe_load(docker_compose_file_path.read_text())
+        except (OSError, yaml.YAMLError):
+            # Unreadable - has_docker_compose_difference already treats it as changed, so it just gets rewritten
+            return False
+        if not isinstance(current_config, dict):
+            return False
+        services = current_config.get("services")
+        service_changed = isinstance(services, dict) and bool(services) and options.service_name not in services
+        return service_changed or current_config.get("name") != self.get_compose_project_name(options)
 
     async def get_existing_or_free_port_docker(
         self,
@@ -1465,9 +1515,50 @@ class DockerService:
         it — which callers doing rollback-on-later-failure need to know so they don't tear down a container
         this install attempt never created (see DFINFRA-297 follow-up).
         """
+        if options.subnet and len(host := self.get_container_host(options.subnet, options)) > _MAX_HOSTNAME_LENGTH:
+            # Refused upfront: the container itself would start fine, but every request DF Infra proxies to it
+            # would then fail on name resolution ("label too long").
+            shorten = (
+                "container_name_suffix, instance name or model id" if _suffixed_container_name(options) else "instance name or model id"
+            )
+            msg = (
+                f"Hostname {host!r} is {len(host)} characters, but with DF_DOCKER_SUBNET set DF Infra connects to the "
+                f"container by it, and a DNS label is limited to {_MAX_HOSTNAME_LENGTH} characters. Use a shorter {shorten} "
+                "and try again (an already-installed container keeps its pinned name until it is updated or reinstalled)."
+            )
+            raise HTTPException(400, msg)
         compose_path = self.get_docker_compose_file_path(options.name)
         is_running = await self.is_docker_compose_running(compose_path, options.service_name)
         has_difference, port = await self.has_docker_compose_difference(compose_path, options)
+        if has_difference and self._compose_project_changed(compose_path, options):
+            # Tear the old project down first, running or not - `up` in the new project never touches the old one's
+            # container, so e.g. a failed update's restart-looping container would otherwise be left orphaned by a
+            # rollback to the previous name, with no compose file left pointing at it.
+            logger.warning(
+                "Removing the previous compose stack of %r defined in %s before recreating it as %r",
+                options.name,
+                compose_path,
+                options.container_name,
+            )
+            try:
+                await self.stop_docker_compose(compose_path)
+            except RuntimeError as e:
+                # Manual-cleanup advice goes to the log only: by the time a user reads the error, a rollback may
+                # already have reused this very compose file for the restored, running container.
+                logger.error(
+                    "Could not remove the previous compose stack of %r; if this persists, check the container defined "
+                    "in %s (e.g. `%s -f %s down`) before retrying",
+                    options.name,
+                    compose_path,
+                    self.docker_compose_cmd,
+                    compose_path,
+                )
+                msg = (
+                    f"Could not remove the previous compose stack of {options.name!r} before recreating it as "
+                    f"{options.container_name!r}: {e}"
+                )
+                raise AppError(msg) from e
+            is_running = False
 
         logger.debug("docker_compose_start: %s is_running=%s has_difference=%s", options.service_name, is_running, has_difference)
 
@@ -1486,14 +1577,30 @@ class DockerService:
         """Stop the service and remove its compose file, or remove the container directly if it has no compose file.
 
         Falls back to stopping/removing the container directly (and removes nothing on disk) when no compose file
-        exists for the service — e.g. an adopted container, see DFINFRA-281.
+        exists for the service — e.g. an adopted container, see DFINFRA-281. If `down` fails, the compose file is
+        kept (and a warning logged) so a later install can clean it up; uninstall itself still doesn't fail.
         """
         docker_compose_cmd = self.docker_compose_cmd
         docker_compose_file = self.get_docker_compose_file_path(options.name)
+        keep_compose_file = False
         if docker_compose_file.is_file():
-            await Utils.run_command([*docker_compose_cmd.split(), "-f", str(docker_compose_file), "down"])
+            result = await Utils.run_command([*docker_compose_cmd.split(), "-f", str(docker_compose_file), "down"])
+            if result.exit_code != 0:
+                # Still best-effort, but the compose file is kept: a container that survived would otherwise have
+                # nothing left pointing at it, and a reinstall under a new (re-derived) name wouldn't even hit a
+                # name conflict with it - with the file kept, that reinstall retries removing it first.
+                keep_compose_file = True
+                logger.warning(
+                    "Failed to stop %r while uninstalling (exit code %s), container %r may still be running - keeping "
+                    "its compose file %s so a later install can clean it up: %s",
+                    options.name,
+                    result.exit_code,
+                    options.container_name,
+                    docker_compose_file,
+                    result.stderr.strip(),
+                )
         elif options.container_name:
-            # Uninstall is best-effort by design (the compose branch above ignores `down`'s exit code too): a
+            # Uninstall is best-effort by design (the compose branch above doesn't abort on a failed `down` either): a
             # Docker daemon hiccup here must not abort uninstall and leave the service stuck as still-installed.
             try:
                 await self._stop_and_remove_container(options.container_name)
@@ -1506,7 +1613,7 @@ class DockerService:
                 )
         else:
             logger.warning("Cannot uninstall %r: no compose file and no container name to fall back to", options.name)
-        if docker_compose_file.is_file():
+        if docker_compose_file.is_file() and not keep_compose_file:
             docker_compose_file.unlink()
         if self.config.compose_prefix:
             with suppress(Exception):
@@ -1529,17 +1636,47 @@ class DockerService:
             dir.mkdir(parents=True)
         return dir / "compose.yaml"
 
-    def get_docker_container_name(self, name: str) -> str:
-        """Return docker container name."""
-        return self.config.container_name_prefix + name if self.config.container_name_prefix else name
+    def get_docker_container_name(self, name: str, *, apply_legacy_prefix: bool = True) -> str:
+        """Return the docker container name for `name`.
+
+        The legacy container_name_prefix is prepended if set (the suffix is then ignored), otherwise
+        container_name_suffix is appended. apply_legacy_prefix=False is for containers that always had a fixed
+        name the legacy prefix never applied to - prefixing them now would rename them on upgrade.
+        """
+        if self.config.container_name_prefix:
+            return self.config.container_name_prefix + name if apply_legacy_prefix else name
+        return name + self.config.container_name_suffix if self.config.container_name_suffix else name
+
+    def get_compose_project_name(self, options: DockerOptions) -> str | None:
+        """Return an explicit compose project name for a suffixed container, None to keep Compose's default.
+
+        Compose tells stacks apart by project name, not container_name, and defaults it to the compose dir's
+        name - identical for every DF Infra instance on the host, so one instance's `up`/`down` would recreate
+        or remove another's container. Derived from the (pinned) container name rather than the live suffix so
+        it can't drift from the running stack; unsuffixed containers keep the default so existing installs
+        aren't orphaned from their current project.
+        """
+        container_name = _suffixed_container_name(options)
+        if container_name is None:
+            return None
+        return re.sub(r"[^a-z0-9_-]", "_", (self.config.compose_prefix + container_name).lower())
 
     def get_docker_subnet(self) -> str | None:
         """Return docker subnet name or None if it is not set."""
         return self.config.docker_subnet if self.config.docker_subnet else None
 
-    def get_container_host(self, subnet: str | None, container_name: str) -> str:
-        """Return container_name if there is docker_subnet in config otherwise return localhost."""
-        return container_name if subnet else "localhost"
+    def get_container_host(self, subnet: str | None, options: DockerOptions) -> str:
+        """Return the container's hostname on the docker_subnet, or localhost when there is none.
+
+        A suffixed container is reached by its container name, which its compose service key follows too (see
+        DockerOptions.service_name) - neither is shared with other DF Infra instances on the subnet, unlike the
+        unsuffixed name, which Docker's DNS would resolve to every instance's container using it. Any other
+        container (unsuffixed, legacy-prefixed) keeps the name it has always been reached by, so upgrading doesn't
+        change its hostname.
+        """
+        if not subnet:
+            return "localhost"
+        return _suffixed_container_name(options) or options.name
 
     def get_container_port(self, subnet: str | None, exposed_port: int, original_port: int) -> int:
         """Return container_name if there is docker_subnet in config otherwise return localhost."""

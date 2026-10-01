@@ -38,6 +38,7 @@ def _make_installed_info() -> InstalledInfo:
 def _make_model_installed_info(model_id: str = "test-model", registration_id: str = "reg-1") -> ModelInstalledInfo:
     docker = MagicMock()
     docker.name = f"df-coqui-{model_id}"
+    docker.container_name = f"df-coqui-{model_id}"
     return ModelInstalledInfo(
         id=model_id,
         type="tts",
@@ -319,6 +320,17 @@ def test_generate_instance_config_none_info(svc: CoquiService) -> None:
 
     assert config.options is None
     assert config.models == []
+
+
+def test_generate_instance_config_persists_resolved_container_name(svc: CoquiService) -> None:
+    """Resolved container name round-trips into the persisted ModelConfig, so a suffix change can't rename it."""
+    info = _make_installed_info()
+    info.models["model1"] = _make_model_installed_info("model1")
+    info.models["model1"].docker.container_name = "pinned-container-name"
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert (config.models or [])[0].container_name == "pinned-container-name"
 
 
 def test_generate_instance_config_with_info(svc: CoquiService) -> None:
@@ -652,6 +664,47 @@ async def test_install_model_uses_rename_as_registered_name(svc: CoquiService, d
     await (await svc._install_model("default", model_id, InstallModelIn(spec={"rename": "my-voice"}))).wait()  # pyright: ignore[reportPrivateUsage]
 
     assert installed.models[model_id].registered_name == "my-voice"
+
+
+@pytest.mark.asyncio
+async def test_install_model_uses_container_name_override_when_given(svc: CoquiService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info()
+    installed.parsed_options = CoquiOptions(hardware=False)
+    svc.instances_info["default"].installed = installed
+    model_id = next(iter(_const.models))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(5002, True, False))
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "container"
+    deps["docker_service"].get_container_host.return_value = "localhost"
+    deps["docker_service"].get_container_port.return_value = 5002
+    deps["endpoint_registry"].register_audio_speech.return_value = "reg-1"
+
+    promise = await svc._install_model("default", model_id, InstallModelIn(spec={}), "pinned-name")  # pyright: ignore[reportPrivateUsage]
+    await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "pinned-name"
+    deps["docker_service"].get_docker_container_name.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_install_model_falls_back_to_generated_container_name(svc: CoquiService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info()
+    installed.parsed_options = CoquiOptions(hardware=False)
+    svc.instances_info["default"].installed = installed
+    model_id = next(iter(_const.models))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(5002, True, False))
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "container"
+    deps["docker_service"].get_container_host.return_value = "localhost"
+    deps["docker_service"].get_container_port.return_value = 5002
+    deps["endpoint_registry"].register_audio_speech.return_value = "reg-1"
+
+    promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+    await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == deps["docker_service"].get_docker_container_name.return_value
 
 
 @pytest.mark.asyncio

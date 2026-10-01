@@ -14,7 +14,7 @@ from typing import Any, Literal, TypedDict, cast
 
 import aiofiles
 
-from server.config import AppSettings
+from server.config import AppSettings, get_services_json_path
 from server.models.common import JsonSerializable
 from server.utils.logger import logger
 
@@ -51,7 +51,7 @@ class ServiceProvider:
         self.file_lock = asyncio.Lock()
 
     def _get_file_path(self) -> Path:
-        return (self.config.get_storage_dir() / "./services.json").resolve()
+        return get_services_json_path(self.config)
 
     def convert_v3_to_v4_config(self, data: dict[str, Any]) -> dict[str, Any]:
         """Convert v3 to v4 config - adds the warnings list."""

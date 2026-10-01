@@ -242,6 +242,7 @@ class CoquiService(Base2Service[InstalledInfo, DownloadedInfo]):
                     definition=self.models[instance][x.id].model_dump(mode="json")
                     if x.id in self.models[instance]
                     else self._get_persisted_model_definition(instance, x.id),
+                    container_name=x.docker.container_name,
                 )
                 for x in info.models.values()
             ]
@@ -256,7 +257,12 @@ class CoquiService(Base2Service[InstalledInfo, DownloadedInfo]):
     def _load_download_info(self, data: dict[str, Any]) -> DownloadedInfo:
         return DownloadedInfo(**data)
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
+    async def _install_instance(
+        self,
+        instance: str,
+        options: InstallServiceIn,
+        container_name_override: str | None = None,  # noqa: ARG002
+    ) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self.load_default_models(instance)
 
@@ -369,7 +375,7 @@ class CoquiService(Base2Service[InstalledInfo, DownloadedInfo]):
         )
 
     async def _install_model(
-        self, instance: str, model_id: str, options: InstallModelIn
+        self, instance: str, model_id: str, options: InstallModelIn, container_name_override: str | None = None
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_model_options = try_parse_pydantic(CoquiModelOptions, options.spec) if options.spec else CoquiModelOptions()
         info = self.get_instance_installed_info(instance)
@@ -395,7 +401,7 @@ class CoquiService(Base2Service[InstalledInfo, DownloadedInfo]):
                 service_name = f"{self.get_service_id(instance)}-{model.docker_name}"
                 docker_options = DockerOptions(
                     name=service_name,
-                    container_name=self.docker_service.get_docker_container_name(service_name),
+                    container_name=container_name_override or self.docker_service.get_docker_container_name(service_name),
                     image=image.name,
                     command=self._build_coqui_command(
                         CoquiCmdOptions(
@@ -430,7 +436,7 @@ class CoquiService(Base2Service[InstalledInfo, DownloadedInfo]):
                     registered_name=registered_name,
                     options=options,
                     docker=docker_options,
-                    container_host=self.docker_service.get_container_host(subnet, docker_options.name),
+                    container_host=self.docker_service.get_container_host(subnet, docker_options),
                     container_port=self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port),
                     docker_exposed_port=docker_exposed_port,
                     registration_id="",

@@ -213,7 +213,9 @@ class FinetuneService(Base2Service[InstalledInfo, DownloadedInfo]):
         await self._stop_docker(installed.docker)
 
     def _generate_instance_config(self, instance: str, info: InstalledInfo | None, custom: list[CustomModel] | None) -> InstanceConfig:  # noqa: ARG002
-        return InstanceConfig(options=info.options if info else None, models=[], custom=custom)
+        return InstanceConfig(
+            options=info.options if info else None, models=[], custom=custom, container_name=info.docker.container_name if info else None
+        )
 
     def _load_download_info(self, data: dict[str, Any]) -> DownloadedInfo:
         return DownloadedInfo(**data)
@@ -224,7 +226,9 @@ class FinetuneService(Base2Service[InstalledInfo, DownloadedInfo]):
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
+    async def _install_instance(
+        self, instance: str, options: InstallServiceIn, container_name_override: str | None = None
+    ) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         parsed_options = try_parse_pydantic(FinetuneOptions, options.spec)
         # Each instance keeps its own job database, so a shared prefix would route a job's
         # requests to whichever instance registered last
@@ -244,7 +248,7 @@ class FinetuneService(Base2Service[InstalledInfo, DownloadedInfo]):
             docker_options = DockerOptions(
                 image_port=8333,
                 name=name,
-                container_name=self.docker_service.get_docker_container_name(name),
+                container_name=container_name_override or self.docker_service.get_docker_container_name(name),
                 image=image,
                 restart="unless-stopped",
                 volumes=[
@@ -269,7 +273,7 @@ class FinetuneService(Base2Service[InstalledInfo, DownloadedInfo]):
                 },
             )
             docker_exposed_port, _, _ = await self.docker_service.install_and_run_docker(docker_options)
-            container_host = self.docker_service.get_container_host(subnet, docker_options.name)
+            container_host = self.docker_service.get_container_host(subnet, docker_options)
             container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
             base_url = get_base_url(container_host, container_port)
             proxy_timeout_seconds = (
@@ -334,6 +338,7 @@ class FinetuneService(Base2Service[InstalledInfo, DownloadedInfo]):
         instance: str,  # noqa: ARG002
         model_id: str,  # noqa: ARG002
         options: InstallModelIn,  # noqa: ARG002
+        container_name_override: str | None = None,  # noqa: ARG002
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         raise HTTPException(400, "This service has no installable models.")
 

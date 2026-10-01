@@ -475,6 +475,26 @@ def test_generate_instance_config_with_info(svc: McpService) -> None:
     assert result.options is options
 
 
+def test_generate_instance_config_persists_resolved_container_name(svc: McpService) -> None:
+    docker_model = MagicMock()
+    docker_model.id = "open-websearch"
+    docker_model.options = InstallModelIn(spec={})
+    docker_model.docker_options.container_name = "df-open-websearch_abc123"
+    proxy_model = MagicMock()
+    proxy_model.id = "remote-proxy"
+    proxy_model.options = InstallModelIn(spec={})
+    proxy_model.docker_options = None
+    installed = InstalledInfo(models={"open-websearch": docker_model, "remote-proxy": proxy_model}, options=InstallServiceIn(spec={}))
+
+    result = svc._generate_instance_config("default", installed, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert result.models is not None
+    assert {m.model_id: m.container_name for m in result.models} == {
+        "open-websearch": "df-open-websearch_abc123",
+        "remote-proxy": None,
+    }
+
+
 def test_load_download_info_creates_downloaded_info(svc: McpService) -> None:
     result = svc._load_download_info({"image": "my-image"})  # pyright: ignore[reportPrivateUsage]
 
@@ -965,6 +985,157 @@ async def test_install_model_happy_path(svc: McpService, deps: dict[str, Any], t
     info = svc.get_instance_installed_info("default")
     assert model_id in info.models
     assert model_id in svc.models_downloaded
+
+
+@pytest.mark.asyncio
+async def test_install_model_uses_container_name_override_when_given(svc: McpService, deps: dict[str, Any], tmp_path: Path) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    model_id = "open-websearch"
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True, False))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.2"
+    deps["docker_service"].get_container_port.return_value = 3000
+    deps["endpoint_registry"].register_mcp_endpoint_as_proxy.return_value = "reg-id"
+    original_container_name = svc.models["default"][model_id].options.container_name  # pyright: ignore[reportOptionalMemberAccess]
+
+    with (
+        patch.object(svc, "_verify_docker_image", new=AsyncMock()),
+        patch.object(svc, "_download_image_or_set_progress", new=AsyncMock()),
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),
+        patch("server.services.mcp_service.get_base_url", return_value="http://172.20.0.2:3000"),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(), "pinned-name")  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "pinned-name"
+    installed_docker_options = svc.get_instance_installed_info("default").models[model_id].docker_options
+    assert installed_docker_options is not None
+    assert installed_docker_options.container_name == "pinned-name"
+    assert svc.models["default"][model_id].options.container_name == original_container_name  # pyright: ignore[reportOptionalMemberAccess]
+
+
+@pytest.mark.asyncio
+async def test_install_model_falls_back_to_generated_container_name(svc: McpService, deps: dict[str, Any], tmp_path: Path) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    model_id = "open-websearch"
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True, False))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.2"
+    deps["docker_service"].get_container_port.return_value = 3000
+    deps["endpoint_registry"].register_mcp_endpoint_as_proxy.return_value = "reg-id"
+
+    with (
+        patch.object(svc, "_verify_docker_image", new=AsyncMock()),
+        patch.object(svc, "_download_image_or_set_progress", new=AsyncMock()),
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),
+        patch("server.services.mcp_service.get_base_url", return_value="http://172.20.0.2:3000"),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn())  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "df-open-websearch"
+
+
+@pytest.mark.asyncio
+async def test_install_model_applies_suffix_changed_after_model_list_was_built(
+    svc: McpService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    """Catalog options are built at load time; a later live suffix change must still reach new installs."""
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    model_id = "open-websearch"
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True, False))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.2"
+    deps["docker_service"].get_container_port.return_value = 3000
+    deps["endpoint_registry"].register_mcp_endpoint_as_proxy.return_value = "reg-id"
+    deps["docker_service"].get_docker_container_name.side_effect = lambda name: f"{name}_new"  # pyright: ignore[reportUnknownLambdaType]
+
+    with (
+        patch.object(svc, "_verify_docker_image", new=AsyncMock()),
+        patch.object(svc, "_download_image_or_set_progress", new=AsyncMock()),
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),
+        patch("server.services.mcp_service.get_base_url", return_value="http://172.20.0.2:3000"),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn())  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "open-websearch_new"
+    assert svc.models["default"][model_id].options.container_name == "df-open-websearch"  # pyright: ignore[reportOptionalMemberAccess]
+
+
+@pytest.mark.asyncio
+async def test_install_model_allows_resolved_container_host_for_duckduckgo(svc: McpService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """DDG's DNS-rebinding protection rejects any other Host header with a 421, so it must list the real hostname."""
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True, False))
+    deps["docker_service"].get_container_host.return_value = "duckduckgo_myinfra_a1b2c3"
+    deps["docker_service"].get_container_port.return_value = 8000
+    deps["endpoint_registry"].register_mcp_endpoint_as_proxy.return_value = "reg-id"
+
+    with (
+        patch.object(svc, "_verify_docker_image", new=AsyncMock()),
+        patch.object(svc, "_download_image_or_set_progress", new=AsyncMock()),
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),
+        patch("server.services.mcp_service.get_base_url", return_value="http://duckduckgo_myinfra_a1b2c3:8000"),
+    ):
+        promise = await svc._install_model("default", "duckduckgo", InstallModelIn())  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.env_vars["DDG_ALLOWED_HOSTS"] == "duckduckgo_myinfra_a1b2c3:*"
+    assert svc.models["default"]["duckduckgo"].options.env_vars["DDG_ALLOWED_HOSTS"] == "{container_host}:*"  # pyright: ignore[reportOptionalMemberAccess]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("override", "expected_host"), [("pinned-name", "pinned-name"), (None, "duckduckgo_new")])
+async def test_install_model_derives_container_host_from_final_container_name(
+    svc: McpService, deps: dict[str, Any], tmp_path: Path, override: str | None, expected_host: str
+) -> None:
+    """The host (and DDG's allow-list) must follow the pinned or re-derived name, not the catalog's load-time one."""
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True, False))
+    deps["docker_service"].get_container_host.side_effect = lambda _subnet, options: options.container_name  # pyright: ignore[reportUnknownLambdaType, reportUnknownMemberType]
+    deps["docker_service"].get_container_port.return_value = 8000
+    deps["docker_service"].get_docker_container_name.side_effect = lambda name: f"{name}_new"  # pyright: ignore[reportUnknownLambdaType]
+    deps["endpoint_registry"].register_mcp_endpoint_as_proxy.return_value = "reg-id"
+
+    with (
+        patch.object(svc, "_verify_docker_image", new=AsyncMock()),
+        patch.object(svc, "_download_image_or_set_progress", new=AsyncMock()),
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),
+        patch("server.services.mcp_service.get_base_url", return_value="http://host:8000") as mock_base_url,
+    ):
+        promise = await svc._install_model("default", "duckduckgo", InstallModelIn(), override)  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.env_vars["DDG_ALLOWED_HOSTS"] == f"{expected_host}:*"
+    assert svc.instances_info["default"].installed.models["duckduckgo"].container_host == expected_host  # pyright: ignore[reportOptionalMemberAccess]
+    assert mock_base_url.call_args.args[0] == expected_host
+
+
+@pytest.mark.asyncio
+async def test_install_model_passes_user_envs_over_catalog_envs(svc: McpService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """User-supplied envs (e.g. API keys) must reach the container, and win over the catalog's own defaults."""
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True, False))
+    deps["docker_service"].get_container_host.return_value = "duckduckgo"
+    deps["docker_service"].get_container_port.return_value = 8000
+    deps["endpoint_registry"].register_mcp_endpoint_as_proxy.return_value = "reg-id"
+    spec = {"envs": {"FOO": "bar", "DDG_ALLOWED_HOSTS": "custom:*"}}
+
+    with (
+        patch.object(svc, "_verify_docker_image", new=AsyncMock()),
+        patch.object(svc, "_download_image_or_set_progress", new=AsyncMock()),
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),
+        patch("server.services.mcp_service.get_base_url", return_value="http://duckduckgo:8000"),
+    ):
+        promise = await svc._install_model("default", "duckduckgo", InstallModelIn(spec=spec))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    env_vars = deps["docker_service"].install_and_run_docker.call_args.args[0].env_vars
+    assert env_vars["FOO"] == "bar"
+    assert env_vars["DDG_ALLOWED_HOSTS"] == "custom:*"
 
 
 @pytest.mark.asyncio

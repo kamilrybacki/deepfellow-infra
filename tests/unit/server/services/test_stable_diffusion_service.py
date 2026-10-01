@@ -50,6 +50,7 @@ from server.utils.hardware import NvidiaGpuInfo
 def _make_installed_info(instance: str = "default") -> InstalledInfo:
     docker = MagicMock()
     docker.name = f"stable-diffusion-{instance}"
+    docker.container_name = f"stable-diffusion-{instance}"
     return InstalledInfo(
         docker=docker,
         models={},
@@ -373,6 +374,16 @@ def test_generate_instance_config_no_info(svc: StableDiffusionService) -> None:
 
     assert config.options is None
     assert config.models == []
+
+
+def test_generate_instance_config_persists_resolved_container_name(svc: StableDiffusionService) -> None:
+    """Resolved container name round-trips into the persisted InstanceConfig, so a suffix change can't rename it."""
+    info = _make_installed_info()
+    info.docker.container_name = "pinned-container-name"
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert config.container_name == "pinned-container-name"
 
 
 def test_generate_instance_config_with_info_no_models(svc: StableDiffusionService) -> None:
@@ -1111,6 +1122,55 @@ async def test_install_instance_calls_docker_and_returns_installed_info(svc: Sta
 
     assert isinstance(result, InstalledInfo)
     assert deps["docker_service"].install_and_run_docker.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_install_instance_uses_container_name_override_when_given(svc: StableDiffusionService, deps: dict[str, Any]) -> None:
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "df-stable-diffusion"
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(7860, True, False))
+    deps["docker_service"].get_container_host.return_value = "localhost"
+    deps["docker_service"].get_container_port.return_value = 7860
+    deps["docker_service"].get_user_for_docker = AsyncMock(return_value=None)
+    options = InstallServiceIn(spec={"hardware": False})
+
+    with (
+        patch.object(svc, "_download_image_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_verify_docker_image", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+        patch.object(svc, "update_config", new_callable=AsyncMock),
+        patch("server.services.stable_diffusion_service.platform.system", return_value="Linux"),
+    ):
+        promise = await svc._install_instance("default", options, "pinned-name")  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "pinned-name"
+    deps["docker_service"].get_docker_container_name.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_install_instance_falls_back_to_generated_container_name(svc: StableDiffusionService, deps: dict[str, Any]) -> None:
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "df-stable-diffusion"
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(7860, True, False))
+    deps["docker_service"].get_container_host.return_value = "localhost"
+    deps["docker_service"].get_container_port.return_value = 7860
+    deps["docker_service"].get_user_for_docker = AsyncMock(return_value=None)
+    options = InstallServiceIn(spec={"hardware": False})
+
+    with (
+        patch.object(svc, "_download_image_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_verify_docker_image", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+        patch.object(svc, "update_config", new_callable=AsyncMock),
+        patch("server.services.stable_diffusion_service.platform.system", return_value="Linux"),
+    ):
+        promise = await svc._install_instance("default", options)  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == deps["docker_service"].get_docker_container_name.return_value
 
 
 @pytest.mark.asyncio

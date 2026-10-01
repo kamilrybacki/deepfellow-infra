@@ -124,7 +124,7 @@ async def update_dynamic_config(
     """Apply a partial update to the dynamic settings backed by `config.json`.
 
     Only fields defined on `DynamicSettings` may be changed here — bootstrap-only fields
-    (`docker_subnet`, `storage_dir`, `storage_services_dir`, `container_name_prefix`,
+    (`docker_subnet`, `storage_dir`, `storage_services_dir`, the legacy `container_name_prefix`,
     `compose_prefix`, `infra_admin_api_key`) are immutable at runtime. Validated, persisted
     atomically, applied in-memory, and any required side effects (mesh reconnect, OTEL
     reconfigure, model downloader token refresh) are triggered — all without a process restart.
@@ -146,6 +146,20 @@ async def update_dynamic_config(
             new_settings = DynamicSettings.model_validate(merged_data)
         except ValidationError as e:
             raise HTTPException(status_code=400, detail=jsonable_encoder(e.errors())) from e
+        # The legacy prefix takes priority in get_docker_container_name(), so a new suffix would be
+        # accepted and persisted but silently do nothing. Clearing it, or re-sending the current one, is fine.
+        if (
+            config.container_name_prefix
+            and new_settings.container_name_suffix
+            and new_settings.container_name_suffix != current.container_name_suffix
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "container_name_suffix has no effect while the legacy DF_CONTAINER_NAME_PREFIX is set. Remove "
+                    "DF_CONTAINER_NAME_PREFIX from .env and restart first - installed containers keep their names."
+                ),
+            )
 
         # Diffed against what parent_infra/otlp_logging last confirmed applied, not `current` —
         # `apply_dynamic_settings()` below overwrites `config` regardless of success.

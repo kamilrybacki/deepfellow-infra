@@ -42,8 +42,10 @@ def svc(deps: dict[str, Any]) -> FinetuneService:
 
 
 def _make_installed_info(base_url: str = "http://172.20.0.1:8333") -> InstalledInfo:
+    docker = MagicMock()
+    docker.container_name = "df-finetune"
     return InstalledInfo(
-        docker=MagicMock(),
+        docker=docker,
         options=InstallServiceIn(spec={}),
         parsed_options=FinetuneOptions(),
         container_host="172.20.0.1",
@@ -305,6 +307,7 @@ def test_generate_instance_config_with_info_has_no_models(svc: FinetuneService) 
 
     assert config.options == installed.options
     assert config.models == []
+    assert config.container_name == "df-finetune"
 
 
 def test_load_download_info(svc: FinetuneService) -> None:
@@ -358,6 +361,21 @@ async def test_install_instance_creates_container_in_one_step(
 
 @pytest.mark.asyncio
 @patch.object(FinetuneService, "_get_working_dir")
+async def test_install_instance_uses_container_name_override_when_given(
+    mock_get_working_dir: MagicMock, svc: FinetuneService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    mock_get_working_dir.return_value = tmp_path
+    _mock_install_deps(deps)
+
+    promise = await svc._install_instance("default", InstallServiceIn(spec={}), "pinned-name")  # pyright: ignore[reportPrivateUsage]
+    await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "pinned-name"
+
+
+@pytest.mark.asyncio
+@patch.object(FinetuneService, "_get_working_dir")
 async def test_install_second_instance_gets_own_container_and_shares_models_and_adapters(
     mock_get_working_dir: MagicMock, svc: FinetuneService, deps: dict[str, Any], tmp_path: Path
 ) -> None:
@@ -378,7 +396,7 @@ async def test_install_second_instance_gets_own_container_and_shares_models_and_
         f"{tmp_path}/finetune-second/data:/workspace/data",
         f"{tmp_path}/finetune-second/db:/data",
     ]
-    deps["docker_service"].get_container_host.assert_called_once_with("172.20.0.0/16", "finetune-second")
+    deps["docker_service"].get_container_host.assert_called_once_with("172.20.0.0/16", docker_options)
 
 
 @pytest.mark.asyncio

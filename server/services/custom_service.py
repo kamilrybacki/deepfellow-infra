@@ -4,6 +4,7 @@
 """Custom service."""
 
 import asyncio
+import copy
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -421,14 +422,23 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
     def _generate_instance_config(self, instance: str, info: InstalledInfo | None, custom: list[CustomModel] | None) -> InstanceConfig:  # noqa: ARG002
         return InstanceConfig(
             options=info.options if info else None,
-            models=[ModelConfig(model_id=x.id, options=x.options) for x in info.models.values()] if info else [],
+            models=[
+                ModelConfig(model_id=x.id, options=x.options, container_name=x.docker_options.container_name) for x in info.models.values()
+            ]
+            if info
+            else [],
             custom=custom,
         )
 
     def _load_download_info(self, data: dict[str, Any]) -> DownloadedInfo:
         return DownloadedInfo(**data)
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
+    async def _install_instance(
+        self,
+        instance: str,
+        options: InstallServiceIn,
+        container_name_override: str | None = None,  # noqa: ARG002
+    ) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self.load_default_models(instance)
 
@@ -641,8 +651,12 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
             repository_url=model.repository_url,
         )
 
-    async def _install_model(
-        self, instance: str, model_id: str, options: InstallModelIn
+    async def _install_model(  # noqa: C901
+        self,
+        instance: str,
+        model_id: str,
+        options: InstallModelIn,
+        container_name_override: str | None = None,
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         info = self.get_instance_installed_info(instance)
         if not self.models.get(instance):
@@ -666,6 +680,13 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
             await self.validate_docker_image_version_for_model(model_id, options.spec.get("image_version"), options.spec.get("hardware"))
             docker_options = model.options(options.spec) if isinstance(model.options, Callable) else model.options
             docker_options = apply_image_version_override(docker_options, options.spec.get("image_version"))
+            if container_name_override or not isinstance(model.options, Callable):
+                # Copy first - a static, non-callable model.options is shared across installs. Its container_name
+                # was derived when the model list was built, so re-derive it: a live suffix change must apply too.
+                docker_options = copy.copy(docker_options)
+                docker_options.container_name = container_name_override or self.docker_service.get_docker_container_name(
+                    docker_options.name
+                )
             await self._verify_docker_image(docker_options.image, options.ignore_warnings)
         except BaseException:
             self._installing.discard(key)
@@ -680,7 +701,7 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
                 await self._download_image_or_set_progress(stream, image)
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
                 docker_exposed_port, _, _ = await self.docker_service.install_and_run_docker(docker_options)
-                container_host = self.docker_service.get_container_host(subnet, docker_options.name)
+                container_host = self.docker_service.get_container_host(subnet, docker_options)
                 container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
@@ -785,7 +806,7 @@ def create_bge_m3_model(custom_service: CustomService, subnet: str | None) -> Sr
         return DockerOptions(
             image_port=8070,
             name="deepfellow-bge-m3",
-            container_name="deepfellow-bge-m3",
+            container_name=custom_service.docker_service.get_docker_container_name("deepfellow-bge-m3", apply_legacy_prefix=False),
             image=image,
             restart="unless-stopped",
             hardware=hardware_parts,
@@ -873,7 +894,7 @@ def create_lemmatizer_model(custom_service: CustomService, subnet: str | None) -
         return DockerOptions(
             image_port=8090,
             name="df-lemmatizer",
-            container_name="df-lemmatizer",
+            container_name=custom_service.docker_service.get_docker_container_name("df-lemmatizer", apply_legacy_prefix=False),
             image=image,
             restart="unless-stopped",
             volumes=[f"{custom_service.get_working_dir()}/lemmatizer/cache/stanza:/root/.cache/stanza"],
@@ -930,7 +951,7 @@ def create_gliner_model(custom_service: CustomService, subnet: str | None) -> Sr
         return DockerOptions(
             image_port=8000,
             name="df-gliner",
-            container_name="df-gliner",
+            container_name=custom_service.docker_service.get_docker_container_name("df-gliner", apply_legacy_prefix=False),
             image=image,
             restart="unless-stopped",
             hardware=hardware_parts,
@@ -1066,7 +1087,7 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
         return DockerOptions(
             image_port=8000,
             name="doc_chunker",
-            container_name="doc_chunker",
+            container_name=custom_service.docker_service.get_docker_container_name("doc_chunker", apply_legacy_prefix=False),
             image=image,
             restart="unless-stopped",
             volumes=[],

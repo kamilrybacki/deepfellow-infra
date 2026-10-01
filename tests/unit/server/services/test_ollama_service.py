@@ -14,6 +14,7 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
+from server.docker import DockerOptions
 from server.models.models import InstallModelIn, ListModelsFilters, UninstallModelIn
 from server.models.services import InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import CustomModel, Instance, InstanceConfig, ModelConfig
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
 def _make_installed_info(svc: OllamaService, instance: str = "default") -> InstalledInfo:
     docker = MagicMock()
     docker.name = f"ollama-{instance}"
+    docker.container_name = f"ollama-{instance}"
     return InstalledInfo(
         instance_name=instance,
         docker=docker,
@@ -491,6 +493,22 @@ def test_generate_instance_config_with_info(svc: OllamaService) -> None:
 
     assert config.options == info.options
     assert len(config.models or []) == 1
+
+
+def test_generate_instance_config_persists_resolved_container_name(svc: OllamaService) -> None:
+    """Resolved container name round-trips into the persisted InstanceConfig."""
+    info = _make_installed_info(svc)
+    info.docker.container_name = "pinned-container-name"
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert config.container_name == "pinned-container-name"
+
+
+def test_generate_instance_config_no_info_has_no_container_name(svc: OllamaService) -> None:
+    config = svc._generate_instance_config("default", None, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert config.container_name is None
 
 
 def test_generate_instance_config_embeds_definition_when_in_registry(svc: OllamaService) -> None:
@@ -1553,6 +1571,49 @@ async def test_install_instance_calls_docker_and_returns_installed_info(svc: Oll
 
 
 @pytest.mark.asyncio
+async def test_install_instance_uses_container_name_override_when_given(svc: OllamaService, deps: dict[str, Any]) -> None:
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "df-ollama"
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(11434, True, False))
+    deps["docker_service"].get_container_host.return_value = "localhost"
+    deps["docker_service"].get_container_port.return_value = 11434
+    options = InstallServiceIn(spec={})
+
+    with (
+        patch.object(svc, "_download_image_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_verify_docker_image", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_instance("default", options, "pinned-name")  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "pinned-name"
+    deps["docker_service"].get_docker_container_name.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_install_instance_falls_back_to_generated_container_name(svc: OllamaService, deps: dict[str, Any]) -> None:
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "df-ollama"
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(11434, True, False))
+    deps["docker_service"].get_container_host.return_value = "localhost"
+    deps["docker_service"].get_container_port.return_value = 11434
+    options = InstallServiceIn(spec={})
+
+    with (
+        patch.object(svc, "_download_image_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_verify_docker_image", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_instance("default", options)  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == deps["docker_service"].get_docker_container_name.return_value
+
+
+@pytest.mark.asyncio
 async def test_install_instance_starts_warmth_poll_task(svc: OllamaService, deps: dict[str, Any]) -> None:
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-ollama"
@@ -2574,6 +2635,23 @@ async def test_local_file_size_bytes_no_docker_path_but_installed_uses_docker_ex
     assert result == 12345
     cmd = deps["docker_service"].run_command_docker_compose.call_args[0][2]
     assert cmd == ["stat", "-c%s", "/other/path/my model.bin"]
+
+
+@pytest.mark.asyncio
+async def test_compose_exec_targets_suffixed_service_key(svc: OllamaService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """A suffixed container's compose service is keyed by its container name, so `exec` must target that, not `name`."""
+    installed = _make_installed_info(svc)
+    installed.docker = DockerOptions(name="ollama-default", container_name="ollama-default_abc123", image="ollama", image_port=11434)
+    svc.instances_info["default"].installed = installed
+    deps["docker_service"].get_docker_compose_file_path.return_value = "/path/to/compose.yaml"
+    deps["docker_service"].run_command_docker_compose = AsyncMock(return_value="12345\n")
+
+    with patch.object(svc, "_get_working_dir", return_value=tmp_path):  # pyright: ignore[reportPrivateUsage]
+        await svc._local_file_size_bytes("/other/path/model.bin", "default")  # pyright: ignore[reportPrivateUsage]
+    await svc.create_model_from_modelfile(installed, "my-model", "/root/.ollama/Modelfile", None)
+
+    services = [c.args[1] for c in deps["docker_service"].run_command_docker_compose.call_args_list]
+    assert services == ["ollama-default_abc123", "ollama-default_abc123"]
 
 
 @pytest.mark.asyncio
