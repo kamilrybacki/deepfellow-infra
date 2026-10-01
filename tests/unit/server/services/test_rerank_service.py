@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 Simplito sp. z o.o.
 
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -28,6 +29,7 @@ from server.utils.hardware import NvidiaGpuInfo
 def _make_installed_info(instance: str = "default") -> InstalledInfo:
     docker = MagicMock()
     docker.name = f"rerank-{instance}"
+    docker.container_name = f"rerank-{instance}"
     return InstalledInfo(
         docker=docker,
         models={},
@@ -258,6 +260,16 @@ def test_generate_instance_config_no_info(svc: RerankService) -> None:
 
     assert config.options is None
     assert config.models == []
+
+
+def test_generate_instance_config_persists_resolved_container_name(svc: RerankService) -> None:
+    """Resolved container name round-trips into the persisted InstanceConfig, so a suffix change can't rename it."""
+    info = _make_installed_info()
+    info.docker.container_name = "pinned-container-name"
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert config.container_name == "pinned-container-name"
 
 
 def test_generate_instance_config_with_info(svc: RerankService) -> None:
@@ -838,6 +850,51 @@ async def test_install_instance_calls_docker_and_returns_installed_info(svc: Rer
 
 
 @pytest.mark.asyncio
+async def test_install_instance_uses_container_name_override_when_given(svc: RerankService, deps: dict[str, Any]) -> None:
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "df-rerank"
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8089, True, False))
+    deps["docker_service"].get_container_host.return_value = "localhost"
+    deps["docker_service"].get_container_port.return_value = 8089
+    options = InstallServiceIn(spec={})
+
+    with (
+        patch.object(svc, "_download_image_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_verify_docker_image", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+        patch("server.services.rerank_service.get_base_url", return_value="http://localhost:8089"),
+    ):
+        promise = await svc._install_instance("default", options, "pinned-name")  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "pinned-name"
+    deps["docker_service"].get_docker_container_name.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_install_instance_falls_back_to_generated_container_name(svc: RerankService, deps: dict[str, Any]) -> None:
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "df-rerank"
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8089, True, False))
+    deps["docker_service"].get_container_host.return_value = "localhost"
+    deps["docker_service"].get_container_port.return_value = 8089
+    options = InstallServiceIn(spec={})
+
+    with (
+        patch.object(svc, "_download_image_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_verify_docker_image", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+        patch("server.services.rerank_service.get_base_url", return_value="http://localhost:8089"),
+    ):
+        promise = await svc._install_instance("default", options)  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == deps["docker_service"].get_docker_container_name.return_value
+
+
+@pytest.mark.asyncio
 async def test_install_instance_sets_keep_alive_env_var(svc: RerankService, deps: dict[str, Any]) -> None:
     deps["docker_service"].get_docker_subnet.return_value = None
     deps["docker_service"].get_docker_container_name.return_value = "df-rerank"
@@ -1292,3 +1349,41 @@ async def test_install_instance_creates_hf_cache_dir_before_container_and_sets_u
     assert captured[0].env_vars["HF_HOME"] == "/mnt/hf"
     assert captured[0].env_vars["USER"] == "deepfellow"
     assert captured[0].env_vars["HOME"] == "/mnt/hf"
+
+
+@pytest.mark.asyncio
+async def test_container_name_survives_suffix_change_across_save_and_reload(deps: dict[str, Any]) -> None:
+    """End to end through a real service: install under suffix A, persist, change the suffix, reload from what was
+    persisted - the container keeps its suffix-A name instead of being renamed."""
+    docker = deps["docker_service"]
+    docker.get_docker_subnet.return_value = None
+    docker.install_and_run_docker = AsyncMock(return_value=(8089, True, False))
+    docker.get_container_host.return_value = "localhost"
+    docker.get_container_port.return_value = 8089
+    deps["service_provider"].save_service_config = AsyncMock()
+    deps["service_provider"].add_warning = AsyncMock()
+    deps["service_provider"].dismiss_warnings_matching = AsyncMock()
+    deps["service_provider"].dismiss_warnings_matching_any = AsyncMock()
+
+    def patched(svc: RerankService) -> ExitStack:
+        stack = ExitStack()
+        stack.enter_context(patch.object(svc, "_download_image_or_set_progress", new_callable=AsyncMock))
+        stack.enter_context(patch.object(svc, "_verify_docker_image", new_callable=AsyncMock))
+        stack.enter_context(patch.object(svc, "get_specified_hardware_parts", return_value=[]))
+        stack.enter_context(patch("server.services.rerank_service.get_base_url", return_value="http://localhost:8089"))
+        return stack
+
+    docker.get_docker_container_name.side_effect = lambda name: f"{name}_a"  # pyright: ignore[reportUnknownLambdaType]
+    installing = RerankService(**deps)
+    with patched(installing):
+        await (await installing.install_instance("default", InstallServiceIn(spec={}))).wait()
+    persisted = deps["service_provider"].save_service_config.call_args.args[1]
+    assert docker.install_and_run_docker.call_args.args[0].container_name == "rerank_a"
+
+    docker.get_docker_container_name.side_effect = lambda name: f"{name}_b"  # pyright: ignore[reportUnknownLambdaType]
+    docker.install_and_run_docker.reset_mock()
+    reloaded = RerankService(**deps)
+    with patched(reloaded):
+        await reloaded.load_service(persisted)
+
+    assert docker.install_and_run_docker.call_args.args[0].container_name == "rerank_a"

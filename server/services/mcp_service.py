@@ -779,14 +779,24 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
     def _generate_instance_config(self, instance: str, info: InstalledInfo | None, custom: list[CustomModel] | None) -> InstanceConfig:  # noqa: ARG002
         return InstanceConfig(
             options=info.options if info else None,
-            models=[ModelConfig(model_id=x.id, options=x.options) for x in info.models.values()] if info else [],
+            models=[
+                ModelConfig(model_id=x.id, options=x.options, container_name=x.docker_options.container_name if x.docker_options else None)
+                for x in info.models.values()
+            ]
+            if info
+            else [],
             custom=custom,
         )
 
     def _load_download_info(self, data: dict[str, Any]) -> DownloadedInfo:
         return DownloadedInfo(**data)
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
+    async def _install_instance(
+        self,
+        instance: str,
+        options: InstallServiceIn,
+        container_name_override: str | None = None,  # noqa: ARG002
+    ) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self.load_default_models(instance)
 
@@ -1957,7 +1967,11 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
         )
 
     async def _install_model(  # noqa: C901
-        self, instance: str, model_id: str, options: InstallModelIn
+        self,
+        instance: str,
+        model_id: str,
+        options: InstallModelIn,
+        container_name_override: str | None = None,
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         info = self.get_instance_installed_info(instance)
         self.models.setdefault(instance, {})
@@ -2046,9 +2060,18 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                     await self._download_image_or_set_progress(stream, image)
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
                 docker_options_edited = deepcopy(docker_options)
-                docker_options_edited.env_vars = docker_options_edited.env_vars | parsed_model_options.envs
+                # Re-derived rather than taken from model.options, built with the suffix current when the model
+                # list was loaded - a live container_name_suffix change must apply to new installs too.
+                docker_options_edited.container_name = container_name_override or self.docker_service.get_docker_container_name(
+                    docker_options_edited.name
+                )
+                container_host = self.docker_service.get_container_host(subnet, docker_options_edited)
+                # {container_host} lets an image allow-list the Host header DF Infra sends it (e.g. the MCP SDK's
+                # DNS-rebinding protection), which depends on the resolved - possibly suffixed - container name.
+                docker_options_edited.env_vars = {
+                    key: value.replace("{container_host}", container_host) for key, value in docker_options_edited.env_vars.items()
+                } | parsed_model_options.envs
                 docker_exposed_port, _, adopted = await self.docker_service.install_and_run_docker(docker_options_edited)
-                container_host = self.docker_service.get_container_host(subnet, docker_options_edited.name)
                 container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options_edited.image_port)
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
@@ -2251,7 +2274,8 @@ _const = McpConst(
                 image="ghcr.io/nickclyde/duckduckgo-mcp-server:0.6.1",
                 subnet=subnet,
                 command="python -m duckduckgo_mcp_server.server --transport streamable-http --host 0.0.0.0 --port 8000",
-                env_vars={"DDG_ALLOWED_HOSTS": "duckduckgo:8000"},
+                # Any port: without docker_subnet DF Infra connects via localhost:<exposed port>, not :8000.
+                env_vars={"DDG_ALLOWED_HOSTS": "{container_host}:*"},
             ),
             description="DuckDuckGo web search solution — no API key required.",
             repository_url="https://github.com/nickclyde/duckduckgo-mcp-server",

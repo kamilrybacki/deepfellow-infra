@@ -43,7 +43,7 @@ _CUSTOM_MODEL_DATA: dict[str, Any] = {
 def deps() -> dict[str, Any]:
     docker_svc = MagicMock()
     docker_svc.get_docker_subnet.return_value = "172.20.0.0/16"
-    docker_svc.get_docker_container_name.side_effect = lambda name: f"df-{name}"  # pyright: ignore[reportUnknownLambdaType]
+    docker_svc.get_docker_container_name.side_effect = lambda name, **_: f"df-{name}"  # pyright: ignore[reportUnknownLambdaType]
     config = MagicMock()
     config.standard_proxy_timeout_seconds = 300
     return {
@@ -232,6 +232,28 @@ def test_create_model_spec_contains_proxy_timeout_field_exactly_once(
     assert field_names.count("proxy_timeout_seconds") == 1
 
 
+@pytest.mark.parametrize(
+    ("create_model", "name"),
+    [
+        (create_bge_m3_model, "deepfellow-bge-m3"),
+        (create_lemmatizer_model, "df-lemmatizer"),
+        (create_gliner_model, "df-gliner"),
+        (create_doc_chunker_model, "doc_chunker"),
+    ],
+)
+def test_create_model_derives_container_name_without_legacy_prefix(
+    svc: CustomService, deps: dict[str, Any], create_model: Callable[[CustomService, str | None], SrvCustomModel], name: str
+) -> None:
+    """These always had a fixed name the legacy prefix never applied to, so it must stay unprefixed on upgrade."""
+    model = create_model(svc, "172.20.0.0/16")
+
+    docker_opts = model.options({"hardware": "CPU"})  # pyright: ignore[reportCallIssue]
+
+    assert docker_opts.name == name
+    assert docker_opts.container_name == f"df-{name}"
+    deps["docker_service"].get_docker_container_name.assert_called_with(name, apply_legacy_prefix=False)
+
+
 def test_model_installed_info_get_info() -> None:
     options = InstallModelIn(spec={"prefix": "test"})
     model_info = ModelInstalledInfo(
@@ -303,6 +325,7 @@ def test_generate_instance_config_with_info(svc: CustomService) -> None:
     mock_model_info = MagicMock()
     mock_model_info.id = "lemmatizer"
     mock_model_info.options = InstallModelIn(spec={})
+    mock_model_info.docker_options.container_name = "df-lemmatizer"
     installed = InstalledInfo(models={"lemmatizer": mock_model_info}, options=InstallServiceIn(spec={}))
 
     config = svc._generate_instance_config("default", installed, None)  # pyright: ignore[reportPrivateUsage]
@@ -311,6 +334,19 @@ def test_generate_instance_config_with_info(svc: CustomService) -> None:
     assert config.models is not None
     assert len(config.models) == 1
     assert config.models[0].model_id == "lemmatizer"
+
+
+def test_generate_instance_config_persists_resolved_container_name(svc: CustomService) -> None:
+    mock_model_info = MagicMock()
+    mock_model_info.id = "lemmatizer"
+    mock_model_info.options = InstallModelIn(spec={})
+    mock_model_info.docker_options.container_name = "df-lemmatizer_abc123"
+    installed = InstalledInfo(models={"lemmatizer": mock_model_info}, options=InstallServiceIn(spec={}))
+
+    config = svc._generate_instance_config("default", installed, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert config.models is not None
+    assert config.models[0].container_name == "df-lemmatizer_abc123"
 
 
 def test_load_download_info(svc: CustomService) -> None:
@@ -944,6 +980,112 @@ async def test_install_model_applies_selected_image_version_for_static_image_mod
     installed_model = svc.instances_info["default"].installed.models["easyOCR"]  # pyright: ignore[reportOptionalMemberAccess]
     assert installed_model.docker_options.image == "hub.simplito.com/deepfellow/df-ocr:2.0.0"
     assert svc.models["default"]["easyOCR"].options.image == original_image  # pyright: ignore[reportFunctionMemberAccess]
+
+
+@pytest.mark.asyncio
+async def test_install_model_uses_container_name_override_when_given(svc: CustomService, deps: dict[str, Any]) -> None:
+    # "easyOCR" uses a single shared (non-callable) DockerOptions instance — the override must not
+    # mutate it in place, or the pinned name would leak into every future install of this model.
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
+    deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True, False))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.1"
+    deps["docker_service"].get_container_port.return_value = 8000
+    deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
+    original_container_name = svc.models["default"]["easyOCR"].options.container_name  # pyright: ignore[reportFunctionMemberAccess]
+
+    promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+        "default", "easyOCR", InstallModelIn(spec={"prefix": "ocr"}), "pinned-name"
+    )
+    await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "pinned-name"
+    installed_model = svc.instances_info["default"].installed.models["easyOCR"]  # pyright: ignore[reportOptionalMemberAccess]
+    assert installed_model.docker_options.container_name == "pinned-name"
+    assert svc.models["default"]["easyOCR"].options.container_name == original_container_name  # pyright: ignore[reportFunctionMemberAccess]
+
+
+@pytest.mark.asyncio
+async def test_install_model_uses_container_name_override_for_callable_options(svc: CustomService, deps: dict[str, Any]) -> None:
+    """Models whose options are built per install (e.g. bge-m3) must keep their pinned name on restart as well."""
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
+    deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8070, True, False))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.1"
+    deps["docker_service"].get_container_port.return_value = 8070
+    deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
+
+    promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+        "default", "deepfellow-bge-m3", InstallModelIn(spec={"hardware": "CPU"}), "pinned-name"
+    )
+    await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "pinned-name"
+    installed_model = svc.instances_info["default"].installed.models["deepfellow-bge-m3"]  # pyright: ignore[reportOptionalMemberAccess]
+    assert installed_model.docker_options.container_name == "pinned-name"
+
+
+@pytest.mark.asyncio
+async def test_install_model_falls_back_to_generated_container_name(svc: CustomService, deps: dict[str, Any]) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
+    deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True, False))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.1"
+    deps["docker_service"].get_container_port.return_value = 8000
+    deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
+
+    promise = await svc._install_model("default", "easyOCR", InstallModelIn(spec={"prefix": "ocr"}))  # pyright: ignore[reportPrivateUsage]
+    await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "df-easyocr"
+
+
+@pytest.mark.asyncio
+async def test_install_model_applies_suffix_changed_after_model_list_was_built(svc: CustomService, deps: dict[str, Any]) -> None:
+    """easyOCR's static options were built at load time; a later live suffix change must still reach new installs."""
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
+    deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True, False))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.1"
+    deps["docker_service"].get_container_port.return_value = 8000
+    deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
+    deps["docker_service"].get_docker_container_name.side_effect = lambda name, **_: f"{name}_new"  # pyright: ignore[reportUnknownLambdaType]
+
+    promise = await svc._install_model("default", "easyOCR", InstallModelIn(spec={"prefix": "ocr"}))  # pyright: ignore[reportPrivateUsage]
+    await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "easyocr_new"
+    assert svc.models["default"]["easyOCR"].options.container_name == "df-easyocr"  # pyright: ignore[reportFunctionMemberAccess]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("override", "expected_host"), [("pinned-name", "pinned-name"), (None, "easyocr_new")])
+async def test_install_model_derives_container_host_from_final_container_name(
+    svc: CustomService, deps: dict[str, Any], override: str | None, expected_host: str
+) -> None:
+    """The registered host must follow the pinned or re-derived name, not the static options' load-time one."""
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
+    deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True, False))
+    deps["docker_service"].get_container_host.side_effect = lambda _subnet, options: options.container_name  # pyright: ignore[reportUnknownLambdaType, reportUnknownMemberType]
+    deps["docker_service"].get_container_port.return_value = 8000
+    deps["docker_service"].get_docker_container_name.side_effect = lambda name, **_: f"{name}_new"  # pyright: ignore[reportUnknownLambdaType]
+    deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
+
+    promise = await svc._install_model("default", "easyOCR", InstallModelIn(spec={"prefix": "ocr"}), override)  # pyright: ignore[reportPrivateUsage]
+    await promise.wait()
+
+    installed_model = svc.instances_info["default"].installed.models["easyOCR"]  # pyright: ignore[reportOptionalMemberAccess]
+    assert installed_model.container_host == expected_host
 
 
 @pytest.mark.asyncio

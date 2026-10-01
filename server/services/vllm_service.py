@@ -689,6 +689,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     capacity=x.capacity,
                     capacity_known=x.capacity_known,
                     gpu_memory_utilization=x.gpu_memory_utilization,
+                    container_name=x.docker.container_name,
                 )
                 for x in info.models.values()
             ]
@@ -742,7 +743,12 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         options.spec["hardware"] = self.canonicalize_hardware_spec(options.spec["hardware"])
         await self.validate_docker_image_version(options.spec.get("image_version"), options.spec.get("hardware"))
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
+    async def _install_instance(
+        self,
+        instance: str,
+        options: InstallServiceIn,
+        container_name_override: str | None = None,  # noqa: ARG002
+    ) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self.load_default_models(instance)
 
@@ -1256,7 +1262,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         return docker_exposed_port, user_model_length, restarted, adopted
 
     async def _install_model(  # noqa: C901
-        self, instance: str, model_id: str, options: InstallModelIn
+        self, instance: str, model_id: str, options: InstallModelIn, container_name_override: str | None = None
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_model_options = try_parse_pydantic(VllmModelOptions, options.spec) if options.spec else VllmModelOptions()
 
@@ -1344,7 +1350,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                 service_name = f"{self.get_service_id(instance)}-{normalize_name(model_id)}"
                 docker_options = DockerOptions(
                     name=service_name,
-                    container_name=self.docker_service.get_docker_container_name(service_name),
+                    container_name=container_name_override or self.docker_service.get_docker_container_name(service_name),
                     image=image.name,
                     command=" ".join(vllm_command),
                     image_port=8000,
@@ -1383,7 +1389,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     instance, model_id, "vLLM", docker_options.container_name or "", restarted, self._parse_max_concurrency
                 )
                 registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
-                container_host = self.docker_service.get_container_host(subnet, docker_options.name)
+                container_host = self.docker_service.get_container_host(subnet, docker_options)
                 container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
                 if model.model_type == "llm":
                     max_context_window = await get_model_dir_context_window(local_model_path)

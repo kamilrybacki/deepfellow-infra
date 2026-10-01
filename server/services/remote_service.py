@@ -450,7 +450,10 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
         return DownloadedInfo(**data)
 
     async def _install_instance(
-        self, instance: str, options: InstallServiceIn
+        self,
+        instance: str,
+        options: InstallServiceIn,
+        container_name_override: str | None = None,  # noqa: ARG002
     ) -> PromiseWithProgress[InstalledInfo[T_Options], StreamChunk]:
         """Install a remote service instance with validated frontend options."""
         if not self.models.get(instance):
@@ -597,7 +600,11 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
         )
 
     async def _install_model(  # noqa: C901
-        self, instance: str, model_id: str, options: InstallModelIn
+        self,
+        instance: str,
+        model_id: str,
+        options: InstallModelIn,
+        container_name_override: str | None = None,  # noqa: ARG002
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_model_options = try_parse_pydantic(RemoteModelOptions, options.spec) if options.spec else RemoteModelOptions()
         info = self.get_instance_installed_info(instance)

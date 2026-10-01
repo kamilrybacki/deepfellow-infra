@@ -69,6 +69,8 @@ class ModelConfig(BaseModel):
     capacity: int | None = None
     capacity_known: bool = False
     gpu_memory_utilization: float | None = None
+    # Resolved container name, pinned so a live container_name_suffix change doesn't rename it on restart.
+    container_name: str | None = None
 
 
 class CustomModel(BaseModel):
@@ -101,6 +103,8 @@ class InstanceConfig(BaseModel):
     options: InstallServiceIn | None = None
     models: list[ModelConfig] | None = None
     custom: list[CustomModel] | None = None
+    # Same purpose as ModelConfig.container_name, for single-container-per-instance services (e.g. Ollama).
+    container_name: str | None = None
 
 
 class ServiceConfig(BaseModel):
@@ -856,8 +860,12 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         if self._warning_tasks:
             await asyncio.gather(*self._warning_tasks, return_exceptions=True)
 
-    async def load_model(self, instance: str, model: ModelConfig) -> None:
-        """Load single model."""
+    async def load_model(self, instance: str, model: ModelConfig, *, derive_container_name: bool = False) -> None:
+        """Load single model.
+
+        derive_container_name re-derives the name instead of pinning the persisted one - set for an
+        explicit reinstall's own reload, not for restoring a config as-is (startup, rollback).
+        """
         logger.info(f"{self.get_id(instance)} loading model {model.model_id}")
         try:
             if model.model_id not in self.models.get(instance, {}) and model.definition:
@@ -874,7 +882,10 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             # response - but with no-op bookkeeping callbacks, since this method already has its own
             # separate success/failure handling below. Routing through install_model() directly
             # would run both, double-recording the warning on failure.
-            promise = await self._reserve_and_install(instance, model.model_id, model.options, on_success, lambda _e: None)
+            container_name_override = None if derive_container_name else model.container_name
+            promise = await self._reserve_and_install(
+                instance, model.model_id, model.options, on_success, lambda _e: None, container_name_override=container_name_override
+            )
             await promise.wait()
         except Exception as exc:
             logger.exception(f"{self.get_id(instance)} get error while loading model {model.model_id}")
@@ -949,6 +960,53 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             if needs_backfill:
                 logger.info(f"{self.get_type()} backfilling model definitions into persisted config")
                 await self._save()
+            elif unpinned := self._instances_with_unpinned_container_names(cfg.instances):
+                logger.info(f"{self.get_type()} backfilling container names into persisted config")
+                await self._backfill_container_names(unpinned)
+
+    async def _backfill_container_names(self, instances: list[str]) -> None:
+        """Save to pin the container names resolved on load, without letting a failed save fail the load itself.
+
+        The service did load fine, so a failed save must not surface as "Service failed to load" - it gets its own
+        per-instance warning instead (a service-level one would be auto-dismissed right after the load succeeds),
+        since the names stay unpinned, and a container_name_suffix change would rename them, until the next save.
+        """
+        try:
+            await self._save()
+        except Exception as exc:
+            logger.exception(f"{self.get_type()} failed to save container names into persisted config")
+            for instance in instances:
+                try:
+                    await self.service_provider.add_warning(
+                        self.get_type(),
+                        f"Container names of instance '{instance}' could not be saved to services.json: {exc}. Until the next "
+                        "successful save, changing container_name_suffix and restarting will rename its containers.",
+                        instance=instance,
+                    )
+                except Exception:
+                    logger.exception(f"{self.get_id(instance)} failed to record warning for unsaved container names")
+
+    def _instances_with_unpinned_container_names(self, persisted: dict[str, InstanceConfig]) -> list[str]:
+        """Instances for which loading resolved a container name the persisted config doesn't pin yet.
+
+        Non-empty for a services.json written before container names were pinned - without saving right away,
+        the name would stay unpinned until some unrelated save, so a container_name_suffix change in the
+        meantime would rename the container on the next restart. Compares against the freshly generated
+        config rather than just checking for None, so services with no container at all don't re-save on
+        every startup.
+        """
+        unpinned: list[str] = []
+        for name, persisted_instance in persisted.items():
+            info = self.instances_info.get(name)
+            if info is None or info.installed is None:
+                continue
+            live = self._generate_instance_config(name, info.installed, info.config.custom)
+            unpinned_model_ids = {m.model_id for m in persisted_instance.models or [] if m.container_name is None}
+            if (persisted_instance.container_name is None and live.container_name is not None) or any(
+                m.model_id in unpinned_model_ids and m.container_name is not None for m in live.models or []
+            ):
+                unpinned.append(name)
+        return unpinned
 
     @abstractmethod
     def _load_download_info(self, data: dict[str, Any]) -> DownloadInfoType:
@@ -1031,7 +1089,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             self._record_warning_in_background(f"Service instance '{instance}' failed to install: {e}", instance=instance)
 
         try:
-            promise = await self._install_instance(instance, options)
+            promise = await self._install_instance(instance, options, instance_config.container_name if instance_config else None)
         except BaseException as e:
             self.instances_info[instance].installing = None
             reservation.reject(e)
@@ -1084,7 +1142,9 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             """
             self._record_warning_in_background(f"Service instance '{instance}' failed to update: {e}", instance=instance)
             if previous_options is not None and self.instances_info[instance].installed is None:
-                reverted = await self._rollback_after_failed_update(instance, previous_options, preserved_models, e)
+                reverted = await self._rollback_after_failed_update(
+                    instance, previous_options, preserved_models, e, previous_container_name=previous_config.container_name
+                )
                 self._append_rollback_outcome(e, reverted)
             else:
                 self.instances_info[instance].installing = None
@@ -1115,7 +1175,9 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             # restore. Awaited inline (this whole method is itself awaited by its caller) so the caller
             # doesn't get a response before the instance's true final state is known.
             if uninstalled and previous_options is not None:
-                reverted = await self._rollback_after_failed_update(instance, previous_options, preserved_models, e)
+                reverted = await self._rollback_after_failed_update(
+                    instance, previous_options, preserved_models, e, previous_container_name=previous_config.container_name
+                )
                 self._append_rollback_outcome(e, reverted)
             else:
                 self.instances_info[instance].installing = None
@@ -1132,15 +1194,16 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         """Shared post-reinstall bookkeeping for a reinstall that just succeeded.
 
         Used by both the original update's own reinstall and a rollback's restore of the previous
-        installation - `context` ("update"/"rollback") only distinguishes the two in log output, so a
-        dismiss-warnings failure logged here is still traceable to which flow it happened in. `installing`
-        is always cleared, even if a step here fails, so neither caller can leave the instance stuck
-        permanently rejecting every future install/update as "currently installing".
+        installation - `context` ("update"/"rollback") distinguishes the two in log output, and also
+        picks whether preserved models re-derive their container name ("update") or keep their pinned
+        one ("rollback"). `installing` is always cleared, even if a step here fails, so neither caller
+        can leave the instance stuck permanently rejecting every future install/update as "currently
+        installing".
         """
         try:
             self.instances_info[instance].installed = data
             for model in preserved_models:
-                await self.load_model(instance, model)
+                await self.load_model(instance, model, derive_container_name=context == "update")
             await self._after_install(instance)
             await self._save()
         finally:
@@ -1151,12 +1214,20 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             logger.exception(f"{self.get_id(instance)} failed to dismiss warnings after successful {context}")
 
     async def _rollback_after_failed_update(
-        self, instance: str, previous_options: InstallServiceIn, preserved_models: list[ModelConfig], original_error: BaseException
+        self,
+        instance: str,
+        previous_options: InstallServiceIn,
+        preserved_models: list[ModelConfig],
+        original_error: BaseException,
+        *,
+        previous_container_name: str | None,
     ) -> bool:
         """Best-effort restore of the pre-update installation after `update_instance()`'s reinstall step failed.
 
         Re-runs `_install_instance` with the options captured before the uninstall and reloads the
         preserved models onto the recreated container - mirroring `update_instance()`'s own success path.
+        `previous_container_name` pins the instance container back to its pre-update name, just like the
+        preserved models keep theirs - a restore must not pick up a suffix changed since the original install.
         If the restore itself fails too, the instance is genuinely gone: that's surfaced as a distinct,
         more prominent warning so it isn't mistaken for the original, potentially transient, update
         failure.
@@ -1167,7 +1238,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         """
         logger.warning(f"{self.get_id(instance)} update failed ({original_error}); attempting to restore the previous installation")
         try:
-            promise = await self._install_instance(instance, previous_options)
+            promise = await self._install_instance(instance, previous_options, previous_container_name)
             data = await promise.wait()
         except asyncio.CancelledError:
             # Never swallow cancellation (e.g. app shutdown) - but still clear `installing` first, so
@@ -1249,8 +1320,10 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         """
 
     @abstractmethod
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfoType, StreamChunk]:
-        """Install service."""
+    async def _install_instance(
+        self, instance: str, options: InstallServiceIn, container_name_override: str | None = None
+    ) -> PromiseWithProgress[InstalledInfoType, StreamChunk]:
+        """Install service. container_name_override, if set, must be used verbatim - see InstanceConfig.container_name."""
 
     async def uninstall_instance(self, instance: str, options: UninstallServiceIn) -> None:
         """Uninstall the service."""
@@ -1538,6 +1611,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         options: InstallModelIn,
         on_success: Callable[[InstallModelOut], Awaitable[InstallModelOut]],
         on_error: Callable[[Exception], None],
+        container_name_override: str | None = None,
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         """Reserve model_id for install, or join an already-in-progress reservation for it.
 
@@ -1546,6 +1620,8 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         one sees the same reservation, instead of racing a duplicate install or fabricating a
         result. on_success/on_error carry each caller's own post-install bookkeeping; reservation
         cleanup itself always happens here regardless of what they do.
+
+        container_name_override: only load_model() passes this, to pin the persisted name - see ModelConfig.container_name.
         """
         installing_model_progress = self.get_instance_info(instance).installing_model_progress
 
@@ -1576,7 +1652,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         # Run _install_model() as its own task (rather than awaiting it inline) so cancel_model_install(),
         # called from a completely different request, has something real to cancel even before this
         # produces a promise - not just something to wait on.
-        reservation.pending_task = asyncio.create_task(self._install_model(instance, model_id, options))
+        reservation.pending_task = asyncio.create_task(self._install_model(instance, model_id, options, container_name_override))
         try:
             promise = await reservation.pending_task
         except BaseException as e:
@@ -1618,9 +1694,9 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
 
     @abstractmethod
     async def _install_model(
-        self, instance: str, model_id: str, options: InstallModelIn
+        self, instance: str, model_id: str, options: InstallModelIn, container_name_override: str | None = None
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
-        """Install the model."""
+        """Install the model. container_name_override, if set, must be used verbatim - see ModelConfig.container_name."""
 
     async def uninstall_model(self, instance: str, model_id: str, options: UninstallModelIn) -> None:
         """Uninstall the model."""

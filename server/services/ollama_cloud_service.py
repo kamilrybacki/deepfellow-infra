@@ -96,7 +96,11 @@ class OllamaCloudService(RemoteService):
         return await super().list_models(input_instance, filters)
 
     async def _install_model(
-        self, instance: str, model_id: str, options: InstallModelIn
+        self,
+        instance: str,
+        model_id: str,
+        options: InstallModelIn,
+        container_name_override: str | None = None,  # noqa: ARG002
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         """Install model, doing a force refresh if model is not in current cache."""
         if not self.models.get(instance) or model_id not in self.models[instance]:

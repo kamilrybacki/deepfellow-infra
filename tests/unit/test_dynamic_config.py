@@ -4,11 +4,12 @@
 """Tests for server/dynamic_config.py."""
 
 import json
+import re
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from server.config import AppSettings, ConfigError
 from server.dynamic_config import (
@@ -16,6 +17,7 @@ from server.dynamic_config import (
     ConfigEnvelope,
     DynamicSettings,
     _build_legacy_defaults,  # pyright: ignore[reportPrivateUsage]
+    _generate_container_name_suffix,  # pyright: ignore[reportPrivateUsage]
     _migrate,  # pyright: ignore[reportPrivateUsage]
     apply_dynamic_settings,
     get_config_json_path,
@@ -35,6 +37,8 @@ def _make_config(storage_dir: Path | None = None, **overrides: object) -> MagicM
         mock.get_storage_dir.return_value = storage_dir
     mock.name = ""
     mock.infra_url = ""
+    mock.container_name_prefix = ""
+    mock.container_name_suffix = ""
     mock.mesh_key = SecretStr("")
     mock.infra_api_key = SecretStr("")
     mock.connect_to_mesh_url = ""
@@ -267,6 +271,15 @@ def test_build_legacy_defaults_returns_snapshot_of_config() -> None:
     assert settings.name == "node-d"
 
 
+@pytest.mark.parametrize("suffix", ["_Prod", "bad.name", "a" * 33])
+def test_build_legacy_defaults_raises_config_error_naming_invalid_env_var(suffix: str) -> None:
+    """Startup only reports a ConfigError's own message, so it must name the variable to fix."""
+    config = _make_config(container_name_suffix=suffix)
+
+    with pytest.raises(ConfigError, match="DF_CONTAINER_NAME_SUFFIX"):
+        _build_legacy_defaults(config)
+
+
 def test_build_legacy_defaults_warns_when_non_default(caplog: pytest.LogCaptureFixture) -> None:
     config = _make_config(name="node-e")
 
@@ -312,6 +325,143 @@ def test_load_or_init_loads_existing_config_json_without_rewriting(tmp_path: Pat
 
     assert config.name == "on-disk-name"
     assert json.loads(config_path.read_text())["settings"]["name"] == "on-disk-name"
+
+
+def test_load_or_init_auto_generates_container_name_suffix_on_fresh_install(tmp_path: Path) -> None:
+    config = _make_config(storage_dir=tmp_path)
+
+    load_or_init(config)
+
+    written = json.loads((tmp_path / "config.json").read_text())
+    assert written["settings"]["container_name_suffix"]
+    assert config.container_name_suffix == written["settings"]["container_name_suffix"]
+
+
+def test_load_or_init_keeps_explicit_container_name_suffix_on_fresh_install(tmp_path: Path) -> None:
+    config = _make_config(storage_dir=tmp_path, container_name_suffix="-pinned")
+
+    load_or_init(config)
+
+    written = json.loads((tmp_path / "config.json").read_text())
+    assert written["settings"]["container_name_suffix"] == "-pinned"
+    assert config.container_name_suffix == "-pinned"
+
+
+def test_load_or_init_skips_suffix_auto_generation_for_existing_install(tmp_path: Path) -> None:
+    """An upgrade from before config.json existed must not rename not-yet-pinned containers."""
+    (tmp_path / "services.json").write_text("{}")
+    config = _make_config(storage_dir=tmp_path)
+
+    load_or_init(config)
+
+    assert json.loads((tmp_path / "config.json").read_text())["settings"]["container_name_suffix"] == ""
+    assert config.container_name_suffix == ""
+
+
+def test_load_or_init_skips_suffix_auto_generation_while_legacy_prefix_set(tmp_path: Path) -> None:
+    config = _make_config(storage_dir=tmp_path, container_name_prefix="df_")
+
+    load_or_init(config)
+
+    assert json.loads((tmp_path / "config.json").read_text())["settings"]["container_name_suffix"] == ""
+
+
+def test_load_or_init_warns_when_suffix_is_ignored_due_to_legacy_prefix(tmp_path: Path) -> None:
+    data = {
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "infra_version": get_infra_version(),
+        "settings": {"container_name_suffix": "_mine"},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(data))
+    config = _make_config(storage_dir=tmp_path, container_name_prefix="df_")
+
+    with patch("server.dynamic_config.logger") as logger_mock:
+        load_or_init(config)
+
+    logger_mock.warning.assert_called_once()
+    assert "DF_CONTAINER_NAME_PREFIX" in logger_mock.warning.call_args.args[0]
+
+
+def test_load_or_init_does_not_warn_without_legacy_prefix(tmp_path: Path) -> None:
+    data = {
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "infra_version": get_infra_version(),
+        "settings": {"container_name_suffix": "_mine"},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(data))
+    config = _make_config(storage_dir=tmp_path)
+
+    with patch("server.dynamic_config.logger") as logger_mock:
+        load_or_init(config)
+
+    logger_mock.warning.assert_not_called()
+
+
+def test_load_or_init_with_non_ascii_name_writes_config_json_that_loads_again(tmp_path: Path) -> None:
+    """A non-ASCII DF_NAME must not brick the next startup's read_envelope(), with the generated suffix alongside it."""
+    config = _make_config(storage_dir=tmp_path, name="Zażółć 日本", mesh_key=SecretStr("secret-key"))
+
+    load_or_init(config)
+
+    envelope = read_envelope(config)
+    assert envelope is not None
+    assert re.fullmatch(r"_[0-9a-f]{6}", envelope.settings.container_name_suffix)
+    assert envelope.settings.name == "Zażółć 日本"
+    assert envelope.settings.mesh_key.get_secret_value() == "secret-key"
+
+
+def test_load_or_init_does_not_backfill_container_name_suffix_for_existing_config_json(tmp_path: Path) -> None:
+    """Upgrading must not rename already-installed services' containers."""
+    data = {
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "infra_version": get_infra_version(),
+        "settings": {"name": "on-disk-name"},
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(data))
+    config = _make_config(storage_dir=tmp_path)
+
+    load_or_init(config)
+
+    assert config.container_name_suffix == ""
+    assert "container_name_suffix" not in json.loads(config_path.read_text())["settings"]
+
+
+def test_generate_container_name_suffix_is_separator_plus_six_random_hex_chars() -> None:
+    """Kept short so that, with docker_subnet, the suffixed name still fits a 63-char hostname."""
+    assert re.fullmatch(r"_[0-9a-f]{6}", _generate_container_name_suffix())
+
+
+def test_generate_container_name_suffix_is_unique_across_calls() -> None:
+    assert _generate_container_name_suffix() != _generate_container_name_suffix()
+
+
+def test_generate_container_name_suffix_passes_suffix_validation() -> None:
+    suffix = _generate_container_name_suffix()
+
+    assert DynamicSettings(container_name_suffix=suffix).container_name_suffix == suffix
+
+
+def test_container_name_suffix_rejects_characters_docker_disallows() -> None:
+    with pytest.raises(ValidationError):
+        DynamicSettings(container_name_suffix="bad/name")
+
+
+def test_container_name_suffix_rejects_uppercase() -> None:
+    """Case-only differences would still collide on hostname and compose project, both case-insensitive."""
+    with pytest.raises(ValidationError):
+        DynamicSettings(container_name_suffix="_Prod")
+
+
+def test_container_name_suffix_accepts_blank_and_valid_values() -> None:
+    assert DynamicSettings(container_name_suffix="").container_name_suffix == ""
+    assert DynamicSettings(container_name_suffix="my-suffix_1").container_name_suffix == "my-suffix_1"
+
+
+def test_container_name_suffix_rejects_values_over_32_chars() -> None:
+    assert DynamicSettings(container_name_suffix="a" * 32).container_name_suffix == "a" * 32
+    with pytest.raises(ValidationError):
+        DynamicSettings(container_name_suffix="a" * 33)
 
 
 # --- persist_settings / persist ---

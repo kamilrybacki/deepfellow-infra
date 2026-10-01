@@ -330,7 +330,12 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         self._remove_stale_models(installed_info, (set(installed_info.models) | set(saved_models)) - current_model_ids)
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
+    async def _install_instance(
+        self,
+        instance: str,
+        options: InstallServiceIn,
+        container_name_override: str | None = None,  # noqa: ARG002
+    ) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self._load_default_models(instance)
 
@@ -542,7 +547,11 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
         stream.emit(StreamChunkProgress(type="progress", stage="download", value=1, data={}))
 
     async def _install_model(
-        self, instance: str, model_id: str, options: InstallModelIn
+        self,
+        instance: str,
+        model_id: str,
+        options: InstallModelIn,
+        container_name_override: str | None = None,  # noqa: ARG002
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_options = (
             try_parse_pydantic(DockerModelRunnerModelOptions, options.spec) if options.spec else DockerModelRunnerModelOptions()

@@ -70,6 +70,7 @@ def docker_service(tmp_path: Path) -> DockerService:
     config = MagicMock()
     config.compose_prefix = ""
     config.container_name_prefix = ""
+    config.container_name_suffix = ""
     config.docker_subnet = ""
     config.get_storage_dir.return_value = tmp_path
     port_service = MagicMock()
@@ -1091,6 +1092,183 @@ async def test_create_compose_file_writes_yaml_and_returns_port(docker_service: 
 
 
 @pytest.mark.asyncio
+async def test_install_and_run_docker_refuses_hostname_over_limit(docker_service: DockerService) -> None:
+    options = _opts(container_name="mymodel_" + "a" * 56, subnet="my-net")
+
+    with (
+        patch.object(docker_service, "is_docker_compose_running", new_callable=AsyncMock) as mock_running,
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await docker_service.install_and_run_docker(options)
+
+    assert exc_info.value.status_code == 400
+    assert "64 characters" in str(exc_info.value.detail)
+    assert "container_name_suffix" in str(exc_info.value.detail)
+    mock_running.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_install_and_run_docker_refuses_unsuffixed_hostname_over_limit_without_blaming_suffix(
+    docker_service: DockerService,
+) -> None:
+    """An unsuffixed container's hostname is its service name, so there's no suffix to shorten."""
+    options = _opts(name="m" * 64, container_name="m" * 64, subnet="my-net")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await docker_service.install_and_run_docker(options)
+
+    assert "64 characters" in str(exc_info.value.detail)
+    assert "container_name_suffix" not in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("container_name", "subnet"),
+    [("mymodel_" + "a" * 55, "my-net"), ("mymodel_" + "a" * 56, None), ("df_mymodel" + "a" * 60, "my-net")],
+)
+async def test_install_and_run_docker_allows_container_name_when_hostname_fits_or_unused(
+    docker_service: DockerService, tmp_path: Path, container_name: str, subnet: str | None
+) -> None:
+    """The limit applies only to the hostname DF Infra actually connects to: without a subnet that's localhost, and a
+    legacy-prefixed container is reached by its (short) service name, not its long container name."""
+    options = _opts(container_name=container_name, subnet=subnet)
+
+    with (
+        patch.object(docker_service, "get_docker_compose_file_path", return_value=tmp_path / "compose.yaml"),
+        patch.object(docker_service, "is_docker_compose_running", new_callable=AsyncMock, return_value=True),
+        patch.object(docker_service, "has_docker_compose_difference", new_callable=AsyncMock, return_value=(False, 11434)),
+        patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock, return_value=True),
+    ):
+        port, _, _ = await docker_service.install_and_run_docker(options)
+
+    assert port == 11434
+
+
+@pytest.mark.parametrize(
+    ("content", "container_name", "expected"),
+    [
+        ("name: mymodel_a\nservices: {}\n", "mymodel_b", True),
+        ("services: {}\n", "mymodel_b", True),
+        ("name: mymodel_b\nservices: {}\n", "mymodel_b", False),
+        ("name: mymodel_a\nservices: {}\n", "mymodel", True),
+        ("name: mymodel_b\nservices:\n  mymodel: {}\n", "mymodel_b", True),
+        ("name: mymodel_b\nservices:\n  mymodel_b: {}\n", "mymodel_b", False),
+        ("services:\n  mymodel: {}\n", "mymodel", False),
+        ("services: {}\n", "mymodel", False),
+        ("", "mymodel_b", False),
+        ("services: [unclosed\n", "mymodel_b", False),
+        (None, "mymodel_b", False),
+    ],
+)
+def test_compose_project_changed(
+    docker_service: DockerService, tmp_path: Path, content: str | None, container_name: str, expected: bool
+) -> None:
+    compose_file = tmp_path / "compose.yaml"
+    if content is not None:
+        compose_file.write_text(content)
+
+    result = docker_service._compose_project_changed(compose_file, _opts(container_name=container_name))  # pyright: ignore[reportPrivateUsage]
+
+    assert result is expected
+
+
+@pytest.mark.asyncio
+async def test_install_and_run_docker_downs_previous_compose_project(docker_service: DockerService, tmp_path: Path) -> None:
+    """A stopped/restart-looping container of the previous project must not be orphaned by `up` in the new one."""
+    options = _opts(container_name="mymodel_b")
+    compose_file = tmp_path / "compose.yaml"
+    compose_file.write_text("name: mymodel_a\nservices: {}\n")
+    manager = MagicMock()
+
+    with (
+        patch.object(docker_service, "get_docker_compose_file_path", return_value=compose_file),
+        patch.object(docker_service, "is_docker_compose_running", new_callable=AsyncMock, return_value=False),
+        patch.object(docker_service, "has_docker_compose_difference", new_callable=AsyncMock, return_value=(True, 11434)),
+        patch.object(docker_service, "stop_docker_compose", new_callable=AsyncMock) as mock_stop,
+        patch.object(docker_service, "create_compose_file", new_callable=AsyncMock, return_value=11434) as mock_create,
+        patch.object(docker_service, "start_docker_compose", new_callable=AsyncMock, return_value=""),
+        patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock, return_value=True),
+    ):
+        manager.attach_mock(mock_stop, "stop")
+        manager.attach_mock(mock_create, "create")
+        await docker_service.install_and_run_docker(options)
+
+    assert [c[0] for c in manager.mock_calls] == ["stop", "create"]
+    mock_stop.assert_awaited_once_with(compose_file)
+
+
+@pytest.mark.asyncio
+async def test_install_and_run_docker_aborts_when_previous_compose_project_cannot_be_removed(
+    docker_service: DockerService, tmp_path: Path
+) -> None:
+    """Starting the new project next to a surviving old one would leave two containers competing for the GPU."""
+    options = _opts(container_name="mymodel_b")
+    compose_file = tmp_path / "compose.yaml"
+    compose_file.write_text("name: mymodel_a\nservices: {}\n")
+
+    with (
+        patch.object(docker_service, "get_docker_compose_file_path", return_value=compose_file),
+        patch.object(docker_service, "is_docker_compose_running", new_callable=AsyncMock, return_value=False),
+        patch.object(docker_service, "has_docker_compose_difference", new_callable=AsyncMock, return_value=(True, 11434)),
+        patch.object(docker_service, "stop_docker_compose", new_callable=AsyncMock, side_effect=RuntimeError("down failed")),
+        patch.object(docker_service, "create_compose_file", new_callable=AsyncMock) as mock_create,
+        patch.object(docker_service, "start_docker_compose", new_callable=AsyncMock) as mock_start,
+        pytest.raises(AppError, match="previous compose stack of 'mymodel'") as exc_info,
+    ):
+        await docker_service.install_and_run_docker(options)
+
+    mock_create.assert_not_called()
+    mock_start.assert_not_called()
+    # A rollback may reuse this compose file for the restored container, so the user-facing error mustn't advise
+    # tearing it down.
+    assert "down" not in str(exc_info.value).replace("down failed", "")
+
+
+@pytest.mark.asyncio
+async def test_install_and_run_docker_keeps_unchanged_compose_project(docker_service: DockerService, tmp_path: Path) -> None:
+    options = _opts(container_name="mymodel_b")
+    compose_file = tmp_path / "compose.yaml"
+    compose_file.write_text("name: mymodel_b\nservices: {}\n")
+
+    with (
+        patch.object(docker_service, "get_docker_compose_file_path", return_value=compose_file),
+        patch.object(docker_service, "is_docker_compose_running", new_callable=AsyncMock, return_value=False),
+        patch.object(docker_service, "has_docker_compose_difference", new_callable=AsyncMock, return_value=(True, 11434)),
+        patch.object(docker_service, "stop_docker_compose", new_callable=AsyncMock) as mock_stop,
+        patch.object(docker_service, "create_compose_file", new_callable=AsyncMock, return_value=11434),
+        patch.object(docker_service, "start_docker_compose", new_callable=AsyncMock, return_value=""),
+        patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock, return_value=True),
+    ):
+        await docker_service.install_and_run_docker(options)
+
+    mock_stop.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subnet", ["my-net", None])
+async def test_install_and_run_docker_addresses_suffixed_service_by_its_written_key(
+    docker_service: DockerService, tmp_path: Path, subnet: str | None
+) -> None:
+    """The running/health checks must target the service key actually written, and a restart must see no difference."""
+    options = _opts(container_name="mymodel_abc123", subnet=subnet)
+    compose_file = tmp_path / "compose.yaml"
+    docker_service.port_service.get_free_port.return_value = 45678  # pyright: ignore[reportAttributeAccessIssue]
+
+    with (
+        patch.object(docker_service, "get_docker_compose_file_path", return_value=compose_file),
+        patch.object(docker_service, "is_docker_compose_running", new_callable=AsyncMock, return_value=False) as mock_running,
+        patch.object(docker_service, "start_docker_compose", new_callable=AsyncMock, return_value=""),
+        patch.object(docker_service, "is_docker_compose_healthy", new_callable=AsyncMock, return_value=True) as mock_healthy,
+    ):
+        await docker_service.install_and_run_docker(options)
+
+    written_services = yaml.safe_load(compose_file.read_text())["services"]
+    assert mock_running.call_args.args[1] in written_services
+    assert mock_healthy.call_args.args[1] in written_services
+    assert await docker_service.has_docker_compose_difference(compose_file, options) == (False, None if subnet else 45678)
+
+
+@pytest.mark.asyncio
 async def test_install_and_run_docker_not_running_no_diff_port_available(docker_service: DockerService, tmp_path: Path) -> None:
     options = _opts()
     compose_file = tmp_path / "compose.yaml"
@@ -1352,6 +1530,26 @@ esac
 
 
 @pytest.mark.asyncio
+async def test_uninstall_docker_warns_when_down_fails(
+    docker_service: DockerService, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Uninstall stays best-effort, but a container that survived `down` must not go unnoticed - nor lose the
+    compose file a later install needs to retry removing it."""
+    compose_file = tmp_path / "mymodel.yaml"
+    compose_file.write_text("services: {}")
+
+    with (
+        patch.object(docker_service, "get_docker_compose_file_path", return_value=compose_file),
+        patch("server.docker.Utils.run_command", new_callable=AsyncMock, return_value=make_result(1, stderr="daemon hiccup\n")),
+        caplog.at_level("WARNING", logger="uvicorn"),
+    ):
+        await docker_service.uninstall_docker(_opts())
+
+    assert compose_file.exists()
+    assert any(record.levelname == "WARNING" and "daemon hiccup" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_uninstall_docker_runs_down_and_removes_file(docker_service: DockerService, tmp_path: Path) -> None:
     options = _opts()
     compose_file = tmp_path / "mymodel.yaml"
@@ -1387,11 +1585,103 @@ def test_get_docker_compose_file_path_with_prefix(docker_service: DockerService,
     assert "pf-mymodel" in str(path)
 
 
-@pytest.mark.parametrize(("prefix", "expected"), [("df-", "df-mymodel"), ("", "mymodel")])
-def test_get_docker_container_name(docker_service: DockerService, prefix: str, expected: str) -> None:
-    docker_service.config.container_name_prefix = prefix
+@pytest.mark.parametrize(("suffix", "expected"), [("-df", "mymodel-df"), ("", "mymodel")])
+def test_get_docker_container_name(docker_service: DockerService, suffix: str, expected: str) -> None:
+    docker_service.config.container_name_suffix = suffix
 
     assert docker_service.get_docker_container_name("mymodel") == expected
+
+
+def test_get_docker_container_name_legacy_prefix_takes_priority_over_suffix(docker_service: DockerService) -> None:
+    docker_service.config.container_name_prefix = "df_"
+    docker_service.config.container_name_suffix = "-df"
+
+    assert docker_service.get_docker_container_name("mymodel") == "df_mymodel"
+
+
+@pytest.mark.parametrize(("prefix", "suffix", "expected"), [("df_", "", "mymodel"), ("df_", "-df", "mymodel"), ("", "-df", "mymodel-df")])
+def test_get_docker_container_name_without_legacy_prefix(docker_service: DockerService, prefix: str, suffix: str, expected: str) -> None:
+    """A historically fixed name must stay unprefixed under the legacy prefix, but still gets the suffix without it."""
+    docker_service.config.container_name_prefix = prefix
+    docker_service.config.container_name_suffix = suffix
+
+    assert docker_service.get_docker_container_name("mymodel", apply_legacy_prefix=False) == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "container_name", "compose_prefix", "expected"),
+    [
+        ("ollama", None, "df_", None),
+        ("ollama", "ollama", "df_", None),
+        ("ollama", "df_ollama", "df_", None),
+        ("deepfellow-bge-m3", "deepfellow-bge-m3", "df_", None),
+        ("ollama", "ollama_abc123", "df_", "df_ollama_abc123"),
+        ("ollama", "ollama_ABC", "df_", "df_ollama_abc"),
+        ("ollama", "ollama_abc123", "", "ollama_abc123"),
+    ],
+)
+def test_get_compose_project_name(
+    docker_service: DockerService, name: str, container_name: str | None, compose_prefix: str, expected: str | None
+) -> None:
+    docker_service.config.compose_prefix = compose_prefix
+    options = DockerOptions(name=name, container_name=container_name, image="ubuntu:latest", image_port=8080)
+
+    assert docker_service.get_compose_project_name(options) == expected
+
+
+@pytest.mark.parametrize(
+    ("container_name", "expected"),
+    [("mymodel_abc123", "mymodel_abc123"), ("mymodel", "mymodel"), ("df_mymodel", "mymodel"), (None, "mymodel")],
+)
+def test_service_name_follows_suffixed_container_name(container_name: str | None, expected: str) -> None:
+    """The service key is a DNS alias too - a suffixed container mustn't answer to the name other instances share."""
+    options = DockerOptions(name="mymodel", container_name=container_name, image="ubuntu:latest", image_port=8080)
+
+    assert options.service_name == expected
+
+
+@pytest.mark.asyncio
+async def test_generate_docker_compose_content_keys_suffixed_service_by_container_name(docker_service: DockerService) -> None:
+    options = DockerOptions(name="mymodel", container_name="mymodel_abc123", image="ubuntu:latest", image_port=8080, subnet="my-net")
+
+    result = await docker_service.generate_docker_compose_content(options, None)
+
+    assert list(result["services"]) == ["mymodel_abc123"]
+
+
+@pytest.mark.asyncio
+async def test_generate_docker_compose_content_sets_project_name_for_suffixed_container(docker_service: DockerService) -> None:
+    docker_service.config.compose_prefix = "df_"
+    options = DockerOptions(name="mymodel", container_name="mymodel_abc123", image="ubuntu:latest", image_port=8080)
+
+    result = await docker_service.generate_docker_compose_content(options, 12345)
+
+    assert result["name"] == "df_mymodel_abc123"  # pyright: ignore[reportTypedDictNotRequiredAccess]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("container_name", ["mymodel_abc123", "mymodel"])
+async def test_written_compose_file_reports_no_difference_on_restart(
+    docker_service: DockerService, tmp_path: Path, container_name: str
+) -> None:
+    """Restarting with unchanged options mustn't recreate the container - with or without the project `name:` key."""
+    options = DockerOptions(name="mymodel", container_name=container_name, image="ubuntu:latest", image_port=8080, subnet="my-net")
+    compose_file = tmp_path / "compose.yaml"
+    await docker_service.create_compose_file(compose_file, options)
+
+    has_difference, _ = await docker_service.has_docker_compose_difference(compose_file, options)
+
+    assert has_difference is False
+
+
+@pytest.mark.asyncio
+async def test_generate_docker_compose_content_omits_project_name_without_suffix(docker_service: DockerService) -> None:
+    docker_service.config.compose_prefix = "df_"
+    options = DockerOptions(name="mymodel", container_name="mymodel", image="ubuntu:latest", image_port=8080)
+
+    result = await docker_service.generate_docker_compose_content(options, 12345)
+
+    assert "name" not in result
 
 
 @pytest.mark.parametrize(("subnet", "expected"), [("my-net", "my-net"), ("", None)])
@@ -1401,9 +1691,22 @@ def test_get_docker_subnet(docker_service: DockerService, subnet: str, expected:
     assert docker_service.get_docker_subnet() == expected
 
 
-@pytest.mark.parametrize(("subnet", "expected"), [("my-net", "my-container"), (None, "localhost")])
-def test_get_container_host(docker_service: DockerService, subnet: str | None, expected: str) -> None:
-    assert docker_service.get_container_host(subnet, "my-container") == expected
+@pytest.mark.parametrize(
+    ("subnet", "container_name", "expected"),
+    [
+        ("my-net", "my-container_suffix", "my-container_suffix"),
+        ("my-net", None, "my-container"),
+        ("my-net", "df_my-container", "my-container"),
+        ("my-net", "my-container", "my-container"),
+        (None, "my-container_suffix", "localhost"),
+    ],
+)
+def test_get_container_host(docker_service: DockerService, subnet: str | None, container_name: str | None, expected: str) -> None:
+    """A suffixed container name is the host, not the compose service name every DF Infra on the subnet shares; any
+    other container keeps the service name it has always been reached by."""
+    options = DockerOptions(name="my-container", container_name=container_name, image="ubuntu:latest", image_port=8080)
+
+    assert docker_service.get_container_host(subnet, options) == expected
 
 
 @pytest.mark.parametrize(("subnet", "expected"), [("my-net", 8080), (None, 11434)])
@@ -3428,7 +3731,7 @@ async def test_assert_compose_healthy_short_message_but_logs_full_output(
 def test_get_docker_compose_dir_creates_dir_when_missing(tmp_path: Path) -> None:
     config = MagicMock()
     config.compose_prefix = ""
-    config.container_name_prefix = ""
+    config.container_name_suffix = ""
     config.docker_subnet = ""
     # Point to a storage dir that does NOT yet have a "config" subdir
     storage = tmp_path / "storage"
@@ -3456,7 +3759,7 @@ def test_get_docker_compose_dir_creates_dir_when_missing(tmp_path: Path) -> None
 def test_get_docker_compose_file_path_with_prefix_creates_dir(tmp_path: Path) -> None:
     config = MagicMock()
     config.compose_prefix = "df-"
-    config.container_name_prefix = ""
+    config.container_name_suffix = ""
     config.docker_subnet = ""
     config.get_storage_dir.return_value = tmp_path
     with patch("server.docker.get_docker_auths", return_value={}):

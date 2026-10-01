@@ -41,6 +41,7 @@ class AppSettings(BaseSettings):
 
     name: str = ""
     infra_url: str = ""
+    container_name_suffix: str = ""
 
     mesh_key: SecretStr = SecretStr("")  # key to connect subinfra through ws
     infra_api_key: SecretStr = SecretStr("")  # key to call /v1/ endpoints
@@ -126,6 +127,11 @@ class AppSettings(BaseSettings):
 def get_main_dir() -> Path:
     """Get main dir of the application."""
     return Path(__file__).resolve().parent.parent
+
+
+def get_services_json_path(config: AppSettings) -> Path:
+    """Return the path of services.json, the installed-services state persisted by ServiceProvider."""
+    return (config.get_storage_dir() / "./services.json").resolve()
 
 
 def load_config() -> AppSettings:

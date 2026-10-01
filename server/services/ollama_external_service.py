@@ -284,7 +284,12 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
             return _const.models[model_name].type
         return "llm"
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
+    async def _install_instance(
+        self,
+        instance: str,
+        options: InstallServiceIn,
+        container_name_override: str | None = None,  # noqa: ARG002
+    ) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self.load_default_models(instance)
 
@@ -718,7 +723,11 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                     break
 
     async def _install_model(  # noqa: C901
-        self, instance: str, model_id: str, options: InstallModelIn
+        self,
+        instance: str,
+        model_id: str,
+        options: InstallModelIn,
+        container_name_override: str | None = None,  # noqa: ARG002
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_model_options = try_parse_pydantic(OllamaModelOptions, options.spec) if options.spec else OllamaModelOptions()
         info = self.get_instance_installed_info(instance)
