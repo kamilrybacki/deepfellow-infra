@@ -21,7 +21,6 @@ from server.dynamic_config import (
     _migrate,  # pyright: ignore[reportPrivateUsage]
     apply_dynamic_settings,
     get_config_json_path,
-    get_infra_version,
     load_or_init,
     persist,
     persist_settings,
@@ -29,6 +28,7 @@ from server.dynamic_config import (
     snapshot_dynamic_settings,
     write_envelope_atomic,
 )
+from server.utils.version import get_infra_version
 
 
 def _make_config(storage_dir: Path | None = None, **overrides: object) -> MagicMock:
