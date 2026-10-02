@@ -3,12 +3,18 @@
 
 """Global exception handlers producing OpenAI-style error responses."""
 
+import uuid
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
+
+from server.utils.failed_span import get_failed_span_context
+from server.utils.logger import logger
+
+ERROR_ID_HEADER = "X-Error-Id"
 
 OPENAI_ERROR_TYPE_BY_STATUS: dict[int, str] = {
     401: "authentication_error",
@@ -57,7 +63,28 @@ async def handle_validation_error(_request: Request, exc: Exception) -> JSONResp
     return JSONResponse(status_code=400, content=body)
 
 
+async def handle_unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
+    """Translate any exception no other handler caught into an OpenAI-style 500 carrying an error ID.
+
+    The same ID goes into the message, the `X-Error-Id` header and the log line, along with the
+    trace/span IDs of the traced endpoint that failed, if any. The log line has no traceback:
+    Starlette re-raises the exception after this handler returns, and uvicorn logs it then. If the
+    response had already started (e.g. mid-stream), Starlette drops this response but the log
+    line is still written.
+    """
+    error_id = str(uuid.uuid4())
+    correlation = f"error_id={error_id}"
+    span_context = get_failed_span_context(request)
+    if span_context is not None and span_context.is_valid:
+        correlation += f", trace_id={span_context.trace_id:032x}, span_id={span_context.span_id:016x}"
+    logger.error("Unhandled %s on %s %r (%s)", type(exc).__name__, request.method, request.url.path, correlation)
+
+    body = build_error_body(f"Internal server error. Error ID: {error_id}", "api_error")
+    return JSONResponse(status_code=500, content=body, headers={ERROR_ID_HEADER: error_id})
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     """Register global exception handlers producing OpenAI-style error responses."""
     app.add_exception_handler(HTTPException, handle_http_exception)
     app.add_exception_handler(RequestValidationError, handle_validation_error)
+    app.add_exception_handler(Exception, handle_unhandled_exception)

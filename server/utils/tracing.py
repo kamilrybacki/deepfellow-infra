@@ -33,6 +33,7 @@ from opentelemetry.trace import Span, Tracer
 from pydantic import BaseModel
 
 from server.config import AppSettings
+from server.utils.failed_span import remember_failed_span
 from server.utils.logger import logger
 
 _OTEL_SHUTDOWN_TIMEOUT_MILLIS = 5000
@@ -459,6 +460,7 @@ class InfraTracer:
                     res = await func(*args, **kwargs)
                 except Exception as e:
                     span.record_exception(e)
+                    remember_failed_span(func_args.request, span.get_span_context())
                     span_end()
                     raise
                 else:
