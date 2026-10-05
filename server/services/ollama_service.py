@@ -13,6 +13,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal, NamedTuple, TypedDict
+from urllib.parse import urlparse
 
 import aiofiles
 import aiohttp
@@ -49,6 +50,7 @@ from server.models.services import (
 )
 from server.services.base2_service import Base2Service, CustomModel, Instance, InstanceConfig, ModelConfig
 from server.utils.core import (
+    CommandFailedError,
     DownloadedPacket,
     PreDownloadPacket,
     PromiseWithProgress,
@@ -66,7 +68,12 @@ from server.utils.files import detect_context_window_from_path
 from server.utils.hardware import GpuInfo, HardwarePartInfo, IntelGpuInfo
 from server.utils.loading import Progress
 from server.utils.logger import logger
-from server.utils.ollama import raise_ollama_pull_error
+from server.utils.ollama import (
+    GGUF_QUANTIZATION_UNSUPPORTED_MESSAGE,
+    get_ollama_create_error_message,
+    raise_ollama_pull_error,
+    supports_gguf_quantization,
+)
 from server.utils.ollama_catalog import OllamaCatalogClient
 from server.utils.registry_client import image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fetch_ollama_ref_bytes, fmt_size
@@ -83,6 +90,7 @@ from server.utils.vram_calculator import (
 _PROGRESS_LOG_STEP = 0.1  # log every ~10% of progress so the console isn't flooded with updates
 _WARMTH_POLL_INTERVAL_SECONDS = 15  # matches the staleness already tolerated for the UI's loaded-model display
 
+_OLLAMA_VERSION_TIMEOUT_SECONDS = 5  # the version pre-check is best-effort; a slow Ollama just skips it
 _DEFAULT_KV_CACHE_TYPE = "f16"  # matches Ollama's own real default when an instance doesn't set one
 _DEFAULT_NUM_PARALLEL = 1  # conservative stand-in for Ollama's real "auto" (0) behavior, not a reproduction of it
 
@@ -91,7 +99,26 @@ _SHOW_FAILURE_CACHE_SECONDS = 30  # how long a failed /api/show is remembered, s
 
 
 type Quantization = Literal[
-    "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q3_K_S", "q3_K_M", "q3_K_L", "q4_K_S", "q4_K_M", "q5_K_S", "q5_K_M", "q6_K"
+    # GGUF sources (Ollama < 0.34.1)
+    "q4_0",
+    "q4_1",
+    "q5_0",
+    "q5_1",
+    "q8_0",
+    "q3_K_S",
+    "q3_K_M",
+    "q3_K_L",
+    "q4_K_S",
+    "q4_K_M",
+    "q5_K_S",
+    "q5_K_M",
+    "q6_K",
+    # safetensors sources (Ollama >= 0.34.1)
+    "int4",
+    "int8",
+    "nvfp4",
+    "mxfp4",
+    "mxfp8",
 ]
 
 
@@ -457,7 +484,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                     placeholder="FROM gemma3:1b\nPARAMETER num_ctx 8192",
                     required=False,
                 ),
-                CustomModelField(type="text", name="quantization", description="Quantization", placeholder="q4_0", required=False),
+                CustomModelField(type="text", name="quantization", description="Quantization", placeholder="int4", required=False),
                 CustomModelField(type="text", name="size", description="Model size", placeholder="1 GB", required=False),
             ]
         )
@@ -1355,6 +1382,8 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             )
             model_context: int | None = None
             modelfile = OllamaModelFile.parse(modelfile_recipe)
+            if model.quantization:
+                await self._reject_unsupported_quantization_source(instance_info.base_url, modelfile)
             for line in modelfile.lines:
                 if isinstance(line, OllamaModelFileLine):
                     if line.value.startswith(("http://", "https://")):
@@ -1402,7 +1431,41 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             raise
         except Exception as e:
             self._remove_paths(paths_to_remove_on_error)
-            raise HTTPException(status_code=400, detail="Cannot install modelfile") from e
+            stderr = e.stderr if isinstance(e, CommandFailedError) else ""
+            message = get_ollama_create_error_message(stderr) or "Cannot install modelfile"
+            raise HTTPException(status_code=400, detail=message) from e
+
+    async def _reject_unsupported_quantization_source(self, base_url: str, modelfile: OllamaModelFile) -> None:
+        """Raise a friendly 400 before any download if this Ollama version can't quantize the modelfile's FROM source.
+
+        Since Ollama 0.34.1 `ollama create -q` only works for safetensors imports, so a GGUF file or a model referenced
+        by name always fails. Older versions (or an unknown version) are left to Ollama; its error is mapped afterwards.
+        """
+        from_values = [line.value for line in modelfile.lines if isinstance(line, OllamaModelFileLine) and line.instruction == "FROM"]
+        if not any(self._is_gguf_or_named_source(value) for value in from_values):
+            return
+        ollama_version = await self._get_ollama_version(base_url)
+        if ollama_version is not None and supports_gguf_quantization(ollama_version) is False:
+            raise HTTPException(status_code=400, detail=GGUF_QUANTIZATION_UNSUPPORTED_MESSAGE)
+
+    @staticmethod
+    def _is_gguf_or_named_source(from_value: str) -> bool:
+        """Return whether a FROM value is a GGUF file or a model name, i.e. anything but a (safetensors) directory or file."""
+        if from_value.startswith(("http://", "https://")):
+            return Path(urlparse(from_value).path).suffix == ".gguf"
+        if from_value.startswith(("./", "/")):
+            return Path(from_value).suffix == ".gguf"
+        return True
+
+    @staticmethod
+    async def _get_ollama_version(base_url: str) -> str | None:
+        """Return the Ollama instance's version from `/api/version`, or None if it can't be read."""
+        with suppress(Exception):
+            result = await fetch_from(f"{base_url}/api/version", timeout=_OLLAMA_VERSION_TIMEOUT_SECONDS)
+            if result.status_code == 200:
+                ollama_version = json.loads(result.data).get("version")
+                return ollama_version if isinstance(ollama_version, str) else None
+        return None
 
     def get_default_context_window(self, model_context: int | None, service_context: int) -> int:
         """Return minimum default context length from model or service context length."""

@@ -44,6 +44,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - The release tag pipeline no longer fails when a tag is pushed right after merging to `main`: `tag_docker_image` now retries pulling the release image for up to 20 minutes instead of failing immediately, so it doesn't race ahead of `main`'s own `build_and_publish_docker_image` job.
 - Retrying `PUT /admin/config` after a partial failure to reconnect the mesh, reconfigure OTLP log export, or disable tracing now actually retries what failed, instead of silently reporting success without reapplying it.
 - Commands run inside a service's container (e.g. creating a custom Ollama model) now pass each value as a single argument instead of splitting on spaces, so a model name can no longer smuggle extra flags into `ollama create`, and file paths containing spaces work.
+- Installing a custom Ollama model with a quantization option set on Ollama 0.34.1 or newer, where `ollama create -q` only works for safetensors imports, now fails immediately with a clear error when the `FROM` source is a GGUF file or a model referenced by name — before anything is downloaded — instead of downloading the source and then failing with a generic "Cannot install modelfile". An `ollama create` failure that does reach the command now translates Ollama's quantization errors (both the pre-0.34.1 "only supported for F16 and F32 models" and the newer "only supported for safetensors imports" / unsupported quantize type errors) into user-facing messages.
 
 ## [0.34.0] - 2026-09-16
 

@@ -8,7 +8,16 @@ import json
 import pytest
 from fastapi import HTTPException
 
-from server.utils.ollama import raise_ollama_pull_error
+from server.utils.ollama import (
+    ALREADY_QUANTIZED_MESSAGE,
+    GGUF_QUANTIZATION_UNSUPPORTED_MESSAGE,
+    MLX_RUNTIME_UNAVAILABLE_MESSAGE,
+    UNSUPPORTED_MLX_ARCHITECTURE_MESSAGE,
+    UNSUPPORTED_QUANTIZATION_TYPE_MESSAGE,
+    get_ollama_create_error_message,
+    raise_ollama_pull_error,
+    supports_gguf_quantization,
+)
 
 
 def test_raise_ollama_pull_error_invalid_json_raises_400() -> None:
@@ -57,3 +66,54 @@ def test_raise_ollama_pull_error_missing_error_field() -> None:
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail == "Model not available"
+
+
+def test_get_ollama_create_error_message_known_quantization_fragment() -> None:
+    stderr = "Error: 500 Internal Server Error: quantization is only supported for F16 and F32 models"
+
+    assert get_ollama_create_error_message(stderr) == ALREADY_QUANTIZED_MESSAGE
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        (
+            "Error: create-time quantization is only supported for safetensors imports; quantize GGUF models before importing",
+            GGUF_QUANTIZATION_UNSUPPORTED_MESSAGE,
+        ),
+        (
+            'Error: unsupported --quantize "q4_K_M": supported types are int4, int8, nvfp4, mxfp4, mxfp8',
+            UNSUPPORTED_QUANTIZATION_TYPE_MESSAGE,
+        ),
+        (
+            'Error: 400 Bad Request: unsupported quantize type "q4_K_M": supported types are int4, int8, nvfp4, mxfp4, mxfp8',
+            UNSUPPORTED_QUANTIZATION_TYPE_MESSAGE,
+        ),
+        (
+            "Error: MLX runtime is not available: failed to load MLX dynamic library (searched: [/usr/lib/ollama])",
+            MLX_RUNTIME_UNAVAILABLE_MESSAGE,
+        ),
+        (
+            'Error: unsupported MLX architecture: model "Gemma3ForCausalLM"',
+            UNSUPPORTED_MLX_ARCHITECTURE_MESSAGE,
+        ),
+    ],
+)
+def test_get_ollama_create_error_message_new_ollama_quantization_fragments(stderr: str, expected: str) -> None:
+    assert get_ollama_create_error_message(stderr) == expected
+
+
+def test_get_ollama_create_error_message_unknown_fragment_returns_none() -> None:
+    assert get_ollama_create_error_message("some other failure") is None
+
+
+def test_get_ollama_create_error_message_empty_string_returns_none() -> None:
+    assert get_ollama_create_error_message("") is None
+
+
+@pytest.mark.parametrize(
+    ("ollama_version", "expected"),
+    [("0.32.6", True), ("0.34.0", True), ("0.34.1", False), ("0.35.0", False), ("0.40.0-rc0", False), ("not-a-version", None)],
+)
+def test_supports_gguf_quantization(ollama_version: str, expected: bool | None) -> None:
+    assert supports_gguf_quantization(ollama_version) is expected
