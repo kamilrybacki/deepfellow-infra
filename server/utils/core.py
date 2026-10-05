@@ -42,6 +42,17 @@ class HttpClientError(Exception):
         self.body = body
 
 
+class CommandFailedError(RuntimeError):
+    """Raised by `Utils.run_command_for_success` when a command exits with a non-zero code."""
+
+    def __init__(self, exit_code: int, cmd: list[str], stdout: str, stderr: str):
+        super().__init__("Invalid exit code for command", (exit_code, cmd, stdout, stderr))
+        self.exit_code = exit_code
+        self.cmd = cmd
+        self.stdout = stdout
+        self.stderr = stderr
+
+
 class CommandResult(NamedTuple):
     exit_code: int
     stdout: str
@@ -106,7 +117,7 @@ class Utils:
         """Run given command and if the exit code is not 0 raise and exception."""
         result = await Utils.run_command(cmd)
         if result.exit_code != 0:
-            raise RuntimeError("Invalid exit code for command", (result.exit_code, cmd, result.stdout, result.stderr))
+            raise CommandFailedError(result.exit_code, cmd, result.stdout, result.stderr)
         return CommandResult2(stdout=result.stdout, stderr=result.stderr)
 
     @staticmethod
