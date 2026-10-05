@@ -13,7 +13,7 @@ from fastapi import HTTPException
 from pydantic import AliasChoices, BaseModel, Field
 
 from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
-from server.models.api import ModelProps
+from server.models.api import EMBEDDINGS_ENDPOINTS, IMG_ENDPOINTS, STT_ENDPOINTS, TTS_ENDPOINTS, ModelProps
 from server.models.models import (
     CustomModelField,
     CustomModelId,
@@ -112,9 +112,22 @@ class RemoteCustomModel(BaseModel):
     max_context_length: int | None = None
 
 
-def get_model_props(model: RemoteModel | RemoteCustomModel) -> ModelProps:
-    """Get model props."""
-    endpoints = []
+# Endpoints advertised by non-LLM models. The completions/responses/messages flags only apply to LLMs.
+_NON_LLM_ENDPOINTS: dict[RemoteModelType, list[str]] = {
+    "embedding": EMBEDDINGS_ENDPOINTS,
+    "stt": STT_ENDPOINTS,
+    "tts": TTS_ENDPOINTS,
+    "txt2img": IMG_ENDPOINTS,
+}
+
+
+def get_model_endpoints(model: RemoteModel | RemoteCustomModel) -> list[str]:
+    """Get the endpoints the model accepts, based on its type."""
+    if model.type is None:
+        return []
+    if model.type != "llm":
+        return list(_NON_LLM_ENDPOINTS[model.type])
+    endpoints: list[str] = []
     if model.legacy_completions:
         endpoints.append("/v1/completions")
     if model.completions:
@@ -123,10 +136,15 @@ def get_model_props(model: RemoteModel | RemoteCustomModel) -> ModelProps:
         endpoints.append("/v1/responses")
     if model.messages:
         endpoints.append("/v1/messages")
+    return endpoints
+
+
+def get_model_props(model: RemoteModel | RemoteCustomModel) -> ModelProps:
+    """Get model props."""
     return ModelProps(
         private=False,
         type=model.type or "unknown",
-        endpoints=endpoints,
+        endpoints=get_model_endpoints(model),
         context_window=positive_context_window_or_none(model.context_length),
         max_context_window=positive_context_window_or_none(model.max_context_length),
     )

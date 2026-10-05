@@ -21,7 +21,9 @@ from server.services.remote_service import (
     InstalledInfo,
     LiveModelEntry,
     ModelInstalledInfo,
+    RemoteCustomModel,
     RemoteModel,
+    RemoteModelType,
     get_model_props,
 )
 
@@ -277,6 +279,40 @@ def test_get_model_props_respects_disabled_endpoints() -> None:
 
     assert "/v1/chat/completions" not in props.endpoints
     assert "/v1/completions" not in props.endpoints
+
+
+@pytest.mark.parametrize(
+    ("model_type", "expected"),
+    [
+        ("embedding", ["/v1/embeddings"]),
+        ("stt", ["/v1/audio/transcriptions"]),
+        ("tts", ["/v1/audio/speech"]),
+        ("txt2img", ["/v1/images/generations"]),
+    ],
+)
+def test_get_model_props_non_llm_advertises_only_its_own_endpoint(model_type: RemoteModelType, expected: list[str]) -> None:
+    """LLM flags default to True, so a non-LLM model must not inherit the conversational endpoints from them."""
+    model = RemoteModel(type=model_type)
+
+    props = get_model_props(model)
+
+    assert props.endpoints == expected
+
+
+def test_get_model_props_custom_embedding_advertises_embeddings() -> None:
+    model = RemoteCustomModel(id="my-embedder", type="embedding")
+
+    props = get_model_props(model)
+
+    assert props.endpoints == ["/v1/embeddings"]
+
+
+def test_get_model_props_unresolved_type_advertises_no_endpoints() -> None:
+    model = RemoteModel(type=None)
+
+    props = get_model_props(model)
+
+    assert props.endpoints == []
 
 
 def test_base_service_options_headers_raises_not_implemented() -> None:
