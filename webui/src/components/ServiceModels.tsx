@@ -2532,12 +2532,14 @@ const ModelRow = memo(function ModelRow({
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
-              <DropdownMenuItem
-                onClick={() => onTestClick(model)}
-                disabled={isTestPending}
-              >
-                {isTestPending ? "Testing..." : "Test"}
-              </DropdownMenuItem>
+              {model.type !== "lora" && (
+                <DropdownMenuItem
+                  onClick={() => onTestClick(model)}
+                  disabled={isTestPending}
+                >
+                  {isTestPending ? "Testing..." : "Test"}
+                </DropdownMenuItem>
+              )}
               {model.custom ? (
                 <DropdownMenuItem
                   onClick={() =>
