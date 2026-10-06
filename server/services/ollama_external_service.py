@@ -576,7 +576,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         installed = self.get_instance_info(instance).installed
         if installed:
-            models = list(installed.models.copy().values())
+            models = list(installed.models.values())
 
             for model in models:
                 if model.type == "llm":
