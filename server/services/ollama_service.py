@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 import aiofiles
 import aiohttp
 from fastapi import HTTPException
-from pydantic import AliasChoices, BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints
 
 from server.applicationcontext import get_base_url
 from server.config import get_main_dir
@@ -62,7 +62,6 @@ from server.utils.core import (
     positive_context_window_or_none,
     stream_fetch_from,
     try_parse_pydantic,
-    with_legacy_key_migrated,
 )
 from server.utils.files import detect_context_window_from_path
 from server.utils.hardware import GpuInfo, HardwarePartInfo, IntelGpuInfo
@@ -215,7 +214,7 @@ class ModelInstalledInfo:
 
     def get_info(self) -> ModelInfo:
         """Get info."""
-        return ModelInfo(spec=with_legacy_key_migrated(self.options.spec, "alias", "rename"), registration_id=self.registration_id)
+        return ModelInfo(spec=self.options.spec, registration_id=self.registration_id)
 
 
 class OllamaOptions(BaseModel):
@@ -229,7 +228,8 @@ class OllamaOptions(BaseModel):
 
 
 class OllamaModelOptions(BaseModel):
-    rename: str | None = Field(default=None, validation_alias=AliasChoices("rename", "alias"))
+    rename: str | None = None
+    alias: str | None = None
     alive_time: int | Annotated[str, StringConstraints(pattern=r"^(\d+[smh])?$", strict=True)] = ""
     context_length: int | None = None
 
@@ -456,6 +456,9 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         return ModelSpecification(
             fields=[
                 ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
+                ModelField(
+                    type="text", name="alias", description="Additional name for the model, the original name keeps working", required=False
+                ),
                 ModelField(
                     type="text",
                     name="alive_time",
@@ -1545,6 +1548,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                     )
 
                 registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
+                registered_alias = parsed_model_options.alias
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
                     type=model.type,
@@ -1602,7 +1606,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                             messages=ProxyOptions(url=f"{info.base_url}/v1/messages", rewrite_model_to=rewrite_model_to),
                             ollama_chat=ProxyOptions(url=f"{info.base_url}/api/chat", rewrite_model_to=rewrite_model_to),
                             registration_options=RegistrationOptions(
-                                origin="local", owned_by=self.get_type(), capacity_state=capacity, warm=False
+                                origin="local", alias=registered_alias, owned_by=self.get_type(), capacity_state=capacity, warm=False
                             ),
                         )
                     if model.type == "embedding":
@@ -1619,7 +1623,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                             ),
                             options=ProxyOptions(url=f"{info.base_url}/v1/embeddings", rewrite_model_to=rewrite_model_to),
                             registration_options=RegistrationOptions(
-                                origin="local", owned_by=self.get_type(), capacity_state=capacity, warm=False
+                                origin="local", alias=registered_alias, owned_by=self.get_type(), capacity_state=capacity, warm=False
                             ),
                         )
                     if model.type == "txt2img":
@@ -1636,7 +1640,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                             ),
                             options=ProxyOptions(url=f"{info.base_url}/v1/images/generations", rewrite_model_to=rewrite_model_to),
                             registration_options=RegistrationOptions(
-                                origin="local", owned_by=self.get_type(), capacity_state=capacity, warm=False
+                                origin="local", alias=registered_alias, owned_by=self.get_type(), capacity_state=capacity, warm=False
                             ),
                         )
                     input_stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))

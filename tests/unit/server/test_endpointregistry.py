@@ -167,6 +167,65 @@ def test_add_model_creates_registration_and_returns_id():
     assert rid in ep.models["gpt-4"]
 
 
+def test_add_model_with_alias_makes_model_reachable_under_both_names():
+    ep = make_endpoint()
+
+    rid = ep.add_model(
+        "gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local", alias="smart")
+    )
+
+    original = ep.get_model("gpt-4")
+    aliased = ep.get_model("smart")
+    assert original is not None
+    assert original is aliased
+    assert original.id == rid
+    assert {m.id for m in ep.get_models()} == {"gpt-4", "smart"}
+
+
+def test_add_model_alias_equal_to_model_id_is_ignored():
+    ep = make_endpoint()
+
+    ep.add_model("gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local", alias="gpt-4"))
+
+    assert list(ep.models) == ["gpt-4"]
+    assert len(ep.models["gpt-4"]) == 1
+
+
+def test_remove_model_with_alias_removes_both_names():
+    ep = make_endpoint()
+    rid = ep.add_model(
+        "gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local", alias="smart")
+    )
+
+    ep.remove_model("gpt-4", rid)
+
+    assert ep.models == {}
+    assert rid not in ep.registry
+
+
+def test_remove_model_with_alias_keeps_alias_for_other_registrations():
+    ep = make_endpoint()
+    first = ep.add_model(
+        "gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local", alias="smart")
+    )
+    second = ep.add_model(
+        "gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local", alias="smart")
+    )
+
+    ep.remove_model("gpt-4", first)
+
+    assert list(ep.models["smart"]) == [second]
+
+
+def test_list_models_reports_aliased_registration_once_under_primary_name():
+    ep = make_endpoint()
+    ep.add_model("gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local", alias="smart"))
+
+    listed = ep.list_models()
+
+    assert [m.name for m in listed] == ["gpt-4"]
+
+
 def test_add_model_uses_provided_registration_id():
     ep = make_endpoint()
     reg_opts = RegistrationOptions(origin="local", id="my-id-123")

@@ -333,15 +333,6 @@ def test_model_installed_info_get_info_returns_model_info() -> None:
     assert result.registration_id == "reg-1"
 
 
-def test_model_installed_info_get_info_migrates_legacy_alias_key() -> None:
-    info = _make_model_installed_info()
-    info.options = InstallModelIn(spec={"alias": "my-alias"})
-
-    result = info.get_info()
-
-    assert result.spec == {"rename": "my-alias"}
-
-
 def test_openai_get_spec_has_api_url_and_api_key_fields(openai_svc: OpenAIService) -> None:
     spec = openai_svc.get_spec()
 

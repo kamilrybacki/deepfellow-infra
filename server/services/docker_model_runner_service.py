@@ -10,10 +10,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from fastapi import HTTPException
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import BaseModel
 
 from server.config import get_main_dir
-from server.endpointregistry import ProxyOptions, RegistrationId
+from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
 from server.models.api import EMBEDDINGS_ENDPOINTS, LLM_ENDPOINTS, ModelProps
 from server.models.models import (
     CustomModelSpecification,
@@ -47,7 +47,6 @@ from server.utils.core import (
     fetch_from,
     stream_fetch_from,
     try_parse_pydantic,
-    with_legacy_key_migrated,
 )
 from server.utils.loading import Progress
 from server.utils.logger import logger
@@ -101,7 +100,7 @@ class ModelInstalledInfo:
 
     def get_info(self) -> ModelInfo:
         """Get info."""
-        return ModelInfo(spec=with_legacy_key_migrated(self.options.spec, "alias", "rename"), registration_id=self.registration_id)
+        return ModelInfo(spec=self.options.spec, registration_id=self.registration_id)
 
 
 class DockerModelRunnerOptions(BaseModel):
@@ -110,7 +109,8 @@ class DockerModelRunnerOptions(BaseModel):
 
 
 class DockerModelRunnerModelOptions(BaseModel):
-    rename: str | None = Field(default=None, validation_alias=AliasChoices("rename", "alias"))
+    rename: str | None = None
+    alias: str | None = None
 
 
 @dataclass
@@ -188,6 +188,9 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
         return ModelSpecification(
             fields=[
                 ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
+                ModelField(
+                    type="text", name="alias", description="Additional name for the model, the original name keeps working", required=False
+                ),
             ]
         )
 
@@ -253,6 +256,7 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
             try_parse_pydantic(DockerModelRunnerModelOptions, options.spec) if options and options.spec else DockerModelRunnerModelOptions()
         )
         registered_name = parsed_options.rename if parsed_options.rename else model_id
+        registered_alias = parsed_options.alias
 
         model_info = ModelInstalledInfo(
             id=model_id,
@@ -276,7 +280,7 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
                 responses=None,
                 messages=None,
                 ollama_chat=None,
-                registration_options=None,
+                registration_options=RegistrationOptions(origin="local", alias=registered_alias),
             )
         if model_type == "embedding":
             model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
@@ -286,7 +290,7 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
                     url=f"{installed_info.base_url}/engines/v1/embeddings",
                     rewrite_model_to=model_id,
                 ),
-                registration_options=None,
+                registration_options=RegistrationOptions(origin="local", alias=registered_alias),
             )
         installed_info.models[model_id] = model_info
 
@@ -576,6 +580,7 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
 
             stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
             registered_name = parsed_options.rename if parsed_options.rename else model_id
+            registered_alias = parsed_options.alias
 
             model_info = ModelInstalledInfo(
                 id=model_id,
@@ -599,7 +604,7 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
                     responses=None,
                     messages=None,
                     ollama_chat=None,
-                    registration_options=None,
+                    registration_options=RegistrationOptions(origin="local", alias=registered_alias),
                 )
             if model.type == "embedding":
                 model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
@@ -609,7 +614,7 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
                         url=f"{info.base_url}/engines/v1/embeddings",
                         rewrite_model_to=model_id,
                     ),
-                    registration_options=None,
+                    registration_options=RegistrationOptions(origin="local", alias=registered_alias),
                 )
 
             info.models[model_id] = model_info

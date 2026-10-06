@@ -149,13 +149,6 @@ def test_model_installed_info_get_info() -> None:
     assert result.registration_id == "reg-abc"
 
 
-def test_model_installed_info_get_info_migrates_legacy_alias_key() -> None:
-    info = _make_model_installed_info(reg_id="reg-abc")
-    info.options = InstallModelIn(spec={"alias": "my-alias"})
-    result = info.get_info()
-    assert result.spec == {"rename": "my-alias"}
-
-
 # ─── DmrRegistry / Pydantic models ───────────────────────────────────────────
 
 

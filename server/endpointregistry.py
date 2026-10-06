@@ -120,6 +120,7 @@ class RegisteredModel[T](BaseModel):
     healthy: bool = False
     capacity_state: CapacityState = "unbounded"
     warm: bool = True
+    alias: ModelId | None = None
 
     @field_validator("capacity_state")
     @classmethod
@@ -145,6 +146,7 @@ class RegistrationOptions(NamedTuple):
     owned_by: str = "local"
     capacity_state: CapacityState = "unbounded"
     warm: bool = True
+    alias: ModelId | None = None
 
 
 class RegistryEntry(NamedTuple):
@@ -265,10 +267,14 @@ class Endpoint[T]:
             owned_by=options.owned_by if options else "local",
             capacity_state=options.capacity_state if options else "unbounded",
             warm=options.warm if options else True,
+            alias=options.alias if options and options.alias and options.alias != model_id else None,
         )
         if model_id not in self.models:
             self.models[model_id] = {}
         self.models[model_id][registered_model.id] = registered_model
+        if registered_model.alias:
+            # The alias bucket shares the very same RegisteredModel, so usage, warmth and capacity are counted once.
+            self.models.setdefault(registered_model.alias, {})[registered_model.id] = registered_model
         self.registry[registered_model.id] = RegistryEntry(model_id=model_id, endpoint=self, registered_model=registered_model)
         if not options or options.send_notification:
             self.parent_infra.send_models_list()
@@ -278,10 +284,13 @@ class Endpoint[T]:
         """Remove model from registry."""
         if model_id not in self.models:
             return
-        if registration_id in self.models[model_id]:
-            del self.models[model_id][registration_id]
+        removed = self.models[model_id].pop(registration_id, None)
         if len(self.models[model_id]) == 0:
             del self.models[model_id]
+        if removed and removed.alias and removed.alias in self.models:
+            self.models[removed.alias].pop(registration_id, None)
+            if len(self.models[removed.alias]) == 0:
+                del self.models[removed.alias]
         if registration_id in self.registry:
             del self.registry[registration_id]
         if send_notification:
@@ -461,7 +470,8 @@ class Endpoint[T]:
         res = list[Model]()
         for model_id, map in self.models.items():
             for item in map.values():
-                if item.owned_by in exclude_owned_by:
+                if item.owned_by in exclude_owned_by or model_id != item.name:
+                    # `model_id != item.name` skips alias buckets: the registration is reported once, under its primary name.
                     continue
                 capacity, capacity_known = _capacity_pair_from_state(item.capacity_state)
                 res.append(

@@ -217,15 +217,6 @@ def test_model_installed_info_get_info() -> None:
     assert info.registration_id == "reg-42"
 
 
-def test_model_installed_info_get_info_migrates_legacy_alias_key() -> None:
-    model = _make_model_installed_info(registration_id="reg-42")
-    model.options = InstallModelIn(spec={"alias": "my-alias"})
-
-    info = model.get_info()
-
-    assert info.spec == {"rename": "my-alias"}
-
-
 def test_get_size_cpu_only(deps: dict[str, Any]) -> None:
     deps["hardware"].nvidia_gpus = []
     deps["hardware"].intel_gpus = []

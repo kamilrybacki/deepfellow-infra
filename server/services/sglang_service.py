@@ -15,7 +15,7 @@ from typing import Any, Literal, TypedDict
 
 import aiohttp
 from fastapi import HTTPException
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import BaseModel, Field
 
 from scripts.get_huggingface_models import fetch_registry_entries
 from server.applicationcontext import get_base_url
@@ -66,7 +66,6 @@ from server.utils.core import (
     normalize_name,
     try_parse_pydantic,
     with_legacy_key_carried_over,
-    with_legacy_key_migrated,
 )
 from server.utils.files import get_model_dir_context_window
 from server.utils.hardware import HardwarePartInfo
@@ -235,7 +234,7 @@ class ModelInstalledInfo:
 
     def get_info(self) -> ModelInfo:
         """Get info."""
-        return ModelInfo(spec=with_legacy_key_migrated(self.options.spec, "alias", "rename"), registration_id=self.registration_id)
+        return ModelInfo(spec=self.options.spec, registration_id=self.registration_id)
 
 
 class SglangOptions(BaseModel):
@@ -243,7 +242,8 @@ class SglangOptions(BaseModel):
 
 
 class SglangModelOptions(BaseModel):
-    rename: str | None = Field(default=None, validation_alias=AliasChoices("rename", "alias"))
+    rename: str | None = None
+    alias: str | None = None
     gpu_memory_utilization: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
     gpu_priority: float | None = Field(default=None, ge=0.01, le=1)
     max_model_length: int | None = None
@@ -435,6 +435,9 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
         """Return the model specification."""
         fields = [
             ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
+            ModelField(
+                type="text", name="alias", description="Additional name for the model, the original name keeps working", required=False
+            ),
         ]
         if options := self.instances_info[instance].config.options:
             if "hardware" not in options.spec:
@@ -1014,6 +1017,7 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
         context_window: int | None,
         max_context_window: int | None,
         capacity: int | None,
+        registered_alias: str | None = None,
     ) -> RegistrationId:
         """Register the model in the endpoint registry based on its type."""
         # SGLang always sizes a real, finite `max_running_requests` from KV-cache memory at startup;
@@ -1025,7 +1029,9 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                 model=registered_name,
                 props=ModelProps(private=True, type="rerank", endpoints=["/v1/rerank"]),
                 options=ProxyOptions(url=f"{model_info.base_url}/v1/rerank", rewrite_model_to=model_id),
-                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), capacity_state=capacity_state),
+                registration_options=RegistrationOptions(
+                    origin="local", alias=registered_alias, owned_by=self.get_type(), capacity_state=capacity_state
+                ),
                 normalize_sglang_response=True,
             )
         if model.model_type == "embedding":
@@ -1033,7 +1039,9 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                 model=registered_name,
                 props=ModelProps(private=True, type="embedding", endpoints=EMBEDDINGS_ENDPOINTS),
                 options=ProxyOptions(url=f"{model_info.base_url}/v1/embeddings", rewrite_model_to=model_id),
-                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), capacity_state=capacity_state),
+                registration_options=RegistrationOptions(
+                    origin="local", alias=registered_alias, owned_by=self.get_type(), capacity_state=capacity_state
+                ),
             )
         return self.endpoint_registry.register_chat_completion_as_proxy(
             model=registered_name,
@@ -1051,7 +1059,9 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
             responses=ProxyOptions(url=f"{model_info.base_url}/v1/responses", rewrite_model_to=model_id),
             messages=ProxyOptions(url=f"{model_info.base_url}/v1/messages", rewrite_model_to=model_id),
             ollama_chat=None,
-            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), capacity_state=capacity_state),
+            registration_options=RegistrationOptions(
+                origin="local", alias=registered_alias, owned_by=self.get_type(), capacity_state=capacity_state
+            ),
         )
 
     @staticmethod
@@ -1181,6 +1191,7 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                 )
 
                 registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
+                registered_alias = parsed_model_options.alias
                 container_host = self.docker_service.get_container_host(subnet, docker_options)
                 container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
                 if model.model_type == "llm":
@@ -1209,6 +1220,7 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                     model_info=model_info,
                     model=model,
                     registered_name=registered_name,
+                    registered_alias=registered_alias,
                     model_id=model_id,
                     context_window=context_window,
                     max_context_window=max_context_window,

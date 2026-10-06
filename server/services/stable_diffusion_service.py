@@ -19,7 +19,7 @@ import aiofiles
 from aiohttp import ClientSession
 from fastapi import HTTPException, Request
 from PIL import Image
-from pydantic import AliasChoices, BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from server.applicationcontext import get_base_url
 from server.config import get_main_dir
@@ -64,7 +64,6 @@ from server.utils.core import (
     convert_size_to_bytes,
     load_json_registry,
     try_parse_pydantic,
-    with_legacy_key_migrated,
 )
 from server.utils.loading import Progress
 from server.utils.size_fetcher import fetch_file_size_from_url
@@ -192,7 +191,7 @@ class ModelInstalledInfo(BaseModel):
 
     def get_info(self) -> ModelInfo:
         """Get info."""
-        return ModelInfo(spec=with_legacy_key_migrated(self.options.spec, "alias", "rename"), registration_id=self.registration_id)
+        return ModelInfo(spec=self.options.spec, registration_id=self.registration_id)
 
 
 class SDOptions(BaseModel):
@@ -201,7 +200,8 @@ class SDOptions(BaseModel):
 
 
 class SDModelOptions(BaseModel):
-    rename: str | None = Field(default=None, validation_alias=AliasChoices("rename", "alias"))
+    rename: str | None = None
+    alias: str | None = None
 
 
 @dataclass
@@ -269,6 +269,9 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
         return ModelSpecification(
             fields=[
                 ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
+                ModelField(
+                    type="text", name="alias", description="Additional name for the model, the original name keeps working", required=False
+                ),
             ]
         )
 
@@ -677,6 +680,7 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
 
                 registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
+                registered_alias = parsed_model_options.alias
                 model_path = local_model_path.absolute()
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
@@ -693,7 +697,7 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
                             model=registered_name,
                             props=ModelProps(private=True, type=model.type, endpoints=IMG_ENDPOINTS),
                             endpoint=SimpleEndpoint(on_request=_stable_diffusion_handler(info.base_url, model_filename)),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                            registration_options=RegistrationOptions(origin="local", alias=registered_alias, owned_by=self.get_type()),
                         )
 
                     await self.refresh_models(instance)

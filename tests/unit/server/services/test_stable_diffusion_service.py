@@ -315,15 +315,6 @@ def test_model_installed_info_get_info() -> None:
     assert info.spec == {}
 
 
-def test_model_installed_info_get_info_migrates_legacy_alias_key() -> None:
-    mi = _make_model_installed_info(registration_id="reg-123")
-    mi.options = InstallModelIn(spec={"alias": "my-alias"})
-
-    info = mi.get_info()
-
-    assert info.spec == {"rename": "my-alias"}
-
-
 def test_get_size_returns_cpu_size(svc: StableDiffusionService) -> None:
     sizes: ServiceSize = svc.get_size()
 

@@ -12,7 +12,7 @@ from typing import Any, Literal, TypedDict
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 from langdetect import detect  # type: ignore
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import BaseModel
 
 from server.applicationcontext import get_base_url
 from server.config import get_main_dir
@@ -51,7 +51,6 @@ from server.utils.core import (
     convert_size_to_bytes,
     load_json_registry,
     try_parse_pydantic,
-    with_legacy_key_migrated,
 )
 from server.utils.loading import Progress
 
@@ -176,7 +175,7 @@ class ModelInstalledInfo:
 
     def get_info(self) -> ModelInfo:
         """Get info."""
-        return ModelInfo(spec=with_legacy_key_migrated(self.options.spec, "alias", "rename"), registration_id=self.registration_id)
+        return ModelInfo(spec=self.options.spec, registration_id=self.registration_id)
 
 
 class SpeachesAIOptions(BaseModel):
@@ -184,7 +183,8 @@ class SpeachesAIOptions(BaseModel):
 
 
 class SpeachesAIModelOptions(BaseModel):
-    rename: str | None = Field(default=None, validation_alias=AliasChoices("rename", "alias"))
+    rename: str | None = None
+    alias: str | None = None
 
 
 @dataclass
@@ -261,6 +261,9 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
         return ModelSpecification(
             fields=[
                 ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
+                ModelField(
+                    type="text", name="alias", description="Additional name for the model, the original name keeps working", required=False
+                ),
             ]
         )
 
@@ -620,6 +623,7 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
 
                 registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
+                registered_alias = parsed_model_options.alias
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
                     type=model.type,
@@ -646,14 +650,14 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
                             model=registered_name,
                             props=ModelProps(private=True, type=model.type, endpoints=TTS_ENDPOINTS),
                             endpoint=SimpleEndpoint(on_request=on_request),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                            registration_options=RegistrationOptions(origin="local", alias=registered_alias, owned_by=self.get_type()),
                         )
                     if model.type == "stt":
                         model_info.registration_id = self.endpoint_registry.register_audio_transcriptions_as_proxy(
                             model=registered_name,
                             props=ModelProps(private=True, type=model.type, endpoints=STT_ENDPOINTS),
                             options=ProxyOptions(url=f"{info.base_url}/v1/audio/transcriptions", rewrite_model_to=model_id),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                            registration_options=RegistrationOptions(origin="local", alias=registered_alias, owned_by=self.get_type()),
                         )
                     stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
                     self.models_downloaded[model_id] = DownloadedInfo(model_path=str(model_dir))

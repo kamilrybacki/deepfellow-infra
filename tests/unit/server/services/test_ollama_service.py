@@ -190,10 +190,11 @@ def test_model_options_rename_defaults_none() -> None:
     assert opts.rename is None
 
 
-def test_model_options_rename_accepts_legacy_alias_key() -> None:
-    opts = try_parse_pydantic(OllamaModelOptions, {"alias": "old-config-value"})
+def test_model_options_alias_is_separate_from_rename() -> None:
+    opts = try_parse_pydantic(OllamaModelOptions, {"alias": "extra-name"})
 
-    assert opts.rename == "old-config-value"
+    assert opts.alias == "extra-name"
+    assert opts.rename is None
 
 
 def test_model_options_context_length_defaults_none() -> None:
@@ -576,15 +577,6 @@ def test_model_installed_info_get_info() -> None:
     info = model.get_info()
 
     assert info.registration_id == "reg-42"
-
-
-def test_model_installed_info_get_info_migrates_legacy_alias_key() -> None:
-    model = _make_model_installed_info(registration_id="reg-42")
-    model.options = InstallModelIn(spec={"alias": "my-alias"})
-
-    info = model.get_info()
-
-    assert info.spec == {"rename": "my-alias"}
 
 
 def test_get_local_modelfile_path(svc: OllamaService) -> None:

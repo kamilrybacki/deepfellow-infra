@@ -10,7 +10,7 @@ from typing import Annotated, Any, Literal
 
 from fastapi import HTTPException
 from packaging import version
-from pydantic import AliasChoices, BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints
 
 from server.config import get_main_dir
 from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
@@ -47,7 +47,6 @@ from server.utils.core import (
     fetch_from,
     stream_fetch_from,
     try_parse_pydantic,
-    with_legacy_key_migrated,
 )
 from server.utils.loading import Progress
 from server.utils.logger import logger
@@ -114,7 +113,7 @@ class ModelInstalledInfo:
 
     def get_info(self) -> ModelInfo:
         """Get info."""
-        return ModelInfo(spec=with_legacy_key_migrated(self.options.spec, "alias", "rename"), registration_id=self.registration_id)
+        return ModelInfo(spec=self.options.spec, registration_id=self.registration_id)
 
 
 class OllamaExternalOptions(BaseModel):
@@ -123,7 +122,8 @@ class OllamaExternalOptions(BaseModel):
 
 
 class OllamaModelOptions(BaseModel):
-    rename: str | None = Field(default=None, validation_alias=AliasChoices("rename", "alias"))
+    rename: str | None = None
+    alias: str | None = None
     alive_time: int | Annotated[str, StringConstraints(pattern=r"^(\d+[smh])?$", strict=True)] = ""
 
 
@@ -186,6 +186,9 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
         return ModelSpecification(
             fields=[
                 ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
+                ModelField(
+                    type="text", name="alias", description="Additional name for the model, the original name keeps working", required=False
+                ),
                 ModelField(
                     type="text",
                     name="alive_time",
@@ -756,6 +759,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
 
                 context_length, supports_vision, supports_audio = await self._fetch_show_info(info.base_url, model_id)
                 registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
+                registered_alias = parsed_model_options.alias
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
                     type=model.type,
@@ -796,7 +800,9 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                             # ranking over an actually-warm instance and route the first requests into a cold load.
                             # The warmth-poll task (already running per-instance) corrects this to `True` within one
                             # tick once `/api/ps` confirms it's genuinely loaded (or leaves it `False` otherwise).
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), warm=False),
+                            registration_options=RegistrationOptions(
+                                origin="local", alias=registered_alias, owned_by=self.get_type(), warm=False
+                            ),
                         )
                     if model.type == "embedding":
                         model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
@@ -809,7 +815,9 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 max_context_window=context_length,
                             ),
                             options=ProxyOptions(url=f"{info.base_url}/v1/embeddings", rewrite_model_to=model_id),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), warm=False),
+                            registration_options=RegistrationOptions(
+                                origin="local", alias=registered_alias, owned_by=self.get_type(), warm=False
+                            ),
                         )
                     stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
                     self.models_downloaded[model_id] = DownloadedInfo()
