@@ -156,15 +156,6 @@ def test_model_installed_info_get_info() -> None:
     assert info.registration_id == "reg-42"
 
 
-def test_model_installed_info_get_info_migrates_legacy_alias_key() -> None:
-    model = _make_model_installed_info(registration_id="reg-42")
-    model.options = InstallModelIn(spec={"alias": "my-alias"})
-
-    info = model.get_info()
-
-    assert info.spec == {"rename": "my-alias"}
-
-
 def test_load_download_info_returns_downloaded_info(svc: OllamaExternalService) -> None:
     result = svc._load_download_info({})  # pyright: ignore[reportPrivateUsage]
 

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Literal, TypedDict
 
 from fastapi import HTTPException
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import BaseModel
 
 from server.applicationcontext import get_base_url
 from server.config import get_main_dir
@@ -53,7 +53,6 @@ from server.utils.core import (
     fetch_from,
     load_json_registry,
     try_parse_pydantic,
-    with_legacy_key_migrated,
 )
 from server.utils.hardware import GpuInfo, HardwarePartInfo, NvidiaGpuInfo
 from server.utils.loading import Progress
@@ -111,7 +110,7 @@ class ModelInstalledInfo:
 
     def get_info(self) -> ModelInfo:
         """Get info."""
-        return ModelInfo(spec=with_legacy_key_migrated(self.options.spec, "alias", "rename"), registration_id=self.registration_id)
+        return ModelInfo(spec=self.options.spec, registration_id=self.registration_id)
 
 
 class RerankOptions(BaseModel):
@@ -120,7 +119,8 @@ class RerankOptions(BaseModel):
 
 
 class RerankModelOptions(BaseModel):
-    rename: str | None = Field(default=None, validation_alias=AliasChoices("rename", "alias"))
+    rename: str | None = None
+    alias: str | None = None
     alive_time: int | None = None
     preload: bool | None = None
 
@@ -196,6 +196,9 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
         return ModelSpecification(
             fields=[
                 ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
+                ModelField(
+                    type="text", name="alias", description="Additional name for the model, the original name keeps working", required=False
+                ),
                 ModelField(
                     type="text",
                     name="alive_time",
@@ -500,6 +503,7 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
 
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
                 registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
+                registered_alias = parsed_model_options.alias
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
                     type=model.type,
@@ -517,7 +521,7 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 endpoints=["/v1/rerank"],
                             ),
                             options=ProxyOptions(url=f"{info.base_url}/v1/rerank", rewrite_model_to=model_id),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                            registration_options=RegistrationOptions(origin="local", alias=registered_alias, owned_by=self.get_type()),
                         )
                     stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
 

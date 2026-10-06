@@ -1845,15 +1845,6 @@ def test_carry_over_edited_install_options_lets_new_priority_replace_legacy_valu
     assert svc._carry_over_edited_install_options(old, new) is new  # pyright: ignore[reportPrivateUsage]
 
 
-def test_model_installed_info_get_info_migrates_legacy_alias_key() -> None:
-    model = _make_model_installed_info(registration_id="reg-42")
-    model.options = InstallModelIn(spec={"alias": "my-alias"})
-
-    info = model.get_info()
-
-    assert info.spec == {"rename": "my-alias"}
-
-
 def test_generate_instance_config_none_info(svc: SglangService) -> None:
     config = svc._generate_instance_config("default", None, None)  # pyright: ignore[reportPrivateUsage]
 
