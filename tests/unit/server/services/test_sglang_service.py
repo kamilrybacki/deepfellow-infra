@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from server.docker import ContainerStatus
 from server.models.models import InstallModelIn, ListModelsFilters, UninstallModelIn
@@ -160,13 +161,13 @@ def test_get_model_spec_baseline_fields(svc: SglangService) -> None:
         assert expected in field_names
 
 
-def test_get_model_spec_adds_gpu_memory_utilization(svc: SglangService) -> None:
+def test_get_model_spec_adds_gpu_priority(svc: SglangService) -> None:
     svc.instances_info["default"].config.options = InstallServiceIn(spec={"hardware": True})
 
     spec = svc.get_model_spec("default", "llm")
 
-    field_names = [f.name for f in spec.fields]
-    assert "gpu_memory_utilization" in field_names
+    field = next(f for f in spec.fields if f.name == "gpu_priority")
+    assert field.type == "gpu-priority"
 
 
 def test_get_model_spec_reranker_default_extra_args(svc: SglangService) -> None:
@@ -1395,6 +1396,164 @@ async def test_get_default_gpu_memory_utilization_uses_free_fraction_with_margin
     assert result == 0.45
 
 
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_applies_priority_to_available_vram(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    gpu_deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.45
+    assert svc.gpu_memory_utilization == 0.45
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_applies_priority_to_currently_free_vram(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.4
+    gpu_deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=4.0, gpus=None))
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.27
+    assert svc.gpu_memory_utilization == pytest.approx(0.67)
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_priority_path_still_enforces_total_limit(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.95
+    gpu_deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_priority=0.5)
+
+    with pytest.raises(HTTPException) as exc:
+        await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc.value.status_code == 422
+    assert svc.gpu_memory_utilization == 0.95
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_rejects_priority_that_rounds_below_minimum(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    """A tiny priority (or almost no free VRAM) must not start the engine with 0 utilization."""
+    svc.gpu_memory_utilization = 0.0
+    gpu_deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=9.5, gpus=None))
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_priority=0.01)
+
+    with pytest.raises(HTTPException) as exc:
+        await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc.value.status_code == 422
+    assert svc.gpu_memory_utilization == 0.0
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_priority_wins_over_model_default(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    gpu_deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = SglangModel(hf_id="google/test", size="1GB", gpu_memory_utilization=0.8)
+    opts = SglangModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.45
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_explicit_absolute_value_wins_over_priority(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_memory_utilization=0.3, gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.3
+    gpu_deps["hardware"].get_realtime_stats.assert_not_called()
+
+
+@pytest.mark.parametrize("priority", [0.0, -0.1, 1.5])
+def test_model_options_reject_out_of_range_gpu_priority(priority: float) -> None:
+    with pytest.raises(ValidationError):
+        SglangModelOptions(gpu_priority=priority)
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_priority_never_exceeds_available_vram(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    gpu_deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_priority=1.0)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.9
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_reuses_persisted_value_over_priority(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    """A persisted value must win over recomputing from priority, for the same reload-stability reason as the default."""
+    svc.gpu_memory_utilization = 0.0
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id="google/test", options=InstallModelIn(spec={"gpu_priority": 1.0}), gpu_memory_utilization=0.33)]
+    )
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_priority=1.0)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.33
+    gpu_deps["hardware"].get_realtime_stats.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_recomputes_when_priority_changed(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    """A persisted value computed for a different priority must not silently override the new one."""
+    svc.gpu_memory_utilization = 0.0
+    gpu_deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id="google/test", options=InstallModelIn(spec={"gpu_priority": 1.0}), gpu_memory_utilization=0.9)]
+    )
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.45
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_reuses_persisted_value_for_string_priority(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    """The persisted spec is the raw request body, so a priority sent as a string must still match its parsed value."""
+    svc.gpu_memory_utilization = 0.0
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id="google/test", options=InstallModelIn(spec={"gpu_priority": "0.5"}), gpu_memory_utilization=0.33)]
+    )
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.33
+    gpu_deps["hardware"].get_realtime_stats.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_treats_legacy_zero_as_unset(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    """The old free-text field allowed 0, which used to mean "unset" - it must not launch the engine with no memory."""
+    svc.gpu_memory_utilization = 0.0
+    gpu_deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_memory_utilization=0)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.9
+
+
 def test_release_gpu_utilization_floors_at_zero(svc: SglangService) -> None:
     svc.gpu_memory_utilization = 0.1
     svc._release_gpu_utilization(0.5)  # pyright: ignore[reportPrivateUsage]
@@ -1659,6 +1818,33 @@ def test_model_installed_info_get_info() -> None:
     assert info.registration_id == "reg-42"
 
 
+def test_model_installed_info_get_info_keeps_legacy_gpu_memory_utilization_spec_key() -> None:
+    model = _make_model_installed_info()
+    model.options.spec = {"gpu_memory_utilization": 0.5}
+
+    info = model.get_info()
+
+    assert info.spec == {"gpu_memory_utilization": 0.5}
+
+
+def test_carry_over_edited_install_options_keeps_legacy_absolute_utilization(svc: SglangService) -> None:
+    """The edit form only renders gpu_priority, so a legacy absolute value must survive an unrelated edit."""
+    old = InstallModelIn(spec={"gpu_memory_utilization": 0.3, "prefix": "old"})
+    new = InstallModelIn(spec={"prefix": "new"})
+
+    result = svc._carry_over_edited_install_options(old, new)  # pyright: ignore[reportPrivateUsage]
+
+    assert result.spec == {"prefix": "new", "gpu_memory_utilization": 0.3}
+    assert new.spec == {"prefix": "new"}
+
+
+def test_carry_over_edited_install_options_lets_new_priority_replace_legacy_value(svc: SglangService) -> None:
+    old = InstallModelIn(spec={"gpu_memory_utilization": 0.3})
+    new = InstallModelIn(spec={"gpu_priority": 0.5})
+
+    assert svc._carry_over_edited_install_options(old, new) is new  # pyright: ignore[reportPrivateUsage]
+
+
 def test_model_installed_info_get_info_migrates_legacy_alias_key() -> None:
     model = _make_model_installed_info(registration_id="reg-42")
     model.options = InstallModelIn(spec={"alias": "my-alias"})
@@ -1783,13 +1969,13 @@ def test_get_model_spec_adds_hardware_key_when_missing(svc: SglangService, gpu_d
     assert result is not None
 
 
-def test_get_model_spec_omits_gpu_memory_utilization_for_non_gpu_hardware(svc: SglangService) -> None:
+def test_get_model_spec_omits_gpu_priority_for_non_gpu_hardware(svc: SglangService) -> None:
     svc.instances_info["default"].config.options = InstallServiceIn(spec={"hardware": False})
 
     spec = svc.get_model_spec("default", "llm")
 
     field_names = [f.name for f in spec.fields]
-    assert "gpu_memory_utilization" not in field_names
+    assert "gpu_priority" not in field_names
 
 
 @pytest.mark.asyncio

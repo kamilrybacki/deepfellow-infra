@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import aiohttp
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from scripts.get_huggingface_models import ModelIncompatibleError
 from server.docker import ContainerStatus
@@ -192,20 +193,20 @@ def test_get_model_spec_baseline_fields(svc: VllmService) -> None:
         assert expected in field_names
 
 
-def test_get_model_spec_adds_gpu_memory_utilization_for_gpu_hardware(svc: VllmService) -> None:
+def test_get_model_spec_adds_gpu_priority_for_gpu_hardware(svc: VllmService) -> None:
     svc.instances_info["default"].config.options = InstallServiceIn(spec={"hardware": True})
 
     spec = svc.get_model_spec("default", "llm")
 
-    field_names = [f.name for f in spec.fields]
-    assert "gpu_memory_utilization" in field_names
+    field = next(f for f in spec.fields if f.name == "gpu_priority")
+    assert field.type == "gpu-priority"
 
 
-def test_get_model_spec_omits_gpu_memory_utilization_for_cpu_hardware(svc: VllmService) -> None:
+def test_get_model_spec_omits_gpu_priority_for_cpu_hardware(svc: VllmService) -> None:
     spec = svc.get_model_spec("default", "llm")
 
     field_names = [f.name for f in spec.fields]
-    assert "gpu_memory_utilization" not in field_names
+    assert "gpu_priority" not in field_names
 
 
 def test_get_model_spec_reranker_default_extra_args(svc: VllmService) -> None:
@@ -233,6 +234,33 @@ def test_model_installed_info_get_info() -> None:
     info = model.get_info()
 
     assert info.registration_id == "reg-42"
+
+
+def test_model_installed_info_get_info_keeps_legacy_gpu_memory_utilization_spec_key() -> None:
+    model = _make_model_installed_info()
+    model.options.spec = {"gpu_memory_utilization": 0.5}
+
+    info = model.get_info()
+
+    assert info.spec == {"gpu_memory_utilization": 0.5}
+
+
+def test_carry_over_edited_install_options_keeps_legacy_absolute_utilization(svc: VllmService) -> None:
+    """The edit form only renders gpu_priority, so a legacy absolute value must survive an unrelated edit."""
+    old = InstallModelIn(spec={"gpu_memory_utilization": 0.3, "prefix": "old"})
+    new = InstallModelIn(spec={"prefix": "new"})
+
+    result = svc._carry_over_edited_install_options(old, new)  # pyright: ignore[reportPrivateUsage]
+
+    assert result.spec == {"prefix": "new", "gpu_memory_utilization": 0.3}
+    assert new.spec == {"prefix": "new"}
+
+
+def test_carry_over_edited_install_options_lets_new_priority_replace_legacy_value(svc: VllmService) -> None:
+    old = InstallModelIn(spec={"gpu_memory_utilization": 0.3})
+    new = InstallModelIn(spec={"gpu_priority": 0.5})
+
+    assert svc._carry_over_edited_install_options(old, new) is new  # pyright: ignore[reportPrivateUsage]
 
 
 def test_model_installed_info_get_info_migrates_legacy_alias_key() -> None:
@@ -825,8 +853,183 @@ async def test_get_gpu_memory_utilization_reuses_persisted_value_instead_of_live
     deps["hardware"].get_realtime_stats.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_applies_priority_to_available_vram(svc: VllmService, deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.45
+    assert svc.gpu_memory_utilization == 0.45
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_applies_priority_to_currently_free_vram(svc: VllmService, deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.4
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=4.0, gpus=None))
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.27
+    assert svc.gpu_memory_utilization == pytest.approx(0.67)
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_priority_path_still_enforces_total_limit(svc: VllmService, deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.95
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_priority=0.5)
+
+    with pytest.raises(HTTPException) as exc:
+        await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc.value.status_code == 422
+    assert svc.gpu_memory_utilization == 0.95
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_rejects_priority_that_rounds_below_minimum(svc: VllmService, deps: dict[str, Any]) -> None:
+    """A tiny priority (or almost no free VRAM) must not start the engine with 0 utilization."""
+    svc.gpu_memory_utilization = 0.0
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=9.5, gpus=None))
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_priority=0.01)
+
+    with pytest.raises(HTTPException) as exc:
+        await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc.value.status_code == 422
+    assert svc.gpu_memory_utilization == 0.0
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_priority_wins_over_model_default(svc: VllmService, deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = VllmModel(hf_id="google/test", size="1GB", gpu_memory_utilization=0.8)
+    opts = VllmModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.45
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_explicit_absolute_value_wins_over_priority(svc: VllmService, deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_memory_utilization=0.3, gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.3
+    deps["hardware"].get_realtime_stats.assert_not_called()
+
+
+@pytest.mark.parametrize("priority", [0.0, 0.005, -0.1, 1.5])
+def test_model_options_reject_out_of_range_gpu_priority(priority: float) -> None:
+    with pytest.raises(ValidationError):
+        VllmModelOptions(gpu_priority=priority)
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_priority_never_exceeds_available_vram(svc: VllmService, deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_priority=1.0)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.9
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_reuses_persisted_value_over_priority(svc: VllmService, deps: dict[str, Any]) -> None:
+    """A persisted value must win over recomputing from priority, for the same reload-stability reason as the default."""
+    svc.gpu_memory_utilization = 0.0
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id="google/test", options=InstallModelIn(spec={"gpu_priority": 1.0}), gpu_memory_utilization=0.33)]
+    )
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_priority=1.0)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.33
+    deps["hardware"].get_realtime_stats.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_recomputes_when_priority_changed(svc: VllmService, deps: dict[str, Any]) -> None:
+    """A persisted value computed for a different priority must not silently override the new one."""
+    svc.gpu_memory_utilization = 0.0
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id="google/test", options=InstallModelIn(spec={"gpu_priority": 1.0}), gpu_memory_utilization=0.9)]
+    )
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.45
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_reuses_persisted_value_for_string_priority(svc: VllmService, deps: dict[str, Any]) -> None:
+    """The persisted spec is the raw request body, so a priority sent as a string must still match its parsed value."""
+    svc.gpu_memory_utilization = 0.0
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id="google/test", options=InstallModelIn(spec={"gpu_priority": "0.5"}), gpu_memory_utilization=0.33)]
+    )
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.33
+    deps["hardware"].get_realtime_stats.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_treats_legacy_zero_as_unset(svc: VllmService, deps: dict[str, Any]) -> None:
+    """The old free-text field allowed 0, which used to mean "unset" - it must not launch the engine with no memory."""
+    svc.gpu_memory_utilization = 0.0
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_memory_utilization=0)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.9
+
+
+def test_get_persisted_model_gpu_memory_utilization_returns_none_for_unparseable_priority(svc: VllmService) -> None:
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id="google/test", options=InstallModelIn(spec={"gpu_priority": "high"}), gpu_memory_utilization=0.33)]
+    )
+
+    assert svc._get_persisted_model_gpu_memory_utilization("default", "google/test", None) is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_get_persisted_model_gpu_memory_utilization_returns_none_when_priority_was_reset(svc: VllmService) -> None:
+    """Resetting a priority back to unset must re-derive the default, not reuse the value sized for the old priority."""
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id="google/test", options=InstallModelIn(spec={"gpu_priority": 0.5}), gpu_memory_utilization=0.33)]
+    )
+
+    assert svc._get_persisted_model_gpu_memory_utilization("default", "google/test", None) is None  # pyright: ignore[reportPrivateUsage]
+
+
 def test_get_persisted_model_gpu_memory_utilization_returns_none_for_untracked_instance(svc: VllmService) -> None:
-    assert svc._get_persisted_model_gpu_memory_utilization("no-such-instance", "model") is None  # pyright: ignore[reportPrivateUsage]
+    assert svc._get_persisted_model_gpu_memory_utilization("no-such-instance", "model", None) is None  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
@@ -3866,6 +4069,35 @@ async def test_sync_models_logs_warning_when_background_refresh_fails(svc: VllmS
     mock_logger.warning.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_edit_model_install_options_keeps_legacy_gpu_utilization(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """An edit through the form (which only renders gpu_priority) must not drop a model's legacy absolute utilization."""
+    _setup_install_mocks(svc, deps)
+    deps["service_provider"].save_service_config = AsyncMock()
+    deps["service_provider"].dismiss_warnings_matching = AsyncMock()
+    deps["service_provider"].dismiss_warnings_matching_any = AsyncMock()
+    deps["docker_service"].uninstall_docker = AsyncMock()
+    model_id = next(iter(svc.models["default"]))
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+        patch("server.services.vllm_service.validate_model_compatibility", new=AsyncMock(return_value=None)),
+    ):
+        install_promise = await svc.install_model("default", model_id, InstallModelIn(spec={"gpu_memory_utilization": 0.3}))
+        await install_promise.wait()
+
+        was_installed, promise = await svc.edit_model_install_options("default", model_id, InstallModelIn(spec={"alias": "renamed"}))
+        result = await promise.wait()
+
+    assert was_installed is True
+    assert result.status == "OK"
+    installed = svc.get_instance_installed_info("default").models[model_id]
+    assert installed.options.spec == {"alias": "renamed", "gpu_memory_utilization": 0.3}
+
+
 def _write_cached_adapter(tmp_path: Path, created: str | None = None) -> Path:
     adapter_dir = tmp_path / "adapter-pirate_llama"
     adapter_dir.mkdir()
@@ -4125,3 +4357,26 @@ async def test_resolve_adapter_metadata_raises_when_rank_above_vllm_maximum(svc:
         await svc._resolve_adapter_metadata({}, "huge-adapter")  # pyright: ignore[reportPrivateUsage]
 
     assert exc_info.value.status_code == 400
+
+
+@pytest.mark.parametrize("utilization", [-0.1, 1.5, float("nan"), float("inf")])
+def test_model_options_reject_invalid_legacy_gpu_memory_utilization(utilization: float) -> None:
+    with pytest.raises(ValidationError):
+        VllmModelOptions(gpu_memory_utilization=utilization)
+
+
+@pytest.mark.asyncio
+async def test_get_default_gpu_memory_utilization_warns_when_stats_unavailable(svc: VllmService, deps: dict[str, Any]) -> None:
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=None)
+
+    with patch("server.services.vllm_service.logger") as mock_logger:
+        result = await svc._get_default_gpu_memory_utilization()  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.9
+    mock_logger.warning.assert_called_once()
+
+
+def test_get_persisted_model_gpu_memory_utilization_prefers_value_kept_across_an_edit(svc: VllmService) -> None:
+    svc._edit_kept_gpu_utilization[("default", "google/test")] = 0.4  # pyright: ignore[reportPrivateUsage]
+
+    assert svc._get_persisted_model_gpu_memory_utilization("default", "google/test", 0.5) == 0.4  # pyright: ignore[reportPrivateUsage]

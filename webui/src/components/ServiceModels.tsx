@@ -8,6 +8,7 @@ This software is Licensed under the DeepFellow Free License.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+import { GpuAllocationBar } from "@/components/GpuAllocationBar";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -234,6 +235,14 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
         id: m.id,
         effective_prefix: m.effective_prefix,
       })),
+    [modelsData],
+  );
+
+  const gpuAllocationSegments = useMemo(
+    () =>
+      (modelsData?.list ?? [])
+        .filter((m) => m.installed && typeof m.vram_estimate_gb === "number")
+        .map((m) => ({ id: m.id, label: m.id, gb: m.vram_estimate_gb ?? 0 })),
     [modelsData],
   );
 
@@ -1891,6 +1900,19 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
         <GpuStatsPanel stats={gpuStatsQuery.data} />
       )}
 
+      {!isCpuOnly &&
+        gpuAllocationSegments.length > 0 &&
+        gpuStatsQuery.data != null &&
+        gpuStatsQuery.data.total_vram_gb > 0 && (
+          <GpuAllocationBar
+            heading="GPU allocation"
+            segments={gpuAllocationSegments}
+            totalGb={gpuStatsQuery.data.total_vram_gb}
+            usedGb={gpuStatsQuery.data.used_vram_gb}
+            className="mb-4"
+          />
+        )}
+
       <ModelsTable
         models={filteredModels}
         loadFailed={modelsQuery.isError && !modelsData}
@@ -2551,10 +2573,12 @@ const ModelRow = memo(function ModelRow({
                   Edit Settings
                 </DropdownMenuItem>
               ) : (
-                // Ticket scope is "MCP and custom services" only - catalog models on other
-                // services (Ollama, vLLM, sglang, etc.) don't get this action, even though the
-                // backend route is generic enough to support them too.
-                (serviceId === "mcp" || serviceId === "custom") && (
+                // Catalog models get this action only on services whose install options are editable
+                // (MCP, custom, vLLM, SGLang) - the backend route is generic enough to support others too.
+                (serviceId === "mcp" ||
+                  serviceId === "custom" ||
+                  serviceId === "vllm" ||
+                  serviceId === "sglang") && (
                   <DropdownMenuItem
                     onClick={() => onEditModelOptionsClick(model)}
                   >

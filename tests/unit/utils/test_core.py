@@ -33,6 +33,7 @@ from server.utils.core import (
     make_http_request,
     positive_context_window_or_none,
     stream_fetch_from,
+    with_legacy_key_carried_over,
     with_legacy_key_migrated,
 )
 
@@ -431,6 +432,33 @@ async def test_stream_fetch_from():
 )
 def test_convert_size_to_bytes(size_str: str, expected: int | None):
     assert convert_size_to_bytes(size_str) == expected
+
+
+def test_with_legacy_key_carried_over_copies_legacy_key_into_new_spec():
+    result = with_legacy_key_carried_over({"gpu_memory_utilization": 0.5}, {"prefix": "p"}, "gpu_memory_utilization", "gpu_priority")
+    assert result == {"prefix": "p", "gpu_memory_utilization": 0.5}
+
+
+def test_with_legacy_key_carried_over_fills_empty_new_spec():
+    assert with_legacy_key_carried_over({"gpu_memory_utilization": 0.5}, None, "gpu_memory_utilization", "gpu_priority") == {
+        "gpu_memory_utilization": 0.5
+    }
+
+
+def test_with_legacy_key_carried_over_keeps_new_key_when_set():
+    new_spec = {"gpu_priority": 0.7}
+    assert with_legacy_key_carried_over({"gpu_memory_utilization": 0.5}, new_spec, "gpu_memory_utilization", "gpu_priority") is new_spec
+
+
+def test_with_legacy_key_carried_over_keeps_explicit_legacy_value():
+    new_spec = {"gpu_memory_utilization": 0.2}
+    assert with_legacy_key_carried_over({"gpu_memory_utilization": 0.5}, new_spec, "gpu_memory_utilization", "gpu_priority") is new_spec
+
+
+def test_with_legacy_key_carried_over_passes_through_when_old_spec_lacks_legacy_key():
+    new_spec = {"quantization": "fp8"}
+    assert with_legacy_key_carried_over({"gpu_priority": 0.5}, new_spec, "gpu_memory_utilization", "gpu_priority") is new_spec
+    assert with_legacy_key_carried_over(None, new_spec, "gpu_memory_utilization", "gpu_priority") is new_spec
 
 
 def test_load_json_registry_builds_from_valid_file(tmp_path: Path):
