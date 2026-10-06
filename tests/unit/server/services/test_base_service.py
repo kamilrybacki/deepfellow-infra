@@ -3556,14 +3556,14 @@ def test_get_specified_hardware_parts_no_match_returns_empty(base2_deps: dict[st
     assert list(result) == []
 
 
-def test_add_hardware_field_to_spec_no_cpu_without_avx512(base2_deps: dict[str, Any]) -> None:
+def test_add_hardware_field_to_spec_no_cpu_when_cpu_unsupported(base2_deps: dict[str, Any]) -> None:
     hw = MagicMock()
     hw.gpus = []
     hw.cpu.avx512 = False
     base2_deps["hardware"] = hw
     svc = _Base2Impl(**base2_deps)
 
-    fields = svc.add_hardware_field_to_spec(add_cpu_option_only_on_avx512_support=True)
+    fields = svc.add_hardware_field_to_spec(cpu_supported=False)
 
     hw_field = next(f for f in fields if f.name == "hardware")
     assert "CPU" not in [getattr(v, "value", v) for v in hw_field.values]  # pyright: ignore[reportOptionalIterable]
@@ -3598,14 +3598,14 @@ def test_add_hardware_field_to_spec_multiple_gpus(base2_deps: dict[str, Any]) ->
     assert hw_field.default == "GPUs"
 
 
-def test_add_hardware_field_to_model_spec_no_cpu_without_avx512(base2_deps: dict[str, Any]) -> None:
+def test_add_hardware_field_to_model_spec_no_cpu_when_cpu_unsupported(base2_deps: dict[str, Any]) -> None:
     hw = MagicMock()
     hw.gpus = []
     hw.cpu.avx512 = False
     base2_deps["hardware"] = hw
     svc = _Base2Impl(**base2_deps)
 
-    fields = svc.add_hardware_field_to_model_spec(add_cpu_option_only_on_avx512_support=True)
+    fields = svc.add_hardware_field_to_model_spec(cpu_supported=False)
 
     hw_field = next(f for f in fields if f.name == "hardware")
     assert "CPU" not in [getattr(v, "value", v) for v in hw_field.values]  # pyright: ignore[reportOptionalIterable]

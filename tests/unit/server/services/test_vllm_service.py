@@ -376,6 +376,51 @@ def test_load_download_info(svc: VllmService) -> None:
     assert result.model_path == "/tmp/x"
 
 
+@pytest.fixture(autouse=True)
+def _x86_host() -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]
+    with patch("platform.machine", return_value="x86_64"):
+        yield
+
+
+@pytest.mark.parametrize("machine", ["arm64", "aarch64"])
+def test_arm_host_without_gpu_is_supported_despite_no_avx512(deps: dict[str, Any], machine: str) -> None:
+    deps["hardware"].cpu.avx512 = False
+    deps["hardware"].gpus = []
+    svc = VllmService(**deps)
+
+    with patch("platform.machine", return_value=machine):
+        assert svc.get_hardware_unsupported_reason() is None
+        assert "cpu" in svc.get_size()
+
+
+def _hardware_option_values(svc: VllmService) -> list[str]:
+    field = next(f for f in svc.get_spec().fields if f.name == "hardware")
+    return [v if isinstance(v, str) else v.value for v in field.values or []]
+
+
+def test_get_spec_hides_cpu_option_on_x86_without_avx512_even_with_gpu(deps: dict[str, Any]) -> None:
+    deps["hardware"].cpu.avx512 = False
+    deps["hardware"].gpus = [MagicMock(spec=NvidiaGpuInfo)]
+    svc = VllmService(**deps)
+
+    options = _hardware_option_values(svc)
+
+    assert "CPU" not in options
+
+
+@pytest.mark.parametrize("machine", ["arm64", "aarch64"])
+@patch("platform.machine")
+def test_get_spec_offers_cpu_option_on_arm_without_avx512(mock_machine: MagicMock, deps: dict[str, Any], machine: str) -> None:
+    mock_machine.return_value = machine
+    deps["hardware"].cpu.avx512 = False
+    deps["hardware"].gpus = []
+    svc = VllmService(**deps)
+
+    options = _hardware_option_values(svc)
+
+    assert "CPU" in options
+
+
 def test_is_given_hardware_support_gpu_raises_400_no_avx512_no_gpu(deps: dict[str, Any]) -> None:
     deps["hardware"].cpu.avx512 = False
     deps["hardware"].gpus = []

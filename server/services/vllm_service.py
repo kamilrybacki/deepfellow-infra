@@ -64,6 +64,7 @@ from server.utils.core import (
     SuccessDownloadPacket,
     Utils,
     convert_size_to_bytes,
+    get_cpu_architecture,
     normalize_name,
     try_parse_pydantic,
     with_legacy_key_migrated,
@@ -448,7 +449,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
     def get_size(self) -> ServiceSize:
         """Return the service size."""
         sizes: dict[str, str] = {}
-        if self.hardware.cpu.avx512:
+        if self._cpu_supported:
             sizes["cpu"] = _const.images["cpu"].size
         if self._supported_gpus:
             sizes["gpu"] = _const.images["gpu"].size
@@ -456,7 +457,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
 
     def get_spec(self) -> ServiceSpecification:
         """Return the service specification."""
-        fields = self.add_hardware_field_to_spec(add_cpu_option_only_on_avx512_support=True)
+        fields = self.add_hardware_field_to_spec(cpu_supported=self._cpu_supported)
         fields.append(
             ServiceField(
                 type="docker-tags",
@@ -703,12 +704,21 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
 
     def get_hardware_unsupported_reason(self) -> str | None:
         """Return why vLLM can't run here, or None if it can."""
-        if not self.hardware.cpu.avx512 and not self._supported_gpus:
+        if not self._cpu_supported and not self._supported_gpus:
             return (
                 "Your hardware doesn't support this service.\nCPU does not support AVX 512 instructions."
                 "\nThere are not any graphic cards. Restart Infra if this has changed."
             )
         return None
+
+    @property
+    def _cpu_supported(self) -> bool:
+        """Return whether the vLLM CPU image can run here: AVX-512 on x86, no such requirement on ARM (AVX-512 is x86-only)."""
+        return self._is_arm_host() or self.hardware.cpu.avx512
+
+    @staticmethod
+    def _is_arm_host() -> bool:
+        return get_cpu_architecture() == "arm64"
 
     def get_default_docker_image_name(self) -> str | None:
         """Return the default docker image, for the upfront platform-compatibility check.
@@ -1464,10 +1474,13 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         return self.filter_docker_tags(tags, hardware)
 
     def filter_docker_tags(self, tags: list[str], hardware: str | None) -> list[str]:
-        """Filter tags to GPU (-cu*) variants; CPU tags come from a dedicated repo and need no filtering."""
-        if hardware is None or not self._use_gpu_image(hardware):
+        """Filter tags to GPU (-cu*) variants, or for CPU to the tags usable on this host's architecture."""
+        if hardware is None:
             return tags
-        return [t for t in tags if re.search(r"cu\d", t, re.IGNORECASE) and "cpu" not in t.lower()]
+        if self._use_gpu_image(hardware):
+            return [t for t in tags if re.search(r"cu\d", t, re.IGNORECASE) and "cpu" not in t.lower()]
+        other_arch_suffix = "-x86_64" if self._is_arm_host() else "-arm64"
+        return [t for t in tags if not t.endswith(other_arch_suffix)]
 
     def get_default_docker_tag(self, hardware: str | None) -> str | None:
         """Return the pinned default vLLM image tag for the given hardware variant."""
