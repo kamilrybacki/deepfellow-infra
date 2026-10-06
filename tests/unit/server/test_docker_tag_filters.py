@@ -3,7 +3,7 @@
 
 """Tests for filter_docker_tags in llama.cpp and vLLM services."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -29,6 +29,8 @@ VLLM_TAGS = [
     "v0.17.0-cu120",
 ]
 
+VLLM_CPU_TAGS = ["latest", "latest-arm64", "latest-x86_64", "v0.31.0", "v0.31.0-arm64", "v0.31.0-x86_64"]
+
 
 @pytest.fixture
 def llamacpp_service() -> LLamacppService:
@@ -43,6 +45,7 @@ def vllm_service() -> VllmService:
     svc: VllmService = MagicMock(spec=VllmService)
     svc.filter_docker_tags = VllmService.filter_docker_tags.__get__(svc, VllmService)  # type: ignore[method-assign]
     svc._use_gpu_image = VllmService._use_gpu_image.__get__(svc, VllmService)  # type: ignore[method-assign]
+    svc._is_arm_host = VllmService._is_arm_host  # type: ignore[method-assign]
     return svc
 
 
@@ -85,11 +88,16 @@ class TestVllmFilterDockerTags:
         assert "v0.19.0-cu130-ubuntu2404" in result
         assert "v0.19.0-cpu" not in result
 
-    def test_cpu_returns_tags_unfiltered(self, vllm_service: VllmService) -> None:
-        # The CPU image lives in its own ECR repo (public.ecr.aws/.../vllm-cpu-release-repo) whose
-        # tags are plain semver without a "cpu" marker, so CPU tags must pass through unfiltered.
-        result = vllm_service.filter_docker_tags(VLLM_TAGS, "cpu")
-        assert result == VLLM_TAGS
+    def test_cpu_on_x86_excludes_arm64_tags(self, vllm_service: VllmService) -> None:
+        with patch("platform.machine", return_value="x86_64"):
+            result = vllm_service.filter_docker_tags(VLLM_CPU_TAGS, "cpu")
+        assert result == ["latest", "latest-x86_64", "v0.31.0", "v0.31.0-x86_64"]
+
+    @pytest.mark.parametrize("machine", ["arm64", "aarch64"])
+    def test_cpu_on_arm_excludes_x86_tags(self, vllm_service: VllmService, machine: str) -> None:
+        with patch("platform.machine", return_value=machine):
+            result = vllm_service.filter_docker_tags(VLLM_CPU_TAGS, "cpu")
+        assert result == ["latest", "latest-arm64", "v0.31.0", "v0.31.0-arm64"]
 
     def test_none_hardware_returns_all(self, vllm_service: VllmService) -> None:
         result = vllm_service.filter_docker_tags(VLLM_TAGS, None)

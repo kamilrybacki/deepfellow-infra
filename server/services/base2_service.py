@@ -1975,7 +1975,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
     def add_hardware_field_to_spec(
         self,
         fields: list[ServiceField] | None = None,
-        add_cpu_option_only_on_avx512_support: bool = False,
+        cpu_supported: bool = True,
     ) -> list[ServiceField]:
         """Add hardware (CPU/GPU/GPUs) field to specification."""
         fields = fields or []
@@ -1989,7 +1989,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             options.append(OneOfOption(value="GPUs", label="All GPUs"))
             default = "GPUs"
         options.extend([f"GPU | {gpu.long_name}" for gpu in gpus])
-        if not add_cpu_option_only_on_avx512_support or self.hardware.cpu.avx512:
+        if cpu_supported:
             options.append("CPU")
             if default is None:
                 default = "CPU"
@@ -2002,7 +2002,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
     def add_hardware_field_to_model_spec(
         self,
         fields: list[ModelField] | None = None,
-        add_cpu_option_only_on_avx512_support: bool = False,
+        cpu_supported: bool = True,
     ) -> list[ModelField]:
         """Add hardware (CPU/GPU/GPUs) field to specification."""
         fields = fields or []
@@ -2016,7 +2016,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             options.append(OneOfOption(value="GPUs", label="All GPUs"))
             default = "GPUs"
         options.extend([f"GPU | {gpu.long_name}" for gpu in gpus])
-        if not add_cpu_option_only_on_avx512_support or self.hardware.cpu.avx512:
+        if cpu_supported:
             options.append("CPU")
             if default is None:
                 default = "CPU"
