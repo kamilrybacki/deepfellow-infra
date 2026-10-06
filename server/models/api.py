@@ -494,6 +494,15 @@ class ApiModel(BaseModel):
     created: int
     owned_by: str
     props: ModelProps
+    usage: int = 0
+    """Requests in flight for this model, summed across its registrations.
+
+    Live for local models and close to live (with some lag) for models from child nodes. For models received from a
+    parent/ancestor (`owned_by="mesh-ancestor"`) it is only the value reported when the model was registered, because
+    usage updates are sent upward only and are never refreshed downward.
+    """
+    capacity: int | None = None
+    """Total concurrency limit summed across registrations; `None` if any registration is unbounded or unknown."""
 
 
 class ApiModels(BaseModel):

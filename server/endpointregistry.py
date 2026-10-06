@@ -404,6 +404,16 @@ class Endpoint[T]:
         """Aggregate `supports_audio` across a model's registrations. See `_aggregate_modality_support`."""
         return self._aggregate_modality_support([item.props.supports_audio for item in model.values()])
 
+    @staticmethod
+    def _aggregate_capacity(model: dict[RegistrationId, RegisteredModel[T]]) -> int | None:
+        """Sum finite capacities across registrations; `None` if any registration is unbounded or unknown."""
+        total = 0
+        for item in model.values():
+            if not isinstance(item.capacity_state, int):
+                return None
+            total += item.capacity_state
+        return total
+
     def _build_api_model(self, model_id: ModelId, model: dict[RegistrationId, RegisteredModel[T]]) -> ApiModel:
         """Build an ApiModel from a model's registrations."""
         return ApiModel(
@@ -423,6 +433,8 @@ class Endpoint[T]:
                 supports_vision=self.get_model_supports_vision(model),
                 supports_audio=self.get_model_supports_audio(model),
             ),
+            usage=sum(item.usage for item in model.values()),
+            capacity=self._aggregate_capacity(model),
         )
 
     def get_models(self) -> list[ApiModel]:

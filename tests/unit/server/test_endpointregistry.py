@@ -1208,6 +1208,43 @@ def test_build_api_model_includes_modality_support():
     assert api_model.props.supports_audio is False
 
 
+def test_build_api_model_sums_usage_and_capacity_across_registrations():
+    ep = make_endpoint()
+    for reg_id, usage in (("id-1", 2), ("id-2", 3)):
+        ep.add_model(
+            "llm-a",
+            make_props(),
+            SimpleEndpoint(on_request=AsyncMock()),
+            "llm",
+            RegistrationOptions(origin="local", id=reg_id, usage=usage, capacity_state=4),
+        )
+
+    api_model = ep._build_api_model("llm-a", ep.models["llm-a"])  # pyright: ignore[reportPrivateUsage]
+
+    assert api_model.usage == 5
+    assert api_model.capacity == 8
+
+
+def test_build_api_model_capacity_is_none_when_any_registration_is_not_finite():
+    ep = make_endpoint()
+    ep.add_model(
+        "llm-b",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-1", capacity_state=4),
+    )
+    ep.add_model(
+        "llm-b",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-2", capacity_state="unbounded"),
+    )
+
+    assert ep._build_api_model("llm-b", ep.models["llm-b"]).capacity is None  # pyright: ignore[reportPrivateUsage]
+
+
 def test_get_models_returns_api_model_list():
     ep = make_endpoint()
     ep.add_model("gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local"))
