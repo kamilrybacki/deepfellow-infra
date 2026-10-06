@@ -8,6 +8,7 @@ This software is Licensed under the DeepFellow Free License.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+import { GpuAllocationBar } from "@/components/GpuAllocationBar";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
   Command,
@@ -32,11 +33,19 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { apiClient } from "@/deepfellow/client";
-import type { SpecField } from "@/deepfellow/types";
+import type { GpuStats, SpecField } from "@/deepfellow/types";
+import { useQuery } from "@tanstack/react-query";
 import {
   CheckIcon,
   ChevronsUpDownIcon,
+  InfoIcon,
   Loader2Icon,
   RotateCcwIcon,
 } from "lucide-react";
@@ -54,6 +63,9 @@ export interface DynamicFormFieldsProps {
   /** Field names to render read-only (grayed out) - e.g. `id` while editing, since the backend
    * rejects changing it there and only allows a new one via duplicate. */
   disabledFields?: string[];
+  /** The raw spec the form was opened with (e.g. an installed model's persisted install options),
+   * including keys no rendered field covers - lets a field reflect legacy values it replaced. */
+  initialData?: Record<string, unknown>;
 }
 
 interface DockerTagsFieldProps {
@@ -221,6 +233,126 @@ function DockerTagsField({
   );
 }
 
+interface GpuPriorityFieldProps {
+  value: unknown;
+  onChange: (value: number | undefined) => void;
+  serviceId: string;
+  modelId: string | undefined;
+  initialData: Record<string, unknown> | undefined;
+}
+
+/** Parses a persisted 0-1 fraction, which may be a string since specs are stored as raw request bodies. */
+function parseFraction(raw: unknown): number | undefined {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  const parsed = typeof raw === "number" ? raw : Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+/** gparted-style bar plus slider for the `gpu_priority` field: existing installed GPU models render
+ * as fixed, read-only segments (resizing them would require restarting an already-running model),
+ * and this model's own share is carved out of whatever VRAM is currently free. */
+function GpuPriorityField({
+  value,
+  onChange,
+  serviceId,
+  modelId,
+  initialData,
+}: GpuPriorityFieldProps) {
+  const modelsQuery = useQuery({
+    queryKey: ["admin", "services", serviceId, "models"],
+    queryFn: () => apiClient.listAdminServiceModels(serviceId),
+  });
+  const gpuStatsQuery = useQuery<GpuStats | null>({
+    queryKey: ["admin", "settings", "hardware", "gpu-stats"],
+    queryFn: () => apiClient.getGpuStats(),
+    retry: false,
+  });
+
+  const models = modelsQuery.data?.list ?? [];
+  const segments = models
+    .filter(
+      (model) =>
+        model.id !== modelId &&
+        model.installed &&
+        typeof model.vram_estimate_gb === "number",
+    )
+    .map((model) => ({
+      id: model.id,
+      label: model.id,
+      gb: model.vram_estimate_gb ?? 0,
+    }));
+  // When editing an installed model, the backend uninstalls it before sizing the reinstall, so its
+  // own live usage is about to be freed - don't count it against the free space in the preview.
+  const selfGb =
+    models.find((model) => model.id === modelId && model.installed)
+      ?.vram_estimate_gb ?? 0;
+  const priority = parseFraction(value);
+  const initialPriority = parseFraction(initialData?.gpu_priority);
+  // Left unchanged on an edit, the backend reuses the model's persisted utilization instead of
+  // re-deriving it from live free VRAM - so preview its current size, not a recomputed one.
+  const fixedGb =
+    priority !== undefined && priority === initialPriority && selfGb > 0
+      ? selfGb
+      : undefined;
+  const legacyUtilization = parseFraction(initialData?.gpu_memory_utilization);
+  const totalGb = gpuStatsQuery.data?.total_vram_gb ?? 0;
+  const usedGb =
+    gpuStatsQuery.data != null
+      ? Math.max(0, gpuStatsQuery.data.used_vram_gb - selfGb)
+      : undefined;
+
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
+        <span>GPU allocation for this install</span>
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                aria-label="About the GPU share"
+                className="inline-flex rounded-sm focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <InfoIcon className="size-3.5" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-xs">
+              The share is a percentage of the VRAM that is free when the model
+              starts, so other models&apos; values never need recomputing.
+              Already-running models keep their current allocation. At 100%, the
+              model takes all currently-free VRAM (minus a safety margin), the
+              same as the default. Left unset, the model&apos;s default GPU
+              share is used
+              {legacyUtilization !== undefined
+                ? ", or here its legacy fixed value"
+                : ""}
+              .
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      </div>
+      <GpuAllocationBar
+        segments={segments}
+        totalGb={totalGb}
+        usedGb={usedGb}
+        newModel={{
+          label: modelId ?? "New model",
+          priority,
+          fixedGb,
+          legacyUtilization,
+          onPriorityChange: onChange,
+        }}
+      />
+      {!gpuStatsQuery.isLoading && totalGb <= 0 && (
+        <p className="text-xs text-muted-foreground">
+          No GPU VRAM info available - the share will be applied to the
+          backend's default GPU share.
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function DynamicFormFields({
   fields,
   formData,
@@ -229,6 +361,7 @@ export function DynamicFormFields({
   serviceId,
   modelId,
   disabledFields,
+  initialData,
 }: DynamicFormFieldsProps) {
   const visibleFields = useMemo(
     () =>
@@ -273,6 +406,14 @@ export function DynamicFormFields({
                     : undefined
                 }
                 modelId={modelId}
+              />
+            ) : field.type === "gpu-priority" && serviceId ? (
+              <GpuPriorityField
+                value={formData[field.name]}
+                onChange={(v) => onChange(field.name, v)}
+                serviceId={serviceId}
+                modelId={modelId}
+                initialData={initialData}
               />
             ) : field.type === "bool" ? (
               <div className="flex items-center space-x-2">

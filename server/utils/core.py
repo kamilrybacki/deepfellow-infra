@@ -329,6 +329,21 @@ def try_parse_pydantic[T](cls: type[T], data: Any) -> T:  # noqa: ANN401
         raise HTTPException(400, format_pydantic_errors(e) if isinstance(e, ValidationError) else "Unknown") from e
 
 
+def with_legacy_key_carried_over(
+    old_spec: dict[str, Any] | None, new_spec: dict[str, Any] | None, legacy_key: str, new_key: str
+) -> dict[str, Any] | None:
+    """Carry `legacy_key` from `old_spec` into `new_spec` when the new spec sets neither it nor `new_key`.
+
+    Lets a value persisted under a field's old name survive an edit made through a form that no longer
+    renders that field, instead of being silently dropped (or reinterpreted under the new field's meaning).
+    """
+    if not old_spec or legacy_key not in old_spec:
+        return new_spec
+    if new_spec and (legacy_key in new_spec or new_key in new_spec):
+        return new_spec
+    return {**(new_spec or {}), legacy_key: old_spec[legacy_key]}
+
+
 def with_legacy_key_migrated(spec: dict[str, Any] | None, old_key: str, new_key: str) -> dict[str, Any] | None:
     """Return `spec` with `old_key` renamed to `new_key`, so a value persisted under a field's old name still surfaces under the new one."""
     if not spec or old_key not in spec or new_key in spec:

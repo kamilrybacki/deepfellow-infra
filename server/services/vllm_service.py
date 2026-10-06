@@ -66,6 +66,7 @@ from server.utils.core import (
     convert_size_to_bytes,
     normalize_name,
     try_parse_pydantic,
+    with_legacy_key_carried_over,
     with_legacy_key_migrated,
 )
 from server.utils.exceptions import AppError
@@ -286,7 +287,8 @@ class VllmOptions(BaseModel):
 
 class VllmModelOptions(BaseModel):
     rename: str | None = Field(default=None, validation_alias=AliasChoices("rename", "alias"))
-    gpu_memory_utilization: float | None = None
+    gpu_memory_utilization: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    gpu_priority: float | None = Field(default=None, ge=0.01, le=1)
     max_model_length: int | None = None
     quantization: str | None = None
     extra_args: dict[str, str] = {}
@@ -321,6 +323,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
     gpu_memory_utilization = 0
     _default_gpu_memory_utilization = 0.9
     _gpu_memory_free_safety_margin = 0.9
+    _min_gpu_memory_utilization = 0.01
     _vram_cache: dict[tuple[str, str], float]
     _installing: set[tuple[str, str]]
 
@@ -483,9 +486,9 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             if (isinstance(hardware, bool) and hardware is True) or (isinstance(hardware, str) and hardware.startswith("GPU")):
                 fields.append(
                     ModelField(
-                        type="number",
-                        name="gpu_memory_utilization",
-                        description="Gpu usage (in range 0.00 - 1.00). Left blank, defaults to the fraction of VRAM currently free.",
+                        type="gpu-priority",
+                        name="gpu_priority",
+                        description="Share of currently-free GPU memory (0.01 - 1.00) to reserve for this model.",
                         required=False,
                     ),
                 )
@@ -1053,6 +1056,15 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
             raise HTTPException(500, f"Downloader doesn't return filepath in {model_dir} of {model.hf_id} model")
         return local_model_path
 
+    def _carry_over_edited_install_options(self, old_options: InstallModelIn, new_options: InstallModelIn) -> InstallModelIn:
+        """Keep a legacy absolute `gpu_memory_utilization` across an edit.
+
+        The edit form only renders `gpu_priority`, so without this a model installed with the old absolute
+        key would silently lose it on any edit (even one touching only prefix/envs) and be re-sized.
+        """
+        spec = with_legacy_key_carried_over(old_options.spec, new_options.spec, "gpu_memory_utilization", "gpu_priority")
+        return new_options if spec is new_options.spec else new_options.model_copy(update={"spec": spec})
+
     async def _get_default_gpu_memory_utilization(self) -> float:
         """Size the default utilization to the fraction of VRAM currently free instead of a flat value.
 
@@ -1061,6 +1073,10 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
         """
         stats = await self.hardware.get_realtime_stats(force_refresh=True)
         if not stats or stats.total_vram_gb <= 0:
+            logger.warning(
+                f"vLLM: GPU stats unavailable, assuming {self._default_gpu_memory_utilization} of total VRAM is free; "
+                "a gpu_priority share is applied to that and may exceed the memory actually free"
+            )
             return self._default_gpu_memory_utilization
         free_fraction = max(0.0, stats.total_vram_gb - stats.used_vram_gb) / stats.total_vram_gb
         return round(min(self._default_gpu_memory_utilization, free_fraction * self._gpu_memory_free_safety_margin), 2)
@@ -1068,9 +1084,28 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
     async def _get_gpu_memory_utilization(
         self, instance: str, model_id: str, parsed_model_options: VllmModelOptions, model: VllmModel
     ) -> float:
-        gpu_memory_utilization = parsed_model_options.gpu_memory_utilization or model.gpu_memory_utilization
+        gpu_memory_utilization = parsed_model_options.gpu_memory_utilization
+        if gpu_memory_utilization is not None and gpu_memory_utilization <= 0:
+            # A persisted 0 (the old free-text field allowed it) used to mean "unset" - keep it that way
+            # rather than launching the engine with no memory, which fails to start.
+            gpu_memory_utilization = None
+        if gpu_memory_utilization is None and parsed_model_options.gpu_priority is None:
+            # An explicit priority must win over the model definition's own default utilization.
+            gpu_memory_utilization = model.gpu_memory_utilization
         if gpu_memory_utilization is None:
-            gpu_memory_utilization = self._get_persisted_model_gpu_memory_utilization(instance, model_id)
+            gpu_memory_utilization = self._get_persisted_model_gpu_memory_utilization(instance, model_id, parsed_model_options.gpu_priority)
+        if gpu_memory_utilization is None and parsed_model_options.gpu_priority is not None:
+            available = await self._get_default_gpu_memory_utilization()
+            gpu_memory_utilization = round(parsed_model_options.gpu_priority * available, 2)
+            if gpu_memory_utilization < self._min_gpu_memory_utilization:
+                raise HTTPException(
+                    422,
+                    (
+                        f"GPU priority {parsed_model_options.gpu_priority} of the currently free VRAM ({available}) "
+                        f"gives {gpu_memory_utilization} utilization, below the minimum {self._min_gpu_memory_utilization}. "
+                        "Raise the priority or free up GPU memory."
+                    ),
+                )
         if gpu_memory_utilization is None:
             gpu_memory_utilization = await self._get_default_gpu_memory_utilization()
         if self.gpu_memory_utilization + gpu_memory_utilization > 1:

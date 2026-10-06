@@ -2251,6 +2251,18 @@ async def test_save_calls_service_provider(base2_svc: _Base2Impl, base2_deps: di
 
 
 @pytest.mark.asyncio
+async def test_save_refreshes_in_memory_instance_options(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
+    base2_deps["service_provider"].save_service_config = AsyncMock()
+    base2_svc.instances_info["default"].config.options = None
+    generated_options = InstallServiceIn(spec={"gpu_priority": 0.5})
+
+    with patch.object(base2_svc, "_generate_instance_config", return_value=InstanceConfig(options=generated_options, models=[])):
+        await base2_svc._save()  # pyright: ignore[reportPrivateUsage]
+
+    assert base2_svc.instances_info["default"].config.options == generated_options
+
+
+@pytest.mark.asyncio
 async def test_save_preserves_model_that_failed_to_load(base2_svc: _Base2Impl, base2_deps: dict[str, Any]) -> None:
     base2_deps["service_provider"].save_service_config = AsyncMock()
     persisted_model = ModelConfig(model_id="m1", options=InstallModelIn(), definition={"hf_id": "m1"})

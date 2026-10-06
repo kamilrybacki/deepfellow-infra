@@ -343,6 +343,7 @@ export function DynamicFormModal({
                 serviceId={serviceId}
                 modelId={modelId}
                 disabledFields={onDuplicate && !duplicateMode ? ["id"] : []}
+                initialData={duplicateMode ? undefined : initialDataProp}
               />
             )}
           </div>

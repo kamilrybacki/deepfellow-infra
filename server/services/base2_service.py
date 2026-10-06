@@ -8,8 +8,8 @@ import shutil
 import time
 import uuid
 from abc import abstractmethod
-from collections.abc import Awaitable, Callable, Sequence
-from contextlib import suppress
+from collections.abc import Awaitable, Callable, Iterator, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar, cast
@@ -390,6 +390,8 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
     (e.g. it has no registry snapshot to persist). Otherwise ``load_service`` treats every model as needing a
     backfill save on every startup, forever."""
     _edit_locks: dict[tuple[str, str], asyncio.Lock]
+    # GPU utilization of a model being re-installed by an edit, so the reinstall (or a rollback) keeps its current size.
+    _edit_kept_gpu_utilization: dict[tuple[str, str], float]
 
     def __init__(
         self,
@@ -419,6 +421,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         self._failed_models = {}
         self._warning_tasks = set()
         self._edit_locks = {}
+        self._edit_kept_gpu_utilization = {}
         self._platform_unsupported_reason = None
         self._after_init()
 
@@ -830,19 +833,43 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         match = next((m for m in persisted.config.models or [] if m.model_id == model_id), None)
         return (match.capacity, match.capacity_known) if match else (None, False)
 
-    def _get_persisted_model_gpu_memory_utilization(self, instance: str, model_id: str) -> float | None:
+    @staticmethod
+    def _parse_gpu_priority(spec: dict[str, Any] | None) -> float | None:
+        """Read `gpu_priority` from a raw spec, where it may be a string (e.g. "0.5") since specs are stored as request bodies."""
+        raw = (spec or {}).get("gpu_priority")
+        if raw is None:
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _get_persisted_model_gpu_memory_utilization(self, instance: str, model_id: str, gpu_priority: float | None) -> float | None:
         """Look up the last-persisted auto-computed GPU utilization for a model, from a prior successful install.
 
         Reusing this avoids spurious docker-compose diffs on reload: the auto-tuned default is sized off
         currently-free VRAM (see `VllmService._get_default_gpu_memory_utilization`), which keeps shrinking
         once the model's own container is already running and holding memory, making every reload look like
         a config change and forcing an unnecessary container restart.
+
+        Only reused while `gpu_priority` matches the one it was computed for - otherwise a changed priority
+        (e.g. an edit of a model that failed to load, whose persisted entry survives) would be silently ignored.
+        An options edit that left the priority unchanged also lands here, via the value kept across its uninstall.
         """
+        if (kept := self._edit_kept_gpu_utilization.get((instance, model_id))) is not None:
+            return kept
         persisted = self.instances_info.get(instance)
         if not persisted:
             return None
         match = next((m for m in persisted.config.models or [] if m.model_id == model_id), None)
-        return match.gpu_memory_utilization if match else None
+        if match is None:
+            return None
+        persisted_priority = self._parse_gpu_priority(match.options.spec)
+        if persisted_priority != gpu_priority or (
+            persisted_priority is None and (match.options.spec or {}).get("gpu_priority") is not None
+        ):
+            return None
+        return match.gpu_memory_utilization
 
     def _record_warning_in_background(self, message: str, *, instance: str | None = None, model_id: str | None = None) -> None:
         """Fire-and-forget a warning write from a synchronous callback, e.g. a promise's on_error."""
@@ -1018,6 +1045,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             generated = self._generate_instance_config(instance_name, instance.installed, instance.config.custom)
             generated.models = self._preserve_failed_models(instance_name, generated.models or [])
             instance.config.models = generated.models
+            instance.config.options = generated.options
             instances_config[instance_name] = generated
         cfg = self.service_config(instances_config)
         await self.service_provider.save_service_config(self.get_type(), cfg.model_dump())
@@ -1474,6 +1502,30 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             if effective_prefix == prefix:
                 raise HTTPException(400, f"Prefix '{prefix}' is already in use by model '{mid}'.")
 
+    @contextmanager
+    def _keep_gpu_allocation(self, instance: str, model_id: str, installed_models: dict[str, Any]) -> Iterator[Callable[[bool], None]]:
+        """Keep a model's current GPU utilization across an uninstall/reinstall edit, clearing it on exit.
+
+        The uninstall drops the model's persisted entry, so without this every reinstall (and rollback) would
+        re-derive the size from whatever VRAM is free at that moment. Yields a toggle: `set_active(False)` hides
+        the kept value (e.g. for an install whose gpu_priority changed), `set_active(True)` restores it (rollbacks).
+        """
+        key = (instance, model_id)
+        installed = installed_models.get(model_id)
+        kept = getattr(installed, "gpu_memory_utilization", None) if installed is not None else None
+
+        def set_active(active: bool) -> None:
+            if kept and active:
+                self._edit_kept_gpu_utilization[key] = kept
+            else:
+                self._edit_kept_gpu_utilization.pop(key, None)
+
+        set_active(True)
+        try:
+            yield set_active
+        finally:
+            self._edit_kept_gpu_utilization.pop(key, None)
+
     async def edit_model(  # noqa: C901
         self, instance: str, custom_model_id: CustomModelId, new_definition: AddCustomModelIn
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk] | None:
@@ -1510,57 +1562,62 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             install_options: InstallModelIn | None = installed_models[model_id].options if was_installed else None
             old_data = dict(model.data)
 
-            if was_installed:
-                await self.uninstall_model(instance, model_id, UninstallModelIn(purge=False))
-
-            try:
-                await self.update_custom_model(instance, custom_model_id, new_definition)
-            except Exception:
-                logger.exception(f"{self.get_id(instance)} failed to apply new definition for model {model_id} while editing")
+            with self._keep_gpu_allocation(instance, model_id, installed_models):
                 if was_installed:
-                    assert install_options is not None
+                    await self.uninstall_model(instance, model_id, UninstallModelIn(purge=False))
+
+                try:
+                    await self.update_custom_model(instance, custom_model_id, new_definition)
+                except Exception:
+                    logger.exception(f"{self.get_id(instance)} failed to apply new definition for model {model_id} while editing")
+                    if was_installed:
+                        assert install_options is not None
+                        try:
+                            await self._install_model_and_wait(instance, model_id, install_options)
+                        except Exception:
+                            logger.exception(f"{self.get_id(instance)} failed to roll back model {model_id} after a failed edit")
+                    raise
+
+                if not was_installed:
+                    return None
+
+                assert install_options is not None
+                # Read the prefix `update_custom_model` actually computed for the model now sitting in the
+                # registry - not `new_definition.spec.get("default_prefix")`. `default_prefix` is optional
+                # for MCP `user`/`proxy` models and the WebUI sends it as absent whenever the field is
+                # cleared; `_update_custom_model` still falls back to `normalize_name(id)` in that case and
+                # writes that as the model's new `default_prefix`, which the raw request body never reflects.
+                updated_model = self.models.get(instance, {}).get(model_id)
+                new_default_prefix = getattr(updated_model, "default_prefix", None)
+                reinstall_options = install_options
+                if (
+                    install_options.spec is not None
+                    and new_default_prefix is not None
+                    and install_options.spec.get("prefix") != new_default_prefix
+                ):
+                    # The install-time `prefix` starts out equal to the definition's `default_prefix` (set by
+                    # `_install_model` when "prefix" is absent from the install spec) and there's no user-facing
+                    # way to diverge a custom-backed model's `prefix` from that - `edit_model_install_options`
+                    # (the only path that edits `prefix` directly) is only reachable for catalog models with no
+                    # `CustomModel` definition, mutually exclusive with this one. So `prefix` must always follow
+                    # `default_prefix` here, or editing it would silently do nothing to the registered endpoint.
+                    # `install_options` itself is left untouched so a rollback below reinstalls with the prefix
+                    # that actually matches the restored (old) definition.
+                    reinstall_options = install_options.model_copy(update={"spec": {**install_options.spec, "prefix": new_default_prefix}})
+                try:
+                    return await self._install_model_and_wait(instance, model_id, reinstall_options)
+                except Exception:
+                    logger.exception(f"{self.get_id(instance)} failed to reinstall model {model_id} while editing")
                     try:
+                        await self.update_custom_model(instance, custom_model_id, AddCustomModelIn(spec=old_data))
                         await self._install_model_and_wait(instance, model_id, install_options)
                     except Exception:
-                        logger.exception(f"{self.get_id(instance)} failed to roll back model {model_id} after a failed edit")
-                raise
+                        logger.exception(f"{self.get_id(instance)} failed to roll back model {model_id} after a failed reinstall")
+                    raise
 
-            if not was_installed:
-                return None
-
-            assert install_options is not None
-            # Read the prefix `update_custom_model` actually computed for the model now sitting in the
-            # registry - not `new_definition.spec.get("default_prefix")`. `default_prefix` is optional
-            # for MCP `user`/`proxy` models and the WebUI sends it as absent whenever the field is
-            # cleared; `_update_custom_model` still falls back to `normalize_name(id)` in that case and
-            # writes that as the model's new `default_prefix`, which the raw request body never reflects.
-            updated_model = self.models.get(instance, {}).get(model_id)
-            new_default_prefix = getattr(updated_model, "default_prefix", None)
-            reinstall_options = install_options
-            if (
-                install_options.spec is not None
-                and new_default_prefix is not None
-                and install_options.spec.get("prefix") != new_default_prefix
-            ):
-                # The install-time `prefix` starts out equal to the definition's `default_prefix` (set by
-                # `_install_model` when "prefix" is absent from the install spec) and there's no user-facing
-                # way to diverge a custom-backed model's `prefix` from that - `edit_model_install_options`
-                # (the only path that edits `prefix` directly) is only reachable for catalog models with no
-                # `CustomModel` definition, mutually exclusive with this one. So `prefix` must always follow
-                # `default_prefix` here, or editing it would silently do nothing to the registered endpoint.
-                # `install_options` itself is left untouched so a rollback below reinstalls with the prefix
-                # that actually matches the restored (old) definition.
-                reinstall_options = install_options.model_copy(update={"spec": {**install_options.spec, "prefix": new_default_prefix}})
-            try:
-                return await self._install_model_and_wait(instance, model_id, reinstall_options)
-            except Exception:
-                logger.exception(f"{self.get_id(instance)} failed to reinstall model {model_id} while editing")
-                try:
-                    await self.update_custom_model(instance, custom_model_id, AddCustomModelIn(spec=old_data))
-                    await self._install_model_and_wait(instance, model_id, install_options)
-                except Exception:
-                    logger.exception(f"{self.get_id(instance)} failed to roll back model {model_id} after a failed reinstall")
-                raise
+    def _carry_over_edited_install_options(self, old_options: InstallModelIn, new_options: InstallModelIn) -> InstallModelIn:  # noqa: ARG002
+        """Carry install options the edit form can't express from `old_options` into `new_options` (override hook)."""
+        return new_options
 
     async def edit_model_install_options(
         self, instance: str, model_id: str, new_options: InstallModelIn
@@ -1585,24 +1642,31 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             installed_models = cast("_HasModels", info.installed).models if info.installed else {}
             was_installed = model_id in installed_models
             old_options: InstallModelIn | None = installed_models[model_id].options if was_installed else None
+            if old_options is not None:
+                new_options = self._carry_over_edited_install_options(old_options, new_options)
 
-            if was_installed:
-                await self.uninstall_model(instance, model_id, UninstallModelIn(purge=False))
-
-            try:
-                promise = await self._install_model_and_wait(instance, model_id, new_options)
-            except Exception:
-                logger.exception(f"{self.get_id(instance)} failed to reinstall model {model_id} with new install options")
+            with self._keep_gpu_allocation(instance, model_id, installed_models) as set_kept_active:
                 if was_installed:
-                    assert old_options is not None
-                    try:
-                        await self._install_model_and_wait(instance, model_id, old_options)
-                    except Exception:
-                        logger.exception(
-                            f"{self.get_id(instance)} failed to roll back model {model_id} after a failed install-options edit"
-                        )
-                raise
-            return was_installed, promise
+                    await self.uninstall_model(instance, model_id, UninstallModelIn(purge=False))
+
+                # A changed gpu_priority must be re-sized from scratch; an unchanged one keeps the current allocation.
+                if self._parse_gpu_priority(new_options.spec) != self._parse_gpu_priority(old_options.spec if old_options else None):
+                    set_kept_active(False)
+                try:
+                    promise = await self._install_model_and_wait(instance, model_id, new_options)
+                except Exception:
+                    logger.exception(f"{self.get_id(instance)} failed to reinstall model {model_id} with new install options")
+                    if was_installed:
+                        assert old_options is not None
+                        set_kept_active(True)
+                        try:
+                            await self._install_model_and_wait(instance, model_id, old_options)
+                        except Exception:
+                            logger.exception(
+                                f"{self.get_id(instance)} failed to roll back model {model_id} after a failed install-options edit"
+                            )
+                    raise
+                return was_installed, promise
 
     async def _reserve_and_install(
         self,

@@ -39,7 +39,8 @@ export interface SpecField {
     | "list"
     | "map"
     | "textarea"
-    | "docker-tags";
+    | "docker-tags"
+    | "gpu-priority";
   required: boolean;
   default?: string | number | boolean;
   placeholder?: string;
