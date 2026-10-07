@@ -1362,7 +1362,7 @@ def test_create_doc_chunker_model_falls_back_to_default_version(svc: CustomServi
     model = create_doc_chunker_model(svc, "172.20.0.0/16")
 
     docker_opts = model.options({"hardware": "CPU"})  # pyright: ignore[reportCallIssue]
-    assert docker_opts.image == "hub.simplito.com/deepfellow/doc-chunker-cpu:v2.0.0"
+    assert docker_opts.image == "hub.simplito.com/deepfellow/doc-chunker-cpu:v2.4.0"
 
 
 def test_loaded_doc_chunker_model_has_docker_tags_field(svc: CustomService) -> None:
@@ -1392,7 +1392,7 @@ def test_get_docker_image_repo_for_model_unknown_model_returns_none(svc: CustomS
 
 
 def test_get_default_docker_tag_for_model_doc_chunker(svc: CustomService) -> None:
-    assert svc.get_default_docker_tag_for_model("doc_chunker", "CPU") == "v2.0.0"
+    assert svc.get_default_docker_tag_for_model("doc_chunker", "CPU") == "v2.4.0"
 
 
 def test_get_default_docker_tag_for_model_unknown_model_returns_none(svc: CustomService) -> None:
