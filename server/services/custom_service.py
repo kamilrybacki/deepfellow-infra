@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Annotated, Any, Final
 
 from fastapi import HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field, ValidationInfo, field_validator
 
 from server.applicationcontext import get_base_url
 from server.docker import DockerImage, DockerOptions
@@ -109,6 +109,7 @@ class SrvCustomModel:
     # Proxy read timeout used when the install leaves `proxy_timeout_seconds` empty; None falls back to
     # the global `standard_proxy_timeout_seconds`. For services that answer only once a long job is done.
     default_proxy_timeout_seconds: int | None = None
+    validate_install_options: Callable[[InstallModelOptions], None] | None = None
 
 
 class SrvCustomCustomModel(BaseModel):
@@ -682,6 +683,8 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
         self._installing.add(key)
 
         try:
+            if model.validate_install_options:
+                model.validate_install_options(options.spec)
             await self.validate_docker_image_version_for_model(model_id, options.spec.get("image_version"), options.spec.get("hardware"))
             docker_options = model.options(options.spec) if isinstance(model.options, Callable) else model.options
             docker_options = apply_image_version_override(docker_options, options.spec.get("image_version"))
@@ -986,6 +989,62 @@ def create_gliner_model(custom_service: CustomService, subnet: str | None) -> Sr
     )
 
 
+def _empty_to_none(value: object) -> object:
+    return None if value == "" else value
+
+
+# An emptied optional form field arrives as "", which doc-chunker reads as unset (its own default).
+type OptionalPositiveInt = Annotated[Annotated[int, Field(ge=1)] | None, BeforeValidator(_empty_to_none)]
+type OptionalNonNegativeInt = Annotated[Annotated[int, Field(ge=0)] | None, BeforeValidator(_empty_to_none)]
+
+
+class DocChunkerWorkerOptions(BaseModel):
+    """Worker split doc-chunker accepts; it refuses to start with any other.
+
+    Each field may be left unset, so doc-chunker falls back to its own default: max_concurrent is
+    then auto-sized from the container's CPU/RAM limits (unknown here, so the split can't be
+    checked against it), async_priority_workers 0, sync_only_workers 0.
+
+    Cross-field rules are field validators rather than a model validator so each error carries the
+    offending field - `format_pydantic_errors` reads the error location.
+    """
+
+    max_concurrent: OptionalPositiveInt = None
+    async_priority_workers: OptionalNonNegativeInt = None
+    sync_only_workers: OptionalNonNegativeInt = None
+
+    @field_validator("async_priority_workers")
+    @classmethod
+    def _async_priority_below_max_concurrent(cls, value: int | None, info: ValidationInfo) -> int | None:
+        max_concurrent = info.data.get("max_concurrent")
+        if max_concurrent is not None and value is not None and value >= max_concurrent:
+            msg = f"must be lower than max_concurrent ({max_concurrent})"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("sync_only_workers")
+    @classmethod
+    def _sync_only_fits_max_concurrent(cls, value: int | None, info: ValidationInfo) -> int | None:
+        max_concurrent = info.data.get("max_concurrent")
+        if max_concurrent is None or value is None:
+            return value
+        if value >= max_concurrent:
+            msg = f"must be lower than max_concurrent ({max_concurrent})"
+            raise ValueError(msg)
+        if "async_priority_workers" not in info.data:
+            return value  # async_priority_workers itself failed validation and already reports its own error
+        async_priority = info.data["async_priority_workers"] or 0  # unset uses doc-chunker's default of 0
+        if async_priority + value > max_concurrent:
+            msg = f"together with async_priority_workers ({async_priority}) must not exceed max_concurrent ({max_concurrent})"
+            raise ValueError(msg)
+        return value
+
+
+def validate_doc_chunker_workers(model_fields: InstallModelOptions) -> None:
+    """Reject a worker split doc-chunker would refuse to start with."""
+    try_parse_pydantic(DocChunkerWorkerOptions, model_fields)
+
+
 def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) -> SrvCustomModel:
     """Create doc-chunker model."""
     fields: list[ModelField] = custom_service.add_hardware_field_to_model_spec()
@@ -998,14 +1057,6 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
                 required=True,
                 placeholder="doc_chunker",
                 default="doc_chunker",
-            ),
-            ModelField(
-                type="number",
-                name="max_concurrent",
-                description="Max parallel conversion jobs",
-                required=False,
-                placeholder="2",
-                default="2",
             ),
             ModelField(
                 type="number",
@@ -1022,6 +1073,55 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
                 required=False,
                 placeholder="120",
                 default="120",
+            ),
+            ModelField(
+                type="number",
+                name="max_concurrent",
+                description=(
+                    "Workers | total parallel worker count. Workers not assigned as async priority or sync only "
+                    "take sync jobs first and async jobs when none is waiting"
+                ),
+                required=False,
+                placeholder="2",
+                default="2",
+            ),
+            ModelField(
+                type="number",
+                name="async_priority_workers",
+                description=(
+                    "Workers | workers that take queued async jobs first and sync jobs when no async job is waiting. "
+                    "Must be lower than max_concurrent; together with sync_only_workers must not exceed it"
+                ),
+                required=False,
+                placeholder="0",
+                default="0",
+            ),
+            ModelField(
+                type="number",
+                name="sync_only_workers",
+                description=(
+                    "Workers | workers reserved for sync jobs, never used by async jobs. "
+                    "Must be lower than max_concurrent; together with async_priority_workers must not exceed it"
+                ),
+                required=False,
+                placeholder="0",
+                default="0",
+            ),
+            ModelField(
+                type="number",
+                name="max_queued_jobs",
+                description="Async jobs | jobs that can wait in queue for a slot; above this limit new jobs are rejected",
+                required=False,
+                placeholder="100",
+                default="100",
+            ),
+            ModelField(
+                type="number",
+                name="job_result_ttl",
+                description="Async jobs | seconds a finished job's status and result stay available",
+                required=False,
+                placeholder="86400",
+                default="86400",
             ),
             # Image description and speech-to-text both go through the same OpenAI-compatible
             # gateway, so they share one address and key. doc-chunker appends the endpoint paths
@@ -1099,11 +1199,16 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
             container_name=custom_service.docker_service.get_docker_container_name("doc_chunker", apply_legacy_prefix=False),
             image=image,
             restart="unless-stopped",
-            volumes=[],
+            # DATA_DIR (default /var/lib/doc-chunker): registered tokenizers and async job uploads/results.
+            volumes=[f"{custom_service.get_working_dir()}/doc_chunker/data:/var/lib/doc-chunker"],
             hardware=hardware_parts,
             subnet=subnet,
             env_vars={
                 "MAX_CONCURRENT": model_fields.get("max_concurrent", 2),
+                "ASYNC_PRIORITY_WORKERS": model_fields.get("async_priority_workers", 0),
+                "SYNC_ONLY_WORKERS": model_fields.get("sync_only_workers", 0),
+                "MAX_QUEUED_JOBS": model_fields.get("max_queued_jobs", 100),
+                "JOB_RESULT_TTL": model_fields.get("job_result_ttl", 86400),
                 "DOCUMENT_TIMEOUT": model_fields.get("document_timeout", 3600),
                 "LIBREOFFICE_TIMEOUT": model_fields.get("libreoffice_timeout", 120),
                 "INFRA_API_URL": model_fields.get("infra_api_url", ""),
@@ -1132,6 +1237,7 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
         options=generate_docker_options,
         description="Converts many data types (pdf, xlxs, mp3, etc.) into text chunks suitable for vector search.",
         default_proxy_timeout_seconds=DOC_CHUNKER_PROXY_TIMEOUT_SECONDS,
+        validate_install_options=validate_doc_chunker_workers,
     )
 
 
