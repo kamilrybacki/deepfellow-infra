@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import ClientTimeout
+from aiohttp.streams import EMPTY_PAYLOAD
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -748,14 +749,14 @@ async def test_http_response_discard_releases_response_and_closes_session():
 
 @pytest.mark.asyncio
 async def test_make_http_request_success():
-    async def fake_iter_chunks():
-        yield (b"response body", False)
+    async def fake_iter_any():
+        yield b"response body"
 
     mock_resp = MagicMock()
     mock_resp.content_type = "text/plain"
     mock_resp.status = 200
     mock_resp.headers = {}
-    mock_resp.content.iter_chunks = fake_iter_chunks
+    mock_resp.content.iter_any = fake_iter_any
     mock_resp.release = AsyncMock()
 
     mock_session = MagicMock()
@@ -812,33 +813,34 @@ async def test_make_http_request_passes_timeout_when_given():
 
 
 @pytest.mark.asyncio
-async def test_make_http_request_skips_falsy_chunks():
-    """iter_chunks yields a falsy (empty) chunk — covers the False branch of 'if chunk' (559->558)."""
+async def test_make_http_request_repeated_bodiless_responses_terminate():
+    """Regression: aiohttp's shared EMPTY_PAYLOAD must end the body stream on every bodiless response, not only the first."""
 
-    async def fake_iter_chunks():
-        yield ()  # falsy — should be skipped
-        yield (b"real data", False)
+    async def collect_body(limit: int = 10) -> list[bytes]:
+        mock_resp = MagicMock()
+        mock_resp.content_type = "text/plain"
+        mock_resp.status = 204
+        mock_resp.headers = {}
+        mock_resp.content = EMPTY_PAYLOAD
+        mock_resp.release = AsyncMock()
 
-    mock_resp = MagicMock()
-    mock_resp.content_type = "text/plain"
-    mock_resp.status = 200
-    mock_resp.headers = {}
-    mock_resp.content.iter_chunks = fake_iter_chunks
-    mock_resp.release = AsyncMock()
+        mock_session = MagicMock()
+        mock_session.request = AsyncMock(return_value=mock_resp)
+        mock_session.close = AsyncMock()
 
-    mock_session = MagicMock()
-    mock_session.request = AsyncMock(return_value=mock_resp)
-    mock_session.close = AsyncMock()
+        with patch("server.utils.core.ClientSession", return_value=mock_session):
+            result = await make_http_request("http://example.com/", method="DELETE")
 
-    with patch("server.utils.core.ClientSession", return_value=mock_session):
-        result = await make_http_request("http://example.com/")
+        chunks = list[bytes]()
+        async for chunk in result.content:
+            chunks.append(chunk)
+            if len(chunks) >= limit:
+                break
+        await result.content.aclose()
+        return chunks
 
-    chunks = []
-    async for chunk in result.content:
-        chunks.append(chunk)
-
-    assert b"real data" in chunks
-    assert () not in chunks
+    assert await collect_body() == []
+    assert await collect_body() == []
 
 
 @pytest.mark.asyncio
