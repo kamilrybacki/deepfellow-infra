@@ -4,7 +4,7 @@
 import asyncio
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -27,6 +27,7 @@ from server.services.custom_service import (
     create_doc_chunker_model,
     create_gliner_model,
     create_lemmatizer_model,
+    validate_doc_chunker_workers,
 )
 from server.utils.hardware import NvidiaGpuInfo
 from server.utils.registry_client import RegistryUnavailableError
@@ -907,7 +908,11 @@ async def test_install_model_uses_the_models_default_proxy_timeout_over_the_stan
 
     with patch.object(svc, "validate_docker_image_version_for_model", new_callable=AsyncMock):
         promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
-            "default", "doc_chunker", InstallModelIn(spec={"prefix": "doc_chunker", "hardware": "CPU"})
+            "default",
+            "doc_chunker",
+            InstallModelIn(
+                spec={"prefix": "doc_chunker", "hardware": "CPU", "max_concurrent": 2, "async_priority_workers": 1, "sync_only_workers": 0}
+            ),
         )
     await promise.wait()
 
@@ -924,7 +929,16 @@ async def test_install_model_prefers_the_install_proxy_timeout_over_the_models_d
         promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
             "default",
             "doc_chunker",
-            InstallModelIn(spec={"prefix": "doc_chunker", "hardware": "CPU", "proxy_timeout_seconds": 42}),
+            InstallModelIn(
+                spec={
+                    "prefix": "doc_chunker",
+                    "hardware": "CPU",
+                    "max_concurrent": 2,
+                    "async_priority_workers": 1,
+                    "sync_only_workers": 0,
+                    "proxy_timeout_seconds": 42,
+                }
+            ),
         )
     await promise.wait()
 
@@ -947,6 +961,135 @@ def test_doc_chunker_proxy_timeout_field_names_its_own_default(svc: CustomServic
     proxy_field = next(field for field in fields if field.name == "proxy_timeout_seconds")
 
     assert f"{DOC_CHUNKER_PROXY_TIMEOUT_SECONDS}s" in proxy_field.description
+
+
+def test_doc_chunker_mounts_data_dir_and_sets_async_job_defaults(svc: CustomService) -> None:
+    model = svc.models["default"]["doc_chunker"]
+
+    docker_options = model.options({"hardware": "CPU"})  # pyright: ignore[reportCallIssue]
+
+    assert docker_options.volumes == [f"{svc.get_working_dir()}/doc_chunker/data:/var/lib/doc-chunker"]
+    env_vars = docker_options.env_vars or {}
+    assert env_vars["MAX_QUEUED_JOBS"] == 100
+    assert env_vars["JOB_RESULT_TTL"] == 86400
+    assert "TOKENIZER_DIR" not in env_vars
+
+
+def test_doc_chunker_worker_fields_are_optional(svc: CustomService) -> None:
+    fields = {field.name: field for field in svc.models["default"]["doc_chunker"].model_spec.fields}
+
+    for name, default in (("max_concurrent", "2"), ("async_priority_workers", "0"), ("sync_only_workers", "0")):
+        assert fields[name].required is False
+        assert fields[name].default == default
+
+
+def test_doc_chunker_passes_worker_split_to_container(svc: CustomService) -> None:
+    model = svc.models["default"]["doc_chunker"]
+
+    docker_options = model.options(  # pyright: ignore[reportCallIssue]
+        {"hardware": "CPU", "max_concurrent": 4, "async_priority_workers": 2, "sync_only_workers": 1}
+    )
+
+    env_vars = docker_options.env_vars or {}
+    assert env_vars["MAX_CONCURRENT"] == 4
+    assert env_vars["ASYNC_PRIORITY_WORKERS"] == 2
+    assert env_vars["SYNC_ONLY_WORKERS"] == 1
+
+
+def test_doc_chunker_options_fall_back_to_field_defaults_for_partial_spec(svc: CustomService) -> None:
+    """Image resolution and model export call options with just the hardware - only install validates."""
+    model = svc.models["default"]["doc_chunker"]
+
+    docker_options = model.options({"hardware": "CPU"})  # pyright: ignore[reportCallIssue]
+
+    env_vars = docker_options.env_vars or {}
+    assert env_vars["MAX_CONCURRENT"] == 2
+    assert env_vars["ASYNC_PRIORITY_WORKERS"] == 0
+    assert env_vars["SYNC_ONLY_WORKERS"] == 0
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"max_concurrent": 1, "async_priority_workers": 0, "sync_only_workers": 0},
+        {"max_concurrent": 2, "async_priority_workers": 1, "sync_only_workers": 1},
+        {"max_concurrent": "4", "async_priority_workers": "3", "sync_only_workers": "0"},
+        {},
+        {"max_concurrent": "", "async_priority_workers": "", "sync_only_workers": ""},
+        # max_concurrent left to doc-chunker's auto-sizing - the split can't be checked against it
+        {"max_concurrent": "", "async_priority_workers": 5, "sync_only_workers": 5},
+        # unset async_priority_workers counts as doc-chunker's default of 0
+        {"max_concurrent": 1, "async_priority_workers": "", "sync_only_workers": 0},
+        {"max_concurrent": 3, "async_priority_workers": "", "sync_only_workers": 2},
+    ],
+)
+def test_validate_doc_chunker_workers_accepts_valid_split(fields: dict[str, Any]) -> None:
+    validate_doc_chunker_workers(fields)
+
+
+@pytest.mark.parametrize(
+    ("fields", "field", "message"),
+    [
+        (
+            {"max_concurrent": 2, "async_priority_workers": "", "sync_only_workers": 2},
+            "sync_only_workers",
+            "must be lower than max_concurrent (2)",
+        ),
+        (
+            {"max_concurrent": 3, "async_priority_workers": "", "sync_only_workers": 3},
+            "sync_only_workers",
+            "must be lower than max_concurrent (3)",
+        ),
+        (
+            {"max_concurrent": 2, "sync_only_workers": 2},
+            "sync_only_workers",
+            "must be lower than max_concurrent (2)",
+        ),
+        (
+            {"max_concurrent": 2, "async_priority_workers": 2, "sync_only_workers": 0},
+            "async_priority_workers",
+            "must be lower than max_concurrent (2)",
+        ),
+        (
+            {"max_concurrent": 1, "async_priority_workers": 0, "sync_only_workers": 1},
+            "sync_only_workers",
+            "must be lower than max_concurrent (1)",
+        ),
+        (
+            {"max_concurrent": 3, "async_priority_workers": 2, "sync_only_workers": 2},
+            "sync_only_workers",
+            "together with async_priority_workers (2) must not exceed max_concurrent (3)",
+        ),
+        ({"max_concurrent": 0, "async_priority_workers": 0, "sync_only_workers": 0}, "max_concurrent", "greater than or equal to 1"),
+        ({"max_concurrent": 2, "async_priority_workers": 0, "sync_only_workers": -1}, "sync_only_workers", "greater than or equal to 0"),
+        ({"max_concurrent": 2, "async_priority_workers": "many", "sync_only_workers": 0}, "async_priority_workers", "valid integer"),
+        ({"max_concurrent": "1.5", "async_priority_workers": 0, "sync_only_workers": 0}, "max_concurrent", "valid integer"),
+    ],
+)
+def test_validate_doc_chunker_workers_rejects_invalid_split(fields: dict[str, Any], field: str, message: str) -> None:
+    with pytest.raises(HTTPException) as exc:
+        validate_doc_chunker_workers(fields)
+
+    assert exc.value.status_code == 400
+    errors = cast("list[dict[str, str]]", exc.value.detail)
+    assert any(error["field"] == field and message in error["message"] for error in errors)
+
+
+@pytest.mark.asyncio
+async def test_install_doc_chunker_rejects_invalid_worker_split_before_pulling_image(svc: CustomService, deps: dict[str, Any]) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    _mock_successful_install(deps)
+
+    with patch.object(svc, "validate_docker_image_version_for_model", new_callable=AsyncMock), pytest.raises(HTTPException) as exc:
+        await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+            "default",
+            "doc_chunker",
+            InstallModelIn(spec={"prefix": "doc_chunker", "hardware": "CPU", "max_concurrent": 2, "sync_only_workers": 2}),
+        )
+
+    assert exc.value.status_code == 400
+    deps["docker_service"].install_and_run_docker.assert_not_called()
+    assert ("default", "doc_chunker") not in svc._installing  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
