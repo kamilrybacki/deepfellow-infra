@@ -671,9 +671,8 @@ async def make_http_request(
 
         async def generator() -> AsyncGenerator[bytes]:
             try:
-                async for chunk in response.content.iter_chunks():
-                    if chunk:
-                        yield chunk[0]
+                async for chunk in response.content.iter_any():
+                    yield chunk
             finally:
                 await response.release()
                 await session.close()
