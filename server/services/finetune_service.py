@@ -55,7 +55,7 @@ from server.utils.core import PromiseWithProgress, Stream, StreamChunk, StreamCh
 logger = logging.getLogger("uvicorn.error")
 
 _FINETUNE_MODEL_ID = "deepfellow-finetune"
-_FINETUNE_IMAGE = f"hub.simplito.com/deepfellow/{_FINETUNE_MODEL_ID}:0.0.18"
+_FINETUNE_IMAGE = f"hub.simplito.com/deepfellow/{_FINETUNE_MODEL_ID}:0.0.20"
 
 
 class FinetuneOptions(BaseModel):
@@ -245,6 +245,16 @@ class FinetuneService(Base2Service[InstalledInfo, DownloadedInfo]):
             subnet = self.docker_service.get_docker_subnet()
             name = self.get_service_id(instance)
             instance_dir = self.get_working_dir() / name
+            # Created here rather than by the docker daemon on bind-mount, so they're owned by the same
+            # uid the container runs as (see `user` below) and the worker can write to them
+            for subdir in ("configs", "data", "db"):
+                (instance_dir / subdir).mkdir(parents=True, exist_ok=True)
+            # df-finetune (>= 0.0.19) requires a bearer token on every endpoint except /health. Infra
+            # authenticates to it with the adapter registry secret: directly (`list_adapters`, the vLLM
+            # adapter download) and via the proxy below. Without a secret, run it unauthenticated as before
+            # (it's only reachable on the docker subnet and through infra's authenticated proxy).
+            worker_token = self.config.adapter_registry_secret.get_secret_value()
+            auth_env = {"DFFT_TOKEN": worker_token} if worker_token else {"DFFT_ALLOW_NOAUTH": "1"}
             docker_options = DockerOptions(
                 image_port=8333,
                 name=name,
@@ -260,9 +270,13 @@ class FinetuneService(Base2Service[InstalledInfo, DownloadedInfo]):
                 ],
                 hardware=hardware_parts,
                 subnet=subnet,
+                # The image runs as uid 1000 by default; run as infra's own user instead so the container
+                # can write the bind-mounted dirs infra creates (and infra can delete what it writes)
+                user=await self.docker_service.get_user_for_docker(),
                 env_vars={
                     "HF_TOKEN": self.config.hugging_face_token.get_secret_value(),
                     "DFFT_DB_PATH": "/data/worker.db",
+                    **auth_env,
                 },
                 healthcheck={
                     "test": "wget -q --spider http://localhost:8333/health",
@@ -284,7 +298,12 @@ class FinetuneService(Base2Service[InstalledInfo, DownloadedInfo]):
             registration_id = self.endpoint_registry.register_custom_endpoint_as_proxy(
                 url=parsed_options.prefix,
                 props=ModelProps(private=True, type="custom", endpoints=[f"/custom/{parsed_options.prefix}"]),
-                options=ProxyOptions(url=base_url, read_timeout_seconds=proxy_timeout_seconds),
+                # The proxy drops the client's Authorization (infra's own API key); authenticate to the worker instead
+                options=ProxyOptions(
+                    url=base_url,
+                    headers=Utils.create_bearer_header(worker_token),
+                    read_timeout_seconds=proxy_timeout_seconds,
+                ),
                 registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
             )
             stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
