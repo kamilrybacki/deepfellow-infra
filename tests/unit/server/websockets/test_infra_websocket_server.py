@@ -237,15 +237,36 @@ async def test_on_init_already_authorised_raises():
 
 
 @pytest.mark.asyncio
-async def test_on_init_wrong_key_raises():
+@pytest.mark.parametrize("provided", ["wrong-key", "", MESH_KEY + "-longer", MESH_KEY[:-1], "ü" + MESH_KEY])
+async def test_on_init_wrong_key_raises(provided: str):
     server = make_server()
     ctx = InfraWsData(authorized=None)
-    params = InitRequest(auth="wrong-key", name="sub", url="http://sub", api_key="key", models=[], check_key="ck")
+    params = InitRequest(auth=provided, name="sub", url="http://sub", api_key="key", models=[], check_key="ck")
 
     with pytest.raises(ApiError) as exc_info:
         await server._on_init(params, ctx)  # pyright: ignore[reportPrivateUsage]
 
     assert exc_info.value.code == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provided", ["", "any-key"])
+async def test_on_init_rejects_when_mesh_key_not_configured(provided: str):
+    server = make_server()
+    cast("MagicMock", server.config).mesh_key.get_secret_value.return_value = ""
+    ctx = InfraWsData(authorized=None)
+    params = InitRequest(auth=provided, name="sub", url="http://sub", api_key="key", models=[], check_key="ck")
+
+    with (
+        patch("server.websockets.infra_websocket_server.make_http_request", new=AsyncMock()) as http_mock,
+        pytest.raises(ApiError) as exc_info,
+    ):
+        await server._on_init(params, ctx)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.code == 2
+    assert exc_info.value.message == "Invalid api key"
+    assert http_mock.call_count == 0
+    assert ctx.authorized is None
 
 
 def test_init_request_rejects_empty_check_key():

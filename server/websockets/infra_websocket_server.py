@@ -11,7 +11,7 @@ from server.config import AppSettings
 from server.endpointregistry import EndpointRegistry
 from server.models.api import Model
 from server.models.mesh import CheckMeshConnection, MeshInfo, MeshInfoInfra, MeshInfoModel, MeshTopologyNode
-from server.utils.core import make_http_request
+from server.utils.core import make_http_request, secrets_equal
 from server.utils.exceptions import ApiError
 from server.utils.json_rpc_server import JsonRpcServer
 from server.utils.logger import logger
@@ -108,7 +108,10 @@ class InfraWebsocketServer(WebSocketServer[InfraWsData]):
     async def _on_init(self, params: InitRequest, context: InfraWsData) -> InitResponse:
         if context.authorized:
             raise ApiError(code=1, message="Already authorized")
-        if params.auth != self.config.mesh_key.get_secret_value():
+        mesh_key = self.config.mesh_key.get_secret_value()
+        # An unset mesh key must not accept an empty auth: the follow-up check goes to a client-supplied URL.
+        # Same error as a wrong key, so the subinfra stops reconnecting (see ParentInfra.on_start).
+        if not mesh_key or not secrets_equal(params.auth, mesh_key):
             raise ApiError(code=2, message="Invalid api key")
 
         url = f"{params.url}/admin/mesh/check"

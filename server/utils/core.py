@@ -9,6 +9,7 @@ import errno
 import json
 import platform
 import re
+import secrets
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -686,6 +687,11 @@ async def make_http_request(
         raise
 
 
+def secrets_equal(provided: str, expected: str) -> bool:
+    """Compare secrets in constant time (UTF-8 encoded, so non-ASCII input is safe)."""
+    return secrets.compare_digest(provided.encode(), expected.encode())
+
+
 class OneTimeKey:
     """Generate new key every time. If key is correct then remove it."""
 
@@ -705,7 +711,10 @@ class OneTimeKey:
 
         Remove key if correct.
         """
-        if input_key == self._key:
+        if self._key is None:
+            return False
+
+        if secrets_equal(input_key, self._key):
             self._key = None
             return True
 
