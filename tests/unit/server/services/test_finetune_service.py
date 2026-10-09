@@ -344,7 +344,7 @@ async def test_install_instance_creates_container_in_one_step(
     assert docker_options.image_port == 8333
     assert docker_options.name == "finetune"
     assert docker_options.container_name == "df-finetune"
-    assert docker_options.image == "hub.simplito.com/deepfellow/deepfellow-finetune:0.0.18"
+    assert docker_options.image == "hub.simplito.com/deepfellow/deepfellow-finetune:0.0.20"
     assert docker_options.volumes == [
         f"{tmp_path}/models:/workspace/models",
         f"{tmp_path}/adapters:/workspace/adapters",
@@ -357,6 +357,64 @@ async def test_install_instance_creates_container_in_one_step(
     assert (tmp_path / "adapters").is_dir()
     registered_options = deps["endpoint_registry"].register_custom_endpoint_as_proxy.call_args.kwargs["options"]
     assert registered_options.read_timeout_seconds == 300
+
+
+@pytest.mark.asyncio
+@patch.object(FinetuneService, "_get_working_dir")
+async def test_install_instance_authenticates_worker_with_adapter_registry_secret(
+    mock_get_working_dir: MagicMock, svc: FinetuneService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    """df-finetune >= 0.0.19 refuses to start without DFFT_TOKEN; the proxy drops the client's Authorization, so it must send the token."""
+    mock_get_working_dir.return_value = tmp_path
+    _mock_install_deps(deps)
+
+    promise = await svc._install_instance("default", InstallServiceIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+    await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.env_vars["DFFT_TOKEN"] == "test-secret"
+    assert "DFFT_ALLOW_NOAUTH" not in docker_options.env_vars
+    registered_options = deps["endpoint_registry"].register_custom_endpoint_as_proxy.call_args.kwargs["options"]
+    assert registered_options.headers == {"Authorization": "Bearer test-secret"}
+
+
+@pytest.mark.asyncio
+@patch.object(FinetuneService, "_get_working_dir")
+async def test_install_instance_runs_worker_unauthenticated_without_adapter_registry_secret(
+    mock_get_working_dir: MagicMock, svc: FinetuneService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    """Without a secret there's no token to give the worker, so it must be told to accept unauthenticated requests or it won't start."""
+    mock_get_working_dir.return_value = tmp_path
+    deps["config"].adapter_registry_secret = SecretStr("")
+    _mock_install_deps(deps)
+
+    promise = await svc._install_instance("default", InstallServiceIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+    await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.env_vars["DFFT_ALLOW_NOAUTH"] == "1"
+    assert "DFFT_TOKEN" not in docker_options.env_vars
+    registered_options = deps["endpoint_registry"].register_custom_endpoint_as_proxy.call_args.kwargs["options"]
+    assert registered_options.headers == {}
+
+
+@pytest.mark.asyncio
+@patch.object(FinetuneService, "_get_working_dir")
+async def test_install_instance_runs_as_infra_user_and_precreates_instance_dirs(
+    mock_get_working_dir: MagicMock, svc: FinetuneService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    """The image runs as uid 1000; bind-mounted dirs created by the docker daemon would be root-owned and unwritable."""
+    mock_get_working_dir.return_value = tmp_path
+    _mock_install_deps(deps)
+    deps["docker_service"].get_user_for_docker = AsyncMock(return_value="1234:1234")
+
+    promise = await svc._install_instance("default", InstallServiceIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+    await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.user == "1234:1234"
+    for subdir in ("configs", "data", "db"):
+        assert (tmp_path / "finetune" / subdir).is_dir()
 
 
 @pytest.mark.asyncio
@@ -451,7 +509,7 @@ async def test_uninstall_instance_with_purge_removes_image(svc: FinetuneService,
     await svc._uninstall_instance("default", UninstallServiceIn(purge=True))  # pyright: ignore[reportPrivateUsage]
 
     assert svc.service_downloaded is False
-    deps["docker_service"].remove_image.assert_called_once_with("hub.simplito.com/deepfellow/deepfellow-finetune:0.0.18")
+    deps["docker_service"].remove_image.assert_called_once_with("hub.simplito.com/deepfellow/deepfellow-finetune:0.0.20")
 
 
 @pytest.mark.asyncio
