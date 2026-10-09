@@ -15,6 +15,7 @@ from server.metrics import MetricsService
 from server.serviceprovider import ServiceProvider
 from server.services_manager import ServicesManager
 from server.task_manager import TaskManager
+from server.utils.core import secrets_equal
 from server.utils.hardware import Hardware
 from server.utils.model_downloader import ModelDownloader
 from server.utils.tracing import OtlpLoggingManager
@@ -99,7 +100,7 @@ def auth_server(
     config: Annotated[AppSettings, Depends(get_config)],
 ) -> str:
     """Authenticate an server key."""
-    if api_key.credentials == config.infra_api_key.get_secret_value():
+    if secrets_equal(api_key.credentials, config.infra_api_key.get_secret_value()):
         return api_key.credentials
 
     raise HTTPException(status_code=401, detail="Unauthorized")
@@ -110,7 +111,7 @@ def auth_admin(
     config: Annotated[AppSettings, Depends(get_config)],
 ) -> str:
     """Authenticate administrator."""
-    if api_key.credentials == config.infra_admin_api_key.get_secret_value():
+    if secrets_equal(api_key.credentials, config.infra_admin_api_key.get_secret_value()):
         return api_key.credentials
 
     raise HTTPException(status_code=401, detail="Unauthorized")
@@ -122,7 +123,10 @@ async def auth_metrics(
 ) -> None:
     """Authenticate using HTTP Basic Auth."""
     config: AppSettings = request.app.state.config
-    if (auth.username == config.metrics_username) and (auth.password == config.metrics_password.get_secret_value()):
+    # Evaluate both comparisons so the response time doesn't reveal whether the username matched.
+    username_ok = secrets_equal(auth.username, config.metrics_username)
+    password_ok = secrets_equal(auth.password, config.metrics_password.get_secret_value())
+    if username_ok and password_ok:
         return
 
     raise HTTPException(401, "Not Authenticated.")

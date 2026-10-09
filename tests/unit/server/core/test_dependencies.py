@@ -3,7 +3,8 @@
 
 """Tests for server/core/dependencies.py."""
 
-from unittest.mock import MagicMock
+import contextlib
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -27,6 +28,7 @@ from server.core.dependencies import (
     get_services_manager,
     get_task_manager,
 )
+from server.utils.core import secrets_equal
 
 
 def _make_request(state_attrs: dict[str, object] | None = None) -> MagicMock:
@@ -94,9 +96,10 @@ def test_auth_server_returns_credentials_when_valid() -> None:
     assert result == "server-key"
 
 
-def test_auth_server_raises_401_when_invalid() -> None:
+@pytest.mark.parametrize("provided", ["wrong-key", "", "server-key-longer", "server-kez", "sérver-key"])
+def test_auth_server_raises_401_when_invalid(provided: str) -> None:
     with pytest.raises(HTTPException) as exc_info:
-        auth_server(_bearer("wrong-key"), _config(api_key="server-key"))
+        auth_server(_bearer(provided), _config(api_key="server-key"))
 
     assert exc_info.value.status_code == 401
 
@@ -107,9 +110,10 @@ def test_auth_admin_returns_credentials_when_valid() -> None:
     assert result == "admin-key"
 
 
-def test_auth_admin_raises_401_when_invalid() -> None:
+@pytest.mark.parametrize("provided", ["wrong-key", "", "admin-key-longer", "admin-kez", "ädmin-key"])
+def test_auth_admin_raises_401_when_invalid(provided: str) -> None:
     with pytest.raises(HTTPException) as exc_info:
-        auth_admin(_bearer("wrong-key"), _config(admin_key="admin-key"))
+        auth_admin(_bearer(provided), _config(admin_key="admin-key"))
 
     assert exc_info.value.status_code == 401
 
@@ -136,6 +140,11 @@ async def test_auth_metrics_passes_when_credentials_match(metrics_request: Magic
     [
         ("wrong", "pass"),
         ("user", "wrong"),
+        ("", "pass"),
+        ("user", ""),
+        ("user", "pass-longer"),
+        ("üser", "pass"),
+        ("user", "päss"),
     ],
 )
 @pytest.mark.asyncio
@@ -146,3 +155,14 @@ async def test_auth_metrics_raises_401_for_invalid_credentials(username: str, pa
         await auth_metrics(metrics_request, creds)
 
     assert exc_info.value.status_code == 401
+
+
+@pytest.mark.parametrize(("username", "password"), [("wrong", "pass"), ("user", "wrong"), ("user", "pass")])
+@pytest.mark.asyncio
+async def test_auth_metrics_always_compares_both_credentials(username: str, password: str, metrics_request: MagicMock) -> None:
+    creds = HTTPBasicCredentials(username=username, password=password)
+
+    with patch("server.core.dependencies.secrets_equal", wraps=secrets_equal) as secrets_equal_mock, contextlib.suppress(HTTPException):
+        await auth_metrics(metrics_request, creds)
+
+    assert secrets_equal_mock.call_count == 2

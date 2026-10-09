@@ -33,6 +33,7 @@ from server.utils.core import (
     load_json_registry,
     make_http_request,
     positive_context_window_or_none,
+    secrets_equal,
     stream_fetch_from,
     with_legacy_key_carried_over,
     with_legacy_key_migrated,
@@ -882,10 +883,35 @@ def test_one_time_key_valid():
     assert otk._key is None  # type: ignore[attr-defined]
 
 
-def test_one_time_key_invalid():
+@pytest.mark.parametrize("provided", ["wrong-key", "", "a" * 64, "ł" * 32])
+def test_one_time_key_invalid(provided: str):
     otk = OneTimeKey()
-    _ = otk.key
-    assert otk.check("wrong-key") is False
+    key = otk.key
+    assert otk.check(provided) is False
+    assert otk._key == key  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("provided", ["", "some-key"])
+def test_one_time_key_returns_false_when_no_key_generated(provided: str):
+    otk = OneTimeKey()
+    assert otk.check(provided) is False
+
+
+@pytest.mark.parametrize(
+    ("provided", "expected", "result"),
+    [
+        ("secret", "secret", True),
+        ("", "", True),
+        ("zażółć", "zażółć", True),
+        ("secret", "secreT", False),
+        ("secret", "secret-longer", False),
+        ("", "secret", False),
+        ("secret", "", False),
+        ("sécret", "secret", False),
+    ],
+)
+def test_secrets_equal(provided: str, expected: str, result: bool):
+    assert secrets_equal(provided, expected) is result
 
 
 def test_one_time_key_consumed_after_correct_check():

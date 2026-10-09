@@ -308,12 +308,13 @@ def test_check_subinfra_connection_returns_false_when_key_invalid():
     assert infra.check_subinfra_connection(model) is False
 
 
-def test_check_subinfra_connection_returns_false_when_api_key_mismatch():
+@pytest.mark.parametrize("provided", ["wrong-key", "", "api-key-longer", "api-kez", "äpi-key"])
+def test_check_subinfra_connection_returns_false_when_api_key_mismatch(provided: str):
     infra = make_parent_infra()
     infra.one_time_key = MagicMock()
     infra.one_time_key.check.return_value = True
 
-    model = CheckMeshConnection(infra_api_key="wrong-key", connection_verifier="ck")
+    model = CheckMeshConnection(infra_api_key=provided, connection_verifier="ck")
 
     assert infra.check_subinfra_connection(model) is False
 
