@@ -1304,7 +1304,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                 docker_adapter_path=docker_adapter_path,
                 lora_rank=lora_rank,
             )
-            docker_options.command = " ".join(vllm_command)
+            docker_options.command = vllm_command
             try:
                 docker_exposed_port, restarted, adopted = await self.docker_service.install_and_run_docker(docker_options)
             except Exception as retry_exc:
@@ -1407,7 +1407,7 @@ class VllmService(Base2Service[InstalledInfo, DownloadedInfo]):
                     name=service_name,
                     container_name=container_name_override or self.docker_service.get_docker_container_name(service_name),
                     image=image.name,
-                    command=" ".join(vllm_command),
+                    command=vllm_command,
                     image_port=8000,
                     env_vars=env_vars,
                     restart="unless-stopped",

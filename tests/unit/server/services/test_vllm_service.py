@@ -1250,6 +1250,36 @@ async def test_install_model_appends_revision_suffix_to_model_dir(svc: VllmServi
 
 
 @pytest.mark.asyncio
+@patch.object(VllmService, "get_specified_hardware_parts", return_value=[])
+@patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000")
+@patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096)
+@patch.object(VllmService, "_download_model_or_set_progress", new_callable=AsyncMock)
+async def test_install_model_passes_json_extra_arg_verbatim(
+    mock_download_model_or_set_progress: AsyncMock,
+    mock_get_model_dir_context_window: AsyncMock,
+    mock_get_base_url: MagicMock,
+    mock_get_specified_hardware_parts: MagicMock,
+    svc: VllmService,
+    deps: dict[str, Any],
+    tmp_path: Path,
+):
+    _setup_install_mocks(svc, deps)
+    mock_download_model_or_set_progress.return_value = tmp_path / "model"
+    model_id = next(iter(svc.models["default"]))
+    json_value = '{"method":"mtp","num_speculative_tokens":3}'
+    spec = {"extra_args": {"--speculative-config": json_value}}
+
+    promise = await svc._install_model("default", model_id, InstallModelIn(spec=spec))  # pyright: ignore[reportPrivateUsage]
+    await promise.wait()
+
+    assert deps["docker_service"].install_and_run_docker.call_count == 1
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert isinstance(docker_options.command, list)
+    idx = docker_options.command.index("--speculative-config")
+    assert docker_options.command[idx + 1] == json_value
+
+
+@pytest.mark.asyncio
 async def test_install_model_dedups_download_by_revision_aware_key(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
     """Two custom models sharing an hf_id but differing only by revision must not share a download dedup key.
 
@@ -1356,8 +1386,10 @@ async def test_install_model_downloads_and_mounts_lora_adapter(svc: VllmService,
     docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
     assert any("adapter-pirate_llama" in volume and "/mnt/hf/loras/pirate_llama" in volume for volume in docker_options.volumes)
     assert "--enable-lora" in docker_options.command
-    assert "--lora-modules pirate-bot=/mnt/hf/loras/pirate_llama" in docker_options.command
-    assert "--max-lora-rank 16" in docker_options.command
+    command = docker_options.command
+    assert isinstance(command, list)
+    assert command[command.index("--lora-modules") + 1] == "pirate-bot=/mnt/hf/loras/pirate_llama"
+    assert command[command.index("--max-lora-rank") + 1] == "16"
     assert svc.models_downloaded["pirate-bot"].adapter_path is not None
 
 
@@ -1841,6 +1873,44 @@ async def test_install_model_retries_with_suggested_max_len_on_kv_cache_error(
     assert deps["docker_service"].install_and_run_docker.call_count == 2
     register_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
     assert register_kwargs["props"].context_window == 110256
+
+
+@pytest.mark.asyncio
+@patch.object(VllmService, "get_specified_hardware_parts")
+@patch.object(VllmService, "is_given_hardware_support_gpu", return_value=True)
+@patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000")
+@patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=131072)
+@patch.object(VllmService, "_download_model_or_set_progress", new_callable=AsyncMock)
+async def test_install_model_keeps_json_extra_arg_verbatim_on_kv_cache_retry(
+    mock_download_model_or_set_progress: AsyncMock,
+    mock_get_model_dir_context_window: AsyncMock,
+    mock_get_base_url: MagicMock,
+    mock_is_given_hardware_support_gpu: MagicMock,
+    mock_get_specified_hardware_parts: MagicMock,
+    deps: dict[str, Any],
+    tmp_path: Path,
+):
+    nvidia = MagicMock(spec=NvidiaGpuInfo)
+    deps["hardware"].gpus = [nvidia]
+    gpu_svc = VllmService(**deps)
+    _setup_install_mocks(gpu_svc, deps, hardware=True)
+    kv_cache_error = AppError("the estimated maximum model length is 110256.")
+    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[kv_cache_error, (8000, True, False)])
+    deps["docker_service"].stop_docker = AsyncMock()
+    mock_download_model_or_set_progress.return_value = tmp_path / "model"
+    mock_get_specified_hardware_parts.return_value = [nvidia]
+    model_id = next(iter(gpu_svc.models["default"]))
+    json_value = '{"method":"mtp","num_speculative_tokens":3}'
+    spec = {"gpu_memory_utilization": 0.5, "extra_args": {"--speculative-config": json_value}}
+
+    promise = await gpu_svc._install_model("default", model_id, InstallModelIn(spec=spec))  # pyright: ignore[reportPrivateUsage]
+    await promise.wait()
+
+    assert deps["docker_service"].install_and_run_docker.call_count == 2
+    retried_command = deps["docker_service"].install_and_run_docker.call_args.args[0].command
+    assert isinstance(retried_command, list)
+    assert retried_command[retried_command.index("--max-model-len") + 1] == "110256"
+    assert retried_command[retried_command.index("--speculative-config") + 1] == json_value
 
 
 @pytest.mark.asyncio
