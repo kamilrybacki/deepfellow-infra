@@ -23,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Removed
 
+- The temporary DFFL-to-MIT migration step of the license header check (`scripts/check_license_header.py`): `--fix` no longer strips the old DeepFellow Free License prose header from `.py` files, as the transition period that began on 2026-08-14 has ended.
 - The Coqui TTS service (`CoquiService`) and its model registry. It was unmaintained and unused. Installed Coqui instances are no longer managed by DF Infra; remove their containers manually.
 - The `adapter_registry_url` setting (`DF_ADAPTER_REGISTRY_URL`, `PUT /admin/config`). The df-finetune adapter registry's address is now resolved live from the installed Finetune service, since the manually configured URL drifted from the container's dynamically assigned host port. An existing `config.json` is migrated automatically (schema version 2 → 3) and the key dropped. `adapter_registry_secret` is unchanged.
 - The `deepfellow-finetune` model of the Custom service, superseded by the Finetune service. On the first startup after upgrading, an installed one is dropped from the Custom service's config and its container is removed. Its data under the Custom service's working directory is left in place but not migrated; install the Finetune service instead.
