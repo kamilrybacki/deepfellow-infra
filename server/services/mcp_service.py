@@ -98,6 +98,10 @@ NodeVersion = Literal["20", "22", "24", "latest"]
 _DEFAULT_PYTHON_VERSION: PythonVersion = "3.13"
 _DEFAULT_NODE_VERSION: NodeVersion = "22"
 
+_HEALTH_MONITOR_INTERVAL_SECONDS = 30.0
+# Consecutive failed probes before a healthy MCP is hidden; a single timeout must not flap it (and the mesh parent).
+_HEALTH_MONITOR_FAILURE_THRESHOLD = 3
+
 
 def _version_to_base_image(variant: McpUserVariant, python_version: PythonVersion | None, node_version: NodeVersion | None) -> str:
     if variant in (McpUserVariant.python_headless, McpUserVariant.python_headed):
@@ -556,6 +560,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
         self._oauth_state_store = McpOAuthStateStore()
         self._oauth_refresh_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._oauth_refresh_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
+        self._health_monitor_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
 
     def load_default_models(self, instance: str) -> None:
         """Load default models to instance."""
@@ -676,6 +681,8 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
 
     async def stop_instance(self, instance: str) -> None:
         """Stop all MCP service Docker containers."""
+        for key in [key for key in self._health_monitor_tasks if key[0] == instance]:
+            self._stop_health_monitor(*key)
         installed = self.get_instance_info(instance).installed
         if not installed:
             return
@@ -1371,15 +1378,88 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                 pass
 
     def _apply_healthcheck_result(self, model: SrvMcpModel, prefix: str, result: McpHealthCheckResult) -> None:
-        """Persist tool list, transport, and healthy flag from a successful health check."""
-        model.model_props.tools = result.tools
-        if result.transport:
-            model.model_props.transport = result.transport
+        """Persist tool list, transport, and healthy flag from a successful health check.
+
+        Notifies the parent infra when anything a mesh parent mirrors (tools, transport, health) changed.
+        """
+        changed = False
+        # Registrations may share `model.model_props`, so compare against them before it is overwritten below.
         for reg_model in self.endpoint_registry.mcp_endpoints.models.get(prefix, {}).values():
+            changed = changed or not reg_model.healthy or reg_model.props.tools != result.tools
             reg_model.healthy = True
             reg_model.props.tools = result.tools
             if result.transport:
+                changed = changed or reg_model.props.transport != result.transport
                 reg_model.props.transport = result.transport
+        model.model_props.tools = result.tools
+        if result.transport:
+            model.model_props.transport = result.transport
+        if changed:
+            self.endpoint_registry.parent_infra.send_models_list()
+
+    def _mark_unhealthy(self, prefix: str) -> None:
+        """Hide an MCP whose server stopped answering, keeping its last known tools, and tell the mesh parent."""
+        changed = False
+        for reg_model in self.endpoint_registry.mcp_endpoints.models.get(prefix, {}).values():
+            if reg_model.healthy:
+                reg_model.healthy = False
+                changed = True
+        if changed:
+            self.endpoint_registry.parent_infra.send_models_list()
+
+    async def _health_monitor_background(self, instance: str, model_id: str) -> None:
+        """Re-probe an installed MCP periodically so a server that dies stops being reported as healthy.
+
+        Fail-safe: only a probe that completes and reports the server unreachable counts as a failure. A crash of
+        the check itself (or a probe needing OAuth) leaves the current state untouched, and the loop keeps running.
+        """
+        consecutive_failures = 0
+        while True:
+            await asyncio.sleep(_HEALTH_MONITOR_INTERVAL_SECONDS)
+            instance_info = self.instances_info.get(instance)
+            info = instance_info.installed if instance_info else None
+            if info is None or model_id not in info.models:
+                return
+            prefix = info.models[model_id].prefix
+            try:
+                result = await self.healthcheck_model(instance, model_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("MCP health monitor probe crashed for %s/%s; keeping current state", instance, model_id)
+                continue
+            if result.healthy or result.requires_oauth:
+                consecutive_failures = 0
+                continue
+            consecutive_failures += 1
+            if consecutive_failures >= _HEALTH_MONITOR_FAILURE_THRESHOLD:
+                logger.warning(
+                    "MCP %s/%s failed %d consecutive health checks (%s); marking unhealthy",
+                    instance,
+                    model_id,
+                    consecutive_failures,
+                    result.error,
+                )
+                try:
+                    self._mark_unhealthy(prefix)
+                except Exception:
+                    logger.exception("Failed to mark MCP %s/%s unhealthy", instance, model_id)
+
+    def _start_health_monitor(self, instance: str, model_id: str) -> None:
+        key = (instance, model_id)
+        existing = self._health_monitor_tasks.get(key)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(self._health_monitor_background(instance, model_id))
+        self._health_monitor_tasks[key] = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        task.add_done_callback(lambda t: self._health_monitor_tasks.pop(key, None) if self._health_monitor_tasks.get(key) is t else None)
+
+    def _stop_health_monitor(self, instance: str, model_id: str) -> None:
+        task = self._health_monitor_tasks.pop((instance, model_id), None)
+        if task is not None:
+            task.cancel()
 
     async def healthcheck_model(self, instance: str, model_id: str) -> McpHealthCheckResult:  # noqa: C901
         """Probe an installed MCP server: check liveness, detect transport, and fetch tool list."""
@@ -2022,6 +2102,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                     task.add_done_callback(self._background_tasks.discard)
                 if model.oauth and model.oauth.enabled and model.oauth.refresh_token:
                     self._start_oauth_refresh_background(instance, model_id)
+                self._start_health_monitor(instance, model_id)
                 self._installing.discard(key)
                 requires_oauth = bool(probe and probe.requires_oauth)
                 details = "Installed. OAuth authorization required — use the Authorize action." if requires_oauth else "Installed"
@@ -2092,6 +2173,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                 task = asyncio.create_task(self._fetch_tools_background(instance, model_id))
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
+                self._start_health_monitor(instance, model_id)
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
                 return InstallModelOut(status="OK", details="Installed")
             except BaseException:
@@ -2115,6 +2197,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
     async def _uninstall_model(self, instance: str, model_id: str, options: UninstallModelIn) -> None:
         info = self.get_instance_installed_info(instance)
         srv_model = self.models.get(instance, {}).get(model_id)
+        self._stop_health_monitor(instance, model_id)
         if model_id in info.models:
             model_info = info.models[model_id]
             self.endpoint_registry.unregister_mcp_endpoint(model_info.prefix, model_info.registration_id)
