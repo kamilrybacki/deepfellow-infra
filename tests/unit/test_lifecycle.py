@@ -126,7 +126,7 @@ def _apply_base_patches(active_patches: dict[str, Mock], *, config: MagicMock | 
     ctx.load_services = AsyncMock()
 
     task_mgr = active_patches["server.lifecycle.TaskManager"].return_value
-    task_mgr.add_task = MagicMock()
+    task_mgr.add_task_safe = MagicMock()
 
     parent = active_patches["server.lifecycle.ParentInfra"].return_value
     parent.run = MagicMock(return_value=MagicMock())

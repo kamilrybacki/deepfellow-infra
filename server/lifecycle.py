@@ -130,7 +130,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
         # Load functions
         await context.load_services()
-        task_manager.add_task(parent_infra.run())
+        task_manager.add_task_safe(parent_infra.run(), "lifecycle.parent_infra")
     except AppStartError as e:
         logger.error(str(e))
         os._exit(1)

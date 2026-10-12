@@ -347,7 +347,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                     await self._sync_models_from_external_ollama(instance, info.installed)
                     await self._save()
                 except Exception:
-                    pass
+                    logger.exception(f"{self.get_id(instance)} model sync tick failed")
 
         self._sync_tasks[instance] = asyncio.create_task(_sync_loop())
 
