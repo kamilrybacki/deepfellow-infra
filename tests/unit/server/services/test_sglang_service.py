@@ -968,6 +968,29 @@ async def test_install_model_calls_docker_install(svc: SglangService, gpu_deps: 
 
 
 @pytest.mark.asyncio
+async def test_install_model_passes_json_extra_arg_verbatim(svc: SglangService, gpu_deps: dict[str, Any], tmp_path: Path) -> None:
+    """A JSON extra_args value must reach the container as a single argv element with its quotes intact."""
+    _setup_install_mocks(svc, gpu_deps)
+    model_id = next(iter(svc.models["default"]))
+    json_value = '{"method":"mtp","num_speculative_tokens":3}'
+    spec = {"extra_args": {"--json-model-override-args": json_value}}
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.sglang_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.sglang_service.get_base_url", return_value="http://localhost:30000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec=spec))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = gpu_deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert isinstance(docker_options.command, list)
+    idx = docker_options.command.index("--json-model-override-args")
+    assert docker_options.command[idx + 1] == json_value
+
+
+@pytest.mark.asyncio
 async def test_install_model_uses_container_name_override_when_given(svc: SglangService, gpu_deps: dict[str, Any], tmp_path: Path) -> None:
     _setup_install_mocks(svc, gpu_deps)
     model_id = next(iter(svc.models["default"]))
@@ -1192,7 +1215,7 @@ async def test_install_model_retries_without_is_embedding_flag_on_mismatch(
 ) -> None:
     installed = _make_installed_info(hardware=True)
     svc.instances_info["default"].installed = installed
-    observed_commands: list[str] = []
+    observed_commands: list[list[str]] = []
 
     async def fake_install_and_run_docker(docker_options: Any) -> tuple[int, bool, bool]:
         observed_commands.append(docker_options.command)
@@ -1221,6 +1244,48 @@ async def test_install_model_retries_without_is_embedding_flag_on_mismatch(
     assert len(observed_commands) == 2
     assert "--is-embedding" in observed_commands[0]
     assert "--is-embedding" not in observed_commands[1]
+
+
+@pytest.mark.asyncio
+async def test_install_model_retry_without_is_embedding_flag_keeps_json_extra_arg_verbatim(
+    svc: SglangService, gpu_deps: dict[str, Any], tmp_path: Path
+) -> None:
+    """The retry command must stay an argv list: only `--is-embedding` dropped, a JSON extra_args value intact."""
+    installed = _make_installed_info(hardware=True)
+    svc.instances_info["default"].installed = installed
+    observed_commands: list[list[str]] = []
+
+    async def fake_install_and_run_docker(docker_options: Any) -> tuple[int, bool, bool]:
+        observed_commands.append(docker_options.command)
+        if len(observed_commands) == 1:
+            raise RuntimeError("Please relaunch without --is-embedding for this model")
+        return 30000, True, False
+
+    gpu_deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=fake_install_and_run_docker)
+    gpu_deps["docker_service"].get_docker_subnet.return_value = None
+    gpu_deps["docker_service"].get_docker_container_name.return_value = "container"
+    gpu_deps["docker_service"].get_container_host.return_value = "localhost"
+    gpu_deps["docker_service"].get_container_port.return_value = 30000
+    gpu_deps["docker_service"].stop_docker = AsyncMock()
+    embedding_id = "embedding-model"
+    svc.models["default"][embedding_id] = SglangModel(hf_id=embedding_id, size="1GB", model_type="embedding")
+    json_value = '{"architectures":["Qwen3ForSequenceClassification"]}'
+    spec = {"extra_args": {"--json-model-override-args": json_value}}
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.sglang_service.get_base_url", return_value="http://localhost:30000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", embedding_id, InstallModelIn(spec=spec))  # pyright: ignore[reportPrivateUsage]
+        result = await promise.wait()
+
+    assert result.status == "OK"
+    first_command, retry_command = observed_commands
+    assert isinstance(retry_command, list)
+    assert "--is-embedding" in first_command
+    assert retry_command == [arg for arg in first_command if arg != "--is-embedding"]
+    assert retry_command[retry_command.index("--json-model-override-args") + 1] == json_value
 
 
 @pytest.mark.asyncio

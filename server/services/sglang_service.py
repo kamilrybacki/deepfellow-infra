@@ -1165,7 +1165,7 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                     name=service_name,
                     container_name=container_name_override or self.docker_service.get_docker_container_name(service_name),
                     image=image.name,
-                    command=" ".join(sglang_command),
+                    command=sglang_command,
                     image_port=30000,
                     env_vars=env_vars,
                     restart="unless-stopped",
@@ -1259,8 +1259,7 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
             if not (self._is_embedding_mismatch_error(str(exc)) and "--is-embedding" in sglang_command):
                 raise self._describe_install_failure(exc) from exc
 
-        sglang_command.remove("--is-embedding")
-        docker_options.command = " ".join(sglang_command)
+        docker_options.command = [arg for arg in sglang_command if arg != "--is-embedding"]
         try:
             return await self.docker_service.install_and_run_docker(docker_options)
         except Exception as retry_exc:
