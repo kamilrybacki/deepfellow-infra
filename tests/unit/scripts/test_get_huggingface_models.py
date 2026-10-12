@@ -30,9 +30,11 @@ from scripts.get_huggingface_models import (
     has_chat_template,
     is_embedding,
     is_llm,
+    is_mlx,
     is_reranker,
     is_reranking_cross_encoder,
     is_supported_cross_encoder,
+    is_test_fixture,
     main,
     validate_model_compatibility,
 )
@@ -579,6 +581,58 @@ async def test_collect_llm_models_deduplicates() -> None:
 
     ids = [m["id"] for m in result]
     assert ids.count("org/llama") == 1
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+        "trl-internal-testing/small-Qwen3ForCausalLM",
+        "peft-internal-testing/foo",
+        "hmellor/tiny-random-LlamaForCausalLM",
+        "llamafactory/tiny-random-Llama-3",
+    ],
+)
+def test_is_test_fixture_true(model_id: str) -> None:
+    assert is_test_fixture({"id": model_id})
+
+
+@pytest.mark.parametrize("model_id", ["Qwen/Qwen3-8B", "meta-llama/Llama-3.1-8B-Instruct", "org/tiny-model"])
+def test_is_test_fixture_false(model_id: str) -> None:
+    assert not is_test_fixture({"id": model_id})
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "lmstudio-community/Qwen3.5-9B-MLX-4bit",
+        "mlx-community/Llama-3.1-8B-Instruct-4bit",
+        "prism-ml/Bonsai-27B-mlx-1bit",
+        "orcarouter/Qwen3.8-27B-Uncensored-MLX",
+    ],
+)
+def test_is_mlx_true(model_id: str) -> None:
+    assert is_mlx({"id": model_id})
+
+
+@pytest.mark.parametrize("model_id", ["Qwen/Qwen3-8B", "org/mlxtral-7b", "org/Gemlx-8B"])
+def test_is_mlx_false(model_id: str) -> None:
+    assert not is_mlx({"id": model_id})
+
+
+@pytest.mark.asyncio
+async def test_collect_llm_models_filters_fixtures_and_mlx() -> None:
+    async def fake_fetch(session: Mock, tag: str, sort: str, limit: int):
+        return [
+            {"id": "org/llama"},
+            {"id": "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"},
+            {"id": "lmstudio-community/Qwen3.5-9B-MLX-4bit"},
+        ]
+
+    with patch("scripts.get_huggingface_models.fetch_popular_models", side_effect=fake_fetch):
+        result = await collect_llm_models(MagicMock(), {"downloads": 10})
+
+    assert [m["id"] for m in result] == ["org/llama"]
 
 
 @pytest.mark.asyncio

@@ -1,1283 +1,2232 @@
 {
     "llms": [
         {
-            "name": "Accio-Lab/occamy-1.0",
-            "size": "65GB"
+            "name": "Aleph-Alpha/Kolibri-1",
+            "size": "73GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "AEON-7/Qwen3.6-35B-A3B-heretic-NVFP4",
-            "size": "21GB"
+            "name": "Aleph-Alpha/Kolibri-1-BF16",
+            "size": "145GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "Agnes-AI/Agnes-3.0-Flash",
-            "size": "61GB"
+            "name": "Alibaba-NLP/Tongyi-DeepResearch-30B-A3B",
+            "size": "56GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "ai-sage/GigaChat3.5-432B-A28B-Reasoning",
-            "size": "415GB"
+            "name": "allenai/AstaBrief_8B",
+            "size": "30GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "allenai/Molmo-7B-D-0924",
+            "size": "29GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "allenai/Olmo-3-7B-Instruct",
+            "size": "13GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "allenai/Olmo-3-7B-Think",
+            "size": "13GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "Altworld/Hemmingway-1",
+            "size": "50GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "ATH-MaaS/Marco-o1",
+            "size": "14GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "audnai/penclaw-GLM-5.3-abliterated",
-            "size": "3TB"
+            "size": "3TB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "autotrust/GLM5.3-Flash-E224-DGX-Spark",
+            "size": "157GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "autotrust/JEV-27B-VL",
+            "size": "52GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "AxionML/Qwen3.5-9B-NVFP4",
+            "size": "8GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "BAAI/AREX-2",
+            "size": "51GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Bahushruth/Qwen3.6-35B-A3B-abliterated-v4",
-            "size": "64GB"
+            "size": "64GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "baidu/ERNIE-4.5-21B-A3B-Thinking",
+            "size": "40GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "baidu/ERNIE-4.5-VL-28B-A3B-Thinking",
+            "size": "55GB",
+            "supports_vision": true,
+            "supports_audio": null
+        },
+        {
+            "name": "Blackfrost-AI/CYBER-FROST-3.8-BF16",
+            "size": "335GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "bottlecapai/ThinkingCap-Qwen3.6-27B",
-            "size": "51GB"
+            "size": "51GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "ByteDance-Seed/UI-TARS-1.5-7B",
-            "size": "30GB"
+            "size": "30GB",
+            "supports_vision": true,
+            "supports_audio": null
+        },
+        {
+            "name": "bytkim/Qwen3.8-27B-pi",
+            "size": "55GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "casperhansen/llama-3.3-70b-instruct-awq",
-            "size": "37GB"
+            "size": "37GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "Cloudflare/clef",
+            "size": "51GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "Cloudflare/clef-flash",
+            "size": "17GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit",
-            "size": "16GB"
-        },
-        {
-            "name": "cyankiwi/gemma-4-31B-it-qat-AWQ-INT4",
-            "size": "19GB"
+            "size": "16GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "cyankiwi/MiniCPM-SALA-AWQ-8bit",
-            "size": "9GB"
+            "size": "9GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit",
-            "size": "16GB"
+            "size": "16GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit",
-            "size": "7GB"
+            "size": "7GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "cyankiwi/Qwen3.5-4B-AWQ-4bit",
-            "size": "3GB"
+            "size": "3GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "cyankiwi/Qwen3.6-27B-AWQ-INT4",
-            "size": "19GB"
-        },
-        {
-            "name": "cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit",
-            "size": "23GB"
+            "size": "19GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "cyankiwi/Qwen3.8-27B-AWQ-INT4",
-            "size": "19GB"
+            "size": "19GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "DavidAU/Qwen3.5-9B-Claude-4.6-HighIQ-INSTRUCT-HERETIC-UNCENSORED",
-            "size": "17GB"
-        },
-        {
-            "name": "DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NM-DAU",
-            "size": "51GB"
-        },
-        {
-            "name": "DavidAU/Qwen3.8-27B-TWIN-TURBO-Fable-Cold-Fusion-709-L-Uncensored",
-            "size": "51GB"
-        },
-        {
-            "name": "DavidAU/Qwen3.8-27B-TWIN-TURBO-Fable-Cold-Fusion-709-ULTRA-HERETIC-Uncensored",
-            "size": "51GB"
+            "name": "datalab-to/chandra",
+            "size": "16GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "dealignai/Gemma-4-31B-JANG_4M-CRACK",
-            "size": "21GB"
+            "size": "21GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "dealignai/GLM-5.3-CYBERSECURITY-FP8",
-            "size": "703GB"
+            "size": "703GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "dealignai/GLM-5.3-UNCENSORED-FP8",
+            "size": "703GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "deepseek-ai/deepseek-coder-7b-instruct-v1.5",
-            "size": "12GB"
+            "size": "12GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "deepseek-ai/DeepSeek-Coder-V2-Instruct",
+            "size": "439GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
-            "size": "29GB"
+            "size": "29GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "deepseek-ai/DeepSeek-Math-V2",
+            "size": "642GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "deepseek-ai/DeepSeek-Prover-V2-671B",
+            "size": "641GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "deepseek-ai/DeepSeek-R1",
-            "size": "641GB"
+            "size": "641GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "deepseek-ai/DeepSeek-R1-0528",
-            "size": "641GB"
+            "size": "641GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
-            "size": "15GB"
+            "size": "15GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
+            "size": "131GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+            "size": "15GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
-            "size": "3GB"
+            "size": "3GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+            "size": "27GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
-            "size": "61GB"
+            "size": "61GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+            "size": "14GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "deepseek-ai/DeepSeek-R1-Zero",
+            "size": "641GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "deepseek-ai/DeepSeek-V2.5",
+            "size": "439GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "deepseek-ai/DeepSeek-V3",
-            "size": "641GB"
+            "size": "641GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "deepseek-ai/DeepSeek-V3-0324",
-            "size": "641GB"
+            "size": "641GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "deepseek-ai/DeepSeek-V3.1",
+            "size": "641GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "deepseek-ai/DeepSeek-V3.1-Base",
+            "size": "641GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "deepseek-ai/DeepSeek-V3.2-Exp",
+            "size": "642GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "size": "475GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "docling-project/SmolDocling-256M-preview",
-            "size": "3GB"
+            "size": "3GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "dphn/dolphin-2.5-mixtral-8x7b",
-            "size": "174GB"
+            "size": "174GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "dphn/dolphin-2.9.1-yi-1.5-34b",
-            "size": "64GB"
+            "size": "64GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "dphn/Dolphin-Mistral-24B-Venice-Edition",
+            "size": "44GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Edge0/Edge0-35B-A3B-preview",
-            "size": "18GB"
+            "size": "18GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "Edge0/Edge0-8B-A1B-preview",
-            "size": "4GB"
+            "name": "empero-ai/Qwythos-9B-Claude-Mythos-5-1M",
+            "size": "17GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "fancyfeast/llama-joycaption-beta-one-hf-llava",
+            "size": "15GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "farbodtavakkoli/OTel-2.0-LLM-31B-IT",
-            "size": "118GB"
-        },
-        {
-            "name": "farbodtavakkoli/OTel-LLM-27B-IT",
-            "size": "101GB"
-        },
-        {
-            "name": "farbodtavakkoli/OTel-LLM-E4B-IT",
-            "size": "29GB"
+            "size": "118GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "gaunernst/gemma-3-27b-it-int4-awq",
-            "size": "17GB"
+            "size": "17GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090",
-            "size": "16GB"
+            "size": "16GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "google/diffusiongemma-26B-A4B-it",
-            "size": "48GB"
+            "size": "48GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "google/functiongemma-270m-it",
+            "size": "823MB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "google/gemma-3n-E4B-it",
-            "size": "14GB"
+            "size": "14GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "google/gemma-4-26B-A4B-it",
-            "size": "48GB"
-        },
-        {
-            "name": "google/gemma-4-26B-A4B-it-qat-q4_0-unquantized",
-            "size": "48GB"
+            "size": "48GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "google/gemma-4-31B-it",
-            "size": "58GB"
+            "size": "58GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "google/gemma-4-31B-it-qat-w4a16-ct",
-            "size": "21GB"
+            "name": "google/gemma-4-31B-it-qat-q4_0-unquantized",
+            "size": "58GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "google/medgemma-1.5-4b-it",
-            "size": "8GB"
+            "size": "8GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "google/medgemma-27b-it",
+            "size": "51GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "google/medgemma-4b-it",
-            "size": "8GB"
+            "size": "8GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "google/translategemma-12b-it",
+            "size": "22GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "google/translategemma-27b-it",
+            "size": "51GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "google/translategemma-4b-it",
-            "size": "8GB"
+            "size": "8GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "hmellor/tiny-random-LlamaForCausalLM",
-            "size": "5MB"
+            "name": "GSAI-ML/LLaDA-8B-Instruct",
+            "size": "14GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "hugging-quants/gemma-2-9b-it-AWQ-INT4",
-            "size": "5GB"
+            "name": "Hcompany/Holo3-35B-A3B",
+            "size": "65GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "HuggingFaceH4/zephyr-7b-alpha",
-            "size": "27GB"
+            "size": "27GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "HuggingFaceH4/zephyr-7b-beta",
-            "size": "27GB"
+            "size": "27GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+            "size": "21GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "HuggingFaceTB/SmolLM2-135M-Instruct",
-            "size": "1GB"
+            "size": "1GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "HuggingFaceTB/SmolLM3-3B",
-            "size": "5GB"
+            "size": "5GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "HuggingFaceTB/SmolVLM-256M-Instruct",
-            "size": "3GB"
+            "size": "3GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "HuggingFaceTB/SmolVLM-Instruct",
+            "size": "27GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
-            "size": "7GB"
+            "size": "7GB",
+            "supports_vision": true,
+            "supports_audio": null
+        },
+        {
+            "name": "huihui-ai/Huihui-Qwen3.5-35B-A3B-abliterated",
+            "size": "67GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "huihui-ai/Huihui-Qwen3.8-27B-abliterated",
-            "size": "51GB"
+            "size": "51GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "ibm-granite/granite-4.1-30b",
-            "size": "53GB"
+            "name": "huihui-ai/Qwen2.5-VL-7B-Instruct-abliterated",
+            "size": "15GB",
+            "supports_vision": true,
+            "supports_audio": null
+        },
+        {
+            "name": "ibm-granite/granite-4.1-3b",
+            "size": "6GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "ibm-granite/granite-docling-258M",
-            "size": "505MB"
-        },
-        {
-            "name": "IFM/K2-Horizon-0.9B",
-            "size": "2GB"
-        },
-        {
-            "name": "IFM/K2-Horizon-3.7B",
-            "size": "9GB"
-        },
-        {
-            "name": "IFM/K2-Horizon-7B",
-            "size": "16GB"
+            "size": "505MB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "IFM/K2-Horizon-MoVA-36B-A4B",
-            "size": "69GB"
+            "size": "69GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "inclusionAI/Ling-3.0-flash-VL",
-            "size": "232GB"
+            "name": "IFM/K2-Type-0.9B",
+            "size": "2GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "Infatoshi/GLM-5.3-UNCENSORED-EXL3-3.0bpw",
+            "size": "272GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Inferact/Qwen3.8-27B-NVFP4",
-            "size": "24GB"
+            "size": "24GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Infomaniak-AI/vllm-translategemma-4b-it",
-            "size": "8GB"
-        },
-        {
-            "name": "internlm/Intern-S2-397B",
-            "size": "751GB"
+            "size": "8GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "ISTA-DASLab/gemma-3-27b-it-GPTQ-4b-128g",
-            "size": "15GB"
+            "size": "15GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled",
-            "size": "51GB"
+            "size": "51GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "jinaai/ReaderLM-v2",
+            "size": "21GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "k-chirkunov/gemma4-e4b-claims-comparison",
-            "size": "14GB"
+            "size": "14GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct-AWQ",
-            "size": "4GB"
+            "size": "4GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "LilaRest/gemma-4-31B-it-NVFP4-turbo",
-            "size": "18GB"
+            "name": "LiquidAI/d1-3B",
+            "size": "5GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "llamafactory/tiny-random-Llama-3",
-            "size": "16MB"
+            "name": "LiquidAI/LFM2.5-2.6B",
+            "size": "5GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "LiquidAI/LFM2.5-8B-A1B",
+            "size": "15GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "liuhaotian/llava-v1.6-34b",
+            "size": "64GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "llava-hf/llava-1.5-7b-hf",
-            "size": "13GB"
+            "size": "13GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "llava-hf/llava-onevision-qwen2-0.5b-ov-hf",
-            "size": "13GB"
+            "size": "13GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "llava-hf/llava-v1.6-mistral-7b-hf",
-            "size": "14GB"
+            "size": "14GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
-            "name": "lmstudio-community/gemma-4-26B-A4B-it-QAT-MLX-4bit",
-            "size": "14GB"
-        },
-        {
-            "name": "lmstudio-community/Qwen3.5-9B-MLX-4bit",
-            "size": "5GB"
-        },
-        {
-            "name": "lmstudio-community/Qwen3.5-9B-MLX-8bit",
-            "size": "9GB"
-        },
-        {
-            "name": "lmstudio-community/Qwen3.6-27B-MLX-4bit",
-            "size": "15GB"
-        },
-        {
-            "name": "lmstudio-community/Qwen3.6-27B-MLX-5bit",
-            "size": "18GB"
-        },
-        {
-            "name": "lmstudio-community/Qwen3.6-27B-MLX-6bit",
-            "size": "21GB"
-        },
-        {
-            "name": "lmstudio-community/Qwen3.6-27B-MLX-8bit",
-            "size": "27GB"
-        },
-        {
-            "name": "lmstudio-community/Qwen3.8-27B-MLX-4bit",
-            "size": "15GB"
-        },
-        {
-            "name": "lmstudio-community/Qwen3.8-27B-MLX-5bit",
-            "size": "18GB"
-        },
-        {
-            "name": "lmstudio-community/Qwen3.8-27B-MLX-6bit",
-            "size": "21GB"
-        },
-        {
-            "name": "lmstudio-community/Qwen3.8-27B-MLX-8bit",
-            "size": "27GB"
-        },
-        {
-            "name": "Lorbus/Qwen3.6-27B-int4-AutoRound",
-            "size": "17GB"
-        },
-        {
-            "name": "maci0/Qwopus3.6-27B-Coder-NVFP4",
-            "size": "19GB"
+            "name": "manycore-research/SpatialLM-Llama-1B",
+            "size": "2GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "mattshumer/Reflection-Llama-3.1-70B",
-            "size": "262GB"
+            "size": "262GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "medismera/Qwen3.8-27B-OBLITERATED-Mythos-Class-Agentic",
-            "size": "51GB"
+            "name": "meta-llama/Llama-4-Maverick-17B-128E-Instruct",
+            "size": "748GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-            "size": "202GB"
+            "size": "202GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "meta-models/Muse-Glimmer-30B",
-            "size": "55GB"
+            "size": "55GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "microsoft/bitnet-b1.58-2B-4T",
-            "size": "1GB"
+            "size": "1GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "microsoft/Fara-7B",
+            "size": "15GB",
+            "supports_vision": true,
+            "supports_audio": null
+        },
+        {
+            "name": "microsoft/Mage-VL",
+            "size": "10GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "microsoft/Phi-3-mini-128k-instruct",
-            "size": "7GB"
+            "size": "7GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "microsoft/Phi-3-mini-4k-instruct",
-            "size": "7GB"
+            "size": "7GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "microsoft/Phi-3-vision-128k-instruct",
+            "size": "7GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "microsoft/Phi-3.5-mini-instruct",
+            "size": "7GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "microsoft/Phi-3.5-vision-instruct",
-            "size": "7GB"
+            "size": "7GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "microsoft/phi-4",
-            "size": "27GB"
+            "size": "27GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "microsoft/Phi-4-mini-instruct",
+            "size": "7GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "MiniMaxAI/MiniMax-M1-80k",
+            "size": "849GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "MiniMaxAI/MiniMax-M2",
-            "size": "214GB"
+            "size": "214GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "MiniMaxAI/MiniMax-M2.1",
-            "size": "214GB"
+            "size": "214GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "MiniMaxAI/MiniMax-M2.5",
-            "size": "214GB"
+            "size": "214GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "MiniMaxAI/MiniMax-M2.7",
-            "size": "214GB"
+            "size": "214GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "MiniMaxAI/MiniMax-M3",
-            "size": "795GB"
+            "size": "795GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "mistralai/Mistral-7B-Instruct-v0.1",
-            "size": "27GB"
+            "size": "27GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "mistralai/Mistral-7B-Instruct-v0.2",
-            "size": "27GB"
+            "size": "27GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "mlx-community/Llama-3.1-8B-Instruct-4bit",
-            "size": "4GB"
+            "name": "mlabonne/gemma-3-27b-it-abliterated",
+            "size": "51GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "moonshotai/Kimi-K2-Instruct",
-            "size": "958GB"
+            "size": "958GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "moonshotai/Kimi-K2-Instruct-0905",
+            "size": "958GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "moonshotai/Kimi-K2-Thinking",
-            "size": "553GB"
+            "size": "553GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "moonshotai/Kimi-K2.5",
-            "size": "554GB"
+            "size": "554GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "moonshotai/Kimi-K2.6",
-            "size": "554GB"
+            "size": "554GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "moonshotai/Kimi-K2.7-Code",
-            "size": "554GB"
+            "size": "554GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "moonshotai/Kimi-VL-A3B-Thinking",
+            "size": "30GB",
+            "supports_vision": true,
+            "supports_audio": null
+        },
+        {
+            "name": "moonshotai/Kimi-VL-A3B-Thinking-2506",
+            "size": "30GB",
+            "supports_vision": true,
+            "supports_audio": null
+        },
+        {
+            "name": "NaiveAI/Naive-N0.5-Flash",
+            "size": "575GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Nanbeige/Nanbeige4.1-3B",
-            "size": "7GB"
+            "size": "7GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "nex-agi/Nex-N2.5-Max",
-            "size": "1TB"
+            "name": "Nanbeige/Nanbeige4.2-3B",
+            "size": "7GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "naver-hyperclovax/HyperCLOVAX-SEED-Think-32B",
+            "size": "62GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "nex-agi/Nex-N2.5-mini",
-            "size": "65GB"
+            "size": "65GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "NexaAI/Octopus-v2",
+            "size": "4GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "nm-testing/SmolLM-1.7B-Instruct-quantized.w4a16",
-            "size": "1GB"
+            "size": "1GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "NousResearch/Hermes-3-Llama-3.1-8B",
+            "size": "15GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "nvidia/Gemma-4-26B-A4B-NVFP4",
-            "size": "17GB"
+            "size": "17GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "nvidia/Gemma-4-31B-IT-NVFP4",
-            "size": "30GB"
+            "size": "30GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "nvidia/GLM-5.2-NVFP4",
-            "size": "432GB"
-        },
-        {
-            "name": "nvidia/GLM-5.3-Flash-NVFP4",
-            "size": "190GB"
+            "size": "432GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF",
-            "size": "131GB"
+            "size": "131GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "nvidia/LocateAnything-3B",
-            "size": "7GB"
+            "size": "7GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
-            "size": "58GB"
-        },
-        {
-            "name": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
-            "size": "30GB"
+            "size": "58GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
-            "size": "18GB"
+            "size": "18GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
-            "size": "7GB"
+            "size": "7GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
-            "size": "230GB"
+            "size": "230GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
-            "size": "74GB"
+            "size": "74GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16",
+            "size": "1TB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
-            "size": "61GB"
+            "size": "61GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
-            "size": "20GB"
+            "size": "20GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "nvidia/NVLM-D-72B",
-            "size": "164GB"
+            "size": "164GB",
+            "supports_vision": true,
+            "supports_audio": null
+        },
+        {
+            "name": "nvidia/Qwen2.5-VL-7B-Instruct-NVFP4",
+            "size": "6GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "nvidia/Qwen3-14B-NVFP4",
-            "size": "9GB"
+            "size": "9GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "nvidia/Qwen3.5-122B-A10B-NVFP4",
-            "size": "77GB"
+            "size": "77GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "nvidia/Qwen3.6-27B-NVFP4",
+            "size": "20GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "nvidia/Qwen3.6-35B-A3B-NVFP4",
-            "size": "21GB"
+            "size": "21GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "nvidia/Qwen3.8-27B-NVFP4",
-            "size": "20GB"
+            "size": "20GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "nvidia/Qwen3.8-Flash-Next-NVFP4",
-            "size": "123GB"
+            "size": "123GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "Open-Orca/Mistral-7B-OpenOrca",
+            "size": "13GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "openai/gpt-oss-120b",
-            "size": "182GB"
+            "size": "182GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "openai/gpt-oss-20b",
-            "size": "38GB"
+            "size": "38GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "openbmb/MiniCPM-Llama3-V-2_5",
-            "size": "16GB"
+            "size": "16GB",
+            "supports_vision": true,
+            "supports_audio": null
+        },
+        {
+            "name": "openbmb/MiniCPM-V-4",
+            "size": "7GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "openbmb/MiniCPM-V-4.6",
-            "size": "2GB"
+            "size": "2GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "openbmb/MiniCPM-V-4_5",
-            "size": "16GB"
+            "size": "16GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "openbmb/MiniCPM5-1B",
-            "size": "2GB"
+            "size": "2GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "openbmb/MiniCPM5-2B",
-            "size": "4GB"
+            "size": "4GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "openchat/openchat_3.5",
-            "size": "13GB"
+            "size": "13GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "opendatalab/MinerU2.5-2509-1.2B",
+            "size": "2GB",
+            "supports_vision": true,
+            "supports_audio": null
+        },
+        {
+            "name": "OpenGVLab/InternVL-Chat-V1-5",
+            "size": "47GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "OpenGVLab/InternVL2-1B",
-            "size": "1GB"
+            "size": "1GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "OpenGVLab/InternVL2-2B",
-            "size": "4GB"
+            "size": "4GB",
+            "supports_vision": true,
+            "supports_audio": null
+        },
+        {
+            "name": "OpenGVLab/InternVL3_5-GPT-OSS-20B-A4B-Preview-HF",
+            "size": "39GB",
+            "supports_vision": true,
+            "supports_audio": null
+        },
+        {
+            "name": "orcarouter/OrcaSAQ-2-27B",
+            "size": "11GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "orcarouter/Qwen3.8-27B-Uncensored",
-            "size": "51GB"
+            "size": "51GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "orcarouter/Qwen3.8-27B-Uncensored-FP8",
-            "size": "28GB"
-        },
-        {
-            "name": "orcarouter/Qwen3.8-27B-Uncensored-MLX",
-            "size": "88GB"
+            "size": "28GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Orion-zhen/Qwen2.5-Coder-7B-Instruct-AWQ",
-            "size": "5GB"
-        },
-        {
-            "name": "OrionLLM/OxCoder-9B",
-            "size": "17GB"
+            "size": "5GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "ornith-ai/Ornith-1.0-35B",
-            "size": "65GB"
-        },
-        {
-            "name": "ornith-ai/Ornith-1.0-35B-FP8",
-            "size": "35GB"
+            "size": "65GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "ornith-ai/Ornith-1.0-9B",
-            "size": "17GB"
+            "size": "17GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "ornith-ai/Ornith-1.5-35B-A3B",
-            "size": "67GB"
+            "size": "67GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "ornith-ai/Ornith-1.5-35B-A3B-FP8",
+            "size": "36GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "ornith-ai/Ornith-1.5-35B-A3B-NVFP4",
-            "size": "21GB"
-        },
-        {
-            "name": "ornith-ai/Ornith-1.5-397B",
-            "size": "751GB"
+            "size": "21GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "ornith-ai/Ornith-1.5-9B",
-            "size": "18GB"
+            "size": "18GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "ornith-ai/Ornith-1.5-9B-NVFP4",
-            "size": "8GB"
+            "size": "8GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "philbert440/Qwen3.8-27B-W4A16-AWQ",
-            "size": "18GB"
+            "size": "18GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "poolside/Laguna-S-2.1-NVFP4",
-            "size": "92GB"
+            "name": "PleIAs/baguettotron-600m",
+            "size": "1GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "prism-ml/Bonsai-27B-mlx-1bit",
-            "size": "4GB"
-        },
-        {
-            "name": "prism-ml/Ternary-Bonsai-27B-mlx-2bit",
-            "size": "7GB"
-        },
-        {
-            "name": "protoLabsAI/Ornith-1.0-35B-FP8",
-            "size": "35GB"
+            "name": "poolside/Laguna-S-2.1",
+            "size": "219GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ",
-            "size": "16GB"
-        },
-        {
-            "name": "QuantTrio/Qwen3.5-27B-AWQ",
-            "size": "20GB"
+            "size": "16GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "QuantTrio/Qwen3.5-9B-AWQ",
-            "size": "11GB"
-        },
-        {
-            "name": "QuantTrio/Qwen3.6-27B-AWQ",
-            "size": "20GB"
+            "size": "11GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "QuantTrio/Qwen3.6-35B-A3B-AWQ",
-            "size": "23GB"
+            "size": "23GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "Qwen/Qwen-Drive-1.0-4B",
-            "size": "12GB"
+            "name": "Qwen/QVQ-72B-Preview",
+            "size": "136GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
-            "name": "Qwen/Qwen1.5-MoE-A2.7B",
-            "size": "26GB"
-        },
-        {
-            "name": "Qwen/Qwen2-0.5B",
-            "size": "953MB"
+            "name": "Qwen/Qwen-AgentWorld-35B-A3B",
+            "size": "64GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2-1.5B-Instruct",
-            "size": "2GB"
+            "size": "2GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "Qwen/Qwen2-72B-Instruct",
+            "size": "135GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "Qwen/Qwen2-7B-Instruct",
+            "size": "14GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2-VL-2B-Instruct",
-            "size": "4GB"
+            "size": "4GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2-VL-7B-Instruct",
-            "size": "15GB"
+            "size": "15GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2-VL-7B-Instruct-AWQ",
-            "size": "6GB"
+            "size": "6GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-0.5B",
-            "size": "953MB"
+            "size": "953MB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-0.5B-Instruct",
-            "size": "953MB"
+            "size": "953MB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-1.5B",
-            "size": "2GB"
+            "size": "2GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-1.5B-Instruct",
-            "size": "2GB"
+            "size": "2GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-14B-Instruct",
-            "size": "27GB"
+            "size": "27GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-14B-Instruct-AWQ",
-            "size": "9GB"
+            "size": "9GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-32B-Instruct",
-            "size": "61GB"
+            "size": "61GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-32B-Instruct-AWQ",
-            "size": "18GB"
+            "size": "18GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4",
-            "size": "18GB"
+            "size": "18GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-3B-Instruct",
-            "size": "5GB"
+            "size": "5GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "Qwen/Qwen2.5-3B-Instruct-AWQ",
+            "size": "2GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "Qwen/Qwen2.5-72B-Instruct",
+            "size": "135GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-72B-Instruct-AWQ",
-            "size": "38GB"
+            "size": "38GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-7B",
-            "size": "14GB"
+            "size": "14GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-7B-Instruct",
-            "size": "14GB"
+            "size": "14GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-7B-Instruct-AWQ",
-            "size": "5GB"
+            "size": "5GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-Coder-1.5B-Instruct",
-            "size": "2GB"
+            "size": "2GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-Coder-14B-Instruct",
-            "size": "27GB"
-        },
-        {
-            "name": "Qwen/Qwen2.5-Coder-14B-Instruct-AWQ",
-            "size": "9GB"
+            "size": "27GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-Coder-32B-Instruct",
-            "size": "61GB"
+            "size": "61GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ",
-            "size": "18GB"
+            "size": "18GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-Coder-3B-Instruct",
-            "size": "5GB"
+            "size": "5GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-Coder-7B",
-            "size": "14GB"
+            "size": "14GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-Coder-7B-Instruct",
-            "size": "14GB"
+            "size": "14GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-Coder-7B-Instruct-AWQ",
-            "size": "5GB"
+            "size": "5GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-Coder-7B-Instruct-GPTQ-Int4",
-            "size": "5GB"
+            "size": "5GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-VL-32B-Instruct",
-            "size": "63GB"
-        },
-        {
-            "name": "Qwen/Qwen2.5-VL-32B-Instruct-AWQ",
-            "size": "19GB"
+            "size": "63GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-VL-3B-Instruct",
-            "size": "7GB"
+            "size": "7GB",
+            "supports_vision": true,
+            "supports_audio": null
+        },
+        {
+            "name": "Qwen/Qwen2.5-VL-3B-Instruct-AWQ",
+            "size": "3GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-VL-72B-Instruct",
-            "size": "136GB"
+            "size": "136GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-VL-7B-Instruct",
-            "size": "15GB"
+            "size": "15GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen2.5-VL-7B-Instruct-AWQ",
-            "size": "6GB"
+            "size": "6GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-0.6B",
-            "size": "1GB"
+            "size": "1GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-0.6B-Base",
-            "size": "1GB"
+            "size": "1GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-1.7B",
-            "size": "3GB"
+            "size": "3GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-1.7B-Base",
-            "size": "3GB"
+            "size": "3GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-14B",
-            "size": "27GB"
+            "size": "27GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-14B-AWQ",
-            "size": "9GB"
-        },
-        {
-            "name": "Qwen/Qwen3-14B-Base",
-            "size": "27GB"
+            "size": "9GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-235B-A22B",
-            "size": "437GB"
+            "size": "437GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "Qwen/Qwen3-235B-A22B-Instruct-2507",
+            "size": "437GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-30B-A3B",
-            "size": "56GB"
+            "size": "56GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-            "size": "56GB"
-        },
-        {
-            "name": "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
-            "size": "29GB"
+            "size": "56GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-32B",
-            "size": "61GB"
+            "size": "61GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-32B-AWQ",
-            "size": "18GB"
+            "size": "18GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-4B",
-            "size": "7GB"
+            "size": "7GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-4B-Base",
-            "size": "7GB"
+            "size": "7GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-4B-Instruct-2507",
-            "size": "7GB"
+            "size": "7GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-4B-Instruct-2507-FP8",
-            "size": "4GB"
+            "size": "4GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "Qwen/Qwen3-4B-Thinking-2507",
+            "size": "7GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-8B",
-            "size": "15GB"
+            "size": "15GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-8B-AWQ",
-            "size": "5GB"
+            "size": "5GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "Qwen/Qwen3-8B-Base",
+            "size": "15GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-8B-FP8",
-            "size": "8GB"
+            "size": "8GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
-            "size": "56GB"
+            "size": "56GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8",
-            "size": "29GB"
+            "size": "29GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-Coder-480B-A35B-Instruct",
-            "size": "894GB"
+            "size": "894GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
-            "size": "449GB"
+            "size": "449GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-Coder-Next",
-            "size": "148GB"
+            "size": "148GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-Coder-Next-FP8",
-            "size": "74GB"
+            "size": "74GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "Qwen/Qwen3-Next-80B-A3B-Instruct",
+            "size": "151GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-VL-235B-A22B-Instruct",
-            "size": "439GB"
+            "size": "439GB",
+            "supports_vision": true,
+            "supports_audio": null
+        },
+        {
+            "name": "Qwen/Qwen3-VL-235B-A22B-Thinking",
+            "size": "439GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-VL-2B-Instruct",
-            "size": "4GB"
+            "size": "4GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-VL-30B-A3B-Instruct",
-            "size": "57GB"
-        },
-        {
-            "name": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
-            "size": "30GB"
+            "size": "57GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-VL-32B-Instruct",
-            "size": "62GB"
-        },
-        {
-            "name": "Qwen/Qwen3-VL-32B-Instruct-FP8",
-            "size": "33GB"
+            "size": "62GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-VL-4B-Instruct",
-            "size": "8GB"
-        },
-        {
-            "name": "Qwen/Qwen3-VL-4B-Instruct-FP8",
-            "size": "5GB"
+            "size": "8GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-VL-8B-Instruct",
-            "size": "16GB"
+            "size": "16GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3-VL-8B-Instruct-FP8",
-            "size": "9GB"
+            "size": "9GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.5-0.8B",
-            "size": "1GB"
+            "size": "1GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "Qwen/Qwen3.5-0.8B-Base",
+            "size": "1GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.5-122B-A10B",
-            "size": "233GB"
+            "size": "233GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.5-122B-A10B-FP8",
-            "size": "118GB"
+            "size": "118GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.5-122B-A10B-GPTQ-Int4",
-            "size": "73GB"
+            "size": "73GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.5-27B",
-            "size": "51GB"
+            "size": "51GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.5-2B",
-            "size": "4GB"
+            "size": "4GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.5-2B-Base",
-            "size": "4GB"
+            "size": "4GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.5-35B-A3B",
-            "size": "67GB"
+            "size": "67GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.5-35B-A3B-FP8",
-            "size": "34GB"
-        },
-        {
-            "name": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
-            "size": "22GB"
+            "size": "34GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.5-397B-A17B",
-            "size": "751GB"
+            "size": "751GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.5-397B-A17B-FP8",
-            "size": "378GB"
+            "size": "378GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.5-4B",
-            "size": "8GB"
+            "size": "8GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.5-4B-Base",
-            "size": "8GB"
+            "size": "8GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.5-9B",
-            "size": "18GB"
+            "size": "18GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.5-9B-Base",
-            "size": "18GB"
+            "size": "18GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.6-27B",
-            "size": "51GB"
+            "size": "51GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.6-27B-FP8",
-            "size": "28GB"
+            "size": "28GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.6-35B-A3B",
-            "size": "67GB"
+            "size": "67GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.6-35B-A3B-FP8",
-            "size": "34GB"
+            "size": "34GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.8-2.4T-A95B",
-            "size": "4TB"
+            "size": "4TB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.8-27B",
-            "size": "51GB"
+            "size": "51GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.8-27B-FP8",
-            "size": "28GB"
+            "size": "28GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.8-Flash-Next",
-            "size": "335GB"
+            "size": "335GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/Qwen3.8-Flash-Next-FP8",
-            "size": "172GB"
+            "size": "172GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/QwQ-32B",
-            "size": "61GB"
+            "size": "61GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "Qwen/QwQ-32B-Preview",
-            "size": "61GB"
+            "size": "61GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "RadixArk/Qwen3.8-27B-NVFP4",
-            "size": "20GB"
+            "size": "20GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead",
+            "size": "22GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
-            "size": "126GB"
-        },
-        {
-            "name": "raxcore-dev/Rax-4.5",
-            "size": "4GB"
+            "size": "126GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "RedHatAI/gemma-3-27b-it-quantized.w4a16",
-            "size": "18GB"
+            "size": "18GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic",
-            "size": "26GB"
+            "size": "26GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "RedHatAI/gemma-4-26B-A4B-it-NVFP4",
+            "size": "15GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "RedHatAI/gemma-4-31B-it-FP8-block",
-            "size": "31GB"
+            "size": "31GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "RedHatAI/Llama-3.2-3B-Instruct-FP8-dynamic",
+            "size": "4GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "RedHatAI/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-FP8",
+            "size": "30GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "RedHatAI/Qwen3.6-35B-A3B-NVFP4",
-            "size": "23GB"
+            "size": "23GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "ReliquaryForge/qwen3-4b-base-dapo-v4",
-            "size": "7GB"
+            "name": "RedHatAI/Qwen3.8-27B-INT4",
+            "size": "18GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "rhymes-ai/Aria",
-            "size": "47GB"
+            "size": "47GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP",
-            "size": "18GB"
+            "name": "sakamakismile/Qwen3.8-27B-MTP-NVFP4",
+            "size": "19GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "shawnw3i/Huihui-Qwen3.6-27B-abliterated-AWQ-MTP",
-            "size": "18GB"
+            "name": "salakash/SamKash-Tolstoy",
+            "size": "163MB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "sukhrobnurali/qwen3vl-resume-parser",
-            "size": "16GB"
+            "name": "sanskar003/Qwen3.5-4B-AWQ",
+            "size": "4GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "ServiceNow-AI/Apriel-1.5-15b-Thinker",
+            "size": "27GB",
+            "supports_vision": true,
+            "supports_audio": null
+        },
+        {
+            "name": "shenzhi-wang/Llama3-8B-Chinese-Chat",
+            "size": "15GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "stelterlab/Qwen3-30B-A3B-Instruct-2507-AWQ",
+            "size": "15GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "stepfun-ai/Step-3.5-Flash",
+            "size": "371GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "stepfun-ai/Step-3.7-Flash",
+            "size": "375GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "stepfun-ai/Step3-VL-10B",
+            "size": "19GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
             "name": "swiss-ai/Apertus-8B-Instruct-2509",
-            "size": "15GB"
+            "size": "15GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "swiss-ai/Apertus-v1.5-8B",
+            "size": "17GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "TaichuAI/ZDTaichu5.0-9B",
-            "size": "18GB"
+            "size": "18GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "teknium/OpenHermes-2.5-Mistral-7B",
+            "size": "27GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "tencent/Hunyuan-A13B-Instruct",
+            "size": "149GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "tencent/HY-Embodied-0.5",
-            "size": "7GB"
+            "size": "7GB",
+            "supports_vision": true,
+            "supports_audio": null
         },
         {
-            "name": "thesysdev/OUI-1",
-            "size": "48GB"
+            "name": "tencent/Hy3",
+            "size": "556GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "thinkingmachines/Inkling",
-            "size": "1TB"
+            "size": "1TB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "thinkingmachines/Inkling-Small",
-            "size": "495GB"
+            "size": "495GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "thinkingmachines/Inkling-Small-NVFP4",
-            "size": "159GB"
+            "name": "tiiuae/falcon-7b-instruct",
+            "size": "52GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-            "size": "2GB"
+            "size": "2GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "TokenRhythm/NeoHorse-1-4B",
-            "size": "7GB"
+            "size": "7GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "TokenRhythm/NeoHorse-1-9B",
-            "size": "16GB"
-        },
-        {
-            "name": "trl-internal-testing/small-Qwen3ForCausalLM",
-            "size": "53MB"
-        },
-        {
-            "name": "trl-internal-testing/tiny-GptOssForCausalLM",
-            "size": "32MB"
-        },
-        {
-            "name": "trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration",
-            "size": "22MB"
-        },
-        {
-            "name": "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
-            "size": "19MB"
-        },
-        {
-            "name": "trl-internal-testing/tiny-Qwen3ForCausalLM",
-            "size": "19MB"
-        },
-        {
-            "name": "trl-internal-testing/tiny-Qwen3MoeForCausalLM",
-            "size": "20MB"
-        },
-        {
-            "name": "ucbye/Qwen3-Coder-Next-NVFP4-GB10",
-            "size": "42GB"
+            "size": "16GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "ukisai/Swift-Qwen3.8-27b",
-            "size": "51GB"
+            "size": "51GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
-            "name": "unsloth/gemma-4-E4B-it-unsloth-bnb-4bit",
-            "size": "10GB"
+            "name": "unsloth/Llama-3.2-1B-Instruct",
+            "size": "2GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "unsloth/Qwen3.6-27B-NVFP4",
-            "size": "21GB"
+            "size": "21GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "unsloth/Qwen3.6-35B-A3B-NVFP4",
-            "size": "24GB"
+            "size": "24GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
+            "size": "22GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "upstage/Solar-Open2-250B",
+            "size": "466GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "vcruz305/CYBER-FROST-3.8-EXL3-SAGE-3.87bpw",
+            "size": "97GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "WeiboAI/VibeThinker-3B",
+            "size": "5GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "XHToken/Spark-X2.5-4B",
-            "size": "7GB"
+            "size": "7GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "XiaomiMiMo/MiMo-V2-Flash",
+            "size": "291GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "XiaomiMiMo/MiMo-V2.5-Pro",
+            "size": "962GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B",
+            "size": "17GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "XiaomiMiMo/MiMo-V2.6-Flash-RL",
+            "size": "165GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "XiaomiMiMo/MiMo-V2.6-Pro-RL",
+            "size": "534GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "XingChen-AGI/Xing4.0-29B-A4B",
+            "size": "58GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "zai-org/AutoGLM-Phone-9B",
+            "size": "19GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "zai-org/GLM-4.1V-9B-Thinking",
-            "size": "19GB"
+            "size": "19GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "zai-org/GLM-4.5",
-            "size": "667GB"
+            "size": "667GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "zai-org/GLM-4.5-Air",
+            "size": "205GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "zai-org/GLM-4.5V",
-            "size": "200GB"
+            "size": "200GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "zai-org/GLM-4.6",
-            "size": "664GB"
+            "size": "664GB",
+            "supports_vision": null,
+            "supports_audio": null
+        },
+        {
+            "name": "zai-org/GLM-4.6V",
+            "size": "200GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "zai-org/GLM-4.6V-Flash",
-            "size": "19GB"
+            "size": "19GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "zai-org/GLM-4.7",
-            "size": "667GB"
+            "size": "667GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "zai-org/GLM-4.7-Flash",
-            "size": "58GB"
+            "size": "58GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "zai-org/GLM-5",
-            "size": "1TB"
+            "size": "1TB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "zai-org/GLM-5.1",
-            "size": "1TB"
+            "size": "1TB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "zai-org/GLM-5.2",
-            "size": "1TB"
-        },
-        {
-            "name": "zai-org/GLM-5.2-FP8",
-            "size": "703GB"
+            "size": "1TB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "zai-org/GLM-5.3",
-            "size": "703GB"
+            "size": "703GB",
+            "supports_vision": null,
+            "supports_audio": null
         },
         {
             "name": "zai-org/GLM-5.3-Flash",
-            "size": "305GB"
+            "size": "305GB",
+            "supports_vision": null,
+            "supports_audio": null
         }
     ],
     "rerankers": [
+        {
+            "name": "Alibaba-NLP/gte-multilingual-reranker-base",
+            "size": "600MB",
+            "is_generative": false
+        },
         {
             "name": "Alibaba-NLP/gte-reranker-modernbert-base",
             "size": "2GB",
@@ -1304,6 +2253,11 @@
             "is_generative": false
         },
         {
+            "name": "cross-encoder/ms-marco-electra-base",
+            "size": "3GB",
+            "is_generative": false
+        },
+        {
             "name": "cross-encoder/ms-marco-MiniLM-L12-v2",
             "size": "1GB",
             "is_generative": false
@@ -1324,18 +2278,13 @@
             "is_generative": false
         },
         {
+            "name": "mixedbread-ai/mxbai-rerank-xsmall-v1",
+            "size": "500MB",
+            "is_generative": false
+        },
+        {
             "name": "nvidia/llama-nemotron-rerank-1b-v2",
             "size": "4GB",
-            "is_generative": false
-        },
-        {
-            "name": "OpenSciLM/OpenScholar_Reranker",
-            "size": "2GB",
-            "is_generative": false
-        },
-        {
-            "name": "qilowoq/bge-reranker-v2-m3-en-ru",
-            "size": "1GB",
             "is_generative": false
         }
     ],
@@ -1353,10 +2302,6 @@
             "size": "4GB"
         },
         {
-            "name": "BAAI/bge-reranker-large",
-            "size": "6GB"
-        },
-        {
             "name": "BAAI/bge-small-en-v1.5",
             "size": "382MB"
         },
@@ -1365,8 +2310,16 @@
             "size": "183MB"
         },
         {
+            "name": "cointegrated/rubert-tiny2",
+            "size": "227MB"
+        },
+        {
             "name": "datasocietyco/bge-base-en-v1.5-course-recommender-v5",
             "size": "418MB"
+        },
+        {
+            "name": "google/embeddinggemma-2",
+            "size": "1GB"
         },
         {
             "name": "google/embeddinggemma-300m",
@@ -1393,12 +2346,8 @@
             "size": "5GB"
         },
         {
-            "name": "jinaai/jina-embeddings-v5-omni-small",
-            "size": "3GB"
-        },
-        {
-            "name": "llm-semantic-router/Vela-1.0-Encoder-307M-Embedding",
-            "size": "2GB"
+            "name": "litert-community/embeddinggemma-2-740m-litert-lm",
+            "size": "6GB"
         },
         {
             "name": "nomic-ai/nomic-embed-text-v1",
@@ -1409,24 +2358,20 @@
             "size": "2GB"
         },
         {
-            "name": "nomic-ai/nomic-embed-text-v2-moe",
-            "size": "1GB"
+            "name": "onnx-community/embeddinggemma-2-ONNX",
+            "size": "5GB"
         },
         {
-            "name": "nomic-ai/nomic-embed-vision-v1.5",
-            "size": "1GB"
+            "name": "perplexity-ai/pplx-embed-v2-context-9b-preview",
+            "size": "31GB"
         },
         {
-            "name": "nvidia/Nemotron-3-Embed-1B-BF16",
+            "name": "perplexity-ai/pplx-embed-v2-late-0.6b",
             "size": "2GB"
         },
         {
-            "name": "nvidia/Nemotron-3-Embed-8B-BF16",
-            "size": "14GB"
-        },
-        {
-            "name": "Octen/Octen-Embedding-8B",
-            "size": "14GB"
+            "name": "perplexity-ai/pplx-embed-v2-late-9b",
+            "size": "31GB"
         },
         {
             "name": "Qwen/Qwen3-Embedding-0.6B",
@@ -1441,8 +2386,12 @@
             "size": "14GB"
         },
         {
-            "name": "sentence-transformers/all-MiniLM-L12-v2",
-            "size": "1GB"
+            "name": "Qwen/Qwen3-VL-Embedding-2B",
+            "size": "4GB"
+        },
+        {
+            "name": "Qwen/Qwen3-VL-Embedding-8B",
+            "size": "15GB"
         },
         {
             "name": "sentence-transformers/all-MiniLM-L6-v2",
@@ -1461,8 +2410,12 @@
             "size": "10GB"
         },
         {
-            "name": "tencent/WeMM-Embedding-9B",
-            "size": "17GB"
+            "name": "unsloth/embeddinggemma-2",
+            "size": "1GB"
+        },
+        {
+            "name": "Xenova/bge-base-en-v1.5",
+            "size": "1GB"
         }
     ]
 }
