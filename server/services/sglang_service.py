@@ -114,7 +114,7 @@ _TOOL_CALL_PARSER_HINTS: tuple[tuple[str, str], ...] = (
 # release process would generate. Unlike vLLM, SGLang's reranker fetch allows generative
 # candidates, tagging each with `is_generative` instead of dropping it.
 _SGLANG_FETCH_PLAN: list[tuple[int, int, int, str, bool]] = [
-    (200, 100, 50, "llm", False),
+    (200, 200, 50, "llm", False),
     (50, 30, 30, "reranker", True),
     (10, 0, 10, "embedding", False),
 ]

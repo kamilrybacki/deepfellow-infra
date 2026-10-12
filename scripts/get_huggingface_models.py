@@ -71,6 +71,30 @@ def is_llm(model: dict[str, Any]) -> bool:
     return not NON_LLM_TASK_WORDS.search(name) and "ocr" not in name
 
 
+CI_FIXTURE_ORG_PREFIXES = ("trl-internal-testing/", "peft-internal-testing/")
+MLX_RE = re.compile(r"\bmlx\b", re.IGNORECASE)
+
+
+def is_test_fixture(model: dict[str, Any]) -> bool:
+    """Detect CI fixtures and test repos (tiny random-weight checkpoints).
+
+    These dominate the downloads ranking because HuggingFace's counter measures CI traffic, but their
+    weights are random so they are useless to serve. Matched by org prefix and the "tiny-random" name.
+    """
+    name = model.get("id", "").lower()
+    return name.startswith(CI_FIXTURE_ORG_PREFIXES) or "tiny-random" in name
+
+
+def is_mlx(model: dict[str, Any]) -> bool:
+    """Detect MLX builds (Apple-silicon only), which neither vLLM nor SGLang can load.
+
+    "mlx" is matched as a token so it is found in "Qwen3.5-9B-MLX-4bit" and "Bonsai-27B-mlx-1bit"
+    but not buried inside an unrelated word.
+    """
+    name = model.get("id", "").lower()
+    return name.startswith("mlx-community/") or bool(MLX_RE.search(name.replace("_", "-")))
+
+
 def is_reranker(model: dict[str, Any]) -> bool:
     """Filter reranker models by name heuristic."""
     name = model.get("id", "").lower()
@@ -313,7 +337,7 @@ async def collect_llm_models(session: aiohttp.ClientSession, active: dict[str, i
     for batch in results:
         for m in batch:
             mid = m["id"]
-            if mid not in seen and is_llm(m) and not is_gguf(m):
+            if mid not in seen and is_llm(m) and not is_gguf(m) and not is_test_fixture(m) and not is_mlx(m):
                 seen.add(mid)
                 models.append(m)
     return models

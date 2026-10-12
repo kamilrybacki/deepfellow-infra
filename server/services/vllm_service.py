@@ -82,7 +82,7 @@ from server.utils.size_fetcher import fetch_huggingface_model_size, fmt_size, su
 # each merged into its own registry key so a refresh reproduces exactly what the offline,
 # reviewed release process would generate.
 _VLLM_FETCH_PLAN: list[tuple[int, int, int, str, bool]] = [
-    (200, 100, 50, "llm", False),
+    (200, 200, 50, "llm", False),
     (10, 0, 10, "reranker", False),
     (10, 0, 10, "embedding", False),
 ]
