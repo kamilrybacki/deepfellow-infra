@@ -445,6 +445,7 @@ class Model(BaseModel):
     capacity: int | None = None
     capacity_known: bool = False
     warm: bool = False
+    healthy: bool = False
 
     @model_validator(mode="before")
     @classmethod

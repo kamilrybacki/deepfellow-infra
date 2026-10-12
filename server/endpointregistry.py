@@ -147,6 +147,7 @@ class RegistrationOptions(NamedTuple):
     capacity_state: CapacityState = "unbounded"
     warm: bool = True
     alias: ModelId | None = None
+    healthy: bool = False
 
 
 class RegistryEntry(NamedTuple):
@@ -268,6 +269,7 @@ class Endpoint[T]:
             capacity_state=options.capacity_state if options else "unbounded",
             warm=options.warm if options else True,
             alias=options.alias if options and options.alias and options.alias != model_id else None,
+            healthy=options.healthy if options else False,
         )
         if model_id not in self.models:
             self.models[model_id] = {}
@@ -484,6 +486,7 @@ class Endpoint[T]:
                         capacity=capacity,
                         capacity_known=capacity_known,
                         warm=item.warm,
+                        healthy=item.healthy,
                     )
                 )
         return res
@@ -639,8 +642,8 @@ class ProxyOptions:
     # register_custom_endpoint_as_proxy; ignored by every other proxy path. This is deliberate —
     # the longer timeout is meant for doc-chunker and other custom services only.
     read_timeout_seconds: int = 300
-    # Custom-endpoint proxy only. True forwards the full path (prefix included) — for proxying to
-    # another DF-Infra node's /custom/{full_path}. False (default) strips the prefix — for
+    # Custom-endpoint and streamable-HTTP MCP proxies only. True forwards the full path (prefix included) — for proxying to
+    # another DF-Infra node's /custom/{full_path} or /mcp/{full_path}. False (default) strips the prefix — for
     # proxying straight to a backing container, which doesn't know about it.
     forward_full_path: bool = False
 
@@ -691,6 +694,11 @@ async def _read_body_with_limit(request: Request, max_bytes: int) -> bytes:
             raise HTTPException(413, f"Request body exceeds the {max_bytes}-byte limit for this MCP proxy endpoint.")
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+def _mcp_transport_changed(existing: RegisteredModel[Any], model: Model) -> bool:
+    """Whether an MCP registration's transport differs from the peer's, which needs a different proxy."""
+    return model.type == "mcp" and existing.props.transport != model.props.transport
 
 
 class ModelInfo(NamedTuple):
@@ -1095,7 +1103,13 @@ class EndpointRegistry:
         async def on_request(request: Request) -> StreamingResponse:
             headers = await options.get_request_headers(request)
             headers["content-type"] = request.headers.get("content-type") or "application/octet-stream"
+            # Mesh proxy only: the child routes by the `{prefix}/...` path, so the whole path must be forwarded.
             full_url = options.url
+            if options.forward_full_path:
+                full_path: str = request.path_params["full_path"]
+                if ".." in full_path.split("/"):
+                    raise HTTPException(400, "Invalid MCP path.")
+                full_url = Utils.join_url(options.url, full_path)
             if request.url.query:
                 full_url = f"{full_url}?{request.url.query}"
             logger.debug("MCP proxy: %s %s -> %s", request.method, request.path_params["full_path"], full_url)
@@ -1259,10 +1273,16 @@ class EndpointRegistry:
                 continue
             if existing is None:
                 logger.info(f"Register new model origin={api_url} id={model.id} name={model.name} type={model.type}")
-            elif key_changed:
-                logger.info(f"Refresh proxy credentials origin={api_url} id={model.id} name={model.name} type={model.type}")
+            elif key_changed or _mcp_transport_changed(existing.registered_model, model):
+                logger.info(f"Refresh proxy origin={api_url} id={model.id} name={model.name} type={model.type}")
                 existing.endpoint.remove_model(model_id=existing.model_id, registration_id=model.id, send_notification=False)
             else:
+                # Same proxy, but the peer may have changed MCP props (tools) or health since the last sync.
+                registered_model = existing.registered_model
+                if model.type == "mcp" and (registered_model.props != model.props or registered_model.healthy != model.healthy):
+                    registered_model.props = model.props
+                    registered_model.healthy = model.healthy
+                    changed = True
                 continue
             changed = True
             self._register_proxy(
@@ -1279,6 +1299,7 @@ class EndpointRegistry:
                     owned_by=owned_by,
                     capacity_state=_capacity_state_from_pair(model.capacity, model.capacity_known),
                     warm=model.warm,
+                    healthy=model.healthy,
                 ),
             )
         for model in prev_list:
@@ -1290,6 +1311,24 @@ class EndpointRegistry:
                     prev.endpoint.remove_model(model_id=prev.model_id, registration_id=model.id, send_notification=False)
         if changed:
             self.parent_infra.send_models_list()
+
+    def _register_mcp_proxy(
+        self, model_id: ModelId, props: ModelProps, url: str, api_key: str, registration_options: RegistrationOptions | None
+    ) -> None:
+        """Register a proxy to an MCP server on a mesh peer, over the transport the peer reported."""
+        options = ProxyOptions(
+            url=urljoin(url, "mcp"),
+            headers={"Authorization": f"Bearer {api_key}"},
+            allowed_request_headers=["accept", "mcp-session-id"],
+            allowed_response_headers=["accept", "mcp-session-id", "www-authenticate"],
+        )
+        if props.transport == "sse":
+            # The SSE proxy always targets `options.url`, so point it at this prefix on the peer.
+            options.url = Utils.join_url(options.url, f"{model_id}/sse")
+            self.register_mcp_sse_endpoint_as_proxy(url=model_id, props=props, options=options, registration_options=registration_options)
+        else:
+            options.forward_full_path = True
+            self.register_mcp_endpoint_as_proxy(url=model_id, props=props, options=options, registration_options=registration_options)
 
     def _register_proxy(
         self,
@@ -1381,15 +1420,7 @@ class EndpointRegistry:
                 registration_options=registration_options,
             )
         elif type == "mcp":
-            self.register_mcp_endpoint_as_proxy(
-                url=model_id,
-                props=props,
-                options=ProxyOptions(
-                    url=urljoin(url, "mcp"),
-                    headers={"Authorization": f"Bearer {api_key}"},
-                ),
-                registration_options=registration_options,
-            )
+            self._register_mcp_proxy(model_id, props, url, api_key, registration_options)
         else:
             logger.warning(f"Cannot register proxy with model_type={type}")
 

@@ -16,7 +16,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from server.docker import DockerOptions
-from server.models.api import McpToolInfo
+from server.models.api import McpToolInfo, ModelProps
 from server.models.models import (
     AddCustomModelIn,
     InstallModelIn,
@@ -1353,7 +1353,9 @@ async def test_install_model_proxy_healthy_probe_skips_background_retry(mock_fet
     assert result.status == "OK"
     assert result.details == "Installed"
     assert result.requires_oauth is False
-    assert len(svc._background_tasks) == 0  # pyright: ignore[reportPrivateUsage]
+    # Only the periodic health monitor runs; no one-shot retry task.
+    assert set(svc._background_tasks) == set(svc._health_monitor_tasks.values())  # pyright: ignore[reportPrivateUsage]
+    svc._stop_health_monitor("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
 
 
 @mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
@@ -1374,7 +1376,9 @@ async def test_install_model_proxy_401_auto_detects_oauth_before_returning(mock_
     assert result.status == "OK"
     assert "authorization required" in result.details.lower()
     assert result.requires_oauth is True
-    assert len(svc._background_tasks) == 0  # pyright: ignore[reportPrivateUsage]
+    # Only the periodic health monitor runs; no one-shot retry task.
+    assert set(svc._background_tasks) == set(svc._health_monitor_tasks.values())  # pyright: ignore[reportPrivateUsage]
+    svc._stop_health_monitor("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
     updated = svc.models["default"]["my-remote-mcp"]
     assert updated.oauth is not None
     assert updated.oauth.enabled is True
@@ -2091,6 +2095,36 @@ def test_apply_healthcheck_result_updates_model_props_and_registry(svc: McpServi
     assert reg_model.healthy is True
     assert reg_model.props.tools == tools
     assert reg_model.props.transport == "streamable_http"
+
+
+def test_apply_healthcheck_result_notifies_parent_when_registration_changes(svc: McpService) -> None:
+    props = ModelProps(private=False, type="mcp", endpoints=[])
+    model = MagicMock(spec=SrvMcpModel)
+    model.model_props = props
+    reg_model = MagicMock()
+    reg_model.props = props
+    reg_model.healthy = False
+    svc.endpoint_registry.mcp_endpoints.models.get.return_value = {"v1": reg_model}  # pyright: ignore[reportAttributeAccessIssue]
+    result = McpHealthCheckResult(healthy=True, transport="sse", tools=[McpToolInfo(name="t", description="d")])
+
+    svc._apply_healthcheck_result(model, "my-prefix", result)  # pyright: ignore[reportPrivateUsage]
+
+    svc.endpoint_registry.parent_infra.send_models_list.assert_called_once()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_apply_healthcheck_result_does_not_notify_parent_when_nothing_changed(svc: McpService) -> None:
+    props = ModelProps(private=False, type="mcp", endpoints=[], transport="sse")
+    model = MagicMock(spec=SrvMcpModel)
+    model.model_props = props
+    reg_model = MagicMock()
+    reg_model.props = props
+    reg_model.healthy = True
+    svc.endpoint_registry.mcp_endpoints.models.get.return_value = {"v1": reg_model}  # pyright: ignore[reportAttributeAccessIssue]
+    result = McpHealthCheckResult(healthy=True, transport="sse", tools=[])
+
+    svc._apply_healthcheck_result(model, "my-prefix", result)  # pyright: ignore[reportPrivateUsage]
+
+    svc.endpoint_registry.parent_infra.send_models_list.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def test_apply_healthcheck_result_no_transport_skips_transport_update(svc: McpService) -> None:
@@ -4594,3 +4628,147 @@ async def test_install_model_proxy_with_refresh_token_starts_background_refresh(
         await asyncio.sleep(0)
 
     mock_start.assert_called_once_with("default", "my-remote-mcp")
+
+
+def _install_model_stub(svc: McpService, prefix: str = "my-prefix") -> None:
+    svc.instances_info["default"].installed = InstalledInfo(
+        models={"open-websearch": MagicMock(prefix=prefix)},
+        options=MagicMock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_health_monitor_marks_unhealthy_after_consecutive_failures(svc: McpService) -> None:
+    _install_model_stub(svc)
+    reg_model = MagicMock(healthy=True)
+    svc.endpoint_registry.mcp_endpoints.models.get.return_value = {"v1": reg_model}  # pyright: ignore[reportAttributeAccessIssue]
+    down = McpHealthCheckResult(healthy=False, error="Connection refused")
+
+    with (
+        mock.patch("server.services.mcp_service.asyncio.sleep", new=AsyncMock()),
+        patch.object(svc, "healthcheck_model", new=AsyncMock(side_effect=[down, down, down, asyncio.CancelledError()])),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await svc._health_monitor_background("default", "open-websearch")  # pyright: ignore[reportPrivateUsage]
+
+    assert reg_model.healthy is False
+    svc.endpoint_registry.parent_infra.send_models_list.assert_called_once()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@pytest.mark.asyncio
+async def test_health_monitor_tolerates_transient_failures(svc: McpService) -> None:
+    _install_model_stub(svc)
+    reg_model = MagicMock(healthy=True)
+    svc.endpoint_registry.mcp_endpoints.models.get.return_value = {"v1": reg_model}  # pyright: ignore[reportAttributeAccessIssue]
+    down = McpHealthCheckResult(healthy=False, error="timeout")
+    up = McpHealthCheckResult(healthy=True)
+
+    with (
+        mock.patch("server.services.mcp_service.asyncio.sleep", new=AsyncMock()),
+        patch.object(svc, "healthcheck_model", new=AsyncMock(side_effect=[down, down, up, down, down, asyncio.CancelledError()])),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await svc._health_monitor_background("default", "open-websearch")  # pyright: ignore[reportPrivateUsage]
+
+    assert reg_model.healthy is True
+    svc.endpoint_registry.parent_infra.send_models_list.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@pytest.mark.asyncio
+async def test_health_monitor_ignores_probe_crashes_and_oauth(svc: McpService) -> None:
+    _install_model_stub(svc)
+    reg_model = MagicMock(healthy=True)
+    svc.endpoint_registry.mcp_endpoints.models.get.return_value = {"v1": reg_model}  # pyright: ignore[reportAttributeAccessIssue]
+    oauth = McpHealthCheckResult(healthy=False, requires_oauth=True)
+    outcomes = [RuntimeError("boom")] * 4 + [oauth] * 4 + [asyncio.CancelledError()]
+
+    with (
+        mock.patch("server.services.mcp_service.asyncio.sleep", new=AsyncMock()),
+        patch.object(svc, "healthcheck_model", new=AsyncMock(side_effect=outcomes)),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await svc._health_monitor_background("default", "open-websearch")  # pyright: ignore[reportPrivateUsage]
+
+    assert reg_model.healthy is True
+    svc.endpoint_registry.parent_infra.send_models_list.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@pytest.mark.asyncio
+async def test_health_monitor_recovers_via_healthcheck_after_unhealthy(svc: McpService) -> None:
+    model = MagicMock(spec=SrvMcpModel)
+    model.model_props = ModelProps(private=False, type="mcp", endpoints=[])
+    reg_model = MagicMock(healthy=False)
+    reg_model.props = model.model_props
+    svc.endpoint_registry.mcp_endpoints.models.get.return_value = {"v1": reg_model}  # pyright: ignore[reportAttributeAccessIssue]
+
+    svc._apply_healthcheck_result(model, "my-prefix", McpHealthCheckResult(healthy=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert reg_model.healthy is True
+    svc.endpoint_registry.parent_infra.send_models_list.assert_called_once()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@pytest.mark.asyncio
+async def test_health_monitor_stops_when_model_uninstalled(svc: McpService) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=MagicMock())
+
+    with (
+        mock.patch("server.services.mcp_service.asyncio.sleep", new=AsyncMock()),
+        patch.object(svc, "healthcheck_model", new=AsyncMock()) as mock_hc,
+    ):
+        await svc._health_monitor_background("default", "open-websearch")  # pyright: ignore[reportPrivateUsage]
+
+    mock_hc.assert_not_awaited()
+
+
+def test_mark_unhealthy_skips_already_unhealthy_registrations(svc: McpService) -> None:
+    already_down = MagicMock(healthy=False)
+    up = MagicMock(healthy=True)
+    svc.endpoint_registry.mcp_endpoints.models.get.return_value = {"v1": already_down, "v2": up}  # pyright: ignore[reportAttributeAccessIssue]
+
+    svc._mark_unhealthy("my-prefix")  # pyright: ignore[reportPrivateUsage]
+
+    assert already_down.healthy is False
+    assert up.healthy is False
+    svc.endpoint_registry.parent_infra.send_models_list.assert_called_once()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_mark_unhealthy_does_not_notify_when_already_unhealthy(svc: McpService) -> None:
+    svc.endpoint_registry.mcp_endpoints.models.get.return_value = {"v1": MagicMock(healthy=False)}  # pyright: ignore[reportAttributeAccessIssue]
+
+    svc._mark_unhealthy("my-prefix")  # pyright: ignore[reportPrivateUsage]
+
+    svc.endpoint_registry.parent_infra.send_models_list.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@pytest.mark.asyncio
+async def test_health_monitor_survives_mark_unhealthy_failure(svc: McpService) -> None:
+    _install_model_stub(svc)
+    down = McpHealthCheckResult(healthy=False, error="refused")
+
+    with (
+        mock.patch("server.services.mcp_service.asyncio.sleep", new=AsyncMock()),
+        patch.object(svc, "healthcheck_model", new=AsyncMock(side_effect=[down] * 4 + [asyncio.CancelledError()])),
+        patch.object(svc, "_mark_unhealthy", side_effect=RuntimeError("registry broke")) as mock_mark,
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await svc._health_monitor_background("default", "open-websearch")  # pyright: ignore[reportPrivateUsage]
+
+    assert mock_mark.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_start_health_monitor_is_idempotent_and_stoppable(svc: McpService) -> None:
+    async def sleep_forever(*_: object) -> None:
+        await asyncio.sleep(3600)
+
+    with patch.object(svc, "_health_monitor_background", new=sleep_forever):
+        svc._start_health_monitor("default", "m")  # pyright: ignore[reportPrivateUsage]
+        first = svc._health_monitor_tasks[("default", "m")]  # pyright: ignore[reportPrivateUsage]
+        svc._start_health_monitor("default", "m")  # pyright: ignore[reportPrivateUsage]
+        assert svc._health_monitor_tasks[("default", "m")] is first  # pyright: ignore[reportPrivateUsage]
+
+        await svc.stop_instance("default")
+        await asyncio.sleep(0)
+
+    assert first.cancelled()
+    assert ("default", "m") not in svc._health_monitor_tasks  # pyright: ignore[reportPrivateUsage]

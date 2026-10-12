@@ -4936,3 +4936,133 @@ async def test_post_json_responses_captures_only_dict_items_from_output_list() -
 
     assert store.get("rs_871851") is not None
     assert store.get("fc_1") is not None
+
+
+@pytest.mark.asyncio
+async def test_register_mcp_endpoint_as_proxy_forwards_full_path_when_requested():
+    reg = make_registry()
+    opts = ProxyOptions(url="http://child.example.com/mcp", forward_full_path=True)
+    reg.register_mcp_endpoint_as_proxy("duck", make_props(), opts, None)
+    ep = reg.mcp_endpoints.get_model("duck")
+    request = MagicMock()
+    request.headers = {}
+    request.method = "POST"
+    request.path_params = {"full_path": "duck/mcp"}
+    request.stream = lambda: _async_byte_stream(b"")
+    request.url.query = ""
+
+    with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=MagicMock()) as mock_req:
+        await ep.endpoint.on_request(request)  # pyright: ignore[reportOptionalMemberAccess]
+
+    assert mock_req.call_args.kwargs["url"] == "http://child.example.com/mcp/duck/mcp"
+
+
+def test_register_proxy_mcp_forwards_protocol_headers_and_full_path():
+    reg = make_registry()
+
+    with patch.object(reg, "register_mcp_endpoint_as_proxy") as mock_register:
+        reg._register_proxy("duck", "mcp", make_props(), "http://child.example.com/", "key", None)  # pyright: ignore[reportPrivateUsage]
+
+    options = mock_register.call_args.kwargs["options"]
+    assert options.url == "http://child.example.com/mcp"
+    assert options.forward_full_path is True
+    assert options.allowed_request_headers == ["accept", "mcp-session-id"]
+    assert options.allowed_response_headers == ["accept", "mcp-session-id", "www-authenticate"]
+
+
+def test_register_proxy_mcp_uses_sse_proxy_for_sse_transport():
+    reg = make_registry()
+    props = make_props(type="mcp")
+    props.transport = "sse"
+
+    with (
+        patch.object(reg, "register_mcp_sse_endpoint_as_proxy") as mock_sse,
+        patch.object(reg, "register_mcp_endpoint_as_proxy") as mock_http,
+    ):
+        reg._register_proxy("duck", "mcp", props, "http://child.example.com/", "key", None)  # pyright: ignore[reportPrivateUsage]
+
+    assert mock_http.call_count == 0
+    assert mock_sse.call_args.kwargs["options"].url == "http://child.example.com/mcp/duck/sse"
+
+
+def test_list_models_reports_registration_health():
+    reg = make_registry()
+    reg.register_mcp_endpoint(
+        "duck", make_props(type="mcp"), McpEndpoint(on_request=AsyncMock()), RegistrationOptions(origin="local", healthy=True)
+    )
+
+    assert [m.healthy for m in reg.list_models()] == [True]
+
+
+def test_update_models_registers_mcp_as_healthy_from_peer():
+    reg = make_registry()
+    model = Model(id="mcp-id", name="duck", type="mcp", props=make_props(type="mcp"), usage=0, healthy=True)
+
+    reg.update_models([], [model], "http://child.example.com/", "key")
+
+    assert [m.id for m in reg.mcp_endpoints.get_healthy_models()] == ["duck"]
+
+
+def test_update_models_applies_health_and_props_change_in_place():
+    reg = make_registry()
+    old = Model(id="mcp-id", name="duck", type="mcp", props=make_props(type="mcp"), usage=0)
+    reg.update_models([], [old], "http://child.example.com/", "key")
+    reg.parent_infra.send_models_list.reset_mock()  # pyright: ignore[reportAttributeAccessIssue]
+    new = old.model_copy(update={"healthy": True, "props": make_props(type="mcp", endpoints=["/mcp/duck/mcp"])})
+
+    with patch.object(reg, "_register_proxy") as mock_register:
+        reg.update_models([old], [new], "http://child.example.com/", "key")
+
+    assert mock_register.call_count == 0
+    assert [m.id for m in reg.mcp_endpoints.get_healthy_models()] == ["duck"]
+    assert reg.registry["mcp-id"].registered_model.props.endpoints == ["/mcp/duck/mcp"]
+    assert reg.parent_infra.send_models_list.call_count == 1  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_update_models_reregisters_mcp_proxy_when_transport_changes():
+    reg = make_registry()
+    old = Model(id="mcp-id", name="duck", type="mcp", props=make_props(type="mcp"), usage=0, healthy=True)
+    reg.update_models([], [old], "http://child.example.com/", "key")
+    sse_props = make_props(type="mcp")
+    sse_props.transport = "sse"
+    new = old.model_copy(update={"props": sse_props})
+
+    with patch.object(reg, "_register_proxy") as mock_register:
+        reg.update_models([old], [new], "http://child.example.com/", "key")
+
+    assert mock_register.call_count == 1
+    assert mock_register.call_args.kwargs["props"].transport == "sse"
+
+
+@pytest.mark.asyncio
+async def test_register_mcp_endpoint_as_proxy_rejects_parent_dir_segments_in_full_path():
+    reg = make_registry()
+    opts = ProxyOptions(url="http://child.example.com/mcp", forward_full_path=True)
+    reg.register_mcp_endpoint_as_proxy("duck", make_props(), opts, None)
+    ep = reg.mcp_endpoints.get_model("duck")
+    request = MagicMock()
+    request.headers = {}
+    request.method = "POST"
+    request.path_params = {"full_path": "duck/../../admin"}
+    request.url.query = ""
+
+    with (
+        patch("server.endpointregistry.make_http_request", new_callable=AsyncMock) as mock_req,
+        pytest.raises(HTTPException) as exc,
+    ):
+        await ep.endpoint.on_request(request)  # pyright: ignore[reportOptionalMemberAccess]
+
+    assert exc.value.status_code == 400
+    assert mock_req.call_count == 0
+
+
+def test_register_proxy_mcp_sse_url_uses_model_name_prefix():
+    reg = make_registry()
+    props = make_props(type="mcp")
+    props.transport = "sse"
+
+    with patch.object(reg, "register_mcp_sse_endpoint_as_proxy") as mock_sse:
+        reg._register_proxy("my-prefix", "mcp", props, "http://child.example.com", "key", None)  # pyright: ignore[reportPrivateUsage]
+
+    assert mock_sse.call_args.kwargs["options"].url == "http://child.example.com/mcp/my-prefix/sse"
+    assert mock_sse.call_args.kwargs["url"] == "my-prefix"
