@@ -1375,7 +1375,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                 if result.healthy or result.requires_oauth:
                     return
             except Exception:
-                pass
+                logger.exception(f"{self.get_id(instance)} background tools fetch for {model_id!r} failed")
 
     def _apply_healthcheck_result(self, model: SrvMcpModel, prefix: str, result: McpHealthCheckResult) -> None:
         """Persist tool list, transport, and healthy flag from a successful health check.

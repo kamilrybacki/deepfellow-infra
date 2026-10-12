@@ -2045,17 +2045,21 @@ async def test_fetch_tools_background_returns_early_when_healthy(svc: McpService
 
 @mock.patch("server.services.mcp_service.asyncio.sleep", new=AsyncMock())
 @pytest.mark.asyncio
-async def test_fetch_tools_background_swallows_exceptions(svc: McpService) -> None:
+async def test_fetch_tools_background_logs_exceptions(svc: McpService) -> None:
     unhealthy_result = McpHealthCheckResult(healthy=False, error="err")
 
-    with patch.object(
-        svc,
-        "healthcheck_model",
-        new=AsyncMock(side_effect=[RuntimeError("boom"), unhealthy_result, unhealthy_result, unhealthy_result, unhealthy_result]),
-    ) as mock_hc:
+    with (
+        patch.object(
+            svc,
+            "healthcheck_model",
+            new=AsyncMock(side_effect=[RuntimeError("boom"), unhealthy_result, unhealthy_result, unhealthy_result, unhealthy_result]),
+        ) as mock_hc,
+        patch("server.services.mcp_service.logger") as mock_logger,
+    ):
         await svc._fetch_tools_background("default", "open-websearch")  # pyright: ignore[reportPrivateUsage]
 
     assert mock_hc.await_count == 5
+    mock_logger.exception.assert_called_once()
 
 
 @mock.patch("server.services.mcp_service.asyncio.sleep", new=AsyncMock())
