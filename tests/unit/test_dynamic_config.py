@@ -57,6 +57,9 @@ def _make_config(storage_dir: Path | None = None, **overrides: object) -> MagicM
     mock.otel_exporter_otlp_endpoint = "http://localhost:4317"
     mock.otel_tracing_enabled = False
     mock.otel_logging_enabled = False
+    mock.sentry_enabled = False
+    mock.sentry_dsn = SecretStr("")
+    mock.sentry_environment = ""
     for key, value in overrides.items():
         setattr(mock, key, value)
     return mock
@@ -484,3 +487,41 @@ def test_persist_writes_current_config_snapshot(tmp_path: Path) -> None:
 
     written = json.loads((tmp_path / "config.json").read_text())
     assert written["settings"]["name"] == "live-name"
+
+
+# --- sentry settings ---
+
+
+def test_load_or_init_does_not_seed_sentry_settings_from_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DF_INFRA_ADMIN_API_KEY", "admin-key")
+    monkeypatch.setenv("DF_STORAGE_DIR", str(tmp_path))
+    monkeypatch.setenv("DF_SENTRY_ENABLED", "true")
+    monkeypatch.setenv("DF_SENTRY_DSN", "https://public@sentry.example.com/42")
+    monkeypatch.setenv("DF_SENTRY_ENVIRONMENT", "staging")
+    config = AppSettings()  # pyright: ignore[reportCallIssue]
+
+    load_or_init(config)
+
+    written = json.loads((tmp_path / "config.json").read_text())["settings"]
+    assert written["sentry_enabled"] is False
+    assert written["sentry_dsn"] == ""
+    assert written["sentry_environment"] == ""
+
+
+def test_write_envelope_atomic_round_trips_sentry_settings_with_unmasked_dsn(tmp_path: Path) -> None:
+    config = _make_config(storage_dir=tmp_path)
+    settings = DynamicSettings(
+        sentry_enabled=True,
+        sentry_dsn=SecretStr("https://public@sentry.example.com/42"),
+        sentry_environment="staging",
+    )
+
+    write_envelope_atomic(config, ConfigEnvelope(settings=settings))
+    envelope = read_envelope(config)
+
+    written = json.loads((tmp_path / "config.json").read_text())["settings"]
+    assert written["sentry_dsn"] == "https://public@sentry.example.com/42"
+    assert envelope is not None
+    assert envelope.settings.sentry_enabled is True
+    assert envelope.settings.sentry_dsn.get_secret_value() == "https://public@sentry.example.com/42"
+    assert envelope.settings.sentry_environment == "staging"

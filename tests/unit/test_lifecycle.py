@@ -10,10 +10,12 @@ from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
 from fastapi import FastAPI
+from pydantic import SecretStr
 
 from server.config import ConfigError
 from server.lifecycle import check_subnet, lifespan
 from server.utils.exceptions import AppStartError
+from server.utils.sentry import SentryManager
 
 
 @pytest.fixture(name="subnet")
@@ -99,6 +101,7 @@ _BASE_PATCHES = [
     "server.lifecycle.PortService",
     "server.lifecycle.create_docker_service",
     "server.lifecycle.ModelDownloader",
+    "server.lifecycle.sentry",
     *[f"server.lifecycle.{cls}" for cls in SERVICE_CLASSES],
 ]
 
@@ -138,6 +141,10 @@ def _apply_base_patches(active_patches: dict[str, Mock], *, config: MagicMock | 
 
     otlp_logging = active_patches["server.lifecycle.OtlpLoggingManager"].return_value
     otlp_logging.teardown = AsyncMock()
+
+    sentry = active_patches["server.lifecycle.sentry"]
+    sentry.reconfigure = AsyncMock()
+    sentry.shutdown = AsyncMock()
 
     return cfg
 
@@ -287,3 +294,58 @@ async def test_lifespan_shutdown_behavior(
         pass
 
     assert svc_mgr.stop_all_services.call_count == expected_call_count
+
+
+@pytest.mark.asyncio
+async def test_lifespan_sets_up_sentry_with_loaded_config(app: FastAPI, base_mocks: dict[str, Mock]) -> None:
+    cfg = _apply_base_patches(base_mocks)
+
+    async with lifespan(app):
+        pass
+
+    mock_sentry = base_mocks["server.lifecycle.sentry"]
+    assert mock_sentry.reconfigure.call_count == 1
+    assert mock_sentry.reconfigure.call_args == call(cfg)
+
+
+@pytest.mark.asyncio
+@patch("server.lifecycle.logger")
+async def test_lifespan_starts_when_sentry_setup_fails(mock_logger: MagicMock, app: FastAPI, base_mocks: dict[str, Mock]) -> None:
+    _apply_base_patches(base_mocks)
+    base_mocks["server.lifecycle.sentry"].reconfigure.side_effect = RuntimeError("sentry down")
+
+    with patch("server.lifecycle.os._exit") as mock_exit:
+        async with lifespan(app):
+            pass
+
+    assert mock_exit.call_count == 0
+    assert mock_logger.warning.call_count == 1
+    assert mock_logger.warning.call_args == call("Sentry error tracking could not be set up and is off", exc_info=True)
+
+
+@pytest.mark.asyncio
+@patch("server.utils.sentry.sentry_sdk.init")
+async def test_lifespan_starts_with_malformed_sentry_dsn(mock_init: MagicMock, app: FastAPI, base_mocks: dict[str, Mock]) -> None:
+    cfg = _make_config()
+    cfg.sentry_enabled = True
+    cfg.sentry_dsn = SecretStr("not-a-dsn")
+    _apply_base_patches(base_mocks, config=cfg)
+    manager = SentryManager()
+
+    with patch("server.lifecycle.sentry", manager), patch("server.lifecycle.os._exit") as mock_exit:
+        async with lifespan(app):
+            is_active = manager.is_active
+
+    assert mock_exit.call_count == 0
+    assert mock_init.call_count == 0
+    assert is_active is False
+
+
+@pytest.mark.asyncio
+async def test_lifespan_shuts_down_sentry_on_exit(app: FastAPI, base_mocks: dict[str, Mock]) -> None:
+    _apply_base_patches(base_mocks)
+
+    async with lifespan(app):
+        pass
+
+    assert base_mocks["server.lifecycle.sentry"].shutdown.call_count == 1

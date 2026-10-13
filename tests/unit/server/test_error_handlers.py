@@ -227,3 +227,47 @@ def test_handle_unhandled_exception_logs_mid_stream_failure_without_second_respo
     assert "X-Error-Id" not in resp.headers
     assert mock_logger.error.call_count == 1
     assert mock_logger.error.call_args.args[1:4] == ("RuntimeError", "GET", "/stream")
+
+
+@mock.patch("server.error_handlers.capture_exception")
+def test_handle_unhandled_exception_reports_to_sentry_with_response_error_id(mock_capture_exception: mock.MagicMock, client: TestClient):
+    resp = client.post("/traced")
+
+    assert mock_capture_exception.call_count == 1
+    exc = mock_capture_exception.call_args.args[0]
+    assert isinstance(exc, RuntimeError)
+    assert mock_capture_exception.call_args == mock.call(
+        exc,
+        error_id=resp.headers["X-Error-Id"],
+        handled=False,
+        span_context=SpanContext(trace_id=TRACE_ID, span_id=SPAN_ID, is_remote=False),
+    )
+
+
+@mock.patch("server.utils.sentry.event_from_exception")
+@mock.patch("server.utils.sentry.sentry_sdk")
+@mock.patch("server.utils.sentry.sentry")
+def test_handle_unhandled_exception_returns_500_when_sentry_reporting_fails(
+    mock_sentry: mock.MagicMock, mock_sentry_sdk: mock.MagicMock, mock_event_from_exception: mock.MagicMock, client: TestClient
+):
+    mock_sentry.is_active = True
+    mock_sentry_sdk.get_client.return_value.is_active.return_value = True
+    mock_event_from_exception.return_value = ({}, {})
+    mock_sentry_sdk.capture_event.side_effect = RuntimeError("sentry down")
+
+    resp = client.get("/boom")
+
+    assert mock_sentry_sdk.capture_event.call_count == 1
+    assert resp.status_code == 500
+    assert resp.json()["error"]["type"] == "api_error"
+    assert resp.headers["X-Error-Id"] in resp.json()["error"]["message"]
+
+
+@pytest.mark.parametrize(("method", "path"), [("GET", "/missing"), ("POST", "/validated")])
+@mock.patch("server.error_handlers.capture_exception")
+def test_handle_http_and_validation_errors_are_not_reported_to_sentry(
+    mock_capture_exception: mock.MagicMock, client: TestClient, method: str, path: str
+):
+    client.request(method, path, json={})
+
+    assert mock_capture_exception.call_count == 0

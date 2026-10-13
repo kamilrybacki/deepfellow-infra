@@ -63,6 +63,10 @@ class DynamicSettings(BaseModel):
     otel_tracing_enabled: bool = False
     otel_logging_enabled: bool = False
 
+    sentry_enabled: bool = False
+    sentry_dsn: SecretStr = SecretStr("")
+    sentry_environment: str = ""
+
     def to_persistable_dict(self) -> dict[str, Any]:
         """Serialize with real secret values — for config.json and internal PUT-merge use only.
 

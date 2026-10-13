@@ -47,6 +47,7 @@ from server.utils.exceptions import AppStartError
 from server.utils.hardware import Hardware
 from server.utils.logger import logger
 from server.utils.model_downloader import ModelDownloader
+from server.utils.sentry import sentry
 from server.utils.tracing import OtlpLoggingManager, tracer
 from server.websockets.infra_websocket_server import InfraWebsocketServer
 from server.websockets.parent_infra import ParentInfra
@@ -73,6 +74,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             raise AppStartError("Config error. Check your .env file and config.json.") from e
 
         tracer.config = config
+        try:
+            await sentry.reconfigure(config)
+        except Exception:
+            # Error tracking must never block startup; the next config update retries it.
+            logger.warning("Sentry error tracking could not be set up and is off", exc_info=True)
         app.state.otlp_logging = otlp_logging = OtlpLoggingManager()
         if config.otel_logging_enabled:
             otlp_logging.setup(config)
@@ -142,6 +148,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         await services_manager.stop_all_services()
     await tracer.shutdown()
     await otlp_logging.teardown()
+    await sentry.shutdown()
 
 
 def check_subnet(subnet: str) -> None:
