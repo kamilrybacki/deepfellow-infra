@@ -164,3 +164,17 @@ def test_connect_to_mesh_url_set(monkeypatch: pytest.MonkeyPatch) -> None:
     s = AppSettings()  # pyright: ignore[reportCallIssue]
 
     assert s.connect_to_mesh_url == "http://mesh.url"
+
+
+def test_app_settings_ignores_sentry_environment_variables(monkeypatch: pytest.MonkeyPatch) -> None:
+    for k, v in _REQUIRED_ENV.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("DF_SENTRY_ENABLED", "true")
+    monkeypatch.setenv("DF_SENTRY_DSN", "https://public@sentry.example.com/42")
+    monkeypatch.setenv("DF_SENTRY_ENVIRONMENT", "staging")
+
+    s = AppSettings()  # pyright: ignore[reportCallIssue]
+
+    assert s.sentry_enabled is False
+    assert s.sentry_dsn.get_secret_value() == ""
+    assert s.sentry_environment == ""

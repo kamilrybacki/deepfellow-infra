@@ -69,6 +69,12 @@ class AppSettings(BaseSettings):
     otel_tracing_enabled: bool = False
     otel_logging_enabled: bool = False
 
+    # Sentry is configured only through config.json / `PUT /admin/config`: the aliases can't match any
+    # real environment variable, so `DF_SENTRY_*` is never read, not even to seed a fresh config.json.
+    sentry_enabled: bool = Field(default=False, validation_alias="__DF_SENTRY_ENABLED_NOT_SETTABLE_VIA_ENV__")
+    sentry_dsn: SecretStr = Field(default=SecretStr(""), validation_alias="__DF_SENTRY_DSN_NOT_SETTABLE_VIA_ENV__")
+    sentry_environment: str = Field(default="", validation_alias="__DF_SENTRY_ENVIRONMENT_NOT_SETTABLE_VIA_ENV__")
+
     model_config = SettingsConfigDict(
         env_file=".env",
         case_sensitive=False,

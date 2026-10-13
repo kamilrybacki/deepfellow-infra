@@ -13,6 +13,7 @@ from starlette.exceptions import HTTPException
 
 from server.utils.failed_span import get_failed_span_context
 from server.utils.logger import logger
+from server.utils.sentry import capture_exception
 
 ERROR_ID_HEADER = "X-Error-Id"
 
@@ -70,7 +71,8 @@ async def handle_unhandled_exception(request: Request, exc: Exception) -> JSONRe
     trace/span IDs of the traced endpoint that failed, if any. The log line has no traceback:
     Starlette re-raises the exception after this handler returns, and uvicorn logs it then. If the
     response had already started (e.g. mid-stream), Starlette drops this response but the log
-    line is still written.
+    line is still written. When Sentry is on, the exception is reported to it as unhandled, tagged
+    with the same IDs; that never raises.
     """
     error_id = str(uuid.uuid4())
     correlation = f"error_id={error_id}"
@@ -78,6 +80,7 @@ async def handle_unhandled_exception(request: Request, exc: Exception) -> JSONRe
     if span_context is not None and span_context.is_valid:
         correlation += f", trace_id={span_context.trace_id:032x}, span_id={span_context.span_id:016x}"
     logger.error("Unhandled %s on %s %r (%s)", type(exc).__name__, request.method, request.url.path, correlation)
+    capture_exception(exc, error_id=error_id, handled=False, span_context=span_context)
 
     body = build_error_body(f"Internal server error. Error ID: {error_id}", "api_error")
     return JSONResponse(status_code=500, content=body, headers={ERROR_ID_HEADER: error_id})
