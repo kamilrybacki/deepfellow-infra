@@ -9,11 +9,13 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Final
+from urllib.parse import urlsplit
 
 from fastapi import HTTPException
 from pydantic import BaseModel, BeforeValidator, Field, ValidationInfo, field_validator
 
 from server.applicationcontext import get_base_url
+from server.config import AppSettings
 from server.docker import DockerImage, DockerOptions
 from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
 from server.models.api import ModelProps
@@ -59,6 +61,9 @@ from server.utils.size_fetcher import fmt_size
 # Token window accepted by BAAI/bge-m3, which the deepfellow-bge-m3 image serves unmodified.
 BGE_M3_CONTEXT_WINDOW = 8192
 DOC_CHUNKER_PROXY_TIMEOUT_SECONDS: Final = 7200
+# This Infra's compose service name, as its containers on the docker subnet reach it. Not unique when several Infra instances
+# share one docker network: it resolves to any of them, so this Infra's key can reach the wrong one.
+DOC_CHUNKER_DEFAULT_GATEWAY_URL: Final = "http://infra:8086"
 
 type SrvCustomModelX = Callable[["CustomService", str | None], SrvCustomModel]
 type DockerOptionsOrCallable = DockerOptions | Callable[[InstallModelOptions], DockerOptions]
@@ -66,6 +71,24 @@ type DockerOptionsOrCallable = DockerOptions | Callable[[InstallModelOptions], D
 
 def _is_gpu_hardware(hardware_parts: Sequence[HardwarePartInfo]) -> bool:
     return any(isinstance(h, NvidiaGpuInfo) for h in hardware_parts)
+
+
+def _normalize_url(url: str) -> tuple[str, str | None, int | None, str] | None:
+    """Return the comparable parts of `url`, or None when it can't be parsed (e.g. a non-numeric port)."""
+    try:
+        parts = urlsplit(url.strip())
+        return parts.scheme.lower(), parts.hostname, parts.port, parts.path.rstrip("/")
+    except ValueError:
+        return None
+
+
+def _is_own_gateway_url(url: str, config: AppSettings) -> bool:
+    """Whether `url` is this Infra's subnet address or its public `infra_url` (literal match, no DNS)."""
+    normalized = _normalize_url(url)
+    if normalized is None:
+        return False
+    own_urls = [DOC_CHUNKER_DEFAULT_GATEWAY_URL, config.infra_url] if config.infra_url else [DOC_CHUNKER_DEFAULT_GATEWAY_URL]
+    return any(normalized == _normalize_url(own_url) for own_url in own_urls)
 
 
 def _model_default_image(model: "SrvCustomModel", hardware: str | None) -> str | None:
@@ -564,6 +587,13 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
         command = docker_options.command if isinstance(docker_options.command, str) else None
         healthcheck = docker_options.healthcheck or {}
         hardware_spec = self.canonicalize_hardware_spec(install_spec["hardware"]) if "hardware" in install_spec else None
+        # A duplicate is persisted in services.json and can't follow key rotation, so it must not carry this Infra's key.
+        infra_api_key = self.config.infra_api_key.get_secret_value()
+        envs = (
+            {key: "" if infra_api_key and str(value) == infra_api_key else str(value) for key, value in docker_options.env_vars.items()}
+            if docker_options.env_vars
+            else None
+        )
         return {
             "id": model_id,
             "private": True,
@@ -583,7 +613,7 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
             # env vars to actual int/bool literals, not strings - `SrvCustomCustomModel.envs` is
             # `dict[str, str]`, so these must be stringified or add_custom_model's validation rejects
             # them ("envs.<key>: Input should be a valid string").
-            "envs": {key: str(value) for key, value in docker_options.env_vars.items()} if docker_options.env_vars else None,
+            "envs": envs,
             "healthcheck_cmd": healthcheck.get("test"),
             "healthcheck_start_period": healthcheck.get("start_period"),
             "description": model.description,
@@ -1131,13 +1161,17 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
                 name="infra_api_url",
                 description="Inference gateway | base URL of the OpenAI-compatible API used to describe images and transcribe audio. ",
                 required=True,
-                placeholder="http://infra:8086",
-                default="http://infra:8086",
+                placeholder=DOC_CHUNKER_DEFAULT_GATEWAY_URL,
+                default=DOC_CHUNKER_DEFAULT_GATEWAY_URL,
             ),
+            # Empty on purpose: this Infra's key is filled in only in generate_docker_options, never in the spec.
             ModelField(
                 type="text",
                 name="infra_api_key",
-                description="Inference gateway | API key, if the gateway requires one",
+                description=(
+                    "Inference gateway | API key, if the gateway requires one. Empty uses this Infra's key when the URL "
+                    "points at this Infra; after rotating it, restart Infra or reinstall doc-chunker."
+                ),
                 required=False,
                 placeholder="",
                 default="",
@@ -1188,6 +1222,12 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
 
     def generate_docker_options(model_fields: InstallModelOptions) -> DockerOptions:
         hardware_parts = custom_service.get_specified_hardware_parts(model_fields.get("hardware"))
+        # An API install with an empty spec gets no field defaults.
+        gateway_url = str(model_fields.get("infra_api_url") or "").strip() or DOC_CHUNKER_DEFAULT_GATEWAY_URL
+        gateway_api_key = str(model_fields.get("infra_api_key") or "")
+        if not gateway_api_key and _is_own_gateway_url(gateway_url, custom_service.config):
+            # Read on every call, so a rotated key lands on the next container rebuild.
+            gateway_api_key = custom_service.config.infra_api_key.get_secret_value()
         image = (
             "hub.simplito.com/deepfellow/doc-chunker-gpu:v2.4.0"
             if _is_gpu_hardware(hardware_parts)
@@ -1211,8 +1251,8 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
                 "JOB_RESULT_TTL": model_fields.get("job_result_ttl", 86400),
                 "DOCUMENT_TIMEOUT": model_fields.get("document_timeout", 3600),
                 "LIBREOFFICE_TIMEOUT": model_fields.get("libreoffice_timeout", 120),
-                "INFRA_API_URL": model_fields.get("infra_api_url", ""),
-                "INFRA_API_KEY": model_fields.get("infra_api_key", ""),
+                "INFRA_API_URL": gateway_url,
+                "INFRA_API_KEY": gateway_api_key,
                 "PICTURE_DESCRIPTION_PROMPT": model_fields.get("picture_description_prompt", "Describe this image in detail."),
                 "PICTURE_DESCRIPTION_API_MAX_TIME": model_fields.get("picture_description_api_max_time", "300"),
                 "PICTURE_DESCRIPTION_CONCURRENCY": model_fields.get("picture_description_concurrency", 4),
