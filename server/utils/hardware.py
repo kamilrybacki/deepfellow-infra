@@ -267,6 +267,7 @@ class Hardware:
     _intel_gpus: list[IntelGpuInfo]
     _realtime_stats_cache: GpuStats | None
     _realtime_stats_cache_ts: float
+    gpu_load_lock: asyncio.Lock
 
     def __init__(self) -> None:
         self.is_info_collected = False
@@ -278,6 +279,7 @@ class Hardware:
         self._total_vram_gb = 0
         self._realtime_stats_cache = None
         self._realtime_stats_cache_ts = 0.0
+        self.gpu_load_lock = asyncio.Lock()
 
     async def init_async(self) -> None:
         """Init async."""

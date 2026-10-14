@@ -831,8 +831,9 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
         return round(min(self._default_gpu_memory_utilization, free_fraction * self._gpu_memory_free_safety_margin), 2)
 
     async def _get_gpu_memory_utilization(
-        self, instance: str, model_id: str, parsed_model_options: SglangModelOptions, model: SglangModel
+        self, instance: str, model_id: str, parsed_model_options: SglangModelOptions, model: SglangModel, *, reserve: bool = True
     ) -> float:
+        """Size the utilization for a model; `reserve=False` only validates, without taking the share."""
         gpu_memory_utilization = parsed_model_options.gpu_memory_utilization
         if gpu_memory_utilization is not None and gpu_memory_utilization <= 0:
             # A persisted 0 (the old free-text field allowed it) used to mean "unset" - keep it that way
@@ -857,6 +858,12 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                 )
         if gpu_memory_utilization is None:
             gpu_memory_utilization = await self._get_default_gpu_memory_utilization()
+            if gpu_memory_utilization < self._min_gpu_memory_utilization:
+                raise HTTPException(
+                    422,
+                    f"Not enough free GPU memory: only {gpu_memory_utilization} of VRAM is free. "
+                    "Wait for running installs to finish or free up GPU memory.",
+                )
         if self.gpu_memory_utilization + gpu_memory_utilization > 1:
             raise HTTPException(
                 422,
@@ -867,6 +874,8 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                     f"which is {self.gpu_memory_utilization + gpu_memory_utilization - 1} more that 1."
                 ),
             )
+        if not reserve:
+            return gpu_memory_utilization
         self.gpu_memory_utilization += gpu_memory_utilization
         msg = f"SGLang gpu utilization = {self.gpu_memory_utilization}"
         logger.debug(msg)
@@ -1110,19 +1119,19 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
         self._installing.add(key)
         model = self.models[instance][model_id]
 
-        gpu_memory_utilization: float | None = None
         try:
-            gpu_memory_utilization = await self._get_gpu_memory_utilization(instance, model_id, parsed_model_options, model)
+            # Fail fast (before a long download) on options that can never fit; the share is really taken in `func`.
+            await self._get_gpu_memory_utilization(instance, model_id, parsed_model_options, model, reserve=False)
             max_model_length = parsed_model_options.max_model_length or model.max_model_len or None
             quantization = await self._get_quantization(parsed_model_options, model)
         except BaseException:
-            self._release_gpu_utilization(gpu_memory_utilization)
             self._installing.discard(key)
             raise
 
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
             model_info: ModelInstalledInfo | None = None
             docker_options: DockerOptions | None = None
+            gpu_memory_utilization: float | None = None
             adopted = False
             try:
                 model_id_fixed = model.hf_id.replace("/", "-")
@@ -1142,49 +1151,54 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                     f"{model_cache_dir}:{docker_model_path}/.cache",
                 ]
 
-                sglang_command = self._build_sglang_command(
-                    docker_model_path=docker_model_path,
-                    model_id=model_id,
-                    model=model,
-                    opts=parsed_model_options,
-                    quantization=quantization,
-                    gpu_memory_utilization=gpu_memory_utilization,
-                    max_model_length=max_model_length,
-                )
+                # Sizing and the container start/health wait are serialized: once the previous container is healthy its
+                # weights are in `used_vram_gb`, so the next model is sized from a measurement that already includes it.
+                # Downloading stays outside the lock, so installs still download in parallel.
+                async with self.hardware.gpu_load_lock:
+                    gpu_memory_utilization = await self._get_gpu_memory_utilization(instance, model_id, parsed_model_options, model)
+                    sglang_command = self._build_sglang_command(
+                        docker_model_path=docker_model_path,
+                        model_id=model_id,
+                        model=model,
+                        opts=parsed_model_options,
+                        quantization=quantization,
+                        gpu_memory_utilization=gpu_memory_utilization,
+                        max_model_length=max_model_length,
+                    )
 
-                env_vars = dict(model.env_vars or {})
-                env_vars["HF_HUB_OFFLINE"] = "1"
-                env_vars["HF_HOME"] = self.hugging_face_cache_path
-                env_vars.update(parsed_model_options.extra_envs)
+                    env_vars = dict(model.env_vars or {})
+                    env_vars["HF_HUB_OFFLINE"] = "1"
+                    env_vars["HF_HOME"] = self.hugging_face_cache_path
+                    env_vars.update(parsed_model_options.extra_envs)
 
-                image = self._get_image(info.options.spec.get("image_version") if info.options else None)
+                    image = self._get_image(info.options.spec.get("image_version") if info.options else None)
 
-                subnet = self.docker_service.get_docker_subnet()
-                service_name = f"{self.get_service_id(instance)}-{normalize_name(model_id)}"
-                docker_options = DockerOptions(
-                    name=service_name,
-                    container_name=container_name_override or self.docker_service.get_docker_container_name(service_name),
-                    image=image.name,
-                    command=sglang_command,
-                    image_port=30000,
-                    env_vars=env_vars,
-                    restart="unless-stopped",
-                    volumes=volumes,
-                    hardware=self.get_specified_hardware_parts(info.parsed_options.hardware),
-                    shm_size=model.shm_size,
-                    ulimits=model.ulimits,
-                    subnet=subnet,
-                    healthcheck={
-                        "test": "curl --fail http://localhost:30000/health_generate || exit 1",
-                        "interval": "80s",
-                        "timeout": "60s",
-                        "retries": "3",
-                        "start_period": "240s",
-                    },
-                )
-                docker_exposed_port, restarted, adopted = await self._start_container_with_embedding_fallback(
-                    docker_options, sglang_command
-                )
+                    subnet = self.docker_service.get_docker_subnet()
+                    service_name = f"{self.get_service_id(instance)}-{normalize_name(model_id)}"
+                    docker_options = DockerOptions(
+                        name=service_name,
+                        container_name=container_name_override or self.docker_service.get_docker_container_name(service_name),
+                        image=image.name,
+                        command=sglang_command,
+                        image_port=30000,
+                        env_vars=env_vars,
+                        restart="unless-stopped",
+                        volumes=volumes,
+                        hardware=self.get_specified_hardware_parts(info.parsed_options.hardware),
+                        shm_size=model.shm_size,
+                        ulimits=model.ulimits,
+                        subnet=subnet,
+                        healthcheck={
+                            "test": "curl --fail http://localhost:30000/health_generate || exit 1",
+                            "interval": "80s",
+                            "timeout": "60s",
+                            "retries": "3",
+                            "start_period": "240s",
+                        },
+                    )
+                    docker_exposed_port, restarted, adopted = await self._start_container_with_embedding_fallback(
+                        docker_options, sglang_command
+                    )
 
                 capacity, capacity_known = await self._resolve_model_capacity(
                     instance, model_id, "SGLang", docker_options.container_name or "", restarted, self._parse_max_concurrency
