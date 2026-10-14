@@ -7,12 +7,12 @@ import asyncio
 import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 from langdetect import detect  # type: ignore
-from pydantic import BaseModel
+from pydantic import BaseModel, BeforeValidator, Field
 
 from server.applicationcontext import get_base_url
 from server.config import get_main_dir
@@ -35,6 +35,7 @@ from server.models.models import (
 from server.models.services import (
     InstallServiceIn,
     InstallServiceProgress,
+    ServiceField,
     ServiceOptions,
     ServiceSize,
     ServiceSpecification,
@@ -178,8 +179,17 @@ class ModelInstalledInfo:
         return ModelInfo(spec=self.options.spec, registration_id=self.registration_id)
 
 
+def _empty_to_none(value: object) -> object:
+    return None if value == "" else value
+
+
+# An emptied optional form field arrives as "", which means unset (speaches' own default of 300 s).
+type OptionalModelTtl = Annotated[Annotated[int, Field(ge=-1)] | None, BeforeValidator(_empty_to_none)]
+
+
 class SpeachesAIOptions(BaseModel):
     hardware: str | bool | None = None
+    keep_alive: OptionalModelTtl = None
 
 
 class SpeachesAIModelOptions(BaseModel):
@@ -254,6 +264,14 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
     def get_spec(self) -> ServiceSpecification:
         """Return the service specification."""
         fields = self.add_hardware_field_to_spec()
+        fields.append(
+            ServiceField(
+                type="text",
+                name="keep_alive",
+                description="The duration that models stay loaded in memory in seconds (default=300, instant_release=0, infinity=-1)",
+                required=False,
+            )
+        )
         return ServiceSpecification(fields=fields)
 
     def get_model_spec(self) -> ModelSpecification:
@@ -325,15 +343,20 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    async def _validate_update_options(self, options: InstallServiceIn) -> None:
+        """Normalize the hardware spec and validate the options spec."""
+        if "hardware" not in options.spec:
+            options.spec["hardware"] = options.spec.get("gpu", self.docker_service.has_gpu_support)
+        options.spec["hardware"] = self.canonicalize_hardware_spec(options.spec["hardware"])
+        try_parse_pydantic(SpeachesAIOptions, options.spec)
+
     async def _install_instance(
         self, instance: str, options: InstallServiceIn, container_name_override: str | None = None
     ) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self.load_default_models(instance)
 
-        if "hardware" not in options.spec:
-            options.spec["hardware"] = options.spec.get("gpu", self.docker_service.has_gpu_support)
-        options.spec["hardware"] = self.canonicalize_hardware_spec(options.spec["hardware"])
+        await self._validate_update_options(options)
         parsed_options = try_parse_pydantic(SpeachesAIOptions, options.spec)
         volumes = [f"{self._get_hub_dir()}:/home/ubuntu/.cache/huggingface/hub"]
 
@@ -347,6 +370,10 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
             stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
             subnet = self.docker_service.get_docker_subnet()
             name = f"{self.get_service_id(instance)}"
+            env_vars = {"ENABLE_UI": "False"}
+            if parsed_options.keep_alive is not None:
+                env_vars["STT_MODEL_TTL"] = str(parsed_options.keep_alive)
+                env_vars["TTS_MODEL_TTL"] = str(parsed_options.keep_alive)
             docker_options = DockerOptions(
                 name=name,
                 container_name=container_name_override or self.docker_service.get_docker_container_name(name),
@@ -354,9 +381,7 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
                 image_port=8000,
                 hardware=self.get_specified_hardware_parts(parsed_options.hardware),
                 volumes=volumes,
-                env_vars={
-                    "ENABLE_UI": "False",
-                },
+                env_vars=env_vars,
                 restart="unless-stopped",
                 # user pinned to 0:0 - get_user_for_docker() returns the host uid:gid on rootful Docker, but the image's /home/ubuntu
                 # is 0750 ubuntu:ubuntu, so any uid other than 1000 cannot reach the venv on PATH - the container then dies with
