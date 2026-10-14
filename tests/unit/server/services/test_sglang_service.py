@@ -29,7 +29,9 @@ from server.services.sglang_service import (
     _const,  # pyright: ignore[reportPrivateUsage]
 )
 from server.utils.core import DownloadedPacket, PreDownloadPacket, Stream, StreamChunk, StreamChunkProgress, SuccessDownloadPacket
+from server.utils.docker_image_version import newer_tag_needing_cuda, newest_docker_tag
 from server.utils.hardware import NvidiaGpuInfo
+from tests.unit.server.real_docker_tags import real_tags
 
 
 @pytest.fixture
@@ -2869,3 +2871,22 @@ async def test_sync_models_logs_warning_when_background_refresh_fails(svc: Sglan
         await asyncio.sleep(0)  # let the fire-and-forget task run
 
     mock_logger.warning.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("max_cuda", "expected"),
+    [
+        (None, "v0.5.19-cu129"),  # without a known driver the CUDA major stays, and no newer CUDA 12 build exists
+        ((12, 9), "v0.5.19-cu129"),
+        ((13, 4), "v0.5.21-cu130"),
+    ],
+)
+def test_newest_tag_in_the_real_docker_hub_list(svc: SglangService, max_cuda: tuple[int, int] | None, expected: str) -> None:
+    tags = svc.filter_docker_tags(real_tags("sglang"), "GPU")
+    assert newest_docker_tag(tags, "v0.5.19-cu129", max_cuda) == expected
+
+
+def test_newer_real_tag_needing_a_newer_cuda(svc: SglangService) -> None:
+    tags = svc.filter_docker_tags(real_tags("sglang"), "GPU")
+    assert newer_tag_needing_cuda(tags, "v0.5.19-cu129", (12, 9)) == ("v0.5.21-cu130", (13, 0))
+    assert newer_tag_needing_cuda(tags, "v0.5.19-cu129", (13, 4)) is None

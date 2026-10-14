@@ -30,7 +30,9 @@ from server.services.llamacpp_service import (
 )
 from server.services.model_catalog_refresh import huggingface_refresh_guard
 from server.utils.core import DownloadedPacket, PreDownloadPacket, Stream, StreamChunk, StreamChunkProgress, SuccessDownloadPacket
+from server.utils.docker_image_version import newest_docker_tag
 from server.utils.hardware import CpuInfo, GpuInfo, IntelGpuInfo, NvidiaGpuInfo
+from tests.unit.server.real_docker_tags import real_tags
 
 
 @pytest.fixture
@@ -1796,3 +1798,17 @@ async def test_sync_models_logs_warning_when_background_refresh_fails(svc: LLama
         await asyncio.sleep(0)  # let the fire-and-forget task run
 
     mock_logger.warning.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("hardware", "installed", "expected"),
+    [
+        ("GPU", "server-cuda12-b5966", "server-cuda12-b11580"),
+        ("vulkan", "server-vulkan-b5966", "server-vulkan-b11580"),
+        ("cpu", "server-intel-b5966", "server-intel-b11580"),
+        ("cpu", "server-b5966", "server-b11580"),
+    ],
+)
+def test_newest_tag_in_the_real_ghcr_list(svc: LLamacppService, hardware: str, installed: str, expected: str) -> None:
+    tags = svc.filter_docker_tags(real_tags("llamacpp"), hardware)
+    assert newest_docker_tag(tags, installed) == expected

@@ -29,6 +29,7 @@ import { apiClient } from "@/deepfellow/client";
 import type { InstallProgress, Service } from "@/deepfellow/types";
 import { InstallationWarningsError } from "@/deepfellow/types";
 import { useModal } from "@/hooks/use-modal";
+import { findImageVersionField, planImageUpdate } from "@/lib/imageUpdate";
 import {
   clearServiceInstallProgress,
   getSnapshot,
@@ -824,6 +825,97 @@ export function ServicesList() {
     });
   };
 
+  const handleUpdateClick = async (service: Service) => {
+    const installed = service.installed;
+    const currentValues =
+      installed &&
+      typeof installed === "object" &&
+      !("stage" in (installed as Record<string, unknown>))
+        ? (installed as Record<string, unknown>)
+        : null;
+    const field = findImageVersionField(service.spec.fields);
+    if (!field || !currentValues) return;
+
+    const toastId = toast.loading(`Checking versions for ${service.id}...`);
+    try {
+      const hardware = field.depends_on
+        ? currentValues[field.depends_on]
+        : undefined;
+      const installedTag = currentValues[field.name];
+      const result = await apiClient.getDockerTags(
+        service.id,
+        typeof hardware === "string" ? hardware : undefined,
+        field.name,
+        undefined,
+        typeof installedTag === "string" ? installedTag : undefined,
+      );
+      toast.dismiss(toastId);
+      if (result.registry_unavailable) {
+        toast.error(
+          "Cannot list versions: DeepFellow Infra cannot reach the Docker registry.",
+        );
+        return;
+      }
+      const plan = planImageUpdate(
+        typeof installedTag === "string" ? installedTag : null,
+        result.default,
+        result.newest,
+        result.newest_needs_cuda,
+      );
+      if (plan.kind === "no-release") {
+        toast.error("No release version found. Choose one in Edit instead.");
+        return;
+      }
+      if (plan.kind === "up-to-date") {
+        if (plan.warning) {
+          toast.warning(
+            `${service.id} is on the newest version this host supports (${plan.version}).`,
+            { description: plan.warning, duration: 15000 },
+          );
+        } else {
+          toast.info(
+            `${service.id} is already on the newest version (${plan.version}).`,
+          );
+        }
+        return;
+      }
+      modal.open(ConfirmModal, {
+        title: `Update ${service.id}`,
+        description: `Update ${service.id} from ${plan.from ?? "the bundled version"} to ${plan.to}? DeepFellow Infra recreates the container with the new image, keeps its other settings, and reloads the installed models. If the update fails, it restores the previous settings.${plan.warning ? ` Note: ${plan.warning}` : ""}`,
+        confirmText: "Update",
+        cancelText: "Cancel",
+        onConfirm: () => {
+          modal.close();
+          const spec = { ...currentValues, [field.name]: plan.to };
+          pendingInstallationRef.current = {
+            serviceId: service.id,
+            spec,
+            size: service.size,
+            update: true,
+          };
+          installMutation.mutate({
+            serviceId: service.id,
+            spec,
+            size: service.size,
+            update: true,
+          });
+        },
+        variant: "warning",
+      });
+    } catch (error) {
+      toast.dismiss(toastId);
+      toast.error(
+        `Failed to check versions: ${error instanceof Error ? error.message : "Unknown error"}`,
+      );
+    }
+  };
+
+  const canUpdateImage = (service: Service) =>
+    !!findImageVersionField(service.spec?.fields) &&
+    typeof service.installed === "object" &&
+    service.installed !== null &&
+    !("stage" in service.installed);
+
   const handleWarningsContinue = () => {
     if (pendingInstallationRef.current) {
       hasWarningsRef.current = false;
@@ -1221,6 +1313,13 @@ export function ServicesList() {
                                 >
                                   Install another instance
                                 </DropdownMenuItem>
+                                {canUpdateImage(service) && (
+                                  <DropdownMenuItem
+                                    onClick={() => handleUpdateClick(service)}
+                                  >
+                                    Update
+                                  </DropdownMenuItem>
+                                )}
                                 {service.has_docker && (
                                   <>
                                     <DropdownMenuItem

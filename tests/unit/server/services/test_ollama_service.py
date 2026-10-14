@@ -41,9 +41,11 @@ from server.utils.core import (
     StreamChunkProgress,
     try_parse_pydantic,
 )
+from server.utils.docker_image_version import newest_docker_tag
 from server.utils.hardware import IntelGpuInfo, NvidiaGpuInfo
 from server.utils.ollama import GGUF_QUANTIZATION_UNSUPPORTED_MESSAGE
 from server.utils.vram_calculator import ArchParams
+from tests.unit.server.real_docker_tags import real_tags
 
 if TYPE_CHECKING:
     from server.models.api import ModelProps
@@ -3840,3 +3842,9 @@ def test_ollama_model_accepts_gguf_and_safetensors_quantization(quantization: st
     model = OllamaModel.model_validate(data)
 
     assert model.quantization == quantization
+
+
+@pytest.mark.parametrize(("installed", "expected"), [("0.12.3-rocm", "0.40.3-rocm"), ("0.34.1", "0.40.3")])
+def test_newest_tag_in_the_real_docker_hub_list(svc: OllamaService, installed: str, expected: str) -> None:
+    tags = svc.filter_docker_tags(real_tags("ollama"), "GPU")
+    assert newest_docker_tag(tags, installed) == expected

@@ -249,7 +249,7 @@ class TestOciRegistryClient:
         page1 = _make_response(
             200,
             {"tags": ["server-cuda-b4738"]},
-            headers={"Link": '</v2/ggml-org/llama.cpp/tags/list?n=100&last=server-cuda-b4738>; rel="next"'},
+            headers={"Link": '</v2/ggml-org/llama.cpp/tags/list?n=1000&last=server-cuda-b4738>; rel="next"'},
         )
         page2 = _make_response(200, {"tags": ["server-cuda-b7836", "server-cuda-b5000"]})
         with patch("aiohttp.ClientSession", return_value=_make_session(token_resp, page1, page2)):
@@ -277,7 +277,7 @@ class TestOciRegistryClient:
         page1 = _make_response(
             200,
             {"tags": ["server-cuda-b1"]},
-            headers={"Link": '</v2/x/tags/list?n=100>; rel="first"'},
+            headers={"Link": '</v2/x/tags/list?n=1000>; rel="first"'},
         )
         with patch("aiohttp.ClientSession", return_value=_make_session(token_resp, page1)):
             client = OciRegistryClient("https://ghcr.io", "https://ghcr.io/token", "repository:{image}:pull")
@@ -292,16 +292,16 @@ class TestOciRegistryClient:
             _make_response(
                 200,
                 {"tags": [f"server-cuda-b{i}"]},
-                headers={"Link": f'</v2/x/tags/list?n=100&last=b{i}>; rel="next"'},
+                headers={"Link": f'</v2/x/tags/list?n=1000&last=b{i}>; rel="next"'},
             )
-            for i in range(30)
+            for i in range(60)
         ]
         with patch("aiohttp.ClientSession", return_value=_make_session(token_resp, *pages)):
             client = OciRegistryClient("https://ghcr.io", "https://ghcr.io/token", "repository:{image}:pull")
             tags = await client.get_tags("ggml-org/llama.cpp")
 
-        # Capped at _OCI_MAX_PAGES (20) pages fetched, then top _OCI_MAX_TAGS (25) kept.
-        assert len(tags) == 20
+        # Capped at _OCI_MAX_PAGES (50) pages fetched, one tag each here, below _OCI_MAX_TAGS (500).
+        assert len(tags) == 50
 
     @pytest.mark.asyncio
     async def test_get_tags_mid_pagination_failure_returns_pages_fetched_so_far(self) -> None:
@@ -309,7 +309,7 @@ class TestOciRegistryClient:
         page1 = _make_response(
             200,
             {"tags": ["server-cuda-b1"]},
-            headers={"Link": '</v2/x/tags/list?n=100&last=b1>; rel="next"'},
+            headers={"Link": '</v2/x/tags/list?n=1000&last=b1>; rel="next"'},
         )
         error_page = _make_response(503, {})
         with patch("aiohttp.ClientSession", return_value=_make_session(token_resp, page1, error_page)):
@@ -529,3 +529,45 @@ class TestImageWithoutRegistryPrefix:
         # No namespace segment - must not fall back to DockerImageNameInfo.parse()'s Hub-flavored
         # "library" default, which would build a nonexistent /v2/library/myimage/tags/list URL.
         assert image_without_registry_prefix("registry.local/myimage") == "myimage"
+
+
+class TestOciRegistryClientRecentTags:
+    @pytest.mark.asyncio
+    async def test_get_tags_keeps_the_newest_builds_of_every_variant(self) -> None:
+        token_resp = _make_response(200, {"token": "tok"})
+        # Oldest first, as GHCR lists them: 100 old builds of two variants, then the latest builds on the last page.
+        old = [f"server-{variant}-b{build}" for build in range(1, 101) for variant in ("vulkan", "intel")]
+        page1 = _make_response(
+            200,
+            {"tags": old},
+            headers={"Link": '</v2/x/tags/list?n=1000&last=server-intel-b100>; rel="next"'},
+        )
+        page2 = _make_response(200, {"tags": ["server-vulkan-b5000", "server-intel-b5000"]})
+        with patch("aiohttp.ClientSession", return_value=_make_session(token_resp, page1, page2)):
+            client = OciRegistryClient("https://ghcr.io", "https://ghcr.io/token", "repository:{image}:pull")
+            tags = await client.get_tags("ggml-org/llama.cpp")
+
+        assert {"server-vulkan-b5000", "server-intel-b5000"} <= set(tags)
+        assert len(tags) == 202
+
+
+class TestOciRegistryClientTagOrder:
+    @pytest.mark.asyncio
+    async def test_get_tags_orders_build_tags_by_build_number_not_by_variant_digits(self) -> None:
+        token_resp = _make_response(200, {"token": "tok"})
+        tags_resp = _make_response(200, {"tags": ["server-cuda13-b10000", "server-cuda12-b11580", "server-b9"]})
+        with patch("aiohttp.ClientSession", return_value=_make_session(token_resp, tags_resp)):
+            client = OciRegistryClient("https://ghcr.io", "https://ghcr.io/token", "repository:{image}:pull")
+            tags = await client.get_tags("ggml-org/llama.cpp")
+
+        assert tags == ["server-cuda12-b11580", "server-cuda13-b10000", "server-b9"]
+
+    @pytest.mark.asyncio
+    async def test_get_tags_orders_version_tags_by_all_numbers(self) -> None:
+        token_resp = _make_response(200, {"token": "tok"})
+        tags_resp = _make_response(200, {"tags": ["v0.9.0", "v0.10.0", "v0.2.11"]})
+        with patch("aiohttp.ClientSession", return_value=_make_session(token_resp, tags_resp)):
+            client = OciRegistryClient("https://ghcr.io", "https://ghcr.io/token", "repository:{image}:pull")
+            tags = await client.get_tags("x/y")
+
+        assert tags == ["v0.10.0", "v0.9.0", "v0.2.11"]

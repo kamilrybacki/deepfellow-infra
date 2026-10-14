@@ -58,6 +58,7 @@ import type { McpOAuthStatusValue, ServiceModel } from "@/deepfellow/types";
 import { InstallationWarningsError } from "@/deepfellow/types";
 import { MODEL_TYPES } from "@/deepfellow/types";
 import { useModal } from "@/hooks/use-modal";
+import { findImageVersionField, planImageUpdate } from "@/lib/imageUpdate";
 import {
   clearModelInstallProgress,
   getSnapshot,
@@ -892,18 +893,20 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
     }: {
       modelId: string;
       spec: Record<string, unknown>;
+      successMessage?: string;
     }) => {
       return apiClient.editModelInstallOptions(serviceId, modelId, spec);
     },
-    onSuccess: (result) => {
+    onSuccess: (result, { successMessage }) => {
       queryClient.invalidateQueries({
         queryKey: ["admin", "services", serviceId, "models"],
       });
       setEditingModelId(null);
       toast.success(
-        result.reinstalled
-          ? "Settings saved. The service was reinstalled with the new settings."
-          : "Settings saved.",
+        successMessage ??
+          (result.reinstalled
+            ? "Settings saved. The service was reinstalled with the new settings."
+            : "Settings saved."),
       );
     },
     onError: (error) => {
@@ -1231,6 +1234,93 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
       installMutation.mutate({ modelId: newModelId, spec, size });
     },
     [installMutation.mutate],
+  );
+
+  const handleUpdateModelClick = useCallback(
+    async (model: ServiceModel) => {
+      const field = findImageVersionField(model.spec?.fields);
+      const installedSpec =
+        model.installed && typeof model.installed === "object"
+          ? model.installed.spec
+          : undefined;
+      if (!field || !installedSpec) return;
+
+      const toastId = toast.loading(`Checking versions for ${model.id}...`);
+      try {
+        const hardware = field.depends_on
+          ? installedSpec[field.depends_on]
+          : undefined;
+        const installedTag = installedSpec[field.name];
+        const result = await apiClient.getDockerTags(
+          serviceId,
+          typeof hardware === "string" ? hardware : undefined,
+          field.name,
+          model.id,
+          typeof installedTag === "string" ? installedTag : undefined,
+        );
+        toast.dismiss(toastId);
+        if (result.registry_unavailable) {
+          toast.error(
+            "Cannot list versions: DeepFellow Infra cannot reach the Docker registry.",
+          );
+          return;
+        }
+        const plan = planImageUpdate(
+          typeof installedTag === "string" ? installedTag : null,
+          result.default,
+          result.newest,
+          result.newest_needs_cuda,
+        );
+        if (plan.kind === "no-release") {
+          toast.error(
+            "No release version found. Choose one in Edit Settings instead.",
+          );
+          return;
+        }
+        if (plan.kind === "up-to-date") {
+          if (plan.warning) {
+            toast.warning(
+              `${model.id} is on the newest version this host supports (${plan.version}).`,
+              { description: plan.warning, duration: 15000 },
+            );
+          } else {
+            toast.info(
+              `${model.id} is already on the newest version (${plan.version}).`,
+            );
+          }
+          return;
+        }
+        modal.open(ConfirmModal, {
+          title: `Update ${model.id}`,
+          description: `Update ${model.id} from ${plan.from ?? "the bundled version"} to ${plan.to}? DeepFellow Infra reinstalls the model with the new image and keeps its other settings. If the update fails, it restores the previous settings.${plan.warning ? ` Note: ${plan.warning}` : ""}`,
+          confirmText: "Update",
+          cancelText: "Cancel",
+          onConfirm: () => {
+            modal.close();
+            setEditingModelId(model.id);
+            editModelInstallOptionsMutation.mutate({
+              modelId: model.id,
+              successMessage: `${model.id} updated to ${plan.to}.`,
+              spec: Object.fromEntries(
+                Object.entries({
+                  ...installedSpec,
+                  [field.name]: plan.to,
+                }).filter(
+                  ([_, value]) => value !== null && value !== undefined,
+                ),
+              ),
+            });
+          },
+          variant: "warning",
+        });
+      } catch (error) {
+        toast.dismiss(toastId);
+        toast.error(
+          `Failed to check versions: ${error instanceof Error ? error.message : "Unknown error"}`,
+        );
+      }
+    },
+    [modal, serviceId, editModelInstallOptionsMutation.mutate],
   );
 
   const handleEditModelOptionsClick = useCallback(
@@ -1932,6 +2022,7 @@ export function ServiceModels({ serviceId }: ServiceModelsProps) {
         onEditMcpServerClick={handleEditMcpServerClick}
         onEditCustomModelClick={handleEditCustomModelClick}
         onEditModelOptionsClick={handleEditModelOptionsClick}
+        onUpdateModelClick={handleUpdateModelClick}
         onPurgeClick={handlePurgeClick}
         onTestClick={handleTestClick}
         onShowDockerLogs={handleShowDockerLogs}
@@ -2053,6 +2144,7 @@ type ModelsTableProps = {
   onEditMcpServerClick: (model: ServiceModel) => void;
   onEditCustomModelClick: (model: ServiceModel) => void;
   onEditModelOptionsClick: (model: ServiceModel) => void | Promise<void>;
+  onUpdateModelClick: (model: ServiceModel) => void | Promise<void>;
   onPurgeClick: (modelId: string) => void;
   onTestClick: (model: ServiceModel) => void;
   onShowDockerLogs: (modelId: string) => void | Promise<void>;
@@ -2080,6 +2172,7 @@ const ModelsTable = memo(function ModelsTable({
   onEditMcpServerClick,
   onEditCustomModelClick,
   onEditModelOptionsClick,
+  onUpdateModelClick,
   onPurgeClick,
   onTestClick,
   onShowDockerLogs,
@@ -2162,6 +2255,7 @@ const ModelsTable = memo(function ModelsTable({
                 onEditMcpServerClick={onEditMcpServerClick}
                 onEditCustomModelClick={onEditCustomModelClick}
                 onEditModelOptionsClick={onEditModelOptionsClick}
+                onUpdateModelClick={onUpdateModelClick}
                 onPurgeClick={onPurgeClick}
                 onTestClick={onTestClick}
                 onShowDockerLogs={onShowDockerLogs}
@@ -2194,6 +2288,7 @@ type ModelRowProps = {
   onEditMcpServerClick: (model: ServiceModel) => void;
   onEditCustomModelClick: (model: ServiceModel) => void;
   onEditModelOptionsClick: (model: ServiceModel) => void | Promise<void>;
+  onUpdateModelClick: (model: ServiceModel) => void | Promise<void>;
   onPurgeClick: (modelId: string) => void;
   onTestClick: (model: ServiceModel) => void;
   onShowDockerLogs: (modelId: string) => void | Promise<void>;
@@ -2235,6 +2330,7 @@ const ModelRow = memo(function ModelRow({
   onEditMcpServerClick,
   onEditCustomModelClick,
   onEditModelOptionsClick,
+  onUpdateModelClick,
   onPurgeClick,
   onTestClick,
   onShowDockerLogs,
@@ -2256,6 +2352,14 @@ const ModelRow = memo(function ModelRow({
     !!installedInfo?.stage && installedInfo?.value !== undefined;
   const isInstallingCurrent = isInstallingAny && installingModelId === model.id;
   const isEditingCurrent = editingModelId === model.id;
+  // Only models with their own docker-tags field (mcp, custom); vLLM and SGLang models are updated per service.
+  const canUpdateImage =
+    !model.custom &&
+    (serviceId === "mcp" || serviceId === "custom") &&
+    !!installedInfo?.spec &&
+    !isInProgress &&
+    !isEditingCurrent &&
+    !!findImageVersionField(model.spec?.fields);
 
   const oauthConfig = (
     model.custom_spec as { oauth?: { enabled?: boolean } } | null
@@ -2585,6 +2689,11 @@ const ModelRow = memo(function ModelRow({
                     Edit Settings
                   </DropdownMenuItem>
                 )
+              )}
+              {canUpdateImage && (
+                <DropdownMenuItem onClick={() => onUpdateModelClick(model)}>
+                  Update
+                </DropdownMenuItem>
               )}
               {oauthEnabled && (
                 <DropdownMenuItem
