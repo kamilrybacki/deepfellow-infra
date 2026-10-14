@@ -14,9 +14,13 @@ from server.utils.logger import logger
 
 _HUB_PAGE_SIZE = 100
 _HUB_MAX_TAGS = 200
-_OCI_PAGE_SIZE = 100
-_OCI_MAX_PAGES = 20
-_OCI_MAX_TAGS = 25
+# GHCR lists tags oldest first and a repo like ggml-org/llama.cpp has over 12 000 of them (one per build and
+# variant), so the newest ones are on the last pages: fetch large pages, and keep enough tags that each
+# variant still has its recent builds after sorting.
+_OCI_PAGE_SIZE = 1000
+_OCI_MAX_PAGES = 50
+_OCI_MAX_TAGS = 500
+_BUILD_SUFFIX_RE = re.compile(r"-b(\d+)$")
 _LINK_NEXT_RE = re.compile(r'<([^>]+)>\s*;\s*rel="next"')
 
 
@@ -118,8 +122,12 @@ def _tag_sort_key(tag: str) -> tuple[tuple[int, ...], str]:
 
     Tags like "server-cuda-b7836" or "v0.19.0" aren't guaranteed to come back from the registry
     in any particular order, so we extract every digit run and compare them numerically, falling
-    back to the raw string to keep the sort stable for tags without comparable numbers.
+    back to the raw string to keep the sort stable for tags without comparable numbers. Tags ending in
+    `-b<build>` are ordered by that build number alone.
     """
+    if build := _BUILD_SUFFIX_RE.search(tag):
+        # "server-cuda12-b7836": the build decides, not the "12" in the variant name.
+        return (int(build[1]),), tag
     numbers = tuple(int(n) for n in re.findall(r"\d+", tag))
     return numbers, tag
 

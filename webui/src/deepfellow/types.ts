@@ -27,6 +27,13 @@ export interface InstallProgress {
   value: number; // 0.0 to 1.0
 }
 
+/** A newer image tag that needs a newer CUDA than the host's NVIDIA driver supports. */
+export interface NewerNeedsCuda {
+  tag: string;
+  required_cuda: string;
+  host_cuda: string;
+}
+
 export interface SpecField {
   name: string;
   description: string;

@@ -153,10 +153,22 @@ class CatalogRefreshOut(BaseModel):
     total: int
 
 
+class NewerNeedsCuda(BaseModel):
+    """A newer image tag that is held back because the host's NVIDIA driver supports too old a CUDA version."""
+
+    tag: str
+    required_cuda: str
+    host_cuda: str
+
+
 class DockerTagsOut(BaseModel):
     image: str
     tags: list[str]
     default: str | None = None
+    # Newest tag of the same variant as `current` (or the default), None when it cannot be determined.
+    newest: str | None = None
+    # Set when an even newer tag exists but needs a newer CUDA than the host's driver supports.
+    newest_needs_cuda: NewerNeedsCuda | None = None
     # True if `tags` is empty because the registry couldn't be reached, not because the image
     # genuinely has no tags - lets the frontend show an error+retry state instead of "No tags found."
     registry_unavailable: bool = False

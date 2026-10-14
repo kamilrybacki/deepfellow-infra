@@ -10,6 +10,9 @@ test *FLAGS:
 ntest *FLAGS:
     uv run pytest --showlocals --tb=auto -ra --cov server --cov-branch --cov-report=term-missing --no-cov-on-fail -n auto {{FLAGS}}
 
+test-live *FLAGS:
+    DF_TEST_LIVE_REGISTRIES=1 uv run pytest tests/integration -v --no-cov {{FLAGS}}
+
 ruff *FLAGS:
     uv run ruff check server/ scripts/ tests/ {{FLAGS}}
 

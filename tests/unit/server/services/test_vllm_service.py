@@ -42,8 +42,10 @@ from server.utils.core import (
     StreamChunkProgress,
     SuccessDownloadPacket,
 )
+from server.utils.docker_image_version import newest_docker_tag
 from server.utils.exceptions import AppError
 from server.utils.hardware import NvidiaGpuInfo
+from tests.unit.server.real_docker_tags import real_tags
 
 
 @pytest.fixture
@@ -4441,3 +4443,16 @@ def test_get_persisted_model_gpu_memory_utilization_prefers_value_kept_across_an
     svc._edit_kept_gpu_utilization[("default", "google/test")] = 0.4  # pyright: ignore[reportPrivateUsage]
 
     assert svc._get_persisted_model_gpu_memory_utilization("default", "google/test", 0.5) == 0.4  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    ("installed", "max_cuda", "expected"),
+    [
+        ("v0.29.0-cu129-ubuntu2404", None, "v0.31.0-cu129-ubuntu2404"),
+        ("v0.29.0-cu129-ubuntu2404", (13, 4), "v0.31.0-cu129-ubuntu2404"),
+        ("v0.29.0-cu129", None, "v0.31.0-cu129"),
+    ],
+)
+def test_newest_tag_in_the_real_docker_hub_list(svc: VllmService, installed: str, max_cuda: tuple[int, int] | None, expected: str) -> None:
+    tags = svc.filter_docker_tags(real_tags("vllm"), "GPU")
+    assert newest_docker_tag(tags, installed, max_cuda) == expected
