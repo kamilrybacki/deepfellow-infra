@@ -3,7 +3,7 @@
 
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
 from fastapi import HTTPException
@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from server.models.models import InstallModelIn, ListModelsFilters, UninstallModelIn
 from server.models.services import InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import CustomModel, Instance, InstanceConfig
+from server.services.rerank_service import RerankService
 from server.services.speaches_ai_service import (
     DownloadedInfo,
     InstalledInfo,
@@ -21,7 +22,7 @@ from server.services.speaches_ai_service import (
     SrvSpeachesCustomModel,
     _const,  # pyright: ignore[reportPrivateUsage]
 )
-from server.utils.core import DownloadedPacket, PreDownloadPacket, Stream, StreamChunkProgress
+from server.utils.core import DownloadedPacket, PreDownloadPacket, Stream, StreamChunkProgress, try_parse_pydantic
 from server.utils.hardware import NvidiaGpuInfo
 
 
@@ -1442,3 +1443,158 @@ async def test_install_model_registration_failure_skips_rollback_when_already_re
             await promise.wait()
 
     assert stt_model_id not in installed.models
+
+
+@pytest.mark.parametrize(
+    ("keep_alive", "expected"),
+    [
+        ("", None),
+        ("600", 600),
+        (3600, 3600),
+        (0, 0),
+        (-1, -1),
+    ],
+)
+def test_speaches_options_parses_keep_alive(keep_alive: str | int, expected: int | None) -> None:
+    opts = try_parse_pydantic(SpeachesAIOptions, {"keep_alive": keep_alive})
+
+    assert opts.keep_alive == expected
+
+
+def test_speaches_options_keep_alive_defaults_none() -> None:
+    opts = SpeachesAIOptions()
+
+    assert opts.keep_alive is None
+
+
+@pytest.mark.parametrize("keep_alive", [-5, "5m"])
+def test_speaches_options_rejects_invalid_keep_alive(keep_alive: str | int) -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        try_parse_pydantic(SpeachesAIOptions, {"keep_alive": keep_alive})
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == [{"field": "keep_alive", "message": ANY}]
+
+
+def test_get_spec_keep_alive_is_optional_and_matches_rerank(svc: SpeachesAIService, deps: dict[str, Any]) -> None:
+    rerank_spec = RerankService(**deps).get_spec()
+
+    spec = svc.get_spec()
+
+    keep_alive = next(f for f in spec.fields if f.name == "keep_alive")
+    rerank_keep_alive = next(f for f in rerank_spec.fields if f.name == "keep_alive")
+    assert keep_alive.required is False
+    assert keep_alive.type == rerank_keep_alive.type
+    assert keep_alive.description == rerank_keep_alive.description
+
+
+async def _install_and_get_env_vars(svc: SpeachesAIService, deps: dict[str, Any], tmp_path: Path, spec: dict[str, Any]) -> dict[str, str]:
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "df-speaches"
+    deps["docker_service"].get_container_host.return_value = "localhost"
+    deps["docker_service"].get_container_port.return_value = 8000
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True, False))
+
+    with (
+        patch.object(svc, "_download_image_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_verify_docker_image", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+    ):
+        promise = await svc._install_instance("default", InstallServiceIn(spec={"hardware": False, **spec}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    assert deps["docker_service"].install_and_run_docker.call_count == 1
+    return deps["docker_service"].install_and_run_docker.call_args.args[0].env_vars
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("keep_alive", "expected"),
+    [
+        (3600, "3600"),
+        ("600", "600"),
+        (0, "0"),
+        (-1, "-1"),
+    ],
+)
+async def test_install_instance_sets_model_ttl_env_vars_from_keep_alive(
+    svc: SpeachesAIService, deps: dict[str, Any], tmp_path: Path, keep_alive: str | int, expected: str
+) -> None:
+    env_vars = await _install_and_get_env_vars(svc, deps, tmp_path, {"keep_alive": keep_alive})
+
+    assert env_vars["STT_MODEL_TTL"] == expected
+    assert env_vars["TTS_MODEL_TTL"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec", [{}, {"keep_alive": ""}])
+async def test_install_instance_leaves_model_ttl_unset_without_keep_alive(
+    svc: SpeachesAIService, deps: dict[str, Any], tmp_path: Path, spec: dict[str, Any]
+) -> None:
+    env_vars = await _install_and_get_env_vars(svc, deps, tmp_path, spec)
+
+    assert env_vars == {"ENABLE_UI": "False"}
+
+
+@pytest.mark.asyncio
+async def test_install_instance_rejects_invalid_keep_alive_before_creating_container(
+    svc: SpeachesAIService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True, False))
+
+    with (
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc._install_instance("default", InstallServiceIn(spec={"hardware": False, "keep_alive": -5}))  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+    assert deps["docker_service"].install_and_run_docker.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_update_instance_recreates_container_with_new_keep_alive(
+    svc: SpeachesAIService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    svc.instances_info["default"].installed = _make_installed_info()
+    deps["service_provider"].save_service_config = AsyncMock()
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "df-speaches"
+    deps["docker_service"].get_container_host.return_value = "localhost"
+    deps["docker_service"].get_container_port.return_value = 8000
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True, False))
+
+    with (
+        patch.object(svc, "_uninstall_instance", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_download_image_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_verify_docker_image", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+    ):
+        promise = await svc.update_instance("default", InstallServiceIn(spec={"hardware": False, "keep_alive": -1}))
+        await promise.wait()
+
+    installed = svc.instances_info["default"].installed
+    assert installed is not None
+    assert installed.parsed_options.keep_alive == -1
+    assert deps["docker_service"].install_and_run_docker.call_count == 1
+    env_vars = deps["docker_service"].install_and_run_docker.call_args.args[0].env_vars
+    assert env_vars["STT_MODEL_TTL"] == "-1"
+    assert env_vars["TTS_MODEL_TTL"] == "-1"
+
+
+@pytest.mark.asyncio
+async def test_update_instance_rejects_invalid_keep_alive_before_uninstalling(svc: SpeachesAIService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info()
+    svc.instances_info["default"].installed = installed
+
+    with (
+        patch.object(svc, "_uninstall_instance", new_callable=AsyncMock) as mock_uninstall_instance,  # pyright: ignore[reportPrivateUsage]
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc.update_instance("default", InstallServiceIn(spec={"hardware": False, "keep_alive": "5m"}))
+
+    assert exc_info.value.status_code == 400
+    assert mock_uninstall_instance.call_count == 0
+    assert svc.instances_info["default"].installed is installed
