@@ -55,6 +55,7 @@ def deps() -> dict[str, Any]:
     hw.gpus = []
     hw.nvidia_gpus = []
     hw.intel_gpus = []
+    hw.gpu_load_lock = asyncio.Lock()
     finetune_service = MagicMock(spec=FinetuneService)
     finetune_service.get_installed_base_url.return_value = "http://df-finetune:8333"
     services_manager = MagicMock()
@@ -4443,6 +4444,101 @@ def test_get_persisted_model_gpu_memory_utilization_prefers_value_kept_across_an
     svc._edit_kept_gpu_utilization[("default", "google/test")] = 0.4  # pyright: ignore[reportPrivateUsage]
 
     assert svc._get_persisted_model_gpu_memory_utilization("default", "google/test", 0.5) == 0.4  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_second_install_is_sized_only_after_the_first_container_is_healthy(deps: dict[str, Any], tmp_path: Path) -> None:
+    nvidia = MagicMock(spec=NvidiaGpuInfo)
+    deps["hardware"].gpus = [nvidia]
+    svc = VllmService(**deps)
+    loaded = False
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def stats(*_args: Any, **_kwargs: Any) -> GpuStats:
+        return GpuStats(total_vram_gb=10.0, used_vram_gb=4.0 if loaded else 0.0, gpus=None)
+
+    async def run_docker(options: Any) -> tuple[int, bool, bool]:
+        nonlocal loaded
+        if not first_started.is_set():
+            first_started.set()
+            await release_first.wait()  # the first container is still loading its weights
+            loaded = True
+        return 8000, True, False
+
+    deps["hardware"].get_realtime_stats = stats
+    deps["docker_service"].install_and_run_docker = run_docker
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "container"
+    svc.instances_info["default"].installed = _make_installed_info(hardware=True)
+    first_id, second_id = list(svc.models["default"])[:2]
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_get_quantization", new=AsyncMock(return_value=None)),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[nvidia]),
+        patch.object(svc, "is_given_hardware_support_gpu", return_value=True),
+    ):
+        first = await svc._install_model("default", first_id, InstallModelIn(spec={"gpu_memory_utilization": 0.4}))  # pyright: ignore[reportPrivateUsage]
+        second = await svc._install_model("default", second_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        first_task = asyncio.create_task(first.wait())
+        second_task = asyncio.create_task(second.wait())
+        await first_started.wait()
+        for _ in range(20):
+            await asyncio.sleep(0)  # the second one downloads meanwhile, but must wait for the first before sizing
+        assert svc.gpu_memory_utilization == 0.4  # nothing reserved for the second yet: no double counting while loading
+        release_first.set()
+        await asyncio.gather(first_task, second_task)
+
+    models = svc.instances_info["default"].installed.models  # pyright: ignore[reportOptionalMemberAccess]
+    assert models[second_id].gpu_memory_utilization == 0.54  # 0.9 * the 0.6 left once the first model is loaded
+    assert svc.gpu_memory_utilization == pytest.approx(0.94)
+
+
+@pytest.mark.asyncio
+async def test_cpu_install_does_not_wait_for_the_gpu_load_lock(deps: dict[str, Any], tmp_path: Path) -> None:
+    svc = VllmService(**deps)
+
+    async def run_docker(options: Any) -> tuple[int, bool, bool]:
+        return 8000, True, False
+
+    deps["docker_service"].install_and_run_docker = run_docker
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "container"
+    svc.instances_info["default"].installed = _make_installed_info(hardware=False)
+    model_id = next(iter(svc.models["default"]))
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_get_quantization", new=AsyncMock(return_value=None)),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "is_given_hardware_support_gpu", return_value=False),
+    ):
+        async with deps["hardware"].gpu_load_lock:  # a GPU model is loading right now
+            promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+            await asyncio.wait_for(promise.wait(), timeout=5)
+
+    assert model_id in svc.instances_info["default"].installed.models  # pyright: ignore[reportOptionalMemberAccess]
+
+
+def test_vllm_and_sglang_share_the_gpu_load_lock_of_hardware(deps: dict[str, Any]) -> None:
+    assert VllmService(**deps).hardware.gpu_load_lock is deps["hardware"].gpu_load_lock
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_raises_422_when_default_is_below_minimum(svc: VllmService, deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=10.0, gpus=None))
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 422
+    assert "Not enough free GPU memory" in exc_info.value.detail
+    assert svc.gpu_memory_utilization == 0.0
 
 
 @pytest.mark.parametrize(
