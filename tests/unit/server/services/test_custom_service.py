@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from fastapi import HTTPException
+from pydantic import SecretStr
 
 from server.docker import DockerOptions
 from server.models.api import ModelProps
@@ -16,6 +17,7 @@ from server.models.models import AddCustomModelIn, InstallModelIn, ListModelsFil
 from server.models.services import InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import CustomModel, Instance, InstanceConfig
 from server.services.custom_service import (
+    DOC_CHUNKER_DEFAULT_GATEWAY_URL,
     DOC_CHUNKER_PROXY_TIMEOUT_SECONDS,
     CustomService,
     DownloadedInfo,
@@ -23,6 +25,7 @@ from server.services.custom_service import (
     ModelInstalledInfo,
     SrvCustomModel,
     _const,  # pyright: ignore[reportPrivateUsage]
+    _is_own_gateway_url,  # pyright: ignore[reportPrivateUsage]
     create_bge_m3_model,
     create_doc_chunker_model,
     create_gliner_model,
@@ -48,6 +51,8 @@ def deps() -> dict[str, Any]:
     docker_svc.get_docker_container_name.side_effect = lambda name, **_: f"df-{name}"  # pyright: ignore[reportUnknownLambdaType]
     config = MagicMock()
     config.standard_proxy_timeout_seconds = 300
+    config.infra_api_key = SecretStr("infra-key")
+    config.infra_url = ""
     return {
         "config": config,
         "endpoint_registry": MagicMock(),
@@ -1506,6 +1511,181 @@ def test_create_doc_chunker_model_falls_back_to_default_version(svc: CustomServi
 
     docker_opts = model.options({"hardware": "CPU"})  # pyright: ignore[reportCallIssue]
     assert docker_opts.image == "hub.simplito.com/deepfellow/doc-chunker-cpu:v2.4.0"
+
+
+@pytest.mark.parametrize(
+    ("url", "infra_url", "expected"),
+    [
+        ("http://infra:8086", "", True),
+        ("http://infra:8086/", "", True),
+        ("HTTP://INFRA:8086", "", True),
+        ("  http://infra:8086  ", "", True),
+        ("http://infra:8087", "", False),
+        ("http://infra", "", False),
+        ("https://infra:8086", "", False),
+        ("https://gateway.example.com", "", False),
+        ("", "", False),
+        ("http://infra:notaport", "", False),
+        ("http://infra:8086", "https://infra.example.com", True),
+        ("https://infra.example.com", "https://infra.example.com", True),
+        ("HTTPS://Infra.Example.com/", "https://infra.example.com", True),
+        ("https://example.com/infra/", "https://example.com/infra", True),
+        ("https://example.com", "https://example.com/infra", False),
+        ("https://gateway.example.com", "https://infra.example.com", False),
+        ("https://infra.example.com", "https://infra.example.com:notaport", False),
+    ],
+)
+def test_is_own_gateway_url_matches_only_this_infra(deps: dict[str, Any], url: str, infra_url: str, expected: bool):
+    deps["config"].infra_url = infra_url
+
+    result = _is_own_gateway_url(url, deps["config"])
+
+    assert result is expected
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected_url", "expected_key"),
+    [
+        ({}, DOC_CHUNKER_DEFAULT_GATEWAY_URL, "infra-key"),
+        ({"infra_api_url": "", "infra_api_key": ""}, DOC_CHUNKER_DEFAULT_GATEWAY_URL, "infra-key"),
+        ({"infra_api_url": None, "infra_api_key": None}, DOC_CHUNKER_DEFAULT_GATEWAY_URL, "infra-key"),
+        ({"infra_api_url": "   "}, DOC_CHUNKER_DEFAULT_GATEWAY_URL, "infra-key"),
+        ({"infra_api_url": "http://infra:8086/", "infra_api_key": ""}, "http://infra:8086/", "infra-key"),
+        ({"infra_api_url": "http://infra:8086", "infra_api_key": "custom-key"}, "http://infra:8086", "custom-key"),
+        ({"infra_api_url": "https://gateway.example.com"}, "https://gateway.example.com", ""),
+        ({"infra_api_url": "https://gateway.example.com", "infra_api_key": ""}, "https://gateway.example.com", ""),
+        ({"infra_api_url": "https://gateway.example.com", "infra_api_key": "gateway-key"}, "https://gateway.example.com", "gateway-key"),
+    ],
+)
+def test_create_doc_chunker_model_resolves_gateway_address_and_key(
+    svc: CustomService, spec: dict[str, Any], expected_url: str, expected_key: str
+):
+    model = create_doc_chunker_model(svc, "172.20.0.0/16")
+
+    docker_opts = model.options({"hardware": "CPU", **spec})  # pyright: ignore[reportCallIssue]
+
+    assert docker_opts.env_vars is not None
+    assert docker_opts.env_vars["INFRA_API_URL"] == expected_url
+    assert docker_opts.env_vars["INFRA_API_KEY"] == expected_key
+
+
+def test_create_doc_chunker_model_uses_infra_key_for_public_infra_url(svc: CustomService, deps: dict[str, Any]):
+    deps["config"].infra_url = "https://infra.example.com"
+    model = create_doc_chunker_model(svc, "172.20.0.0/16")
+
+    docker_opts = model.options({"hardware": "CPU", "infra_api_url": "HTTPS://Infra.Example.com/"})  # pyright: ignore[reportCallIssue]
+
+    assert docker_opts.env_vars is not None
+    assert docker_opts.env_vars["INFRA_API_KEY"] == "infra-key"
+
+
+def test_create_doc_chunker_model_reads_rotated_infra_key(svc: CustomService, deps: dict[str, Any]):
+    model = create_doc_chunker_model(svc, "172.20.0.0/16")
+    model.options({"hardware": "CPU"})  # pyright: ignore[reportCallIssue]
+    deps["config"].infra_api_key = SecretStr("rotated-key")
+
+    docker_opts = model.options({"hardware": "CPU"})  # pyright: ignore[reportCallIssue]
+
+    assert docker_opts.env_vars is not None
+    assert docker_opts.env_vars["INFRA_API_KEY"] == "rotated-key"
+
+
+def test_create_doc_chunker_model_leaves_install_fields_untouched(svc: CustomService):
+    model = create_doc_chunker_model(svc, "172.20.0.0/16")
+    model_fields: dict[str, Any] = {"hardware": "CPU"}
+
+    model.options(model_fields)  # pyright: ignore[reportCallIssue]
+
+    assert model_fields == {"hardware": "CPU"}
+
+
+def test_doc_chunker_gateway_fields_default_to_this_infra_without_a_key(svc: CustomService):
+    fields = {f.name: f for f in svc.models["default"]["doc_chunker"].model_spec.fields}
+
+    url_field = fields["infra_api_url"]
+    key_field = fields["infra_api_key"]
+
+    assert url_field.default == DOC_CHUNKER_DEFAULT_GATEWAY_URL
+    assert key_field.default == ""
+    assert "infra-key" not in svc.models["default"]["doc_chunker"].model_spec.model_dump_json()
+
+
+def _set_installed_doc_chunker(svc: CustomService, spec: dict[str, Any]) -> None:
+    installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    installed.models["doc_chunker"] = ModelInstalledInfo(
+        id="doc_chunker",
+        options=InstallModelIn(spec=spec),
+        docker_options=MagicMock(),
+        container_host="",
+        container_port=0,
+        docker_exposed_port=0,
+        registration_id="reg-1",
+        prefix="doc_chunker",
+        base_url="",
+    )
+    svc.instances_info["default"].installed = installed
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_blanks_infra_key_of_not_installed_doc_chunker(svc: CustomService):
+    spec = await svc.get_duplicate_spec("default", "doc_chunker")
+
+    assert spec["envs"]["INFRA_API_URL"] == DOC_CHUNKER_DEFAULT_GATEWAY_URL
+    assert spec["envs"]["INFRA_API_KEY"] == ""
+    assert "infra-key" not in spec["envs"].values()
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_blanks_infra_key_of_installed_doc_chunker(svc: CustomService):
+    _set_installed_doc_chunker(svc, {"hardware": "CPU", "infra_api_url": "http://infra:8086", "infra_api_key": ""})
+
+    spec = await svc.get_duplicate_spec("default", "doc_chunker")
+
+    assert spec["envs"]["INFRA_API_KEY"] == ""
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_keeps_admin_provided_doc_chunker_key(svc: CustomService):
+    _set_installed_doc_chunker(svc, {"hardware": "CPU", "infra_api_url": "http://infra:8086", "infra_api_key": "custom-key"})
+
+    spec = await svc.get_duplicate_spec("default", "doc_chunker")
+
+    assert spec["envs"]["INFRA_API_KEY"] == "custom-key"
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_with_empty_infra_key_keeps_envs_as_is(svc: CustomService, deps: dict[str, Any]):
+    deps["config"].infra_api_key = SecretStr("")
+
+    spec = await svc.get_duplicate_spec("default", "doc_chunker")
+
+    assert spec["envs"]["INFRA_API_KEY"] == ""
+    assert spec["envs"]["MAX_CONCURRENT"] == "2"
+    assert spec["envs"]["INFRA_API_URL"] == DOC_CHUNKER_DEFAULT_GATEWAY_URL
+
+
+@pytest.mark.asyncio
+async def test_install_model_doc_chunker_keeps_infra_key_out_of_persisted_config(svc: CustomService, deps: dict[str, Any]):
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    _mock_successful_install(deps)
+
+    with patch.object(svc, "validate_docker_image_version_for_model", new_callable=AsyncMock):
+        promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+            "default", "doc_chunker", InstallModelIn(spec={"hardware": "CPU"})
+        )
+    await promise.wait()
+    instance_config = svc._generate_instance_config(  # pyright: ignore[reportPrivateUsage]
+        "default", svc.instances_info["default"].installed, None
+    )
+
+    started_options: DockerOptions = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert started_options.env_vars is not None
+    assert started_options.env_vars["INFRA_API_KEY"] == "infra-key"
+    assert svc.instances_info["default"].installed.models["doc_chunker"].options.spec == {  # pyright: ignore[reportOptionalMemberAccess]
+        "hardware": "CPU",
+        "prefix": "doc_chunker",
+    }
+    assert "infra-key" not in instance_config.model_dump_json()
 
 
 def test_loaded_doc_chunker_model_has_docker_tags_field(svc: CustomService) -> None:
