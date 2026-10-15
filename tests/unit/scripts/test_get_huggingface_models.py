@@ -38,6 +38,7 @@ from scripts.get_huggingface_models import (
     main,
     validate_model_compatibility,
 )
+from scripts.utils.hf_common import DEFAULT_MODEL_DETAIL_CACHE_DIR
 
 
 @pytest.mark.parametrize(
@@ -1007,7 +1008,7 @@ async def test_main_llm_output_json(capsys: pytest.CaptureFixture[str]) -> None:
         return models
 
     async def fake_details(
-        session: Mock, model_id: str, _sem: asyncio.Semaphore, check_chat_template: bool = False
+        session: Mock, model_id: str, _sem: asyncio.Semaphore, check_chat_template: bool = False, cache_dir: Path | None = None
     ) -> tuple[str, str, list[str], bool]:
         return model_id, sizes.get(model_id, "N/A"), [], True
 
@@ -1038,7 +1039,7 @@ async def test_main_reranker_output_json(capsys: pytest.CaptureFixture[str]) -> 
         return models
 
     async def fake_details(
-        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
+        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False, cache_dir: Path | None = None
     ) -> tuple[str, str, list[str], bool]:
         return model_id, sizes.get(model_id, "N/A"), architectures.get(model_id, []), True
 
@@ -1071,7 +1072,7 @@ async def test_main_reranker_drops_unsupported_architecture(capsys: pytest.Captu
         return models
 
     async def fake_details(
-        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
+        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False, cache_dir: Path | None = None
     ) -> tuple[str, str, list[str], bool]:
         return model_id, sizes.get(model_id, "N/A"), architectures.get(model_id, []), True
 
@@ -1105,7 +1106,7 @@ async def test_main_reranker_keeps_generative_when_allowed(capsys: pytest.Captur
         return models
 
     async def fake_details(
-        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
+        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False, cache_dir: Path | None = None
     ) -> tuple[str, str, list[str], bool]:
         return model_id, sizes.get(model_id, "N/A"), architectures.get(model_id, []), True
 
@@ -1142,7 +1143,7 @@ async def test_main_reranker_drops_failed_detail_fetch_even_when_generative_allo
         return models
 
     async def fake_details(
-        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
+        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False, cache_dir: Path | None = None
     ) -> tuple[str, str, list[str] | None, bool]:
         return model_id, sizes.get(model_id, "N/A"), architectures.get(model_id), model_id in sizes
 
@@ -1173,7 +1174,7 @@ async def test_main_llm_drops_models_without_chat_template(capsys: pytest.Captur
         return models
 
     async def fake_details(
-        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
+        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False, cache_dir: Path | None = None
     ) -> tuple[str, str, list[str], bool]:
         assert check_chat_template is True
         return model_id, sizes.get(model_id, "N/A"), [], chat_capable.get(model_id, False)
@@ -1204,7 +1205,7 @@ async def test_main_embedding_output_json(capsys: pytest.CaptureFixture[str]) ->
         return models
 
     async def fake_details(
-        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
+        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False, cache_dir: Path | None = None
     ) -> tuple[str, str, list[str], bool]:
         return model_id, sizes.get(model_id, "N/A"), [], True
 
@@ -1230,7 +1231,7 @@ async def test_main_raw_false_logs_to_stderr(capsys: pytest.CaptureFixture[str])
         return []
 
     async def fake_details(
-        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
+        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False, cache_dir: Path | None = None
     ) -> tuple[str, str, list[str], bool]:
         return model_id, "N/A", [], True
 
@@ -1260,7 +1261,7 @@ async def test_main_output_writes_file_and_preserves_other_key(tmp_path: Path) -
         return models
 
     async def fake_details(
-        session: Mock, model_id: str, _sem: asyncio.Semaphore, check_chat_template: bool = False
+        session: Mock, model_id: str, _sem: asyncio.Semaphore, check_chat_template: bool = False, cache_dir: Path | None = None
     ) -> tuple[str, str, list[str], bool]:
         return model_id, sizes.get(model_id, "N/A"), [], True
 
@@ -1288,7 +1289,7 @@ async def test_main_output_overwrites_same_key(tmp_path: Path) -> None:
         return [{"id": "org/new-model"}]
 
     async def fake_details(
-        session: Mock, model_id: str, _sem: asyncio.Semaphore, check_chat_template: bool = False
+        session: Mock, model_id: str, _sem: asyncio.Semaphore, check_chat_template: bool = False, cache_dir: Path | None = None
     ) -> tuple[str, str, list[str], bool]:
         return model_id, "2.0 GB", [], True
 
@@ -1315,7 +1316,7 @@ async def test_main_active_dict_built_correctly() -> None:
         return []
 
     async def fake_details(
-        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
+        session: Mock, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False, cache_dir: Path | None = None
     ) -> tuple[str, str, list[str], bool]:
         return model_id, "N/A", [], True
 
@@ -1334,6 +1335,32 @@ async def test_main_active_dict_built_correctly() -> None:
     assert "likes" not in captured_active
     assert "trendingScore" in captured_active
     assert captured_active["trendingScore"] == 3
+
+
+@pytest.mark.asyncio
+async def test_main_passes_default_cache_dir_to_fetch_model_details() -> None:
+    seen: list[Path | None] = []
+
+    async def fake_collect(session: Mock, _active: dict[str, int]) -> list[dict[str, str]]:
+        return [{"id": "org/llama"}]
+
+    async def fake_details(
+        session: Mock, model_id: str, _sem: asyncio.Semaphore, check_chat_template: bool = False, cache_dir: Path | None = None
+    ) -> tuple[str, str, list[str], bool]:
+        seen.append(cache_dir)
+        return model_id, "N/A", [], True
+
+    with (
+        patch("scripts.get_huggingface_models.collect_llm_models", side_effect=fake_collect),
+        patch("scripts.get_huggingface_models.fetch_model_details", side_effect=fake_details),
+        patch(
+            "aiohttp.ClientSession",
+            return_value=AsyncMock(__aenter__=AsyncMock(return_value=MagicMock()), __aexit__=AsyncMock(return_value=False)),
+        ),
+    ):
+        await main(10, 0, 0, raw=True, model_type="llm")
+
+    assert seen == [DEFAULT_MODEL_DETAIL_CACHE_DIR]
 
 
 @pytest.mark.asyncio

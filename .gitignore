@@ -3,6 +3,7 @@ __pycache__
 /.coverage
 /.pytest_cache
 /.ruff_cache
+/.cache
 /.venv
 /storage
 .env

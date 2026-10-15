@@ -20,7 +20,14 @@ from urllib.parse import quote
 
 import aiohttp
 
-from scripts.utils.hf_common import get_json_with_retry, is_embedding, is_gguf
+from scripts.utils.hf_common import (
+    DEFAULT_MODEL_DETAIL_CACHE_DIR,
+    HF_API,
+    get_json_with_retry,
+    get_model_detail_cached,
+    is_embedding,
+    is_gguf,
+)
 
 # ruff: noqa: T201
 
@@ -31,7 +38,6 @@ from scripts.utils.hf_common import get_json_with_retry, is_embedding, is_gguf
 # configured outside the server, so both fall back to `lastResort` there too.
 logger = logging.getLogger("uvicorn.error")
 
-HF_API = "https://huggingface.co/api"
 LLM_TAGS = ["text-generation", "text2text-generation", "image-text-to-text"]
 CONCURRENCY = 10  # parallel size-fetch requests
 PAGE_SIZE = 100  # max models per API page (HF limit)
@@ -395,7 +401,11 @@ async def collect_embedding_models(session: aiohttp.ClientSession, active: dict[
 
 
 async def fetch_model_details(
-    session: aiohttp.ClientSession, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
+    session: aiohttp.ClientSession,
+    model_id: str,
+    sem: asyncio.Semaphore,
+    check_chat_template: bool = False,
+    cache_dir: Path | None = None,
 ) -> tuple[str, str, list[str] | None, bool]:
     """Return (model_id, human_readable_size, architectures, has_chat_template).
 
@@ -406,16 +416,20 @@ async def fetch_model_details(
     rate limiting), as opposed to `[]` when it succeeded but the model genuinely reports none —
     `_drop_unsupported_models` needs to tell these apart so a fetch failure doesn't get treated as
     "confirmed not a cross-encoder" and silently kept with fabricated data.
+
+    `cache_dir` is forwarded to `get_model_detail_cached` - see its docstring for why caching is
+    opt-in rather than on by default.
     """
     async with sem:
         try:
-            data = await get_json_with_retry(session, f"{HF_API}/models/{model_id}", {"blobs": "true"})
+            data = await get_model_detail_cached(session, model_id, cache_dir=cache_dir)
             siblings = data.get("siblings", [])
             total = sum(f.get("size", 0) for f in siblings if f.get("size"))
             architectures = data.get("config", {}).get("architectures") or []
             chat_ok = await has_chat_template(session, model_id, siblings) if check_chat_template else True
             return model_id, fmt_size(total) if total else "N/A", architectures, chat_ok
         except Exception:
+            logger.warning("Failed to fetch details for %s; it will be dropped from the catalog", model_id, exc_info=True)
             return model_id, "N/A", None, False
 
 
@@ -495,7 +509,9 @@ async def fetch_registry_entries(
     log(f"Fetching disk sizes for {len(models)} unique models concurrently (max {CONCURRENCY} at a time)...")
     sem = asyncio.Semaphore(CONCURRENCY)
     check_chat_template = registry_key == "llms"
-    details = await asyncio.gather(*[fetch_model_details(session, m["id"], sem, check_chat_template) for m in models])
+    details = await asyncio.gather(
+        *[fetch_model_details(session, m["id"], sem, check_chat_template, cache_dir=DEFAULT_MODEL_DETAIL_CACHE_DIR) for m in models]
+    )
     sizes = {mid: size for mid, size, _, _ in details}
     architectures = {mid: arch for mid, _, arch, _ in details}
     chat_capable = {mid: chat_ok for mid, _, _, chat_ok in details}

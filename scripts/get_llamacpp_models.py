@@ -19,12 +19,18 @@ from typing import Any
 
 import aiohttp
 
-from scripts.utils.hf_common import get_json_with_retry, is_embedding, is_gguf
+from scripts.utils.hf_common import (
+    DEFAULT_MODEL_DETAIL_CACHE_DIR,
+    HF_API,
+    get_json_with_retry,
+    get_model_detail_cached,
+    is_embedding,
+    is_gguf,
+)
 from server.models.registries import LlamacppRegistryEntry
 
 # ruff: noqa: T201
 
-HF_API = "https://huggingface.co/api"
 CONCURRENCY = 10  # parallel file-listing fetch requests
 MAX_FETCH_FAILURE_RATE = 0.1  # abort instead of writing a possibly-degraded registry above this failure rate
 SPLIT_GGUF_RE = re.compile(r"-\d{5}-of-\d{5}\.gguf$", re.IGNORECASE)
@@ -140,16 +146,21 @@ async def collect_gguf_models(session: aiohttp.ClientSession, active: dict[str, 
     return models
 
 
-async def fetch_model_files(session: aiohttp.ClientSession, model_id: str, sem: asyncio.Semaphore) -> list[dict[str, Any]] | None:
+async def fetch_model_files(
+    session: aiohttp.ClientSession, model_id: str, sem: asyncio.Semaphore, cache_dir: Path | None = None
+) -> list[dict[str, Any]] | None:
     """Return the repo's file listing (siblings), or None if the fetch itself failed.
 
     `None` is deliberately distinct from an empty list: a repo can legitimately have no usable
     GGUF file (empty list), whereas a network error, exhausted rate-limit retries, or a malformed
     response means the repo was never actually checked — callers must not conflate the two.
+
+    `cache_dir` is forwarded to `get_model_detail_cached` - see its docstring for why caching is
+    opt-in rather than on by default.
     """
     async with sem:
         try:
-            data = await get_json_with_retry(session, f"{HF_API}/models/{model_id}", {"blobs": "true"}, max_retries=3)
+            data = await get_model_detail_cached(session, model_id, cache_dir=cache_dir)
             return data.get("siblings", [])
         except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
             print(f"Warning: failed to fetch file listing for {model_id}: {exc}", file=sys.stderr)
@@ -252,7 +263,7 @@ async def fetch_llamacpp_entries(
 
     log(f"Fetching file listings for {len(models)} unique repos concurrently (max {CONCURRENCY} at a time)...")
     sem = asyncio.Semaphore(CONCURRENCY)
-    file_lists = await asyncio.gather(*[fetch_model_files(session, m["id"], sem) for m in models])
+    file_lists = await asyncio.gather(*[fetch_model_files(session, m["id"], sem, cache_dir=DEFAULT_MODEL_DETAIL_CACHE_DIR) for m in models])
 
     entries, failed, dropped = split_fetch_results(models, file_lists)
 
