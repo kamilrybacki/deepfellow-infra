@@ -34,14 +34,34 @@ def test_health() -> None:
     assert resp.json() == "OK"
 
 
+@mock.patch("server.api.utils.get_build_commit", return_value=None)
 @mock.patch("server.api.utils.get_infra_version", return_value="1.2.3")
-def test_info_returns_version_with_valid_server_key(mock_get_infra_version: mock.MagicMock) -> None:
+def test_info_returns_version_with_valid_server_key(
+    mock_get_infra_version: mock.MagicMock,
+    mock_get_build_commit: mock.MagicMock,
+) -> None:
     with TestClient(_make_app(api_key="server-key")) as client:
         resp = client.get("/info", headers={"Authorization": "Bearer server-key"})
 
     assert resp.status_code == 200
-    assert resp.json() == {"version": "1.2.3"}
+    assert resp.json() == {"version": "1.2.3", "commit": None}
     assert mock_get_infra_version.call_count == 1
+    assert mock_get_build_commit.call_count == 1
+
+
+@mock.patch("server.api.utils.get_build_commit", return_value="9c6e4f0a1b2c3d4e5f60718293a4b5c6d7e8f900")
+@mock.patch("server.api.utils.get_infra_version", return_value="1.2.3")
+def test_info_reports_the_commit_the_image_was_built_from(
+    mock_get_infra_version: mock.MagicMock,
+    mock_get_build_commit: mock.MagicMock,
+) -> None:
+    with TestClient(_make_app(api_key="server-key")) as client:
+        resp = client.get("/info", headers={"Authorization": "Bearer server-key"})
+
+    assert resp.status_code == 200
+    assert resp.json()["commit"] == "9c6e4f0a1b2c3d4e5f60718293a4b5c6d7e8f900"
+    assert mock_get_infra_version.call_count == 1
+    assert mock_get_build_commit.call_count == 1
 
 
 def test_info_rejects_invalid_server_key() -> None:

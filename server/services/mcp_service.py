@@ -6,7 +6,6 @@
 import asyncio
 import html
 import json
-import logging
 import secrets
 import shlex
 import shutil
@@ -65,6 +64,7 @@ from server.utils.core import (
     try_parse_pydantic,
 )
 from server.utils.docker_image_version import apply_image_version_override, docker_tags_model_field, split_image_repo_tag
+from server.utils.logger import logger
 from server.utils.mcp_oauth import (
     McpOAuthConfig,
     McpOAuthError,
@@ -97,6 +97,10 @@ NodeVersion = Literal["20", "22", "24", "latest"]
 
 _DEFAULT_PYTHON_VERSION: PythonVersion = "3.13"
 _DEFAULT_NODE_VERSION: NodeVersion = "22"
+
+_HEALTH_MONITOR_INTERVAL_SECONDS = 30.0
+# Consecutive failed probes before a healthy MCP is hidden; a single timeout must not flap it (and the mesh parent).
+_HEALTH_MONITOR_FAILURE_THRESHOLD = 3
 
 
 def _version_to_base_image(variant: McpUserVariant, python_version: PythonVersion | None, node_version: NodeVersion | None) -> str:
@@ -305,8 +309,6 @@ class InstalledInfo:
 class DownloadedInfo:
     image: str
 
-
-logger = logging.getLogger("uvicorn.error")
 
 _MCP_INIT_PAYLOAD: dict[str, Any] = {
     "jsonrpc": "2.0",
@@ -558,6 +560,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
         self._oauth_state_store = McpOAuthStateStore()
         self._oauth_refresh_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._oauth_refresh_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
+        self._health_monitor_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
 
     def load_default_models(self, instance: str) -> None:
         """Load default models to instance."""
@@ -678,6 +681,8 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
 
     async def stop_instance(self, instance: str) -> None:
         """Stop all MCP service Docker containers."""
+        for key in [key for key in self._health_monitor_tasks if key[0] == instance]:
+            self._stop_health_monitor(*key)
         installed = self.get_instance_info(instance).installed
         if not installed:
             return
@@ -781,14 +786,24 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
     def _generate_instance_config(self, instance: str, info: InstalledInfo | None, custom: list[CustomModel] | None) -> InstanceConfig:  # noqa: ARG002
         return InstanceConfig(
             options=info.options if info else None,
-            models=[ModelConfig(model_id=x.id, options=x.options) for x in info.models.values()] if info else [],
+            models=[
+                ModelConfig(model_id=x.id, options=x.options, container_name=x.docker_options.container_name if x.docker_options else None)
+                for x in info.models.values()
+            ]
+            if info
+            else [],
             custom=custom,
         )
 
     def _load_download_info(self, data: dict[str, Any]) -> DownloadedInfo:
         return DownloadedInfo(**data)
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
+    async def _install_instance(
+        self,
+        instance: str,
+        options: InstallServiceIn,
+        container_name_override: str | None = None,  # noqa: ARG002
+    ) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self.load_default_models(instance)
 
@@ -1360,18 +1375,91 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                 if result.healthy or result.requires_oauth:
                     return
             except Exception:
-                pass
+                logger.exception(f"{self.get_id(instance)} background tools fetch for {model_id!r} failed")
 
     def _apply_healthcheck_result(self, model: SrvMcpModel, prefix: str, result: McpHealthCheckResult) -> None:
-        """Persist tool list, transport, and healthy flag from a successful health check."""
-        model.model_props.tools = result.tools
-        if result.transport:
-            model.model_props.transport = result.transport
+        """Persist tool list, transport, and healthy flag from a successful health check.
+
+        Notifies the parent infra when anything a mesh parent mirrors (tools, transport, health) changed.
+        """
+        changed = False
+        # Registrations may share `model.model_props`, so compare against them before it is overwritten below.
         for reg_model in self.endpoint_registry.mcp_endpoints.models.get(prefix, {}).values():
+            changed = changed or not reg_model.healthy or reg_model.props.tools != result.tools
             reg_model.healthy = True
             reg_model.props.tools = result.tools
             if result.transport:
+                changed = changed or reg_model.props.transport != result.transport
                 reg_model.props.transport = result.transport
+        model.model_props.tools = result.tools
+        if result.transport:
+            model.model_props.transport = result.transport
+        if changed:
+            self.endpoint_registry.parent_infra.send_models_list()
+
+    def _mark_unhealthy(self, prefix: str) -> None:
+        """Hide an MCP whose server stopped answering, keeping its last known tools, and tell the mesh parent."""
+        changed = False
+        for reg_model in self.endpoint_registry.mcp_endpoints.models.get(prefix, {}).values():
+            if reg_model.healthy:
+                reg_model.healthy = False
+                changed = True
+        if changed:
+            self.endpoint_registry.parent_infra.send_models_list()
+
+    async def _health_monitor_background(self, instance: str, model_id: str) -> None:
+        """Re-probe an installed MCP periodically so a server that dies stops being reported as healthy.
+
+        Fail-safe: only a probe that completes and reports the server unreachable counts as a failure. A crash of
+        the check itself (or a probe needing OAuth) leaves the current state untouched, and the loop keeps running.
+        """
+        consecutive_failures = 0
+        while True:
+            await asyncio.sleep(_HEALTH_MONITOR_INTERVAL_SECONDS)
+            instance_info = self.instances_info.get(instance)
+            info = instance_info.installed if instance_info else None
+            if info is None or model_id not in info.models:
+                return
+            prefix = info.models[model_id].prefix
+            try:
+                result = await self.healthcheck_model(instance, model_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("MCP health monitor probe crashed for %s/%s; keeping current state", instance, model_id)
+                continue
+            if result.healthy or result.requires_oauth:
+                consecutive_failures = 0
+                continue
+            consecutive_failures += 1
+            if consecutive_failures >= _HEALTH_MONITOR_FAILURE_THRESHOLD:
+                logger.warning(
+                    "MCP %s/%s failed %d consecutive health checks (%s); marking unhealthy",
+                    instance,
+                    model_id,
+                    consecutive_failures,
+                    result.error,
+                )
+                try:
+                    self._mark_unhealthy(prefix)
+                except Exception:
+                    logger.exception("Failed to mark MCP %s/%s unhealthy", instance, model_id)
+
+    def _start_health_monitor(self, instance: str, model_id: str) -> None:
+        key = (instance, model_id)
+        existing = self._health_monitor_tasks.get(key)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(self._health_monitor_background(instance, model_id))
+        self._health_monitor_tasks[key] = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        task.add_done_callback(lambda t: self._health_monitor_tasks.pop(key, None) if self._health_monitor_tasks.get(key) is t else None)
+
+    def _stop_health_monitor(self, instance: str, model_id: str) -> None:
+        task = self._health_monitor_tasks.pop((instance, model_id), None)
+        if task is not None:
+            task.cancel()
 
     async def healthcheck_model(self, instance: str, model_id: str) -> McpHealthCheckResult:  # noqa: C901
         """Probe an installed MCP server: check liveness, detect transport, and fetch tool list."""
@@ -1959,7 +2047,11 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
         )
 
     async def _install_model(  # noqa: C901
-        self, instance: str, model_id: str, options: InstallModelIn
+        self,
+        instance: str,
+        model_id: str,
+        options: InstallModelIn,
+        container_name_override: str | None = None,
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         info = self.get_instance_installed_info(instance)
         self.models.setdefault(instance, {})
@@ -2010,6 +2102,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                     task.add_done_callback(self._background_tasks.discard)
                 if model.oauth and model.oauth.enabled and model.oauth.refresh_token:
                     self._start_oauth_refresh_background(instance, model_id)
+                self._start_health_monitor(instance, model_id)
                 self._installing.discard(key)
                 requires_oauth = bool(probe and probe.requires_oauth)
                 details = "Installed. OAuth authorization required — use the Authorize action." if requires_oauth else "Installed"
@@ -2048,9 +2141,18 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                     await self._download_image_or_set_progress(stream, image)
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
                 docker_options_edited = deepcopy(docker_options)
-                docker_options_edited.env_vars = docker_options_edited.env_vars | parsed_model_options.envs
+                # Re-derived rather than taken from model.options, built with the suffix current when the model
+                # list was loaded - a live container_name_suffix change must apply to new installs too.
+                docker_options_edited.container_name = container_name_override or self.docker_service.get_docker_container_name(
+                    docker_options_edited.name
+                )
+                container_host = self.docker_service.get_container_host(subnet, docker_options_edited)
+                # {container_host} lets an image allow-list the Host header DF Infra sends it (e.g. the MCP SDK's
+                # DNS-rebinding protection), which depends on the resolved - possibly suffixed - container name.
+                docker_options_edited.env_vars = {
+                    key: value.replace("{container_host}", container_host) for key, value in docker_options_edited.env_vars.items()
+                } | parsed_model_options.envs
                 docker_exposed_port, _, adopted = await self.docker_service.install_and_run_docker(docker_options_edited)
-                container_host = self.docker_service.get_container_host(subnet, docker_options_edited.name)
                 container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options_edited.image_port)
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
@@ -2071,6 +2173,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
                 task = asyncio.create_task(self._fetch_tools_background(instance, model_id))
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
+                self._start_health_monitor(instance, model_id)
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
                 return InstallModelOut(status="OK", details="Installed")
             except BaseException:
@@ -2094,6 +2197,7 @@ class McpService(Base2Service[InstalledInfo, DownloadedInfo]):
     async def _uninstall_model(self, instance: str, model_id: str, options: UninstallModelIn) -> None:
         info = self.get_instance_installed_info(instance)
         srv_model = self.models.get(instance, {}).get(model_id)
+        self._stop_health_monitor(instance, model_id)
         if model_id in info.models:
             model_info = info.models[model_id]
             self.endpoint_registry.unregister_mcp_endpoint(model_info.prefix, model_info.registration_id)
@@ -2143,7 +2247,7 @@ _const = McpConst(
                 name="brave-search",
                 container_name=mcp_service.docker_service.get_docker_container_name("brave-search"),
                 image="hub.simplito.com/deepfellow/brave-search-mcp-server:v2.0.72",
-                env_vars={},
+                env_vars={"BRAVE_MCP_TRANSPORT": "http"},
                 subnet=subnet,
             ),
             required_envs=["BRAVE_API_KEY"],
@@ -2151,7 +2255,7 @@ _const = McpConst(
             repository_url="https://github.com/brave/brave-search-mcp-server",
         ),
         "web-search": lambda mcp_service, subnet: SrvMcpModel(
-            model_props=ModelProps(private=True, type="mcp", endpoints=["/mcp/web-search/mcp"], transport="streamable_http"),
+            model_props=ModelProps(private=True, type="mcp", endpoints=["/mcp/web-search/mcp"], transport="sse"),
             model_spec=mcp_service.get_default_model_spec("web-search"),
             model_type="mcp",
             default_prefix="web-search",
@@ -2164,6 +2268,7 @@ _const = McpConst(
                 env_vars={},
                 subnet=subnet,
             ),
+            proxy_transport="sse",
             description="Concurrent multi-engine web search with full-page content extraction — no API key required.",
             repository_url="https://github.com/mrkrsl/web-search-mcp",
         ),
@@ -2249,9 +2354,11 @@ _const = McpConst(
                 image_port=8000,
                 name="duckduckgo",
                 container_name=mcp_service.docker_service.get_docker_container_name("duckduckgo"),
-                image="ghcr.io/nickclyde/duckduckgo-mcp-server:0.4.0",
+                image="ghcr.io/nickclyde/duckduckgo-mcp-server:0.6.1",
                 subnet=subnet,
                 command="python -m duckduckgo_mcp_server.server --transport streamable-http --host 0.0.0.0 --port 8000",
+                # Any port: without docker_subnet DF Infra connects via localhost:<exposed port>, not :8000.
+                env_vars={"DDG_ALLOWED_HOSTS": "{container_host}:*"},
             ),
             description="DuckDuckGo web search solution — no API key required.",
             repository_url="https://github.com/nickclyde/duckduckgo-mcp-server",

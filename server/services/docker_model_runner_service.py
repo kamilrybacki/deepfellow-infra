@@ -5,7 +5,6 @@
 
 import html
 import json
-import logging
 import platform
 from dataclasses import dataclass
 from typing import Any
@@ -14,7 +13,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel
 
 from server.config import get_main_dir
-from server.endpointregistry import ProxyOptions, RegistrationId
+from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
 from server.models.api import EMBEDDINGS_ENDPOINTS, LLM_ENDPOINTS, ModelProps
 from server.models.models import (
     CustomModelSpecification,
@@ -50,9 +49,8 @@ from server.utils.core import (
     try_parse_pydantic,
 )
 from server.utils.loading import Progress
+from server.utils.logger import logger
 from server.utils.size_fetcher import fmt_size
-
-logger = logging.getLogger("uvicorn.error")
 
 
 class DmrModel(BaseModel):
@@ -111,6 +109,7 @@ class DockerModelRunnerOptions(BaseModel):
 
 
 class DockerModelRunnerModelOptions(BaseModel):
+    rename: str | None = None
     alias: str | None = None
 
 
@@ -188,7 +187,10 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
         """Return the model specification."""
         return ModelSpecification(
             fields=[
-                ModelField(type="text", name="alias", description="Model alias", required=False),
+                ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
+                ModelField(
+                    type="text", name="alias", description="Additional name for the model, the original name keeps working", required=False
+                ),
             ]
         )
 
@@ -253,7 +255,8 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
         parsed_options = (
             try_parse_pydantic(DockerModelRunnerModelOptions, options.spec) if options and options.spec else DockerModelRunnerModelOptions()
         )
-        registered_name = parsed_options.alias if parsed_options.alias else model_id
+        registered_name = parsed_options.rename if parsed_options.rename else model_id
+        registered_alias = parsed_options.alias
 
         model_info = ModelInstalledInfo(
             id=model_id,
@@ -277,7 +280,7 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
                 responses=None,
                 messages=None,
                 ollama_chat=None,
-                registration_options=None,
+                registration_options=RegistrationOptions(origin="local", alias=registered_alias),
             )
         if model_type == "embedding":
             model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
@@ -287,7 +290,7 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
                     url=f"{installed_info.base_url}/engines/v1/embeddings",
                     rewrite_model_to=model_id,
                 ),
-                registration_options=None,
+                registration_options=RegistrationOptions(origin="local", alias=registered_alias),
             )
         installed_info.models[model_id] = model_info
 
@@ -304,7 +307,7 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
     async def _sync_models(self, instance: str, installed_info: InstalledInfo, *, is_initial: bool = False) -> None:
         res = await fetch_from(f"{installed_info.base_url}/engines/v1/models", "GET", None)
         if res.status_code != 200:
-            logger.warning(f"DMR model sync for instance {instance} failed: HTTP {res.status_code}")  # noqa: G004
+            logger.warning(f"DMR model sync for instance {instance} failed: HTTP {res.status_code}")
             return
 
         data = json.loads(res.data)
@@ -331,7 +334,12 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         self._remove_stale_models(installed_info, (set(installed_info.models) | set(saved_models)) - current_model_ids)
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
+    async def _install_instance(
+        self,
+        instance: str,
+        options: InstallServiceIn,
+        container_name_override: str | None = None,  # noqa: ARG002
+    ) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self._load_default_models(instance)
 
@@ -512,7 +520,7 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
         if record is None:
             # Warn once per pull — an unparseable stream would otherwise flood the log with one entry per line.
             if not skipped_lines:
-                logger.warning(f"DMR pull stream sent an unparseable line: {line!r}")  # noqa: G004
+                logger.warning(f"DMR pull stream sent an unparseable line: {line!r}")
             skipped_lines.append(line)
             return
         self._handle_pull_record(stream, record, progress, last_layer_values)
@@ -539,11 +547,15 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         self._handle_pull_line(stream, buffer, progress, last_layer_values, skipped_lines)
         if skipped_lines:
-            logger.warning(f"DMR pull stream sent {len(skipped_lines)} unparseable line(s) while pulling {model_id}")  # noqa: G004
+            logger.warning(f"DMR pull stream sent {len(skipped_lines)} unparseable line(s) while pulling {model_id}")
         stream.emit(StreamChunkProgress(type="progress", stage="download", value=1, data={}))
 
     async def _install_model(
-        self, instance: str, model_id: str, options: InstallModelIn
+        self,
+        instance: str,
+        model_id: str,
+        options: InstallModelIn,
+        container_name_override: str | None = None,  # noqa: ARG002
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_options = (
             try_parse_pydantic(DockerModelRunnerModelOptions, options.spec) if options.spec else DockerModelRunnerModelOptions()
@@ -567,7 +579,8 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
             await self._pull_model(stream, model, model_id, info.base_url)
 
             stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
-            registered_name = parsed_options.alias if parsed_options.alias else model_id
+            registered_name = parsed_options.rename if parsed_options.rename else model_id
+            registered_alias = parsed_options.alias
 
             model_info = ModelInstalledInfo(
                 id=model_id,
@@ -591,7 +604,7 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
                     responses=None,
                     messages=None,
                     ollama_chat=None,
-                    registration_options=None,
+                    registration_options=RegistrationOptions(origin="local", alias=registered_alias),
                 )
             if model.type == "embedding":
                 model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
@@ -601,7 +614,7 @@ class DockerModelRunnerService(Base2Service[InstalledInfo, DownloadedInfo]):
                         url=f"{info.base_url}/engines/v1/embeddings",
                         rewrite_model_to=model_id,
                     ),
-                    registration_options=None,
+                    registration_options=RegistrationOptions(origin="local", alias=registered_alias),
                 )
 
             info.models[model_id] = model_info

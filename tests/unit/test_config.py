@@ -166,20 +166,18 @@ def test_connect_to_mesh_url_set(monkeypatch: pytest.MonkeyPatch) -> None:
     assert s.connect_to_mesh_url == "http://mesh.url"
 
 
-@pytest.mark.parametrize("bad_value", ["0", "-1"])
-def test_ollama_num_parallel_clamps_non_positive(monkeypatch: pytest.MonkeyPatch, bad_value: str) -> None:
-    """`OLLAMA_NUM_PARALLEL=0` here (this is DeepFellow's own fallback default, not the Ollama
-    env var's "auto" sentinel) must not be allowed to fall through as a real capacity - it would
-    otherwise saturate every Ollama instance that doesn't override `num_parallel` itself. It's
-    clamped to 1 rather than rejected so an otherwise-valid `OLLAMA_NUM_PARALLEL=0` (the Ollama-side
-    "auto" sentinel) doesn't stop the whole application from starting."""
+def test_app_settings_ignores_sentry_environment_variables(monkeypatch: pytest.MonkeyPatch) -> None:
     for k, v in _REQUIRED_ENV.items():
         monkeypatch.setenv(k, v)
-    monkeypatch.setenv("OLLAMA_NUM_PARALLEL", bad_value)
+    monkeypatch.setenv("DF_SENTRY_ENABLED", "true")
+    monkeypatch.setenv("DF_SENTRY_DSN", "https://public@sentry.example.com/42")
+    monkeypatch.setenv("DF_SENTRY_ENVIRONMENT", "staging")
 
     s = AppSettings()  # pyright: ignore[reportCallIssue]
 
-    assert s.ollama_num_parallel == 1
+    assert s.sentry_enabled is False
+    assert s.sentry_dsn.get_secret_value() == ""
+    assert s.sentry_environment == ""
 
 
 def test_external_only_defaults_false(settings: AppSettings) -> None:

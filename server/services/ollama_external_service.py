@@ -5,7 +5,6 @@
 
 import asyncio
 import json
-import logging
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
@@ -50,6 +49,7 @@ from server.utils.core import (
     try_parse_pydantic,
 )
 from server.utils.loading import Progress
+from server.utils.logger import logger
 from server.utils.ollama import raise_ollama_pull_error
 from server.utils.size_fetcher import fetch_ollama_ref_bytes, fmt_size
 
@@ -98,8 +98,6 @@ _const = OllamaAiConst(
     models=_read_models(),
 )
 
-logger = logging.getLogger("uvicorn.error")
-
 _WARMTH_POLL_INTERVAL_SECONDS = 15  # matches the staleness already tolerated for the UI's loaded-model display
 
 
@@ -110,6 +108,8 @@ class ModelInstalledInfo:
     type: str
     options: InstallModelIn
     registration_id: RegistrationId
+    supports_vision: bool | None = None
+    supports_audio: bool | None = None
 
     def get_info(self) -> ModelInfo:
         """Get info."""
@@ -122,6 +122,7 @@ class OllamaExternalOptions(BaseModel):
 
 
 class OllamaModelOptions(BaseModel):
+    rename: str | None = None
     alias: str | None = None
     alive_time: int | Annotated[str, StringConstraints(pattern=r"^(\d+[smh])?$", strict=True)] = ""
 
@@ -184,7 +185,10 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
         """Return the model specification."""
         return ModelSpecification(
             fields=[
-                ModelField(type="text", name="alias", description="Model alias", required=False),
+                ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
+                ModelField(
+                    type="text", name="alias", description="Additional name for the model, the original name keeps working", required=False
+                ),
                 ModelField(
                     type="text",
                     name="alive_time",
@@ -283,7 +287,12 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
             return _const.models[model_name].type
         return "llm"
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
+    async def _install_instance(
+        self,
+        instance: str,
+        options: InstallServiceIn,
+        container_name_override: str | None = None,  # noqa: ARG002
+    ) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self.load_default_models(instance)
 
@@ -338,7 +347,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                     await self._sync_models_from_external_ollama(instance, info.installed)
                     await self._save()
                 except Exception:
-                    pass
+                    logger.exception(f"{self.get_id(instance)} model sync tick failed")
 
         self._sync_tasks[instance] = asyncio.create_task(_sync_loop())
 
@@ -356,7 +365,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                 try:
                     await self._sync_warm_state(info.installed)
                 except Exception:
-                    logger.exception(f"{self.get_id(instance)} warmth poll tick failed")  # noqa: G004
+                    logger.exception(f"{self.get_id(instance)} warmth poll tick failed")
 
         def _forget_if_current(finished: asyncio.Task[None]) -> None:
             # Only drop the dict entry if it still points at this task: a restart may have
@@ -364,7 +373,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
             if self._warmth_poll_tasks.get(instance) is finished:
                 del self._warmth_poll_tasks[instance]
             if not finished.cancelled() and (exc := finished.exception()):
-                logger.error(f"{self.get_id(instance)} warmth poll task died unexpectedly", exc_info=exc)  # noqa: G004
+                logger.error(f"{self.get_id(instance)} warmth poll task died unexpectedly", exc_info=exc)
 
         task = asyncio.create_task(_poll_loop())
         task.add_done_callback(_forget_if_current)
@@ -403,7 +412,14 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
             return None
 
     def _register_synced_model(
-        self, instance: str, installed_info: InstalledInfo, model_id: str, size_bytes: int, context_length: int | None = None
+        self,
+        instance: str,
+        installed_info: InstalledInfo,
+        model_id: str,
+        size_bytes: int,
+        context_length: int | None = None,
+        supports_vision: bool | None = None,
+        supports_audio: bool | None = None,
     ) -> None:
         model_type = self._determine_model_type(model_id, instance)
         size_str = fmt_size(size_bytes) if size_bytes else ""
@@ -418,6 +434,8 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
             registered_name=model_id,
             options=InstallModelIn(),
             registration_id="",
+            supports_vision=supports_vision,
+            supports_audio=supports_audio,
         )
         if model_type == "llm":
             model_info.registration_id = self.endpoint_registry.register_chat_completion_as_proxy(
@@ -428,6 +446,8 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                     endpoints=self.get_supported_endpoints(),
                     context_window=context_length,
                     max_context_window=context_length,
+                    supports_vision=supports_vision,
+                    supports_audio=supports_audio,
                 ),
                 chat_completions=ProxyOptions(url=f"{installed_info.base_url}/v1/chat/completions", rewrite_model_to=model_id),
                 completions=ProxyOptions(url=f"{installed_info.base_url}/v1/completions", rewrite_model_to=model_id),
@@ -459,7 +479,13 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
             )
         installed_info.models[model_id] = model_info
 
-    async def _fetch_context_length(self, base_url: str, model_id: str) -> int | None:
+    async def _fetch_show_info(self, base_url: str, model_id: str) -> tuple[int | None, bool | None, bool | None]:
+        """Fetch `/api/show` once, returning `(context_length, supports_vision, supports_audio)`.
+
+        `supports_audio` stays unresolved (`None`) when the response doesn't report it - Ollama does
+        not publicly document an "audio" capability tag, so its absence must not be read as "no
+        audio support".
+        """
         try:
             result = await fetch_from(f"{base_url}/api/show", "POST", {"name": model_id})
             if result.status_code == 200:
@@ -467,11 +493,42 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                 info = data.get("model_info", {})
                 arch = info.get("general.architecture", "")
                 context_length = info.get(f"{arch}.context_length")
-                if isinstance(context_length, int) and context_length > 0:
-                    return context_length
+                context_length = context_length if isinstance(context_length, int) and context_length > 0 else None
+
+                supports_vision: bool | None = None
+                supports_audio: bool | None = None
+                capabilities = data.get("capabilities")
+                if isinstance(capabilities, list):
+                    supports_vision = "vision" in capabilities
+                    supports_audio = True if "audio" in capabilities else None
+
+                return context_length, supports_vision, supports_audio
         except Exception:
             pass
-        return None
+        return None, None, None
+
+    async def _retry_unresolved_capabilities(self, installed_info: InstalledInfo, model_id: str) -> None:
+        """Retry `/api/show` for an already-registered model whose capabilities are still unknown.
+
+        A model already in `installed_info.models` is otherwise skipped on every sync - fine for
+        settled fields, but if `/api/show` failed (or returned no `capabilities` list) on first
+        sync, `supports_vision`/`supports_audio` would stay `None` forever without this retry, and
+        a tag re-pulled under the same name would never pick up newly-resolved values either.
+        Models with at least one already-resolved value are left alone: only "never determined"
+        (both still `None`) is retried, so this doesn't re-hit the network for every synced model.
+        """
+        model_info = installed_info.models[model_id]
+        if model_info.supports_vision is not None or model_info.supports_audio is not None:
+            return
+        _, supports_vision, supports_audio = await self._fetch_show_info(installed_info.base_url, model_id)
+        if supports_vision is None and supports_audio is None:
+            return
+        model_info.supports_vision = supports_vision
+        model_info.supports_audio = supports_audio
+        if model_info.registration_id:
+            self.endpoint_registry.update_modality_support(
+                model_info.registration_id, supports_vision=supports_vision, supports_audio=supports_audio
+            )
 
     def _remove_stale_models(self, installed_info: InstalledInfo, stale_ids: set[str]) -> None:
         for removed_id in stale_ids:
@@ -499,12 +556,15 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
             current_model_ids.add(model_id)
 
             if model_id in installed_info.models:
+                await self._retry_unresolved_capabilities(installed_info, model_id)
                 continue
             if not is_initial_sync and model_id in self.models_downloaded:
                 continue
 
-            context_length = await self._fetch_context_length(installed_info.base_url, model_id)
-            self._register_synced_model(instance, installed_info, model_id, entry.get("size", 0), context_length)
+            context_length, supports_vision, supports_audio = await self._fetch_show_info(installed_info.base_url, model_id)
+            self._register_synced_model(
+                instance, installed_info, model_id, entry.get("size", 0), context_length, supports_vision, supports_audio
+            )
 
         self._remove_stale_models(installed_info, (set(installed_info.models) | saved_model_ids) - current_model_ids)
 
@@ -516,7 +576,7 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
 
         installed = self.get_instance_info(instance).installed
         if installed:
-            models = list(installed.models.copy().values())
+            models = list(installed.models.values())
 
             for model in models:
                 if model.type == "llm":
@@ -560,8 +620,12 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
 
             info = self.get_instance_installed_info(instance_name)
             for model_id, model in instance_models.items():
+                supports_vision: bool | None = None
+                supports_audio: bool | None = None
                 if model_id in info.models:
                     installed = info.models[model_id].get_info()
+                    supports_vision = info.models[model_id].supports_vision
+                    supports_audio = info.models[model_id].supports_audio
                 else:
                     installed = self._get_model_installed_info(instance_name, model_id)
 
@@ -577,6 +641,8 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                             custom=model.custom,
                             spec=self.get_model_spec(),
                             has_docker=False,
+                            supports_vision=supports_vision,
+                            supports_audio=supports_audio,
                         )
                     )
         return ListModelsOut(list=out_list)
@@ -589,7 +655,14 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
             raise HTTPException(status_code=400, detail="Model not found")
 
         model = self.models[instance][model_id]
-        installed = info.models[model_id].get_info() if model_id in info.models else self._get_model_installed_info(instance, model_id)
+        supports_vision: bool | None = None
+        supports_audio: bool | None = None
+        if model_id in info.models:
+            installed = info.models[model_id].get_info()
+            supports_vision = info.models[model_id].supports_vision
+            supports_audio = info.models[model_id].supports_audio
+        else:
+            installed = self._get_model_installed_info(instance, model_id)
         return RetrieveModelOut(
             id=model_id,
             service=self.get_id(instance),
@@ -598,6 +671,8 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
             downloaded=model_id in self.models_downloaded,
             size=model.size,
             custom=model.custom,
+            supports_vision=supports_vision,
+            supports_audio=supports_audio,
             spec=self.get_model_spec(),
             has_docker=False,
         )
@@ -651,7 +726,11 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                     break
 
     async def _install_model(  # noqa: C901
-        self, instance: str, model_id: str, options: InstallModelIn
+        self,
+        instance: str,
+        model_id: str,
+        options: InstallModelIn,
+        container_name_override: str | None = None,  # noqa: ARG002
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_model_options = try_parse_pydantic(OllamaModelOptions, options.spec) if options.spec else OllamaModelOptions()
         info = self.get_instance_installed_info(instance)
@@ -678,14 +757,17 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                         {"model": model_id, "keep_alive": parsed_model_options.alive_time},
                     )
 
-                context_length = await self._fetch_context_length(info.base_url, model_id)
-                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                context_length, supports_vision, supports_audio = await self._fetch_show_info(info.base_url, model_id)
+                registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
+                registered_alias = parsed_model_options.alias
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
                     type=model.type,
                     registered_name=registered_name,
                     options=options,
                     registration_id="",
+                    supports_vision=supports_vision,
+                    supports_audio=supports_audio,
                 )
                 try:
                     if model.type == "llm":
@@ -697,6 +779,8 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 endpoints=self.get_supported_endpoints(),
                                 context_window=context_length,
                                 max_context_window=context_length,
+                                supports_vision=supports_vision,
+                                supports_audio=supports_audio,
                             ),
                             chat_completions=ProxyOptions(url=f"{info.base_url}/v1/chat/completions", rewrite_model_to=model_id),
                             completions=ProxyOptions(url=f"{info.base_url}/v1/completions", rewrite_model_to=model_id),
@@ -716,7 +800,9 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                             # ranking over an actually-warm instance and route the first requests into a cold load.
                             # The warmth-poll task (already running per-instance) corrects this to `True` within one
                             # tick once `/api/ps` confirms it's genuinely loaded (or leaves it `False` otherwise).
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), warm=False),
+                            registration_options=RegistrationOptions(
+                                origin="local", alias=registered_alias, owned_by=self.get_type(), warm=False
+                            ),
                         )
                     if model.type == "embedding":
                         model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
@@ -729,7 +815,9 @@ class OllamaExternalService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 max_context_window=context_length,
                             ),
                             options=ProxyOptions(url=f"{info.base_url}/v1/embeddings", rewrite_model_to=model_id),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), warm=False),
+                            registration_options=RegistrationOptions(
+                                origin="local", alias=registered_alias, owned_by=self.get_type(), warm=False
+                            ),
                         )
                     stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
                     self.models_downloaded[model_id] = DownloadedInfo()

@@ -59,7 +59,8 @@ def services_manager(service_out: RetrieveServiceOut) -> MagicMock:
 
 
 @pytest.fixture
-def client(services_manager: MagicMock) -> TestClient:
+def client(services_manager: MagicMock, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    monkeypatch.setattr("server.api.services.get_nvidia_max_cuda_version", AsyncMock(return_value=None))
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_services_manager] = lambda: services_manager
@@ -74,6 +75,57 @@ def test_get_docker_tags_returns_tags(client: TestClient, services_manager: Magi
     assert data["image"] == "ollama/ollama"
     assert data["tags"] == TAGS
     assert data["default"] == TAGS[0]
+
+
+def test_get_docker_tags_returns_newest_of_the_current_variant(client: TestClient, services_manager: MagicMock) -> None:
+    services_manager.get_docker_tags_for_service = AsyncMock(return_value=["0.13.0", "0.13.0-rocm", "0.12.3-rocm"])
+    response = client.get(f"/admin/services/{SERVICE_ID}/docker-tags?current=0.12.3-rocm")
+    assert response.json()["newest"] == "0.13.0-rocm"
+
+
+def test_get_docker_tags_newest_defaults_to_the_default_tag_variant(client: TestClient, services_manager: MagicMock) -> None:
+    response = client.get(f"/admin/services/{SERVICE_ID}/docker-tags")
+    assert response.json()["newest"] == TAGS[0]
+
+
+def test_get_docker_tags_newest_follows_the_host_cuda_version(
+    client: TestClient, services_manager: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    services_manager.get_docker_tags_for_service = AsyncMock(return_value=["v0.5.21-cu130", "v0.5.20-cu129", "v0.5.19-cu129"])
+    cuda = AsyncMock(return_value=(13, 4))
+    monkeypatch.setattr("server.api.services.get_nvidia_max_cuda_version", cuda)
+    assert client.get(f"/admin/services/{SERVICE_ID}/docker-tags?current=v0.5.19-cu129").json()["newest"] == "v0.5.21-cu130"
+
+    cuda.return_value = (12, 9)
+    assert client.get(f"/admin/services/{SERVICE_ID}/docker-tags?current=v0.5.19-cu129").json()["newest"] == "v0.5.20-cu129"
+
+
+def test_get_docker_tags_reports_a_newer_tag_that_needs_a_newer_cuda(
+    client: TestClient, services_manager: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    services_manager.get_docker_tags_for_service = AsyncMock(return_value=["v0.5.21-cu130", "v0.5.19-cu129"])
+    monkeypatch.setattr("server.api.services.get_nvidia_max_cuda_version", AsyncMock(return_value=(12, 9)))
+    data = client.get(f"/admin/services/{SERVICE_ID}/docker-tags?current=v0.5.19-cu129").json()
+    assert data["newest"] == "v0.5.19-cu129"
+    assert data["newest_needs_cuda"] == {"tag": "v0.5.21-cu130", "required_cuda": "13.0", "host_cuda": "12.9"}
+
+    monkeypatch.setattr("server.api.services.get_nvidia_max_cuda_version", AsyncMock(return_value=(13, 4)))
+    data = client.get(f"/admin/services/{SERVICE_ID}/docker-tags?current=v0.5.19-cu129").json()
+    assert data["newest"] == "v0.5.21-cu130"
+    assert data["newest_needs_cuda"] is None
+
+
+def test_get_docker_tags_does_not_ask_for_cuda_without_a_cuda_tag(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    cuda = AsyncMock(return_value=(13, 4))
+    monkeypatch.setattr("server.api.services.get_nvidia_max_cuda_version", cuda)
+    client.get(f"/admin/services/{SERVICE_ID}/docker-tags?current=0.19.0")
+    cuda.assert_not_awaited()
+
+
+def test_get_docker_tags_newest_considers_the_default_tag(client: TestClient, services_manager: MagicMock) -> None:
+    services_manager.get_docker_tags_for_service = AsyncMock(return_value=["0.19.0", "0.18.0"])
+    response = client.get(f"/admin/services/{SERVICE_ID}/docker-tags?current=0.18.0")
+    assert response.json()["newest"] == "0.20.4"
 
 
 def test_get_docker_tags_forwards_hardware_to_default_tag(client: TestClient, services_manager: MagicMock) -> None:

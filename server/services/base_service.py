@@ -3,7 +3,6 @@
 
 """Base service."""
 
-import logging
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -34,9 +33,8 @@ from server.models.services import (
 )
 from server.serviceprovider import ServiceRawConfig
 from server.utils.core import PromiseWithProgress, StreamChunk
+from server.utils.logger import logger
 from server.utils.registry_client import RegistryUnavailableError, image_without_registry_prefix, registry_for
-
-logger = logging.getLogger("uvicorn.error")
 
 
 class BaseService(ABC):
@@ -93,7 +91,7 @@ class BaseService(ABC):
             custom_model_spec=self.get_custom_model_spec(),
             has_docker=self.service_has_docker(),
             is_cloud=self.is_cloud_service(),
-            disabled_reason=self.get_hardware_unsupported_reason(),
+            disabled_reason=self.get_disabled_reason(),
             catalog_refresh_unavailable_reason=self.get_catalog_refresh_unavailable_reason(),
         )
 
@@ -149,6 +147,10 @@ class BaseService(ABC):
     def get_hardware_unsupported_reason(self) -> str | None:
         """Return why this service can't run on the current hardware, or None if it can. None by default."""
         return None
+
+    def get_disabled_reason(self) -> str | None:
+        """Return why this service can't be installed here, or None if it can. Hardware-only by default."""
+        return self.get_hardware_unsupported_reason()
 
     @abstractmethod
     async def load_service(self, config: ServiceRawConfig) -> None:

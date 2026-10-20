@@ -4,11 +4,12 @@
 import asyncio
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from fastapi import HTTPException
+from pydantic import SecretStr
 
 from server.docker import DockerOptions
 from server.models.api import ModelProps
@@ -16,17 +17,20 @@ from server.models.models import AddCustomModelIn, InstallModelIn, ListModelsFil
 from server.models.services import InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import CustomModel, Instance, InstanceConfig
 from server.services.custom_service import (
+    DOC_CHUNKER_DEFAULT_GATEWAY_URL,
+    DOC_CHUNKER_PROXY_TIMEOUT_SECONDS,
     CustomService,
     DownloadedInfo,
     InstalledInfo,
     ModelInstalledInfo,
     SrvCustomModel,
     _const,  # pyright: ignore[reportPrivateUsage]
+    _is_own_gateway_url,  # pyright: ignore[reportPrivateUsage]
     create_bge_m3_model,
     create_doc_chunker_model,
-    create_finetune_model,
     create_gliner_model,
     create_lemmatizer_model,
+    validate_doc_chunker_workers,
 )
 from server.utils.hardware import NvidiaGpuInfo
 from server.utils.registry_client import RegistryUnavailableError
@@ -44,9 +48,11 @@ _CUSTOM_MODEL_DATA: dict[str, Any] = {
 def deps() -> dict[str, Any]:
     docker_svc = MagicMock()
     docker_svc.get_docker_subnet.return_value = "172.20.0.0/16"
-    docker_svc.get_docker_container_name.side_effect = lambda name: f"df-{name}"  # pyright: ignore[reportUnknownLambdaType]
+    docker_svc.get_docker_container_name.side_effect = lambda name, **_: f"df-{name}"  # pyright: ignore[reportUnknownLambdaType]
     config = MagicMock()
     config.standard_proxy_timeout_seconds = 300
+    config.infra_api_key = SecretStr("infra-key")
+    config.infra_url = ""
     return {
         "config": config,
         "endpoint_registry": MagicMock(),
@@ -54,6 +60,7 @@ def deps() -> dict[str, Any]:
         "model_downloader": MagicMock(),
         "docker_service": docker_svc,
         "hardware": MagicMock(gpus=[]),
+        "services_manager": MagicMock(),
     }
 
 
@@ -88,6 +95,117 @@ def test_const_models_not_empty() -> None:
     assert len(_const.models) > 0
 
 
+@pytest.mark.asyncio
+async def test_load_service_strips_retired_finetune_model_entry(svc: CustomService) -> None:
+    """A `services.json` written before deepfellow-finetune moved to its own service must not
+    resurface it as a "failed to load" warning on every future startup."""
+    raw_config = {
+        "instances": {
+            "default": {
+                "options": {"spec": {}},
+                "models": [
+                    {"model_id": "deepfellow-finetune", "options": {"spec": {}}},
+                    {"model_id": "gliner", "options": {"spec": {}}},
+                ],
+            }
+        }
+    }
+
+    with (
+        patch("server.services.base2_service.Base2Service.load_service", new=AsyncMock()) as mock_super_load,
+        patch.object(svc, "_remove_retired_model_container", new=AsyncMock()),
+        patch.object(svc, "_save", new=AsyncMock()),
+    ):
+        await svc.load_service(raw_config)
+
+    loaded_config = mock_super_load.call_args.args[0]
+    model_ids = [m["model_id"] for m in loaded_config["instances"]["default"]["models"]]
+    assert model_ids == ["gliner"]
+
+
+@pytest.mark.asyncio
+async def test_load_service_removes_retired_model_container_and_saves_pruned_config(svc: CustomService) -> None:
+    """The dropped entry's container is still running and holding its GPU/port; the pruned config is
+    saved right away so the teardown happens only once instead of on every startup."""
+    raw_config = {
+        "instances": {
+            "default": {"options": {"spec": {}}, "models": [{"model_id": "deepfellow-finetune", "options": {"spec": {}}}]},
+            "other": {"options": {"spec": {}}, "models": [{"model_id": "deepfellow-finetune", "options": {"spec": {}}}]},
+        }
+    }
+
+    with (
+        patch("server.services.base2_service.Base2Service.load_service", new=AsyncMock()),
+        patch.object(svc, "_remove_retired_model_container", new=AsyncMock()) as mock_remove,
+        patch.object(svc, "_save", new=AsyncMock()) as mock_save,
+    ):
+        await svc.load_service(raw_config)
+
+    assert mock_remove.call_args_list == [call("deepfellow-finetune")]
+    mock_save.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_load_service_without_retired_entries_neither_removes_nor_saves(svc: CustomService) -> None:
+    raw_config = {"instances": {"default": {"options": {"spec": {}}, "models": [{"model_id": "gliner", "options": {"spec": {}}}]}}}
+
+    with (
+        patch("server.services.base2_service.Base2Service.load_service", new=AsyncMock()),
+        patch.object(svc, "_remove_retired_model_container", new=AsyncMock()) as mock_remove,
+        patch.object(svc, "_save", new=AsyncMock()) as mock_save,
+    ):
+        await svc.load_service(raw_config)
+
+    mock_remove.assert_not_called()
+    mock_save.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_remove_retired_model_container_uninstalls_its_docker(svc: CustomService, deps: dict[str, Any]) -> None:
+    deps["docker_service"].uninstall_docker = AsyncMock()
+
+    await svc._remove_retired_model_container("deepfellow-finetune")  # pyright: ignore[reportPrivateUsage]
+
+    docker_options = deps["docker_service"].uninstall_docker.call_args.args[0]
+    assert docker_options.name == "deepfellow-finetune"
+    assert docker_options.container_name == "df-deepfellow-finetune"
+
+
+@pytest.mark.asyncio
+async def test_remove_retired_model_container_logs_and_continues_on_failure(
+    svc: CustomService, deps: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    deps["docker_service"].uninstall_docker = AsyncMock(side_effect=RuntimeError("docker down"))
+
+    with caplog.at_level(logging.WARNING):
+        await svc._remove_retired_model_container("deepfellow-finetune")  # pyright: ignore[reportPrivateUsage]
+
+    assert "Failed to remove container 'df-deepfellow-finetune'" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_load_service_without_instances_key_still_calls_super(svc: CustomService) -> None:
+    raw_config: dict[str, Any] = {}
+
+    with patch("server.services.base2_service.Base2Service.load_service", new=AsyncMock()) as mock_super_load:
+        await svc.load_service(raw_config)
+
+    assert mock_super_load.call_count == 1
+    assert mock_super_load.call_args == call(raw_config)
+
+
+@pytest.mark.asyncio
+async def test_load_service_skips_instance_entries_without_a_models_list(svc: CustomService) -> None:
+    raw_config = {"instances": {"default": "not-a-dict", "other": {"options": {"spec": {}}}}}
+
+    with patch("server.services.base2_service.Base2Service.load_service", new=AsyncMock()) as mock_super_load:
+        await svc.load_service(raw_config)
+
+    loaded_config = mock_super_load.call_args.args[0]
+    assert loaded_config["instances"]["default"] == "not-a-dict"
+    assert "models" not in loaded_config["instances"]["other"]
+
+
 def test_service_has_docker(svc: CustomService) -> None:
     assert svc.service_has_docker() is False
 
@@ -111,7 +229,7 @@ def test_get_default_model_spec_contains_proxy_timeout_field_exactly_once(svc: C
 
 @pytest.mark.parametrize(
     "create_model",
-    [create_bge_m3_model, create_lemmatizer_model, create_gliner_model, create_doc_chunker_model, create_finetune_model],
+    [create_bge_m3_model, create_lemmatizer_model, create_gliner_model, create_doc_chunker_model],
 )
 def test_create_model_spec_contains_proxy_timeout_field_exactly_once(
     svc: CustomService, create_model: Callable[[CustomService, str | None], SrvCustomModel]
@@ -119,6 +237,28 @@ def test_create_model_spec_contains_proxy_timeout_field_exactly_once(
     model = create_model(svc, "172.20.0.0/16")
     field_names = [f.name for f in model.model_spec.fields]
     assert field_names.count("proxy_timeout_seconds") == 1
+
+
+@pytest.mark.parametrize(
+    ("create_model", "name"),
+    [
+        (create_bge_m3_model, "deepfellow-bge-m3"),
+        (create_lemmatizer_model, "df-lemmatizer"),
+        (create_gliner_model, "df-gliner"),
+        (create_doc_chunker_model, "doc_chunker"),
+    ],
+)
+def test_create_model_derives_container_name_without_legacy_prefix(
+    svc: CustomService, deps: dict[str, Any], create_model: Callable[[CustomService, str | None], SrvCustomModel], name: str
+) -> None:
+    """These always had a fixed name the legacy prefix never applied to, so it must stay unprefixed on upgrade."""
+    model = create_model(svc, "172.20.0.0/16")
+
+    docker_opts = model.options({"hardware": "CPU"})  # pyright: ignore[reportCallIssue]
+
+    assert docker_opts.name == name
+    assert docker_opts.container_name == f"df-{name}"
+    deps["docker_service"].get_docker_container_name.assert_called_with(name, apply_legacy_prefix=False)
 
 
 def test_model_installed_info_get_info() -> None:
@@ -192,6 +332,7 @@ def test_generate_instance_config_with_info(svc: CustomService) -> None:
     mock_model_info = MagicMock()
     mock_model_info.id = "lemmatizer"
     mock_model_info.options = InstallModelIn(spec={})
+    mock_model_info.docker_options.container_name = "df-lemmatizer"
     installed = InstalledInfo(models={"lemmatizer": mock_model_info}, options=InstallServiceIn(spec={}))
 
     config = svc._generate_instance_config("default", installed, None)  # pyright: ignore[reportPrivateUsage]
@@ -200,6 +341,19 @@ def test_generate_instance_config_with_info(svc: CustomService) -> None:
     assert config.models is not None
     assert len(config.models) == 1
     assert config.models[0].model_id == "lemmatizer"
+
+
+def test_generate_instance_config_persists_resolved_container_name(svc: CustomService) -> None:
+    mock_model_info = MagicMock()
+    mock_model_info.id = "lemmatizer"
+    mock_model_info.options = InstallModelIn(spec={})
+    mock_model_info.docker_options.container_name = "df-lemmatizer_abc123"
+    installed = InstalledInfo(models={"lemmatizer": mock_model_info}, options=InstallServiceIn(spec={}))
+
+    config = svc._generate_instance_config("default", installed, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert config.models is not None
+    assert config.models[0].container_name == "df-lemmatizer_abc123"
 
 
 def test_load_download_info(svc: CustomService) -> None:
@@ -743,6 +897,206 @@ async def test_install_model_uses_configured_standard_proxy_timeout(svc: CustomS
     assert registered_options.read_timeout_seconds == 1800
 
 
+def _mock_successful_install(deps: dict[str, Any]) -> None:
+    deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
+    deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8090, True, False))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.1"
+    deps["docker_service"].get_container_port.return_value = 8090
+    deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
+
+
+@pytest.mark.asyncio
+async def test_install_model_uses_the_models_default_proxy_timeout_over_the_standard_one(svc: CustomService, deps: dict[str, Any]) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    _mock_successful_install(deps)
+
+    with patch.object(svc, "validate_docker_image_version_for_model", new_callable=AsyncMock):
+        promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+            "default",
+            "doc_chunker",
+            InstallModelIn(
+                spec={"prefix": "doc_chunker", "hardware": "CPU", "max_concurrent": 2, "async_priority_workers": 1, "sync_only_workers": 0}
+            ),
+        )
+    await promise.wait()
+
+    registered_options = deps["endpoint_registry"].register_custom_endpoint_as_proxy.call_args.kwargs["options"]
+    assert registered_options.read_timeout_seconds == DOC_CHUNKER_PROXY_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_install_model_prefers_the_install_proxy_timeout_over_the_models_default(svc: CustomService, deps: dict[str, Any]) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    _mock_successful_install(deps)
+
+    with patch.object(svc, "validate_docker_image_version_for_model", new_callable=AsyncMock):
+        promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+            "default",
+            "doc_chunker",
+            InstallModelIn(
+                spec={
+                    "prefix": "doc_chunker",
+                    "hardware": "CPU",
+                    "max_concurrent": 2,
+                    "async_priority_workers": 1,
+                    "sync_only_workers": 0,
+                    "proxy_timeout_seconds": 42,
+                }
+            ),
+        )
+    await promise.wait()
+
+    registered_options = deps["endpoint_registry"].register_custom_endpoint_as_proxy.call_args.kwargs["options"]
+    assert registered_options.read_timeout_seconds == 42
+
+
+def test_doc_chunker_defaults_to_an_hour_per_document_conversion(svc: CustomService) -> None:
+    model = svc.models["default"]["doc_chunker"]
+
+    docker_options = model.options({"hardware": "CPU"})  # pyright: ignore[reportCallIssue]
+
+    assert docker_options.env_vars["DOCUMENT_TIMEOUT"] == 3600  # pyright: ignore[reportOptionalSubscript]
+    assert DOC_CHUNKER_PROXY_TIMEOUT_SECONDS > 3600
+
+
+def test_doc_chunker_proxy_timeout_field_names_its_own_default(svc: CustomService) -> None:
+    fields = svc.models["default"]["doc_chunker"].model_spec.fields
+
+    proxy_field = next(field for field in fields if field.name == "proxy_timeout_seconds")
+
+    assert f"{DOC_CHUNKER_PROXY_TIMEOUT_SECONDS}s" in proxy_field.description
+
+
+def test_doc_chunker_mounts_data_dir_and_sets_async_job_defaults(svc: CustomService) -> None:
+    model = svc.models["default"]["doc_chunker"]
+
+    docker_options = model.options({"hardware": "CPU"})  # pyright: ignore[reportCallIssue]
+
+    assert docker_options.volumes == [f"{svc.get_working_dir()}/doc_chunker/data:/var/lib/doc-chunker"]
+    env_vars = docker_options.env_vars or {}
+    assert env_vars["MAX_QUEUED_JOBS"] == 100
+    assert env_vars["JOB_RESULT_TTL"] == 86400
+    assert "TOKENIZER_DIR" not in env_vars
+
+
+def test_doc_chunker_worker_fields_are_optional(svc: CustomService) -> None:
+    fields = {field.name: field for field in svc.models["default"]["doc_chunker"].model_spec.fields}
+
+    for name, default in (("max_concurrent", "2"), ("async_priority_workers", "0"), ("sync_only_workers", "0")):
+        assert fields[name].required is False
+        assert fields[name].default == default
+
+
+def test_doc_chunker_passes_worker_split_to_container(svc: CustomService) -> None:
+    model = svc.models["default"]["doc_chunker"]
+
+    docker_options = model.options(  # pyright: ignore[reportCallIssue]
+        {"hardware": "CPU", "max_concurrent": 4, "async_priority_workers": 2, "sync_only_workers": 1}
+    )
+
+    env_vars = docker_options.env_vars or {}
+    assert env_vars["MAX_CONCURRENT"] == 4
+    assert env_vars["ASYNC_PRIORITY_WORKERS"] == 2
+    assert env_vars["SYNC_ONLY_WORKERS"] == 1
+
+
+def test_doc_chunker_options_fall_back_to_field_defaults_for_partial_spec(svc: CustomService) -> None:
+    """Image resolution and model export call options with just the hardware - only install validates."""
+    model = svc.models["default"]["doc_chunker"]
+
+    docker_options = model.options({"hardware": "CPU"})  # pyright: ignore[reportCallIssue]
+
+    env_vars = docker_options.env_vars or {}
+    assert env_vars["MAX_CONCURRENT"] == 2
+    assert env_vars["ASYNC_PRIORITY_WORKERS"] == 0
+    assert env_vars["SYNC_ONLY_WORKERS"] == 0
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"max_concurrent": 1, "async_priority_workers": 0, "sync_only_workers": 0},
+        {"max_concurrent": 2, "async_priority_workers": 1, "sync_only_workers": 1},
+        {"max_concurrent": "4", "async_priority_workers": "3", "sync_only_workers": "0"},
+        {},
+        {"max_concurrent": "", "async_priority_workers": "", "sync_only_workers": ""},
+        # max_concurrent left to doc-chunker's auto-sizing - the split can't be checked against it
+        {"max_concurrent": "", "async_priority_workers": 5, "sync_only_workers": 5},
+        # unset async_priority_workers counts as doc-chunker's default of 0
+        {"max_concurrent": 1, "async_priority_workers": "", "sync_only_workers": 0},
+        {"max_concurrent": 3, "async_priority_workers": "", "sync_only_workers": 2},
+    ],
+)
+def test_validate_doc_chunker_workers_accepts_valid_split(fields: dict[str, Any]) -> None:
+    validate_doc_chunker_workers(fields)
+
+
+@pytest.mark.parametrize(
+    ("fields", "field", "message"),
+    [
+        (
+            {"max_concurrent": 2, "async_priority_workers": "", "sync_only_workers": 2},
+            "sync_only_workers",
+            "must be lower than max_concurrent (2)",
+        ),
+        (
+            {"max_concurrent": 3, "async_priority_workers": "", "sync_only_workers": 3},
+            "sync_only_workers",
+            "must be lower than max_concurrent (3)",
+        ),
+        (
+            {"max_concurrent": 2, "sync_only_workers": 2},
+            "sync_only_workers",
+            "must be lower than max_concurrent (2)",
+        ),
+        (
+            {"max_concurrent": 2, "async_priority_workers": 2, "sync_only_workers": 0},
+            "async_priority_workers",
+            "must be lower than max_concurrent (2)",
+        ),
+        (
+            {"max_concurrent": 1, "async_priority_workers": 0, "sync_only_workers": 1},
+            "sync_only_workers",
+            "must be lower than max_concurrent (1)",
+        ),
+        (
+            {"max_concurrent": 3, "async_priority_workers": 2, "sync_only_workers": 2},
+            "sync_only_workers",
+            "together with async_priority_workers (2) must not exceed max_concurrent (3)",
+        ),
+        ({"max_concurrent": 0, "async_priority_workers": 0, "sync_only_workers": 0}, "max_concurrent", "greater than or equal to 1"),
+        ({"max_concurrent": 2, "async_priority_workers": 0, "sync_only_workers": -1}, "sync_only_workers", "greater than or equal to 0"),
+        ({"max_concurrent": 2, "async_priority_workers": "many", "sync_only_workers": 0}, "async_priority_workers", "valid integer"),
+        ({"max_concurrent": "1.5", "async_priority_workers": 0, "sync_only_workers": 0}, "max_concurrent", "valid integer"),
+    ],
+)
+def test_validate_doc_chunker_workers_rejects_invalid_split(fields: dict[str, Any], field: str, message: str) -> None:
+    with pytest.raises(HTTPException) as exc:
+        validate_doc_chunker_workers(fields)
+
+    assert exc.value.status_code == 400
+    errors = cast("list[dict[str, str]]", exc.value.detail)
+    assert any(error["field"] == field and message in error["message"] for error in errors)
+
+
+@pytest.mark.asyncio
+async def test_install_doc_chunker_rejects_invalid_worker_split_before_pulling_image(svc: CustomService, deps: dict[str, Any]) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    _mock_successful_install(deps)
+
+    with patch.object(svc, "validate_docker_image_version_for_model", new_callable=AsyncMock), pytest.raises(HTTPException) as exc:
+        await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+            "default",
+            "doc_chunker",
+            InstallModelIn(spec={"prefix": "doc_chunker", "hardware": "CPU", "max_concurrent": 2, "sync_only_workers": 2}),
+        )
+
+    assert exc.value.status_code == 400
+    deps["docker_service"].install_and_run_docker.assert_not_called()
+    assert ("default", "doc_chunker") not in svc._installing  # pyright: ignore[reportPrivateUsage]
+
+
 @pytest.mark.asyncio
 async def test_install_model_rejects_unavailable_image_version(svc: CustomService, deps: dict[str, Any]) -> None:
     svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
@@ -833,6 +1187,112 @@ async def test_install_model_applies_selected_image_version_for_static_image_mod
     installed_model = svc.instances_info["default"].installed.models["easyOCR"]  # pyright: ignore[reportOptionalMemberAccess]
     assert installed_model.docker_options.image == "hub.simplito.com/deepfellow/df-ocr:2.0.0"
     assert svc.models["default"]["easyOCR"].options.image == original_image  # pyright: ignore[reportFunctionMemberAccess]
+
+
+@pytest.mark.asyncio
+async def test_install_model_uses_container_name_override_when_given(svc: CustomService, deps: dict[str, Any]) -> None:
+    # "easyOCR" uses a single shared (non-callable) DockerOptions instance — the override must not
+    # mutate it in place, or the pinned name would leak into every future install of this model.
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
+    deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True, False))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.1"
+    deps["docker_service"].get_container_port.return_value = 8000
+    deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
+    original_container_name = svc.models["default"]["easyOCR"].options.container_name  # pyright: ignore[reportFunctionMemberAccess]
+
+    promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+        "default", "easyOCR", InstallModelIn(spec={"prefix": "ocr"}), "pinned-name"
+    )
+    await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "pinned-name"
+    installed_model = svc.instances_info["default"].installed.models["easyOCR"]  # pyright: ignore[reportOptionalMemberAccess]
+    assert installed_model.docker_options.container_name == "pinned-name"
+    assert svc.models["default"]["easyOCR"].options.container_name == original_container_name  # pyright: ignore[reportFunctionMemberAccess]
+
+
+@pytest.mark.asyncio
+async def test_install_model_uses_container_name_override_for_callable_options(svc: CustomService, deps: dict[str, Any]) -> None:
+    """Models whose options are built per install (e.g. bge-m3) must keep their pinned name on restart as well."""
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
+    deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8070, True, False))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.1"
+    deps["docker_service"].get_container_port.return_value = 8070
+    deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
+
+    promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+        "default", "deepfellow-bge-m3", InstallModelIn(spec={"hardware": "CPU"}), "pinned-name"
+    )
+    await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "pinned-name"
+    installed_model = svc.instances_info["default"].installed.models["deepfellow-bge-m3"]  # pyright: ignore[reportOptionalMemberAccess]
+    assert installed_model.docker_options.container_name == "pinned-name"
+
+
+@pytest.mark.asyncio
+async def test_install_model_falls_back_to_generated_container_name(svc: CustomService, deps: dict[str, Any]) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
+    deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True, False))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.1"
+    deps["docker_service"].get_container_port.return_value = 8000
+    deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
+
+    promise = await svc._install_model("default", "easyOCR", InstallModelIn(spec={"prefix": "ocr"}))  # pyright: ignore[reportPrivateUsage]
+    await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "df-easyocr"
+
+
+@pytest.mark.asyncio
+async def test_install_model_applies_suffix_changed_after_model_list_was_built(svc: CustomService, deps: dict[str, Any]) -> None:
+    """easyOCR's static options were built at load time; a later live suffix change must still reach new installs."""
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
+    deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True, False))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.1"
+    deps["docker_service"].get_container_port.return_value = 8000
+    deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
+    deps["docker_service"].get_docker_container_name.side_effect = lambda name, **_: f"{name}_new"  # pyright: ignore[reportUnknownLambdaType]
+
+    promise = await svc._install_model("default", "easyOCR", InstallModelIn(spec={"prefix": "ocr"}))  # pyright: ignore[reportPrivateUsage]
+    await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "easyocr_new"
+    assert svc.models["default"]["easyOCR"].options.container_name == "df-easyocr"  # pyright: ignore[reportFunctionMemberAccess]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("override", "expected_host"), [("pinned-name", "pinned-name"), (None, "easyocr_new")])
+async def test_install_model_derives_container_host_from_final_container_name(
+    svc: CustomService, deps: dict[str, Any], override: str | None, expected_host: str
+) -> None:
+    """The registered host must follow the pinned or re-derived name, not the static options' load-time one."""
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].get_image_warnings = AsyncMock(return_value=[])
+    deps["docker_service"].is_docker_image_pulled = AsyncMock(return_value=True)
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(8000, True, False))
+    deps["docker_service"].get_container_host.side_effect = lambda _subnet, options: options.container_name  # pyright: ignore[reportUnknownLambdaType, reportUnknownMemberType]
+    deps["docker_service"].get_container_port.return_value = 8000
+    deps["docker_service"].get_docker_container_name.side_effect = lambda name, **_: f"{name}_new"  # pyright: ignore[reportUnknownLambdaType]
+    deps["endpoint_registry"].register_custom_endpoint_as_proxy.return_value = "reg-1"
+
+    promise = await svc._install_model("default", "easyOCR", InstallModelIn(spec={"prefix": "ocr"}), override)  # pyright: ignore[reportPrivateUsage]
+    await promise.wait()
+
+    installed_model = svc.instances_info["default"].installed.models["easyOCR"]  # pyright: ignore[reportOptionalMemberAccess]
+    assert installed_model.container_host == expected_host
 
 
 @pytest.mark.asyncio
@@ -1050,7 +1510,182 @@ def test_create_doc_chunker_model_falls_back_to_default_version(svc: CustomServi
     model = create_doc_chunker_model(svc, "172.20.0.0/16")
 
     docker_opts = model.options({"hardware": "CPU"})  # pyright: ignore[reportCallIssue]
-    assert docker_opts.image == "hub.simplito.com/deepfellow/doc-chunker-cpu:v1.0.3"
+    assert docker_opts.image == "hub.simplito.com/deepfellow/doc-chunker-cpu:v2.4.0"
+
+
+@pytest.mark.parametrize(
+    ("url", "infra_url", "expected"),
+    [
+        ("http://infra:8086", "", True),
+        ("http://infra:8086/", "", True),
+        ("HTTP://INFRA:8086", "", True),
+        ("  http://infra:8086  ", "", True),
+        ("http://infra:8087", "", False),
+        ("http://infra", "", False),
+        ("https://infra:8086", "", False),
+        ("https://gateway.example.com", "", False),
+        ("", "", False),
+        ("http://infra:notaport", "", False),
+        ("http://infra:8086", "https://infra.example.com", True),
+        ("https://infra.example.com", "https://infra.example.com", True),
+        ("HTTPS://Infra.Example.com/", "https://infra.example.com", True),
+        ("https://example.com/infra/", "https://example.com/infra", True),
+        ("https://example.com", "https://example.com/infra", False),
+        ("https://gateway.example.com", "https://infra.example.com", False),
+        ("https://infra.example.com", "https://infra.example.com:notaport", False),
+    ],
+)
+def test_is_own_gateway_url_matches_only_this_infra(deps: dict[str, Any], url: str, infra_url: str, expected: bool):
+    deps["config"].infra_url = infra_url
+
+    result = _is_own_gateway_url(url, deps["config"])
+
+    assert result is expected
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected_url", "expected_key"),
+    [
+        ({}, DOC_CHUNKER_DEFAULT_GATEWAY_URL, "infra-key"),
+        ({"infra_api_url": "", "infra_api_key": ""}, DOC_CHUNKER_DEFAULT_GATEWAY_URL, "infra-key"),
+        ({"infra_api_url": None, "infra_api_key": None}, DOC_CHUNKER_DEFAULT_GATEWAY_URL, "infra-key"),
+        ({"infra_api_url": "   "}, DOC_CHUNKER_DEFAULT_GATEWAY_URL, "infra-key"),
+        ({"infra_api_url": "http://infra:8086/", "infra_api_key": ""}, "http://infra:8086/", "infra-key"),
+        ({"infra_api_url": "http://infra:8086", "infra_api_key": "custom-key"}, "http://infra:8086", "custom-key"),
+        ({"infra_api_url": "https://gateway.example.com"}, "https://gateway.example.com", ""),
+        ({"infra_api_url": "https://gateway.example.com", "infra_api_key": ""}, "https://gateway.example.com", ""),
+        ({"infra_api_url": "https://gateway.example.com", "infra_api_key": "gateway-key"}, "https://gateway.example.com", "gateway-key"),
+    ],
+)
+def test_create_doc_chunker_model_resolves_gateway_address_and_key(
+    svc: CustomService, spec: dict[str, Any], expected_url: str, expected_key: str
+):
+    model = create_doc_chunker_model(svc, "172.20.0.0/16")
+
+    docker_opts = model.options({"hardware": "CPU", **spec})  # pyright: ignore[reportCallIssue]
+
+    assert docker_opts.env_vars is not None
+    assert docker_opts.env_vars["INFRA_API_URL"] == expected_url
+    assert docker_opts.env_vars["INFRA_API_KEY"] == expected_key
+
+
+def test_create_doc_chunker_model_uses_infra_key_for_public_infra_url(svc: CustomService, deps: dict[str, Any]):
+    deps["config"].infra_url = "https://infra.example.com"
+    model = create_doc_chunker_model(svc, "172.20.0.0/16")
+
+    docker_opts = model.options({"hardware": "CPU", "infra_api_url": "HTTPS://Infra.Example.com/"})  # pyright: ignore[reportCallIssue]
+
+    assert docker_opts.env_vars is not None
+    assert docker_opts.env_vars["INFRA_API_KEY"] == "infra-key"
+
+
+def test_create_doc_chunker_model_reads_rotated_infra_key(svc: CustomService, deps: dict[str, Any]):
+    model = create_doc_chunker_model(svc, "172.20.0.0/16")
+    model.options({"hardware": "CPU"})  # pyright: ignore[reportCallIssue]
+    deps["config"].infra_api_key = SecretStr("rotated-key")
+
+    docker_opts = model.options({"hardware": "CPU"})  # pyright: ignore[reportCallIssue]
+
+    assert docker_opts.env_vars is not None
+    assert docker_opts.env_vars["INFRA_API_KEY"] == "rotated-key"
+
+
+def test_create_doc_chunker_model_leaves_install_fields_untouched(svc: CustomService):
+    model = create_doc_chunker_model(svc, "172.20.0.0/16")
+    model_fields: dict[str, Any] = {"hardware": "CPU"}
+
+    model.options(model_fields)  # pyright: ignore[reportCallIssue]
+
+    assert model_fields == {"hardware": "CPU"}
+
+
+def test_doc_chunker_gateway_fields_default_to_this_infra_without_a_key(svc: CustomService):
+    fields = {f.name: f for f in svc.models["default"]["doc_chunker"].model_spec.fields}
+
+    url_field = fields["infra_api_url"]
+    key_field = fields["infra_api_key"]
+
+    assert url_field.default == DOC_CHUNKER_DEFAULT_GATEWAY_URL
+    assert key_field.default == ""
+    assert "infra-key" not in svc.models["default"]["doc_chunker"].model_spec.model_dump_json()
+
+
+def _set_installed_doc_chunker(svc: CustomService, spec: dict[str, Any]) -> None:
+    installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    installed.models["doc_chunker"] = ModelInstalledInfo(
+        id="doc_chunker",
+        options=InstallModelIn(spec=spec),
+        docker_options=MagicMock(),
+        container_host="",
+        container_port=0,
+        docker_exposed_port=0,
+        registration_id="reg-1",
+        prefix="doc_chunker",
+        base_url="",
+    )
+    svc.instances_info["default"].installed = installed
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_blanks_infra_key_of_not_installed_doc_chunker(svc: CustomService):
+    spec = await svc.get_duplicate_spec("default", "doc_chunker")
+
+    assert spec["envs"]["INFRA_API_URL"] == DOC_CHUNKER_DEFAULT_GATEWAY_URL
+    assert spec["envs"]["INFRA_API_KEY"] == ""
+    assert "infra-key" not in spec["envs"].values()
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_blanks_infra_key_of_installed_doc_chunker(svc: CustomService):
+    _set_installed_doc_chunker(svc, {"hardware": "CPU", "infra_api_url": "http://infra:8086", "infra_api_key": ""})
+
+    spec = await svc.get_duplicate_spec("default", "doc_chunker")
+
+    assert spec["envs"]["INFRA_API_KEY"] == ""
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_keeps_admin_provided_doc_chunker_key(svc: CustomService):
+    _set_installed_doc_chunker(svc, {"hardware": "CPU", "infra_api_url": "http://infra:8086", "infra_api_key": "custom-key"})
+
+    spec = await svc.get_duplicate_spec("default", "doc_chunker")
+
+    assert spec["envs"]["INFRA_API_KEY"] == "custom-key"
+
+
+@pytest.mark.asyncio
+async def test_get_duplicate_spec_with_empty_infra_key_keeps_envs_as_is(svc: CustomService, deps: dict[str, Any]):
+    deps["config"].infra_api_key = SecretStr("")
+
+    spec = await svc.get_duplicate_spec("default", "doc_chunker")
+
+    assert spec["envs"]["INFRA_API_KEY"] == ""
+    assert spec["envs"]["MAX_CONCURRENT"] == "2"
+    assert spec["envs"]["INFRA_API_URL"] == DOC_CHUNKER_DEFAULT_GATEWAY_URL
+
+
+@pytest.mark.asyncio
+async def test_install_model_doc_chunker_keeps_infra_key_out_of_persisted_config(svc: CustomService, deps: dict[str, Any]):
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    _mock_successful_install(deps)
+
+    with patch.object(svc, "validate_docker_image_version_for_model", new_callable=AsyncMock):
+        promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
+            "default", "doc_chunker", InstallModelIn(spec={"hardware": "CPU"})
+        )
+    await promise.wait()
+    instance_config = svc._generate_instance_config(  # pyright: ignore[reportPrivateUsage]
+        "default", svc.instances_info["default"].installed, None
+    )
+
+    started_options: DockerOptions = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert started_options.env_vars is not None
+    assert started_options.env_vars["INFRA_API_KEY"] == "infra-key"
+    assert svc.instances_info["default"].installed.models["doc_chunker"].options.spec == {  # pyright: ignore[reportOptionalMemberAccess]
+        "hardware": "CPU",
+        "prefix": "doc_chunker",
+    }
+    assert "infra-key" not in instance_config.model_dump_json()
 
 
 def test_loaded_doc_chunker_model_has_docker_tags_field(svc: CustomService) -> None:
@@ -1080,7 +1715,7 @@ def test_get_docker_image_repo_for_model_unknown_model_returns_none(svc: CustomS
 
 
 def test_get_default_docker_tag_for_model_doc_chunker(svc: CustomService) -> None:
-    assert svc.get_default_docker_tag_for_model("doc_chunker", "CPU") == "v1.0.3"
+    assert svc.get_default_docker_tag_for_model("doc_chunker", "CPU") == "v2.4.0"
 
 
 def test_get_default_docker_tag_for_model_unknown_model_returns_none(svc: CustomService) -> None:
@@ -1168,7 +1803,7 @@ def test_get_docker_image_repo_for_model_raises_registry_unavailable_when_option
 def test_get_docker_image_repo_for_model_logs_when_options_raises(svc: CustomService, caplog: pytest.LogCaptureFixture) -> None:
     svc.models["default"]["broken"] = _broken_model()
 
-    with caplog.at_level(logging.ERROR, logger="uvicorn.error"), pytest.raises(RegistryUnavailableError):
+    with caplog.at_level(logging.ERROR, logger="uvicorn"), pytest.raises(RegistryUnavailableError):
         svc.get_docker_image_repo_for_model("broken", "CPU")
 
     assert any("Failed to resolve default image" in record.message and "broken" in record.message for record in caplog.records)
@@ -1369,33 +2004,6 @@ async def test_get_docker_tags_for_model_bge_m3_filters_by_token_not_substring(d
         cpu_tags = await svc_gpu.get_docker_tags_for_model("deepfellow-bge-m3", "CPU")
 
     assert cpu_tags == ["1.12.8-cpu"]
-
-
-def test_create_finetune_model_returns_docker_options(svc: CustomService) -> None:
-    model = create_finetune_model(svc, "172.20.0.0/16")
-
-    assert callable(model.options)
-    docker_opts = model.options({})  # pyright: ignore[reportCallIssue]
-    assert docker_opts.image_port == 8333
-    assert docker_opts.image == "hub.simplito.com/deepfellow/deepfellow-finetune:0.0.1"
-
-
-def test_loaded_finetune_model_has_docker_tags_field(svc: CustomService) -> None:
-    model = svc.models["default"]["deepfellow-finetune"]
-
-    field = next(f for f in model.model_spec.fields if f.name == "image_version")
-    assert field.type == "docker-tags"
-    assert field.docker_image == "hub.simplito.com/deepfellow/deepfellow-finetune"
-
-
-@pytest.mark.asyncio
-async def test_get_docker_tags_for_model_finetune_uses_identity_filter(svc: CustomService) -> None:
-    client = MagicMock()
-    client.get_tags = AsyncMock(return_value=["0.0.1", "0.0.3", "0.0.4", "0.0.6"])
-    with patch("server.services.custom_service.registry_for", return_value=client):
-        tags = await svc.get_docker_tags_for_model("deepfellow-finetune", None)
-
-    assert tags == ["0.0.1", "0.0.3", "0.0.4", "0.0.6"]
 
 
 @pytest.mark.asyncio

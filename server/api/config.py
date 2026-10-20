@@ -4,7 +4,6 @@
 """Infra config API."""
 
 import asyncio
-import logging
 import typing
 from typing import Annotated, Any
 
@@ -27,17 +26,18 @@ from server.core.dependencies import (
 from server.dynamic_config import DynamicSettings
 from server.models.config import ConfigEntry, ConfigOut, ConfigRevealOut
 from server.task_manager import TaskManager
+from server.utils.logger import logger
 from server.utils.model_downloader import ModelDownloader
+from server.utils.sentry import parse_dsn, sentry
 from server.utils.tracing import OtlpLoggingManager, tracer
 from server.websockets.infra_websocket_server import InfraWebsocketServer
 from server.websockets.parent_infra_group import ParentInfraGroup
-
-logger = logging.getLogger("uvicorn.error")
 
 router = APIRouter(prefix="/admin/config", tags=["Config"])
 
 _MASKED = "••••••••"
 _ENV_PREFIX: str = AppSettings.model_config.get("env_prefix", "DF_")  # type: ignore[call-overload]
+_SENTRY_FIELDS = frozenset({"sentry_enabled", "sentry_dsn", "sentry_environment"})
 
 
 def _is_editable(field_name: str) -> bool:
@@ -56,6 +56,46 @@ def _to_env_key(field_name: str) -> str:
 
 def _to_field_name(env_key: str) -> str:
     return env_key.upper().removeprefix(_ENV_PREFIX).lower()
+
+
+def _validate_container_name_suffix(config: AppSettings, current: DynamicSettings, new_settings: DynamicSettings) -> None:
+    """Reject a new container_name_suffix with 400 while the legacy DF_CONTAINER_NAME_PREFIX is set.
+
+    The legacy prefix takes priority in get_docker_container_name(), so a new suffix would be
+    accepted and persisted but silently do nothing. Clearing it, or re-sending the current one, is fine.
+    """
+    if (
+        config.container_name_prefix
+        and new_settings.container_name_suffix
+        and new_settings.container_name_suffix != current.container_name_suffix
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "container_name_suffix has no effect while the legacy DF_CONTAINER_NAME_PREFIX is set. Remove "
+                "DF_CONTAINER_NAME_PREFIX from .env and restart first - installed containers keep their names."
+            ),
+        )
+
+
+def _validate_sentry_dsn(updates: dict[str, Any], new_settings: DynamicSettings) -> None:
+    """Reject with 400 a request that sets a malformed `sentry_dsn`, or that changes Sentry settings and leaves it on with one.
+
+    So enabling Sentry over a malformed stored DSN is refused instead of answering 200 while Sentry stays off.
+    Turning Sentry off, and every update that doesn't touch the Sentry settings, always pass: a bad stored DSN
+    (Sentry is then off with a warning) must not make unrelated updates fail. An empty DSN is valid and means off.
+
+    Not a `DynamicSettings` validator: `read_envelope` would then abort startup on a hand-edited bad DSN.
+    """
+    dsn = new_settings.sentry_dsn.get_secret_value()
+    if not dsn:
+        return
+    if "sentry_dsn" not in updates and not (new_settings.sentry_enabled and not _SENTRY_FIELDS.isdisjoint(updates)):
+        return
+    try:
+        parse_dsn(dsn)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid Sentry DSN: {e}") from e
 
 
 @router.get("", summary="List infra configuration entries.")
@@ -126,9 +166,9 @@ async def update_dynamic_config(
     """Apply a partial update to the dynamic settings backed by `config.json`.
 
     Only fields defined on `DynamicSettings` may be changed here — bootstrap-only fields
-    (`docker_subnet`, `external_only`, `storage_dir`, `storage_services_dir`,
+    (`docker_subnet`, `external_only`, `storage_dir`, `storage_services_dir`, the legacy
     `container_name_prefix`, `compose_prefix`, `infra_admin_api_key`) are immutable at runtime. Validated, persisted
-    atomically, applied in-memory, and any required side effects (mesh reconnect, OTEL
+    atomically, applied in-memory, and any required side effects (mesh reconnect, OTEL and Sentry
     reconfigure, model downloader token refresh) are triggered — all without a process restart.
 
     `config.json` has exactly one writer (this handler); the lock serializes read-merge-write-apply
@@ -148,26 +188,22 @@ async def update_dynamic_config(
             new_settings = DynamicSettings.model_validate(merged_data)
         except ValidationError as e:
             raise HTTPException(status_code=400, detail=jsonable_encoder(e.errors())) from e
+        _validate_container_name_suffix(config, current, new_settings)
+        _validate_sentry_dsn(updates, new_settings)
 
-        mesh_changed = new_settings.connect_to_mesh_url != current.connect_to_mesh_url or (
-            new_settings.connect_to_mesh_key.get_secret_value() != current.connect_to_mesh_key.get_secret_value()
+        # Diffed against what parent_infra/otlp_logging/sentry last confirmed applied, not `current` —
+        # `apply_dynamic_settings()` below overwrites `config` regardless of success.
+        mesh_changed = new_settings.connect_to_mesh_url != parent_infra.configured_mesh_url or (
+            new_settings.connect_to_mesh_key.get_secret_value() != parent_infra.configured_mesh_key.get_secret_value()
         )
         otel_logging_changed = (
-            new_settings.otel_logging_enabled != current.otel_logging_enabled
-            or new_settings.otel_exporter_otlp_endpoint != current.otel_exporter_otlp_endpoint
+            new_settings.otel_logging_enabled != otlp_logging.configured_enabled
+            or new_settings.otel_exporter_otlp_endpoint != otlp_logging.configured_endpoint
         )
-        otel_tracing_disabled = current.otel_tracing_enabled and not new_settings.otel_tracing_enabled
-        ancestor_broadcast_needed = (
-            new_settings.share_models_downstream != current.share_models_downstream
-            or new_settings.infra_api_key.get_secret_value() != current.infra_api_key.get_secret_value()
-            or new_settings.name != current.name
-            or new_settings.infra_url != current.infra_url
-        )
+        sentry_changed = sentry.needs_reconfigure(new_settings)
         downloaders_changed = (
             new_settings.hugging_face_token.get_secret_value() != current.hugging_face_token.get_secret_value()
             or new_settings.civitai_token.get_secret_value() != current.civitai_token.get_secret_value()
-            or new_settings.adapter_registry_url != current.adapter_registry_url
-            or new_settings.adapter_registry_secret.get_secret_value() != current.adapter_registry_secret.get_secret_value()
         )
 
         # Persist before mutating in-memory state: the file is the source of truth.
@@ -183,13 +219,15 @@ async def update_dynamic_config(
                 await parent_infra.reconfigure(config, task_manager)
             if otel_logging_changed:
                 await otlp_logging.reconfigure(config)
-            if otel_tracing_disabled:
-                # Endpoint changes are already picked up lazily by tracer._get_tracer()/
-                # _get_mcp_instruments(); only a disable transition needs an explicit stop, since
-                # nothing calls those getters again to shut down the now-unreferenced providers.
+            if sentry_changed:
+                await sentry.reconfigure(config)
+            if not new_settings.otel_tracing_enabled and tracer.is_active:
+                # Only a disable needs an explicit stop; endpoint changes are picked up lazily
+                # elsewhere. Checked against live state, not a flag, so a retry isn't skipped.
                 await tracer.shutdown()
-            if ancestor_broadcast_needed:
-                infra_websocket_server.broadcast_ancestors_to_children()
+            # Stateless and cheap — run unconditionally rather than gating on a flag that could go
+            # stale like the ones above used to.
+            infra_websocket_server.broadcast_ancestors_to_children()
             if downloaders_changed:
                 model_downloader.create_downloaders(config)
         except Exception as e:

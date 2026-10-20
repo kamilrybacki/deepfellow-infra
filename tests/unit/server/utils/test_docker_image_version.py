@@ -3,8 +3,17 @@
 
 """Unit tests for server/utils/docker_image_version.py."""
 
+import pytest
+
 from server.docker import DockerOptions
-from server.utils.docker_image_version import apply_image_version_override, docker_tags_model_field, split_image_repo_tag
+from server.utils.docker_image_version import (
+    apply_image_version_override,
+    docker_tags_model_field,
+    has_cuda_variant,
+    newer_tag_needing_cuda,
+    newest_docker_tag,
+    split_image_repo_tag,
+)
 
 
 class TestSplitImageRepoTag:
@@ -79,3 +88,95 @@ class TestApplyImageVersionOverride:
 
         assert overridden is docker_options
         assert overridden.image == image
+
+
+class TestNewestDockerTag:
+    @pytest.mark.parametrize(
+        ("reference", "tags", "expected"),
+        [
+            # plain semver ignores variants and non-releases
+            ("v2.2.0", ["latest", "v2.4.0-volta", "v2.3.0", "v2.10.0", "v2.9.0"], "v2.10.0"),
+            # llama.cpp: build number, variant kept
+            (
+                "server-intel-b5966",
+                ["server-intel-b6100", "server-vulkan-b9000", "server-intel-b999", "server-cuda-b7000"],
+                "server-intel-b6100",
+            ),
+            ("server-vulkan-b10902", ["server-vulkan-b9999", "server-vulkan-b10903"], "server-vulkan-b10903"),
+            # vLLM / SGLang: cuda variants
+            ("v0.29.0-cu129-ubuntu2404", ["v0.30.0-cu129-ubuntu2404", "v0.31.0-cu129"], "v0.30.0-cu129-ubuntu2404"),
+            ("v0.5.19-cu129", ["v0.5.20-cu129", "v0.5.20-cu130", "v0.5.20-cu129-xeon"], "v0.5.20-cu129"),
+            # a newer CUDA major is never picked
+            ("v0.5.19-cu129", ["v0.5.21-cu130", "v0.5.20-cu130"], "v0.5.19-cu129"),
+            ("v0.5.19-cu128", ["v0.5.20-cu129", "v0.5.21-cu130"], "v0.5.20-cu129"),
+            # Ollama: ROCm stays ROCm, plain stays plain
+            ("0.12.3-rocm", ["0.13.0", "0.13.0-rocm", "0.12.4-rocm"], "0.13.0-rocm"),
+            ("0.12.3", ["0.13.0", "0.13.0-rocm", "0.30.10-rc0"], "0.13.0"),
+            # already newest -> reference itself
+            ("v2.4.0", ["v2.3.0", "v2.4.0"], "v2.4.0"),
+            ("v2.5.0", ["v2.4.0"], "v2.5.0"),
+        ],
+    )
+    def test_picks_newest_tag_of_the_same_variant(self, reference: str, tags: list[str], expected: str) -> None:
+        assert newest_docker_tag(tags, reference) == expected
+
+    @pytest.mark.parametrize("reference", [None, "", "latest", "dev"])
+    def test_unrecognized_reference_gives_none(self, reference: str | None) -> None:
+        assert newest_docker_tag(["v1.0.0"], reference) is None
+
+
+class TestNewestDockerTagWithHostCuda:
+    TAGS = ("v0.5.21-cu130", "v0.5.20-cu130", "v0.5.20-cu129", "v0.5.19-cu129", "v0.5.21-cu134")
+
+    @pytest.mark.parametrize(
+        ("max_cuda", "expected"),
+        [
+            ((13, 4), "v0.5.21-cu134"),
+            ((13, 0), "v0.5.21-cu130"),
+            ((12, 9), "v0.5.20-cu129"),
+            ((12, 8), "v0.5.19-cu129"),  # driver too old for the reference itself: stay on it
+            (None, "v0.5.20-cu129"),
+        ],
+    )
+    def test_cuda_builds_are_limited_by_the_driver(self, max_cuda: tuple[int, int] | None, expected: str) -> None:
+        assert newest_docker_tag(list(self.TAGS), "v0.5.19-cu129", max_cuda) == expected
+
+    def test_keeps_the_reference_cuda_build_at_the_same_version(self) -> None:
+        assert newest_docker_tag(["v0.5.19-cu130", "v0.5.19-cu129"], "v0.5.19-cu129", (13, 0)) == "v0.5.19-cu129"
+
+    def test_does_not_mix_other_variants(self) -> None:
+        assert newest_docker_tag(["v0.5.21-cu130-runtime", "v0.5.21-cu130-xeon"], "v0.5.19-cu129", (13, 0)) == "v0.5.19-cu129"
+
+
+class TestHasCudaVariant:
+    @pytest.mark.parametrize(("tag", "expected"), [("v0.29.0-cu129-ubuntu2404", True), ("0.12.3-rocm", False), (None, False)])
+    def test_detects_cuda_builds(self, tag: str | None, expected: bool) -> None:
+        assert has_cuda_variant(tag) is expected
+
+
+class TestNewerTagNeedingCuda:
+    TAGS = ["v0.5.21-cu130", "v0.5.20-cu130", "v0.5.19-cu129", "v0.5.21-cu130-runtime"]
+
+    @pytest.mark.parametrize(
+        ("max_cuda", "expected"),
+        [
+            ((12, 9), ("v0.5.21-cu130", (13, 0))),  # driver too old for CUDA 13
+            ((13, 0), None),  # the newest one is selectable
+            (None, None),  # unknown driver: nothing to say
+        ],
+    )
+    def test_reports_the_newer_tag_held_back_by_the_driver(
+        self, max_cuda: tuple[int, int] | None, expected: tuple[str, tuple[int, int]] | None
+    ) -> None:
+        assert newer_tag_needing_cuda(self.TAGS, "v0.5.19-cu129", max_cuda) == expected
+
+    def test_is_none_for_tags_without_cuda(self) -> None:
+        assert newer_tag_needing_cuda(["0.13.0"], "0.12.3", (12, 9)) is None
+
+    def test_is_none_for_an_unrecognized_reference(self) -> None:
+        assert newer_tag_needing_cuda(self.TAGS, "latest", (12, 9)) is None
+
+    def test_reports_the_cuda_needed_when_a_lower_update_is_still_possible(self) -> None:
+        tags = ["v0.5.21-cu130", "v0.5.20-cu129", "v0.5.19-cu129"]
+        assert newest_docker_tag(tags, "v0.5.19-cu129", (12, 9)) == "v0.5.20-cu129"
+        assert newer_tag_needing_cuda(tags, "v0.5.19-cu129", (12, 9)) == ("v0.5.21-cu130", (13, 0))

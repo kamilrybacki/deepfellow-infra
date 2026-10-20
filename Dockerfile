@@ -50,4 +50,7 @@ WORKDIR /app
 COPY --from=builder /app /app
 COPY --from=ui /ui /app/static
 
+ARG DF_BUILD_COMMIT=""
+ENV DF_BUILD_COMMIT=$DF_BUILD_COMMIT
+
 CMD ["./.venv/bin/uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8086", "--log-config", "server/utils/logging_config.yaml", "--ws-ping-interval", "5", "--ws-ping-timeout", "10"]

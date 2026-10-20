@@ -5,7 +5,6 @@
 
 import asyncio
 import json
-import logging
 import random
 import time
 import uuid
@@ -54,7 +53,8 @@ from server.websockets.parent_infra_group import ParentInfraGroup
 if TYPE_CHECKING:
     from server.model_tester import ModelTester
 
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
+
 T = TypeVar("T")
 
 type EndpointCallback[T] = Callable[[T, Request | None], Awaitable[StarletteResponse]]
@@ -120,6 +120,7 @@ class RegisteredModel[T](BaseModel):
     healthy: bool = False
     capacity_state: CapacityState = "unbounded"
     warm: bool = True
+    alias: ModelId | None = None
 
     @field_validator("capacity_state")
     @classmethod
@@ -145,6 +146,8 @@ class RegistrationOptions(NamedTuple):
     owned_by: str = "local"
     capacity_state: CapacityState = "unbounded"
     warm: bool = True
+    alias: ModelId | None = None
+    healthy: bool = False
 
 
 class RegistryEntry(NamedTuple):
@@ -265,10 +268,15 @@ class Endpoint[T]:
             owned_by=options.owned_by if options else "local",
             capacity_state=options.capacity_state if options else "unbounded",
             warm=options.warm if options else True,
+            alias=options.alias if options and options.alias and options.alias != model_id else None,
+            healthy=options.healthy if options else False,
         )
         if model_id not in self.models:
             self.models[model_id] = {}
         self.models[model_id][registered_model.id] = registered_model
+        if registered_model.alias:
+            # The alias bucket shares the very same RegisteredModel, so usage, warmth and capacity are counted once.
+            self.models.setdefault(registered_model.alias, {})[registered_model.id] = registered_model
         self.registry[registered_model.id] = RegistryEntry(model_id=model_id, endpoint=self, registered_model=registered_model)
         if not options or options.send_notification:
             self.parent_infra.send_models_list()
@@ -278,10 +286,13 @@ class Endpoint[T]:
         """Remove model from registry."""
         if model_id not in self.models:
             return
-        if registration_id in self.models[model_id]:
-            del self.models[model_id][registration_id]
+        removed = self.models[model_id].pop(registration_id, None)
         if len(self.models[model_id]) == 0:
             del self.models[model_id]
+        if removed and removed.alias and removed.alias in self.models:
+            self.models[removed.alias].pop(registration_id, None)
+            if len(self.models[removed.alias]) == 0:
+                del self.models[removed.alias]
         if registration_id in self.registry:
             del self.registry[registration_id]
         if send_notification:
@@ -382,6 +393,38 @@ class Endpoint[T]:
                 return item.props.tools
         return []
 
+    @staticmethod
+    def _aggregate_modality_support(values: list[bool | None]) -> bool | None:
+        """Aggregate a modality flag (`supports_vision`/`supports_audio`) across a model's registrations.
+
+        `True` if any registration reports `True` (the model can do it on at least one backend),
+        `False` if every registration explicitly reports `False` (confirmed unsupported everywhere),
+        otherwise `None` (unknown, or a mix of `None` and `False` with no confirmed `True`).
+        """
+        if any(v is True for v in values):
+            return True
+        if values and all(v is False for v in values):
+            return False
+        return None
+
+    def get_model_supports_vision(self, model: dict[RegistrationId, RegisteredModel[T]]) -> bool | None:
+        """Aggregate `supports_vision` across a model's registrations. See `_aggregate_modality_support`."""
+        return self._aggregate_modality_support([item.props.supports_vision for item in model.values()])
+
+    def get_model_supports_audio(self, model: dict[RegistrationId, RegisteredModel[T]]) -> bool | None:
+        """Aggregate `supports_audio` across a model's registrations. See `_aggregate_modality_support`."""
+        return self._aggregate_modality_support([item.props.supports_audio for item in model.values()])
+
+    @staticmethod
+    def _aggregate_capacity(model: dict[RegistrationId, RegisteredModel[T]]) -> int | None:
+        """Sum finite capacities across registrations; `None` if any registration is unbounded or unknown."""
+        total = 0
+        for item in model.values():
+            if not isinstance(item.capacity_state, int):
+                return None
+            total += item.capacity_state
+        return total
+
     def _build_api_model(self, model_id: ModelId, model: dict[RegistrationId, RegisteredModel[T]]) -> ApiModel:
         """Build an ApiModel from a model's registrations."""
         return ApiModel(
@@ -398,7 +441,11 @@ class Endpoint[T]:
                 prefix=self.get_model_prefix(model),
                 transport=self.get_model_transport(model),
                 tools=self.get_model_tools(model),
+                supports_vision=self.get_model_supports_vision(model),
+                supports_audio=self.get_model_supports_audio(model),
             ),
+            usage=sum(item.usage for item in model.values()),
+            capacity=self._aggregate_capacity(model),
         )
 
     def get_models(self) -> list[ApiModel]:
@@ -425,7 +472,8 @@ class Endpoint[T]:
         res = list[Model]()
         for model_id, map in self.models.items():
             for item in map.values():
-                if item.owned_by in exclude_owned_by:
+                if item.owned_by in exclude_owned_by or model_id != item.name:
+                    # `model_id != item.name` skips alias buckets: the registration is reported once, under its primary name.
                     continue
                 capacity, capacity_known = _capacity_pair_from_state(item.capacity_state)
                 res.append(
@@ -438,6 +486,7 @@ class Endpoint[T]:
                         capacity=capacity,
                         capacity_known=capacity_known,
                         warm=item.warm,
+                        healthy=item.healthy,
                     )
                 )
         return res
@@ -593,8 +642,8 @@ class ProxyOptions:
     # register_custom_endpoint_as_proxy; ignored by every other proxy path. This is deliberate —
     # the longer timeout is meant for doc-chunker and other custom services only.
     read_timeout_seconds: int = 300
-    # Custom-endpoint proxy only. True forwards the full path (prefix included) — for proxying to
-    # another DF-Infra node's /custom/{full_path}. False (default) strips the prefix — for
+    # Custom-endpoint and streamable-HTTP MCP proxies only. True forwards the full path (prefix included) — for proxying to
+    # another DF-Infra node's /custom/{full_path} or /mcp/{full_path}. False (default) strips the prefix — for
     # proxying straight to a backing container, which doesn't know about it.
     forward_full_path: bool = False
 
@@ -647,6 +696,11 @@ async def _read_body_with_limit(request: Request, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
+def _mcp_transport_changed(existing: RegisteredModel[Any], model: Model) -> bool:
+    """Whether an MCP registration's transport differs from the peer's, which needs a different proxy."""
+    return model.type == "mcp" and existing.props.transport != model.props.transport
+
+
 class ModelInfo(NamedTuple):
     id: str
     type: str
@@ -679,7 +733,14 @@ class EndpointRegistry:
 
     @property
     def _proxy_timeout(self) -> ClientTimeout:
-        """Default timeout for outbound proxy requests, driven by `DF_STANDARD_PROXY_TIMEOUT_SECONDS`."""
+        """Default timeout for outbound proxy requests, driven by `DF_STANDARD_PROXY_TIMEOUT_SECONDS`.
+
+        This is a total-duration cap (`ClientTimeout.total`) here - the value used for chat
+        completions, embeddings, audio, images, rerank, and MCP proxying. Custom-service proxying
+        (doc-chunker, GLiNER, etc.) reads the same setting but interprets it differently: as a
+        per-chunk idle-read window with no total cap - see `ProxyOptions.read_timeout_seconds`,
+        and `CustomService.get_proxy_timeout_field` for the per-service override.
+        """
         return ClientTimeout(total=self.config.standard_proxy_timeout_seconds, sock_connect=30)
 
     def get_models(self) -> ApiModels:
@@ -1042,7 +1103,13 @@ class EndpointRegistry:
         async def on_request(request: Request) -> StreamingResponse:
             headers = await options.get_request_headers(request)
             headers["content-type"] = request.headers.get("content-type") or "application/octet-stream"
+            # Mesh proxy only: the child routes by the `{prefix}/...` path, so the whole path must be forwarded.
             full_url = options.url
+            if options.forward_full_path:
+                full_path: str = request.path_params["full_path"]
+                if ".." in full_path.split("/"):
+                    raise HTTPException(400, "Invalid MCP path.")
+                full_url = Utils.join_url(options.url, full_path)
             if request.url.query:
                 full_url = f"{full_url}?{request.url.query}"
             logger.debug("MCP proxy: %s %s -> %s", request.method, request.path_params["full_path"], full_url)
@@ -1148,6 +1215,23 @@ class EndpointRegistry:
             entry.registered_model.warm = warm
             self.parent_infra.send_warm(WarmChangeRequest(id=registration_id, warm=warm))
 
+    def update_modality_support(
+        self, registration_id: RegistrationId, *, supports_vision: bool | None, supports_audio: bool | None
+    ) -> None:
+        """Update a registration's resolved `supports_vision`/`supports_audio` in place.
+
+        Lets a service keep an already-registered model's props in sync when its catalog is
+        refreshed after install (e.g. a `classify_modality_support` fix or a regenerated static
+        catalog correcting a previously-unknown or wrong value), without unregistering and losing
+        the registration's id, usage counters, or warm/health state.
+        """
+        entry = self.registry.get(registration_id, None)
+        if entry is None:
+            return
+        props = entry.registered_model.props
+        if props.supports_vision != supports_vision or props.supports_audio != supports_audio:
+            entry.registered_model.props = props.model_copy(update={"supports_vision": supports_vision, "supports_audio": supports_audio})
+
     def update_models(self, prev_list: list[Model], new_list: list[Model], api_url: str, api_key: str, owned_by: str = "mesh") -> None:
         """Update models, it remove old models and add new ones.
 
@@ -1188,11 +1272,17 @@ class EndpointRegistry:
                 )
                 continue
             if existing is None:
-                logger.info(f"Register new model origin={api_url} id={model.id} name={model.name} type={model.type}")  # noqa: G004
-            elif key_changed:
-                logger.info(f"Refresh proxy credentials origin={api_url} id={model.id} name={model.name} type={model.type}")  # noqa: G004
+                logger.info(f"Register new model origin={api_url} id={model.id} name={model.name} type={model.type}")
+            elif key_changed or _mcp_transport_changed(existing.registered_model, model):
+                logger.info(f"Refresh proxy origin={api_url} id={model.id} name={model.name} type={model.type}")
                 existing.endpoint.remove_model(model_id=existing.model_id, registration_id=model.id, send_notification=False)
             else:
+                # Same proxy, but the peer may have changed MCP props (tools) or health since the last sync.
+                registered_model = existing.registered_model
+                if model.type == "mcp" and (registered_model.props != model.props or registered_model.healthy != model.healthy):
+                    registered_model.props = model.props
+                    registered_model.healthy = model.healthy
+                    changed = True
                 continue
             changed = True
             self._register_proxy(
@@ -1209,6 +1299,7 @@ class EndpointRegistry:
                     owned_by=owned_by,
                     capacity_state=_capacity_state_from_pair(model.capacity, model.capacity_known),
                     warm=model.warm,
+                    healthy=model.healthy,
                 ),
             )
         for model in prev_list:
@@ -1216,10 +1307,28 @@ class EndpointRegistry:
                 prev = self.registry.get(model.id, None)
                 if prev and prev.registered_model.owned_by == owned_by:
                     changed = True
-                    logger.info(f"Remove old model origin={api_url} id={model.id} name={model.name} type={model.type}")  # noqa: G004
+                    logger.info(f"Remove old model origin={api_url} id={model.id} name={model.name} type={model.type}")
                     prev.endpoint.remove_model(model_id=prev.model_id, registration_id=model.id, send_notification=False)
         if changed:
             self.parent_infra.send_models_list()
+
+    def _register_mcp_proxy(
+        self, model_id: ModelId, props: ModelProps, url: str, api_key: str, registration_options: RegistrationOptions | None
+    ) -> None:
+        """Register a proxy to an MCP server on a mesh peer, over the transport the peer reported."""
+        options = ProxyOptions(
+            url=urljoin(url, "mcp"),
+            headers={"Authorization": f"Bearer {api_key}"},
+            allowed_request_headers=["accept", "mcp-session-id"],
+            allowed_response_headers=["accept", "mcp-session-id", "www-authenticate"],
+        )
+        if props.transport == "sse":
+            # The SSE proxy always targets `options.url`, so point it at this prefix on the peer.
+            options.url = Utils.join_url(options.url, f"{model_id}/sse")
+            self.register_mcp_sse_endpoint_as_proxy(url=model_id, props=props, options=options, registration_options=registration_options)
+        else:
+            options.forward_full_path = True
+            self.register_mcp_endpoint_as_proxy(url=model_id, props=props, options=options, registration_options=registration_options)
 
     def _register_proxy(
         self,
@@ -1311,17 +1420,9 @@ class EndpointRegistry:
                 registration_options=registration_options,
             )
         elif type == "mcp":
-            self.register_mcp_endpoint_as_proxy(
-                url=model_id,
-                props=props,
-                options=ProxyOptions(
-                    url=urljoin(url, "mcp"),
-                    headers={"Authorization": f"Bearer {api_key}"},
-                ),
-                registration_options=registration_options,
-            )
+            self._register_mcp_proxy(model_id, props, url, api_key, registration_options)
         else:
-            logger.warning(f"Cannot register proxy with model_type={type}")  # noqa: G004
+            logger.warning(f"Cannot register proxy with model_type={type}")
 
     async def execute_messages(
         self,
@@ -1331,7 +1432,7 @@ class EndpointRegistry:
     ) -> StarletteResponse:
         """Process messages request."""
         if self.config.is_log_payloads_enabled():
-            logger.info(f"DUMP REQUEST PAYLOAD /v1/messages {body.model_dump_json(exclude_none=True)}")  # noqa: G004
+            logger.info(f"DUMP REQUEST PAYLOAD /v1/messages {body.model_dump_json(exclude_none=True)}")
 
         endpoint = self.chat_completion_endpoints.get_model(
             body.model,
@@ -1372,7 +1473,7 @@ class EndpointRegistry:
             body.input = [self._resolve_item_reference(item) for item in body.input]
 
         if self.config.is_log_payloads_enabled():
-            logger.info(f"DUMP REQUEST PAYLOAD /v1/responses {body.model_dump_json(exclude_none=True)}")  # noqa: G004
+            logger.info(f"DUMP REQUEST PAYLOAD /v1/responses {body.model_dump_json(exclude_none=True)}")
 
         endpoint = self.chat_completion_endpoints.get_model(
             body.model,
@@ -1423,7 +1524,7 @@ class EndpointRegistry:
     ) -> StarletteResponse:
         """Process chat completion request."""
         if self.config.is_log_payloads_enabled():
-            logger.info(f"DUMP REQUEST PAYLOAD /v1/chat/completions {body.model_dump_json(exclude_none=True)}")  # noqa: G004
+            logger.info(f"DUMP REQUEST PAYLOAD /v1/chat/completions {body.model_dump_json(exclude_none=True)}")
 
         endpoint = self.chat_completion_endpoints.get_model(
             body.model,
@@ -1551,7 +1652,7 @@ class EndpointRegistry:
     ) -> StarletteResponse:
         """Process images generations request."""
         if self.config.is_log_payloads_enabled():
-            logger.info(f"DUMP REQUEST PAYLOAD /v1/images/generations {body.model_dump_json(exclude_none=True)}")  # noqa: G004
+            logger.info(f"DUMP REQUEST PAYLOAD /v1/images/generations {body.model_dump_json(exclude_none=True)}")
         endpoint = self.images_generations_endpoints.get_model(body.model, registration_id=registration_id)
         if not endpoint:
             if not self.model_exists(body.model):
@@ -1571,7 +1672,7 @@ class EndpointRegistry:
     ) -> StarletteResponse:
         """Process audio speech request."""
         if self.config.is_log_payloads_enabled():
-            logger.info(f"DUMP REQUEST PAYLOAD /v1/audio/speech {body.model_dump_json(exclude_none=True)}")  # noqa: G004
+            logger.info(f"DUMP REQUEST PAYLOAD /v1/audio/speech {body.model_dump_json(exclude_none=True)}")
         endpoint = self.audio_speech_endpoints.get_model(body.model, registration_id=registration_id)
         if not endpoint:
             if not self.model_exists(body.model):
@@ -1609,7 +1710,7 @@ class EndpointRegistry:
     ) -> StarletteResponse:
         """Process rerank request."""
         if self.config.is_log_payloads_enabled():
-            logger.info(f"DUMP REQUEST PAYLOAD /v1/rerank {body.model_dump_json(exclude_none=True)}")  # noqa: G004
+            logger.info(f"DUMP REQUEST PAYLOAD /v1/rerank {body.model_dump_json(exclude_none=True)}")
         endpoint = self.rerank_endpoints.get_model(body.model, registration_id=registration_id)
         if not endpoint:
             if not self.model_exists(body.model):
@@ -1674,7 +1775,7 @@ class EndpointRegistry:
                         yield chunk
                 finally:
                     if log_payload:
-                        logger.info(f"DUMP RESPONSE PAYLOAD {b''.join(chunks).decode('utf-8')}")  # noqa: G004
+                        logger.info(f"DUMP RESPONSE PAYLOAD {b''.join(chunks).decode('utf-8')}")
                     duration = time.perf_counter() - start_time
                     self.metrics_registry.request_duration.labels(model_name=model.name, model_type=model.type).observe(duration)
                     self.metrics_registry.request_total.labels(model_name=model.name, model_type=model.type, status="success").inc()
@@ -1698,7 +1799,7 @@ class EndpointRegistry:
         self._refresh_usage(model)
 
     def _refresh_usage(self, model: RegisteredModel[Any]) -> None:
-        logger.debug(f"Model usage origin={model.origin} id={model.id} name={model.name} usage={model.usage}")  # noqa: G004
+        logger.debug(f"Model usage origin={model.origin} id={model.id} name={model.name} usage={model.usage}")
         self.parent_infra.send_usage(UsageChangeRequest(id=model.id, usage=model.usage))
 
     async def test_model(self, registration_id: RegistrationId) -> JsonSerializable:

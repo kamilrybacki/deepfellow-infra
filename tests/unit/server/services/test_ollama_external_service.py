@@ -35,6 +35,16 @@ def _make_installed_info(base_url: str = "http://localhost:11434") -> InstalledI
     )
 
 
+def _make_model_installed_info(model_id: str = "my-llm", registration_id: str = "reg-1") -> ModelInstalledInfo:
+    return ModelInstalledInfo(
+        id=model_id,
+        registered_name=model_id,
+        type="llm",
+        options=InstallModelIn(),
+        registration_id=registration_id,
+    )
+
+
 @pytest.fixture
 def deps() -> dict[str, Any]:
     service_provider = MagicMock()
@@ -46,6 +56,7 @@ def deps() -> dict[str, Any]:
         "model_downloader": MagicMock(),
         "docker_service": MagicMock(),
         "hardware": MagicMock(gpus=[]),
+        "services_manager": MagicMock(),
     }
 
 
@@ -122,11 +133,11 @@ def test_get_size_returns_empty_string(svc: OllamaExternalService) -> None:
     assert svc.get_size() == ""
 
 
-def test_get_model_spec_has_alias_and_alive_time(svc: OllamaExternalService) -> None:
+def test_get_model_spec_has_rename_and_alive_time(svc: OllamaExternalService) -> None:
     spec = svc.get_model_spec()
 
     names = {f.name for f in spec.fields}
-    assert {"alias", "alive_time"} <= names
+    assert {"rename", "alive_time"} <= names
 
 
 def test_get_custom_model_spec_has_required_fields(svc: OllamaExternalService) -> None:
@@ -138,13 +149,7 @@ def test_get_custom_model_spec_has_required_fields(svc: OllamaExternalService) -
 
 
 def test_model_installed_info_get_info() -> None:
-    model = ModelInstalledInfo(
-        id="my-llm",
-        registered_name="my-llm",
-        type="llm",
-        options=InstallModelIn(),
-        registration_id="reg-42",
-    )
+    model = _make_model_installed_info(registration_id="reg-42")
 
     info = model.get_info()
 
@@ -695,14 +700,14 @@ async def test_install_model_registers_embedding_endpoint(
 
 
 @pytest.mark.asyncio
-async def test_install_model_uses_alias_as_registered_name(svc: OllamaExternalService, installed: InstalledInfo) -> None:
+async def test_install_model_uses_rename_as_registered_name(svc: OllamaExternalService, installed: InstalledInfo) -> None:
     svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm")
 
     with (
         patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
         patch.object(svc, "_sync_models_from_external_ollama", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
     ):
-        promise = await svc._install_model("default", "test-llm", InstallModelIn(spec={"alias": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
+        promise = await svc._install_model("default", "test-llm", InstallModelIn(spec={"rename": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
         await promise.wait()
 
     assert installed.models["test-llm"].registered_name == "my-alias"
@@ -714,7 +719,7 @@ async def test_install_model_calls_generate_when_alive_time_set(svc: OllamaExter
     with (
         patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
         patch.object(svc, "_sync_models_from_external_ollama", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
-        patch.object(svc, "_fetch_context_length", new_callable=AsyncMock, return_value=None),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_fetch_show_info", new_callable=AsyncMock, return_value=(None, None, None)),  # pyright: ignore[reportPrivateUsage]
         patch("server.services.ollama_external_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
     ):
         mock_fetch.return_value = FetchResult(status_code=200, data="")
@@ -1009,7 +1014,7 @@ async def test_install_model_triggers_sync_for_new_models(svc: OllamaExternalSer
 
     with (
         patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
-        patch.object(svc, "_fetch_context_length", new_callable=AsyncMock, return_value=None),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_fetch_show_info", new_callable=AsyncMock, return_value=(None, None, None)),  # pyright: ignore[reportPrivateUsage]
         patch("server.services.ollama_external_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
         patch.object(svc, "_save", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
     ):
@@ -1404,39 +1409,54 @@ SHOW_RESPONSE = json.dumps(
 
 
 @pytest.mark.asyncio
-async def test_fetch_context_length_returns_value(svc: OllamaExternalService) -> None:
+async def test_fetch_show_info_returns_context_length(svc: OllamaExternalService) -> None:
     with patch("server.services.ollama_external_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
         mock_fetch.return_value = FetchResult(status_code=200, data=SHOW_RESPONSE)
-        result = await svc._fetch_context_length("http://localhost:11434", "llama3")  # pyright: ignore[reportPrivateUsage]
+        context_length, supports_vision, supports_audio = await svc._fetch_show_info(  # pyright: ignore[reportPrivateUsage]
+            "http://localhost:11434", "llama3"
+        )
 
-    assert result == 131072
+    assert context_length == 131072
+    assert supports_vision is None
+    assert supports_audio is None
 
 
 @pytest.mark.asyncio
-async def test_fetch_context_length_returns_none_on_bad_status(svc: OllamaExternalService) -> None:
+async def test_fetch_show_info_returns_none_on_bad_status(svc: OllamaExternalService) -> None:
     with patch("server.services.ollama_external_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
         mock_fetch.return_value = FetchResult(status_code=404, data="")
-        result = await svc._fetch_context_length("http://localhost:11434", "unknown")  # pyright: ignore[reportPrivateUsage]
+        result = await svc._fetch_show_info("http://localhost:11434", "unknown")  # pyright: ignore[reportPrivateUsage]
 
-    assert result is None
+    assert result == (None, None, None)
 
 
 @pytest.mark.asyncio
-async def test_fetch_context_length_returns_none_on_exception(svc: OllamaExternalService) -> None:
+async def test_fetch_show_info_returns_none_on_exception(svc: OllamaExternalService) -> None:
     with patch("server.services.ollama_external_service.fetch_from", side_effect=ConnectionError("refused")):
-        result = await svc._fetch_context_length("http://localhost:11434", "llama3")  # pyright: ignore[reportPrivateUsage]
+        result = await svc._fetch_show_info("http://localhost:11434", "llama3")  # pyright: ignore[reportPrivateUsage]
 
-    assert result is None
+    assert result == (None, None, None)
 
 
 @pytest.mark.asyncio
-async def test_fetch_context_length_returns_none_when_field_missing(svc: OllamaExternalService) -> None:
+async def test_fetch_show_info_returns_none_context_length_when_field_missing(svc: OllamaExternalService) -> None:
     data = json.dumps({"model_info": {"general.architecture": "llama"}})
     with patch("server.services.ollama_external_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
         mock_fetch.return_value = FetchResult(status_code=200, data=data)
-        result = await svc._fetch_context_length("http://localhost:11434", "llama3")  # pyright: ignore[reportPrivateUsage]
+        context_length, _, _ = await svc._fetch_show_info("http://localhost:11434", "llama3")  # pyright: ignore[reportPrivateUsage]
 
-    assert result is None
+    assert context_length is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_show_info_parses_capabilities(svc: OllamaExternalService) -> None:
+    data = json.dumps({"model_info": {"general.architecture": "llama"}, "capabilities": ["completion", "vision"]})
+    with patch("server.services.ollama_external_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=200, data=data)
+        _, supports_vision, supports_audio = await svc._fetch_show_info("http://localhost:11434", "llama3")  # pyright: ignore[reportPrivateUsage]
+
+    assert supports_vision is True
+    assert supports_audio is None
 
 
 def test_register_synced_model_passes_context_length_to_props(
@@ -1471,7 +1491,7 @@ async def test_sync_models_fetches_and_passes_context_length(
 
     with (
         patch("server.services.ollama_external_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
-        patch.object(svc, "_fetch_context_length", new_callable=AsyncMock, return_value=32768) as mock_ctx,  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_fetch_show_info", new_callable=AsyncMock, return_value=(32768, None, None)) as mock_ctx,  # pyright: ignore[reportPrivateUsage]
     ):
         mock_fetch.return_value = FetchResult(status_code=200, data=tags)
         await svc._sync_models_from_external_ollama("default", installed)  # pyright: ignore[reportPrivateUsage]
@@ -1483,6 +1503,108 @@ async def test_sync_models_fetches_and_passes_context_length(
 
 
 @pytest.mark.asyncio
+async def test_sync_models_retries_capabilities_for_already_installed_model_with_unknown_values(
+    svc: OllamaExternalService, installed: InstalledInfo, deps: dict[str, Any]
+) -> None:
+    """A model already registered with both capabilities unresolved must be retried, not skipped forever."""
+    installed.models["vlm"] = ModelInstalledInfo(
+        id="vlm",
+        registered_name="vlm",
+        type="llm",
+        options=InstallModelIn(),
+        registration_id="reg-vlm",
+        supports_vision=None,
+        supports_audio=None,
+    )
+    tags = json.dumps({"models": [{"name": "vlm:latest", "size": 1024}]})
+
+    with (
+        patch("server.services.ollama_external_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
+        patch.object(svc, "_fetch_show_info", new_callable=AsyncMock, return_value=(None, True, None)) as mock_show,  # pyright: ignore[reportPrivateUsage]
+    ):
+        mock_fetch.return_value = FetchResult(status_code=200, data=tags)
+        await svc._sync_models_from_external_ollama("default", installed)  # pyright: ignore[reportPrivateUsage]
+
+    mock_show.assert_called_once_with(installed.base_url, "vlm")
+    assert installed.models["vlm"].supports_vision is True
+    assert installed.models["vlm"].supports_audio is None
+    deps["endpoint_registry"].update_modality_support.assert_called_once_with("reg-vlm", supports_vision=True, supports_audio=None)
+    # Retrying capabilities must not re-register the already-installed model.
+    assert deps["endpoint_registry"].register_chat_completion_as_proxy.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_models_skips_capability_retry_when_already_resolved(
+    svc: OllamaExternalService, installed: InstalledInfo, deps: dict[str, Any]
+) -> None:
+    """At least one resolved value means don't keep re-hitting the network on every sync."""
+    installed.models["known"] = ModelInstalledInfo(
+        id="known",
+        registered_name="known",
+        type="llm",
+        options=InstallModelIn(),
+        registration_id="reg-known",
+        supports_vision=False,
+        supports_audio=None,
+    )
+    tags = json.dumps({"models": [{"name": "known:latest", "size": 1024}]})
+
+    with (
+        patch("server.services.ollama_external_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
+        patch.object(svc, "_fetch_show_info", new_callable=AsyncMock) as mock_show,  # pyright: ignore[reportPrivateUsage]
+    ):
+        mock_fetch.return_value = FetchResult(status_code=200, data=tags)
+        await svc._sync_models_from_external_ollama("default", installed)  # pyright: ignore[reportPrivateUsage]
+
+    mock_show.assert_not_called()
+    deps["endpoint_registry"].update_modality_support.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sync_models_retries_capabilities_without_registration_id(
+    svc: OllamaExternalService, installed: InstalledInfo, deps: dict[str, Any]
+) -> None:
+    """A model without a registration_id (not yet registered in the endpoint registry) still gets its
+    capability fields updated locally, but must not be pushed to the endpoint registry."""
+    installed.models["unregistered"] = ModelInstalledInfo(
+        id="unregistered",
+        registered_name="unregistered",
+        type="llm",
+        options=InstallModelIn(),
+        registration_id="",
+        supports_vision=None,
+        supports_audio=None,
+    )
+    tags = json.dumps({"models": [{"name": "unregistered:latest", "size": 1024}]})
+
+    with (
+        patch("server.services.ollama_external_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
+        patch.object(svc, "_fetch_show_info", new_callable=AsyncMock, return_value=(None, True, None)) as mock_show,  # pyright: ignore[reportPrivateUsage]
+    ):
+        mock_fetch.return_value = FetchResult(status_code=200, data=tags)
+        await svc._sync_models_from_external_ollama("default", installed)  # pyright: ignore[reportPrivateUsage]
+
+    mock_show.assert_called_once_with(installed.base_url, "unregistered")
+    assert installed.models["unregistered"].supports_vision is True
+    assert installed.models["unregistered"].supports_audio is None
+    deps["endpoint_registry"].update_modality_support.assert_not_called()
+
+
+def test_register_synced_model_forwards_modality_support(
+    svc: OllamaExternalService, installed: InstalledInfo, deps: dict[str, Any]
+) -> None:
+    svc.models["default"]["vlm"] = OllamaModel(id="vlm", size="4GB", type="llm")
+
+    svc._register_synced_model(  # pyright: ignore[reportPrivateUsage]
+        "default", installed, "vlm", 0, supports_vision=True, supports_audio=None
+    )
+
+    call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
+    assert call_kwargs["props"].supports_vision is True
+    assert call_kwargs["props"].supports_audio is None
+
+
+@pytest.mark.asyncio
 async def test_install_model_passes_context_length_to_props(
     svc: OllamaExternalService, installed: InstalledInfo, deps: dict[str, Any]
 ) -> None:
@@ -1491,7 +1613,7 @@ async def test_install_model_passes_context_length_to_props(
     with (
         patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
         patch.object(svc, "_sync_models_from_external_ollama", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
-        patch.object(svc, "_fetch_context_length", new_callable=AsyncMock, return_value=65536),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_fetch_show_info", new_callable=AsyncMock, return_value=(65536, None, None)),  # pyright: ignore[reportPrivateUsage]
     ):
         promise = await svc._install_model("default", "ctx-llm", InstallModelIn())  # pyright: ignore[reportPrivateUsage]
         await promise.wait()

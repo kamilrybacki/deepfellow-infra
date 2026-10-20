@@ -4,6 +4,7 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import SecretStr
 
 from server.websockets.models import AncestorInfo
 from server.websockets.parent_infra_group import ParentInfraGroup
@@ -331,3 +332,48 @@ async def test_reconfigure_defaults_get_children_when_never_assigned() -> None:
         await group.reconfigure(config, task_manager)
 
     assert new_parent.get_children is dict
+
+
+def test_configured_mesh_settings_default_to_empty() -> None:
+    group = ParentInfraGroup([])
+    assert group.configured_mesh_url == ""
+    assert group.configured_mesh_key.get_secret_value() == ""
+
+
+def test_configured_mesh_settings_can_be_seeded_at_construction() -> None:
+    group = ParentInfraGroup([], configured_mesh_url="ws://boot.url", configured_mesh_key=SecretStr("boot-key"))
+    assert group.configured_mesh_url == "ws://boot.url"
+    assert group.configured_mesh_key.get_secret_value() == "boot-key"
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_updates_configured_mesh_settings_on_success() -> None:
+    group = ParentInfraGroup([])
+    config = MagicMock()
+    config.connect_to_mesh_url = "ws://new.url"
+    config.connect_to_mesh_key = SecretStr("new-key")
+    task_manager = MagicMock()
+
+    with patch("server.websockets.parent_infra_group.ParentInfra"):
+        await group.reconfigure(config, task_manager)
+
+    assert group.configured_mesh_url == "ws://new.url"
+    assert group.configured_mesh_key.get_secret_value() == "new-key"
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_leaves_configured_mesh_settings_unchanged_on_failure() -> None:
+    old_parent = _make_parent("http://old.url")
+    old_parent.stop = AsyncMock(side_effect=RuntimeError("boom"))
+    group = ParentInfraGroup([old_parent], configured_mesh_url="http://old.url", configured_mesh_key=SecretStr("old-key"))
+
+    config = MagicMock()
+    config.connect_to_mesh_url = "ws://new.url"
+    config.connect_to_mesh_key = SecretStr("new-key")
+    task_manager = MagicMock()
+
+    with pytest.raises(RuntimeError):
+        await group.reconfigure(config, task_manager)
+
+    assert group.configured_mesh_url == "http://old.url"
+    assert group.configured_mesh_key.get_secret_value() == "old-key"

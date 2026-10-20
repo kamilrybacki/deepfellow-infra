@@ -47,6 +47,7 @@ def mcp_svc() -> McpService:
         model_downloader=MagicMock(),
         docker_service=docker_svc,
         hardware=MagicMock(gpus=[], nvidia_gpus=[]),
+        services_manager=MagicMock(),
     )
 
 
@@ -124,6 +125,23 @@ async def test_drain_warning_tasks_awaits_base2_services_only(services_manager: 
 @pytest.mark.asyncio
 async def test_drain_warning_tasks_noop_when_no_services(services_manager: ServicesManager):
     await services_manager.drain_warning_tasks()
+
+
+@pytest.mark.asyncio
+async def test_resolve_platform_compatibility_awaits_base2_services_only(services_manager: ServicesManager):
+    base2_svc = MagicMock(spec=Base2Service)
+    base2_svc.resolve_platform_compatibility = AsyncMock()
+    services_manager.services["llamacpp"] = base2_svc
+    services_manager.services["ollama"] = FakeService("ollama")
+
+    await services_manager.resolve_platform_compatibility()
+
+    base2_svc.resolve_platform_compatibility.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resolve_platform_compatibility_noop_when_no_services(services_manager: ServicesManager):
+    await services_manager.resolve_platform_compatibility()
 
 
 @pytest.mark.asyncio

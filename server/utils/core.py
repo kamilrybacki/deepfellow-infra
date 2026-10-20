@@ -7,9 +7,9 @@ import asyncio
 import contextlib
 import errno
 import json
-import logging
 import platform
 import re
+import secrets
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,9 +26,7 @@ from multidict import CIMultiDictProxy
 from pydantic import BaseModel, ValidationError
 
 from server.models.common import JsonSerializable
-from server.utils.logger import uvicorn_logger
-
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 # Used by make_http_request only when a caller passes no timeout at all (e.g. the mesh websocket's
 # HTTP call) - proxy paths always pass an explicit timeout, so they never fall back to this. Mirrors
@@ -43,6 +41,17 @@ class HttpClientError(Exception):
         self.status_code = status_code
         self.headers = headers
         self.body = body
+
+
+class CommandFailedError(RuntimeError):
+    """Raised by `Utils.run_command_for_success` when a command exits with a non-zero code."""
+
+    def __init__(self, exit_code: int, cmd: list[str], stdout: str, stderr: str):
+        super().__init__("Invalid exit code for command", (exit_code, cmd, stdout, stderr))
+        self.exit_code = exit_code
+        self.cmd = cmd
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 class CommandResult(NamedTuple):
@@ -109,7 +118,7 @@ class Utils:
         """Run given command and if the exit code is not 0 raise and exception."""
         result = await Utils.run_command(cmd)
         if result.exit_code != 0:
-            raise RuntimeError("Invalid exit code for command", (result.exit_code, cmd, result.stdout, result.stderr))
+            raise CommandFailedError(result.exit_code, cmd, result.stdout, result.stderr)
         return CommandResult2(stdout=result.stdout, stderr=result.stderr)
 
     @staticmethod
@@ -118,6 +127,23 @@ class Utils:
         aa = a[:-1] if a.endswith("/") else a
         bb = b[1:] if b.startswith("/") else b
         return f"{aa}/{bb}"
+
+    @staticmethod
+    def join_versioned_url(base_url: str, version: str, *path_segments: str) -> str:
+        """Join a user-supplied base URL with an API version segment and further path segments.
+
+        Users commonly copy a provider's documented base URL including its version segment
+        (e.g. Ollama's OpenAI-compatible endpoint is documented as `http://host:11434/v1`), so a
+        `base_url` that already ends with `version` is treated as already-versioned instead of
+        appending it a second time.
+        """
+        base = base_url.rstrip("/")
+        version = version.strip("/")
+        if base != version and not base.endswith(f"/{version}"):
+            base = Utils.join_url(base, version)
+        for segment in path_segments:
+            base = Utils.join_url(base, segment)
+        return base
 
     @staticmethod
     def save_file(file_path: Path, file_content: str) -> None:
@@ -175,7 +201,7 @@ class Utils:
             local_path = dir / filename_out
 
             if not local_path.exists():
-                uvicorn_logger.info(f"Downloading {filename_out}...")
+                logger.info(f"Downloading {filename_out}...")
                 temp_path = temp_dir / str(uuid4())
                 temp_path.parent.mkdir(parents=True, exist_ok=True)
                 try:
@@ -203,7 +229,7 @@ class Utils:
                 local_path.parent.mkdir(parents=True, exist_ok=True)
                 temp_path.rename(local_path)
 
-                uvicorn_logger.info(f"Successfully downloaded {filename_out} ({local_path.stat().st_size} bytes)")
+                logger.info(f"Successfully downloaded {filename_out} ({local_path.stat().st_size} bytes)")
 
             yield SuccessDownloadPacket(local_path, filename_out)
 
@@ -304,6 +330,28 @@ def try_parse_pydantic[T](cls: type[T], data: Any) -> T:  # noqa: ANN401
         raise HTTPException(400, format_pydantic_errors(e) if isinstance(e, ValidationError) else "Unknown") from e
 
 
+def with_legacy_key_carried_over(
+    old_spec: dict[str, Any] | None, new_spec: dict[str, Any] | None, legacy_key: str, new_key: str
+) -> dict[str, Any] | None:
+    """Carry `legacy_key` from `old_spec` into `new_spec` when the new spec sets neither it nor `new_key`.
+
+    Lets a value persisted under a field's old name survive an edit made through a form that no longer
+    renders that field, instead of being silently dropped (or reinterpreted under the new field's meaning).
+    """
+    if not old_spec or legacy_key not in old_spec:
+        return new_spec
+    if new_spec and (legacy_key in new_spec or new_key in new_spec):
+        return new_spec
+    return {**(new_spec or {}), legacy_key: old_spec[legacy_key]}
+
+
+def with_legacy_key_migrated(spec: dict[str, Any] | None, old_key: str, new_key: str) -> dict[str, Any] | None:
+    """Return `spec` with `old_key` renamed to `new_key`, so a value persisted under a field's old name still surfaces under the new one."""
+    if not spec or old_key not in spec or new_key in spec:
+        return spec
+    return {**{k: v for k, v in spec.items() if k != old_key}, new_key: spec[old_key]}
+
+
 def convert_size_to_bytes(size_str: str) -> None | int:
     """Convert a string representation of a size (e.g., "46MB", "1.2GB", "512K") into an integer number of bytes.
 
@@ -371,7 +419,7 @@ def load_json_registry[T](path: Path, registry_name: str, builder: Callable[[Any
             data = json.loads(f.read())
         return builder(data)
     except Exception:
-        logger.exception(f"Failed to load {registry_name} registry from {path}")  # noqa: G004
+        logger.exception(f"Failed to load {registry_name} registry from {path}")
         return default
 
 
@@ -624,9 +672,8 @@ async def make_http_request(
 
         async def generator() -> AsyncGenerator[bytes]:
             try:
-                async for chunk in response.content.iter_chunks():
-                    if chunk:
-                        yield chunk[0]
+                async for chunk in response.content.iter_any():
+                    yield chunk
             finally:
                 await response.release()
                 await session.close()
@@ -638,6 +685,11 @@ async def make_http_request(
             await response.release()
         await session.close()
         raise
+
+
+def secrets_equal(provided: str, expected: str) -> bool:
+    """Compare secrets in constant time (UTF-8 encoded, so non-ASCII input is safe)."""
+    return secrets.compare_digest(provided.encode(), expected.encode())
 
 
 class OneTimeKey:
@@ -659,7 +711,10 @@ class OneTimeKey:
 
         Remove key if correct.
         """
-        if input_key == self._key:
+        if self._key is None:
+            return False
+
+        if secrets_equal(input_key, self._key):
             self._key = None
             return True
 

@@ -9,13 +9,11 @@ every service type.
 """
 
 import json
-import logging
 from pathlib import Path
 from typing import Any
 
 from server.services.huggingface_refresh_guard import HuggingFaceRefreshGuard
-
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 huggingface_refresh_guard = HuggingFaceRefreshGuard()
 

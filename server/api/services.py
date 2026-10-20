@@ -5,7 +5,6 @@
 
 import asyncio
 import contextlib
-import logging
 import time
 from typing import Annotated
 
@@ -24,6 +23,7 @@ from server.models.services import (
     ListAllModelsOut,
     ListServicesFilters,
     ListServicesOut,
+    NewerNeedsCuda,
     OptionalModelIdQuery,
     RestartDockerContainerOut,
     RetrieveDockerComposeFileOut,
@@ -34,10 +34,11 @@ from server.models.services import (
 )
 from server.services_manager import ServicesManager
 from server.utils.core import convert_promise_with_progress_to_fastapi_response
+from server.utils.docker_image_version import has_cuda_variant, newer_tag_needing_cuda, newest_docker_tag
+from server.utils.hardware import get_nvidia_max_cuda_version
+from server.utils.logger import logger
 from server.utils.registry_client import RegistryUnavailableError
 from server.utils.tracing import tracer
-
-logger = logging.getLogger("uvicorn.error")
 
 router = APIRouter(prefix="/admin/services", tags=["Services"])
 
@@ -201,6 +202,23 @@ async def refresh_catalog(
     return await convert_promise_with_progress_to_fastapi_response(promise)
 
 
+async def _newest_tags(tags: list[str], default_tag: str | None, current: str | None) -> tuple[str | None, NewerNeedsCuda | None]:
+    """Newest tag of the running tag's variant, and a newer one held back by the host's CUDA version, if any.
+
+    A CUDA build may go up to the CUDA version the host driver supports.
+    """
+    reference = current or default_tag
+    max_cuda = await get_nvidia_max_cuda_version() if has_cuda_variant(reference) else None
+    candidates = [*tags, *([default_tag] if default_tag else [])]
+    blocked = newer_tag_needing_cuda(candidates, reference, max_cuda)
+    needs_cuda = (
+        NewerNeedsCuda(tag=blocked[0], required_cuda=f"{blocked[1][0]}.{blocked[1][1]}", host_cuda=f"{max_cuda[0]}.{max_cuda[1]}")
+        if blocked and max_cuda
+        else None
+    )
+    return newest_docker_tag(candidates, reference, max_cuda), needs_cuda
+
+
 @router.get(
     "/{service_id}/docker-tags",
     summary="Fetch available Docker image tags for the service.",
@@ -212,6 +230,9 @@ async def get_docker_tags(
     hardware: Annotated[str | None, Query(description="Hardware variant for tag filtering (e.g. gpu, cpu)")] = None,
     field_name: Annotated[str | None, Query(description="Name of the docker-tags field requesting tags")] = None,
     model_id: Annotated[str | None, Query(description="ID of the model requesting tags, for services installing several models")] = None,
+    current: Annotated[
+        str | None, Query(description="Currently installed tag; `newest` keeps its variant (defaults to the default tag)")
+    ] = None,
 ) -> DockerTagsOut:
     """Fetch available Docker image tags for the service from its registry, with hardware- and model-aware filtering."""
     try:
@@ -223,7 +244,8 @@ async def get_docker_tags(
     cached = services_manager.docker_tags_cache.get(cache_key)
     if cached and time.monotonic() - cached[2] < _DOCKER_TAGS_TTL:
         cached_tags, cached_image, _ts = cached
-        return DockerTagsOut(image=cached_image, tags=cached_tags, default=default_tag)
+        newest, needs_cuda = await _newest_tags(cached_tags, default_tag, current)
+        return DockerTagsOut(image=cached_image, tags=cached_tags, default=default_tag, newest=newest, newest_needs_cuda=needs_cuda)
 
     model_fields = []
     if model_id:
@@ -252,7 +274,15 @@ async def get_docker_tags(
         registry_unavailable = True
     if tags:
         services_manager.docker_tags_cache[cache_key] = (tags, docker_image, time.monotonic())
-    return DockerTagsOut(image=docker_image, tags=tags, default=default_tag, registry_unavailable=registry_unavailable)
+    newest, needs_cuda = await _newest_tags(tags, default_tag, current)
+    return DockerTagsOut(
+        image=docker_image,
+        tags=tags,
+        default=default_tag,
+        newest=newest,
+        newest_needs_cuda=needs_cuda,
+        registry_unavailable=registry_unavailable,
+    )
 
 
 @router.get(

@@ -111,6 +111,9 @@ class RetrieveModelOut(BaseModel):
     repository_url: str | None = None
     capabilities_resolved: bool = True
     stale: bool = False
+    # `None` means the capability is unknown/not yet resolved for this backend; `True`/`False` means resolved.
+    supports_vision: bool | None = None
+    supports_audio: bool | None = None
 
 
 class ListModelsFilters(BaseModel):

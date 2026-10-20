@@ -6,12 +6,11 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from contextlib import suppress
 
 import websockets
 
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 
 class WebSocketClient:

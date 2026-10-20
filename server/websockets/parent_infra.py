@@ -4,13 +4,12 @@
 """Websocket Manager for subinfras."""
 
 import json
-import logging
 from typing import TYPE_CHECKING
 
 from server.config import AppSettings
 from server.models.mesh import CheckMeshConnection
 from server.task_manager import TaskManager
-from server.utils.core import OneTimeKey
+from server.utils.core import OneTimeKey, secrets_equal
 from server.utils.exceptions import ApiError
 from server.utils.json_rpc_client import JsonRpcClient
 from server.websockets.infra_client import InfraClient
@@ -31,7 +30,7 @@ if TYPE_CHECKING:
     from server.endpointregistry import EndpointRegistry
     from server.models.api import Model
 
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 
 class ParentInfra(WebSocketClient):
@@ -174,4 +173,6 @@ class ParentInfra(WebSocketClient):
     def check_subinfra_connection(self, model: CheckMeshConnection) -> bool:
         """Check if given sub infra connection data is valid."""
         api_key = self.config.infra_api_key.get_secret_value()
-        return self.one_time_key.check(model.connection_verifier) and api_key == model.infra_api_key
+        # Short-circuit is intentional: the verifier is a single-use uuid4 cleared on success,
+        # so the API-key comparison can't be reached repeatedly to probe its timing.
+        return self.one_time_key.check(model.connection_verifier) and secrets_equal(model.infra_api_key, api_key)

@@ -13,6 +13,7 @@ import type {
   ConfigOut,
   ConfigRevealOut,
   ConvertedMcpConfig,
+  FinetuneAdapterListResponse,
   GpuStats,
   InfraSettings,
   ListWarningsOut,
@@ -28,6 +29,7 @@ import type {
   TestResult,
 } from "./types";
 import { InstallationWarningsError } from "./types";
+import type { NewerNeedsCuda } from "./types";
 
 // Simple admin API key storage
 export class AdminApiKeyStorage {
@@ -288,6 +290,14 @@ export class DeepFellowClient {
   ): Promise<ServiceModel> {
     return this.makeRequest<ServiceModel>(
       `/admin/services/${serviceId}/models/_?model_id=${encodeURIComponent(modelId)}`,
+    );
+  }
+
+  async listFinetuneAdapters(
+    serviceId: string,
+  ): Promise<FinetuneAdapterListResponse> {
+    return this.makeRequest<FinetuneAdapterListResponse>(
+      `/admin/services/${serviceId}/adapters`,
     );
   }
 
@@ -635,21 +645,27 @@ export class DeepFellowClient {
     hardware?: string,
     fieldName?: string,
     modelId?: string,
+    current?: string,
   ): Promise<{
     image: string;
     tags: string[];
     default: string | null;
+    newest: string | null;
+    newest_needs_cuda: NewerNeedsCuda | null;
     registry_unavailable: boolean;
   }> {
     const params = new URLSearchParams();
     if (hardware) params.set("hardware", hardware);
     if (fieldName) params.set("field_name", fieldName);
     if (modelId) params.set("model_id", modelId);
+    if (current) params.set("current", current);
     const query = params.toString() ? `?${params.toString()}` : "";
     return this.makeRequest<{
       image: string;
       tags: string[];
       default: string | null;
+      newest: string | null;
+      newest_needs_cuda: NewerNeedsCuda | null;
       registry_unavailable: boolean;
     }>(`/admin/services/${encodeURIComponent(serviceId)}/docker-tags${query}`);
   }

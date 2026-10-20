@@ -1,6 +1,6 @@
 [project]
 name = "df-infra"
-version = "0.34.0"
+version = "0.35.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -26,6 +26,7 @@ dependencies = [
     "opentelemetry-api>=1.27.0",
     "opentelemetry-sdk>=1.27.0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.27.0",
+    "sentry-sdk>=2.46.0",
 ]
 
 [dependency-groups]

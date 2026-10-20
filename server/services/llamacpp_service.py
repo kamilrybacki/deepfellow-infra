@@ -6,7 +6,6 @@
 import asyncio
 import contextlib
 import json
-import logging
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -66,12 +65,11 @@ from server.utils.core import (
 from server.utils.files import get_gguf_arch_params, get_gguf_context_window
 from server.utils.hardware import GpuInfo, HardwarePartInfo, IntelGpuInfo, NvidiaGpuInfo
 from server.utils.loading import Progress
+from server.utils.logger import logger
 from server.utils.registry_client import image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fetch_file_size_from_url
 from server.utils.validators import clamp_non_positive_to_one
 from server.utils.vram_calculator import estimate_vram_gb, parse_cache_type_bits
-
-logger = logging.getLogger("uvicorn.error")
 
 # Mirrors the `just get-llamacpp-models` release recipe (see justfile).
 _LLAMACPP_FETCH_PLAN = (200, 100, 50)  # top_by_downloads, top_by_likes, top_by_trending
@@ -82,6 +80,9 @@ class LlamacppModel(BaseModel):
     size: str
     custom: CustomModelId | None = None
     jinja: bool = False
+    # Presence-only signal from `scripts/get_llamacpp_models.py` (a companion mmproj GGUF found
+    # alongside this file in its HF repo listing). None means unresolved.
+    supports_vision: bool | None = None
 
 
 class LlamacppCustomModel(BaseModel):
@@ -103,19 +104,22 @@ def _read_models() -> dict[str, LlamacppModel]:
     llamacpp_path = get_main_dir() / "./static/llamacpp-min.json"
     with llamacpp_path.open(encoding="utf-8") as f:
         registry = LlamacppRegistry.model_validate_json(f.read())
-        return {entry.name: LlamacppModel(url=entry.url, size=entry.size, jinja=entry.jinja) for entry in registry.llms}
+        return {
+            entry.name: LlamacppModel(url=entry.url, size=entry.size, jinja=entry.jinja, supports_vision=entry.supports_vision)
+            for entry in registry.llms
+        }
 
 
 _const = LlamacppConst(
-    # b10902: latest published image build as of 2026-09-11. Known-risk: CVE-2026-2069 (GBNF
+    # b11641: latest published image build as of 2026-10-15. Known-risk: CVE-2026-2069 (GBNF
     # grammar stack overflow, fix PR ggml-org/llama.cpp#18993 unmerged) and an unpatched GGUF
     # `general.alignment` integer overflow (fix PR #24997 unmerged) are both still open upstream
-    # and were already present in the previous b10290 pin — this bump does not introduce or
+    # and were already present in the previous b10902 pin — this bump does not introduce or
     # resolve them. See DFINFRA-168.
     images={
-        "gpu": DockerImage(name="ghcr.io/ggml-org/llama.cpp:server-cuda12-b10902", size="2.6 GB"),
-        "vulkan": DockerImage(name="ghcr.io/ggml-org/llama.cpp:server-vulkan-b10902", size="0.3 GB"),
-        "cpu": DockerImage(name="ghcr.io/ggml-org/llama.cpp:server-b10902", size="0.3 GB"),
+        "gpu": DockerImage(name="ghcr.io/ggml-org/llama.cpp:server-cuda12-b11641", size="2.6 GB"),
+        "vulkan": DockerImage(name="ghcr.io/ggml-org/llama.cpp:server-vulkan-b11641", size="0.3 GB"),
+        "cpu": DockerImage(name="ghcr.io/ggml-org/llama.cpp:server-b11641", size="0.3 GB"),
     },
     model_type="llm",
     models=_read_models(),
@@ -154,6 +158,7 @@ class LLamacppOptions(BaseModel):
 
 
 class LLamacppModelOptions(BaseModel):
+    rename: str | None = None
     alias: str | None = None
     max_model_length: int | None = None
 
@@ -308,7 +313,10 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
         """Return the model specification."""
         return ModelSpecification(
             fields=[
-                ModelField(type="text", name="alias", description="Model alias", required=False),
+                ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
+                ModelField(
+                    type="text", name="alias", description="Additional name for the model, the original name keeps working", required=False
+                ),
                 ModelField(type="number", name="max_model_length", description="Max model length ex. 4096", required=False),
             ]
         )
@@ -345,6 +353,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
                     definition=self.models[instance][x.id].model_dump(mode="json")
                     if x.id in self.models[instance]
                     else self._get_persisted_model_definition(instance, x.id),
+                    container_name=x.docker.container_name,
                 )
                 for x in info.models.values()
             ]
@@ -367,7 +376,12 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
         await self.validate_docker_image_version(options.spec.get("image_version"), options.spec.get("hardware"))
         try_parse_pydantic(LLamacppOptions, options.spec)
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
+    async def _install_instance(
+        self,
+        instance: str,
+        options: InstallServiceIn,
+        container_name_override: str | None = None,  # noqa: ARG002
+    ) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self.load_default_models(instance)
 
@@ -552,6 +566,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
                             has_docker=True,
                             is_loaded=is_loaded,
                             vram_estimate_gb=vram_estimate_gb,
+                            supports_vision=model.supports_vision,
                         )
                     )
 
@@ -579,6 +594,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
             has_docker=True,
             is_loaded=is_loaded,
             vram_estimate_gb=vram_estimate_gb,
+            supports_vision=model.supports_vision,
         )
 
     async def _download_model(self, stream: Stream[StreamChunk], model: LlamacppModel) -> tuple[Path | None, str]:
@@ -635,7 +651,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
         raise HTTPException(400, "Local model path was not set up and not return by downloader.")
 
     async def _install_model(  # noqa: C901
-        self, instance: str, model_id: str, options: InstallModelIn
+        self, instance: str, model_id: str, options: InstallModelIn, container_name_override: str | None = None
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_model_options = try_parse_pydantic(LLamacppModelOptions, options.spec) if options.spec else LLamacppModelOptions()
         installed = self.get_instance_installed_info(instance)
@@ -687,7 +703,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
                 image = self._get_image(hardware_parts, installed.options.spec.get("image_version") if installed.options else None)
                 docker_options = DockerOptions(
                     name=service_name,
-                    container_name=self.docker_service.get_docker_container_name(service_name),
+                    container_name=container_name_override or self.docker_service.get_docker_container_name(service_name),
                     image=image.name,
                     command=command,
                     image_port=8080,
@@ -698,8 +714,9 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
                 )
                 docker_exposed_port, _, adopted = await self.docker_service.install_and_run_docker(docker_options)
                 self._log_cache.pop(docker_options.container_name or "", None)
-                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
-                container_host = self.docker_service.get_container_host(subnet, docker_options.name)
+                registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
+                registered_alias = parsed_model_options.alias
+                container_host = self.docker_service.get_container_host(subnet, docker_options)
                 container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
                 installed.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
@@ -722,6 +739,7 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
                         endpoints=LLM_ENDPOINTS,
                         context_window=context_window,
                         max_context_window=max_context_window,
+                        supports_vision=model.supports_vision,
                     ),
                     chat_completions=ProxyOptions(url=f"{model_info.base_url}/v1/chat/completions", rewrite_model_to=model_id),
                     completions=ProxyOptions(url=f"{model_info.base_url}/v1/completions", rewrite_model_to=model_id),
@@ -729,7 +747,10 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
                     messages=ProxyOptions(url=f"{model_info.base_url}/v1/messages", rewrite_model_to=model_id),
                     ollama_chat=None,
                     registration_options=RegistrationOptions(
-                        origin="local", owned_by=self.get_type(), capacity_state=installed.parsed_options.num_parallel
+                        origin="local",
+                        alias=registered_alias,
+                        owned_by=self.get_type(),
+                        capacity_state=installed.parsed_options.num_parallel,
                     ),
                 )
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
@@ -757,6 +778,10 @@ class LLamacppService(Base2Service[InstalledInfo, DownloadedInfo]):
             base_name = base.name.split(":")[0]
             return DockerImage(name=f"{base_name}:{image_version}", size=base.size)
         return base
+
+    def get_default_docker_image_name(self) -> str | None:
+        """Return the default docker image, for the upfront platform-compatibility check."""
+        return self._get_image(self.get_specified_hardware_parts(None)).name
 
     def _image_variant_for_hardware(self, hardware: str | None) -> ImageTypes:
         """Return the `_const.images` key matching the given hardware string."""

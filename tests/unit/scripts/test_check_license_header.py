@@ -35,17 +35,6 @@ from scripts.check_license_header import (
     should_exclude,
 )
 
-OLD_DFFL_HEADER = (
-    "# DeepFellow Software Framework.\n"
-    "# Copyright © 2020 Simplito sp. z o.o.\n"
-    "#\n"
-    "# This file is part of the DeepFellow Software Framework (https://deepfellow.ai).\n"
-    "# This software is Licensed under the DeepFellow Free License.\n"
-    "#\n"
-    "# See the License for the specific language governing permissions and\n"
-    "# limitations under the License.\n"
-)
-
 
 @pytest.fixture
 def valid_content() -> str:
@@ -98,10 +87,6 @@ def test_has_license_header_present() -> None:
 
 def test_has_license_header_absent() -> None:
     assert has_license_header("import sys\n") is False
-
-
-def test_has_license_header_old_dffl_header_not_recognized() -> None:
-    assert has_license_header(f"{OLD_DFFL_HEADER}\nimport sys\n") is False
 
 
 def test_has_copyright_header_present() -> None:
@@ -238,14 +223,6 @@ def test_check_file_header_invalid_wrong_header(tmp_path: Path) -> None:
     assert check_file_header(file) is False
 
 
-def test_check_file_header_invalid_old_dffl_header(tmp_path: Path) -> None:
-    """A file still carrying the old DFFL header is not considered valid."""
-    file = tmp_path / "old_dffl.py"
-    file.write_text(f"{OLD_DFFL_HEADER}\nimport sys\n")
-
-    assert check_file_header(file) is False
-
-
 def test_check_file_header_missing_copyright_only(tmp_path: Path) -> None:
     """License line alone is not enough - the copyright line is also required."""
     file = tmp_path / "license_only.py"
@@ -338,21 +315,6 @@ def test_fix_file_header_empty_file(tmp_path: Path) -> None:
 
     content = file.read_text()
     assert "# SPDX-License-Identifier: MIT" in content
-
-
-def test_fix_file_header_migrates_old_dffl_header(tmp_path: Path) -> None:
-    """Fix should strip the old DFFL header and add the SPDX header instead."""
-    file = tmp_path / "old_dffl.py"
-    file.write_text(f"{OLD_DFFL_HEADER}\nimport sys\n")
-
-    result = fix_file_header(file)
-
-    assert result is True
-    assert check_file_header(file) is True
-    content = file.read_text()
-    assert "# SPDX-License-Identifier: MIT" in content
-    assert "DeepFellow Software Framework" not in content
-    assert "import sys" in content
 
 
 def test_fix_file_header_adds_missing_copyright_only(tmp_path: Path) -> None:
@@ -736,15 +698,6 @@ def test_get_files_to_check_without_files(project_dir: Path) -> None:
 def test_classify_files_missing_header(tmp_path: Path) -> None:
     f = tmp_path / "no_header.py"
     f.write_text("import sys\n")
-
-    missing = classify_files([f])
-
-    assert f in missing
-
-
-def test_classify_files_old_dffl_header_counts_as_missing(tmp_path: Path) -> None:
-    f = tmp_path / "old_dffl.py"
-    f.write_text(f"{OLD_DFFL_HEADER}\nimport sys\n")
 
     missing = classify_files([f])
 

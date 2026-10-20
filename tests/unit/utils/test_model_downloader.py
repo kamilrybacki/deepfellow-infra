@@ -35,7 +35,6 @@ def make_mock_config(tmp_path: Path) -> MagicMock:
     config.get_storage_dir.return_value = tmp_path
     config.hugging_face_token = SecretStr("hf-token")
     config.civitai_token = SecretStr("civitai-token")
-    config.adapter_registry_url = "http://registry.local:5000"
     config.adapter_registry_secret = SecretStr("secret")
     return config
 
@@ -814,7 +813,7 @@ async def test_civitai_downloader_download_raises_http_exception_on_client_error
 
 @pytest.mark.asyncio
 async def test_adapter_registry_downloader_download_generic_exception_cleans_temp_and_reraises(tmp_path: Path) -> None:
-    dl = AdapterRegistryDownloader(url="http://registry.local:5000", secret="test-secret")
+    dl = AdapterRegistryDownloader(secret="test-secret")
     model_dir = tmp_path / "models"
     model_dir.mkdir()
     temp_dir = tmp_path / "temp"
@@ -838,7 +837,7 @@ async def test_adapter_registry_downloader_download_generic_exception_cleans_tem
 
 @pytest.mark.asyncio
 async def test_adapter_registry_downloader_download_empty_file_raises_runtime_error(tmp_path: Path) -> None:
-    dl = AdapterRegistryDownloader(url="http://registry.local:5000", secret="test-secret")
+    dl = AdapterRegistryDownloader(secret="test-secret")
     model_dir = tmp_path / "models"
     model_dir.mkdir()
     temp_dir = tmp_path / "temp"
@@ -858,7 +857,7 @@ async def test_adapter_registry_downloader_download_empty_file_raises_runtime_er
 
 @pytest.mark.asyncio
 async def test_adapter_registry_downloader_download_generic_exception_without_temp_file_still_reraises(tmp_path: Path) -> None:
-    dl = AdapterRegistryDownloader(url="http://registry.local:5000", secret="test-secret")
+    dl = AdapterRegistryDownloader(secret="test-secret")
     model_dir = tmp_path / "models"
     model_dir.mkdir()
     temp_dir = tmp_path / "temp"
@@ -877,7 +876,7 @@ async def test_adapter_registry_downloader_download_generic_exception_without_te
 
 @pytest.mark.asyncio
 async def test_adapter_registry_downloader_download_missing_temp_file_raises_runtime_without_unlink(tmp_path: Path) -> None:
-    dl = AdapterRegistryDownloader(url="http://registry.local:5000", secret="test-secret")
+    dl = AdapterRegistryDownloader(secret="test-secret")
     model_dir = tmp_path / "models"
     model_dir.mkdir()
     temp_dir = tmp_path / "temp"
@@ -900,11 +899,10 @@ def test_model_downloader_create_downloaders_sets_all_fields(tmp_path: Path) -> 
 
     assert md.temp_dir == tmp_path / "temp"
     assert isinstance(md.standard_downloader, StandardModelDownloader)
-    assert len(md.custom_downloaders) == 4
-    assert isinstance(md.custom_downloaders[0], AdapterRegistryDownloader)
-    assert isinstance(md.custom_downloaders[1], HuggingFaceRepoDownloader)
-    assert isinstance(md.custom_downloaders[2], HuggingFaceModelDownloader)
-    assert isinstance(md.custom_downloaders[3], CivitaiModelDownloader)
+    assert len(md.custom_downloaders) == 3
+    assert isinstance(md.custom_downloaders[0], HuggingFaceRepoDownloader)
+    assert isinstance(md.custom_downloaders[1], HuggingFaceModelDownloader)
+    assert isinstance(md.custom_downloaders[2], CivitaiModelDownloader)
     assert isinstance(md.hugging_face_repo_with_blobs_downloader, HuggingFaceRepoWithBlobsDownloader)
 
 
@@ -936,7 +934,7 @@ async def test_model_downloader_download_routes_civitai_url_to_civitai_downloade
         routed_to.append("civitai")
         yield SuccessDownloadPacket(model_dir)
 
-    md.custom_downloaders[3].download = mock_civitai_download
+    md.custom_downloaders[2].download = mock_civitai_download
 
     async for _ in md.download("https://civitai.com/api/download/models/123", model_dir):
         pass
@@ -976,7 +974,7 @@ async def test_model_downloader_download_routes_huggingface_gguf_url_to_hf_model
         routed_to.append("hf_model")
         yield SuccessDownloadPacket(model_dir)
 
-    md.custom_downloaders[2].download = mock_hf_model_download
+    md.custom_downloaders[1].download = mock_hf_model_download
 
     async for _ in md.download("https://huggingface.co/user/repo/resolve/main/model.gguf", model_dir):
         pass
@@ -1000,7 +998,7 @@ async def test_model_downloader_download_logs_progress_percentage(tmp_path: Path
 
     md.standard_downloader.download = mock_standard_download
 
-    with caplog.at_level("INFO", logger="uvicorn.error"):
+    with caplog.at_level("INFO", logger="uvicorn"):
         async for _ in md.download("https://example.com/model.gguf", model_dir):
             pass
 
@@ -1024,7 +1022,7 @@ async def test_model_downloader_download_does_not_log_progress_when_size_unknown
 
     md.standard_downloader.download = mock_standard_download
 
-    with caplog.at_level("INFO", logger="uvicorn.error"):
+    with caplog.at_level("INFO", logger="uvicorn"):
         async for _ in md.download("https://example.com/model.gguf", model_dir):
             pass
 

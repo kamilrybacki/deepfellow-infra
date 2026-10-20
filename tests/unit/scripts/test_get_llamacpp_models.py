@@ -30,6 +30,7 @@ from scripts.get_llamacpp_models import (
     main,
     quant_suffix,
 )
+from scripts.utils.hf_common import DEFAULT_MODEL_DETAIL_CACHE_DIR
 
 
 @pytest.mark.parametrize(
@@ -199,6 +200,34 @@ def test_build_entries_skips_mmproj_files() -> None:
 
     names = [e.name for e in entries]
     assert names == ["org/model-q4-k-m"]
+
+
+def test_build_entries_records_mmproj_presence_as_hint_not_supports_vision() -> None:
+    """A companion mmproj file is a catalog hint only - llama.cpp installs don't wire it up.
+
+    `supports_vision` must stay None (never a wrong "vision works" guess); the presence signal
+    is instead carried separately as `has_mmproj`.
+    """
+    siblings = [
+        {"rfilename": "mmproj-F16.gguf", "size": 1024**3},
+        {"rfilename": "model-Q4_K_M.gguf", "size": 1024**3},
+    ]
+
+    entries = build_entries("org/model", siblings)
+
+    assert len(entries) == 1
+    assert entries[0].supports_vision is None
+    assert entries[0].has_mmproj is True
+
+
+def test_build_entries_has_mmproj_none_when_no_mmproj_file() -> None:
+    siblings = [{"rfilename": "model-Q4_K_M.gguf", "size": 1024**3}]
+
+    entries = build_entries("org/model", siblings)
+
+    assert len(entries) == 1
+    assert entries[0].supports_vision is None
+    assert entries[0].has_mmproj is None
 
 
 def test_build_entries_skips_subdirectory_files() -> None:
@@ -437,7 +466,7 @@ async def test_main_emits_multiple_entries_per_repo(capsys: pytest.CaptureFixtur
     async def fake_collect(session: Mock, active: dict[str, int]) -> list[dict[str, str]]:
         return models
 
-    async def fake_files(session: Mock, model_id: str, sem: asyncio.Semaphore) -> list[dict[str, Any]]:
+    async def fake_files(session: Mock, model_id: str, sem: asyncio.Semaphore, cache_dir: Path | None = None) -> list[dict[str, Any]]:
         return files[0]
 
     with (
@@ -465,7 +494,7 @@ async def test_main_sorts_entries_case_insensitively_by_name(capsys: pytest.Capt
     async def fake_collect(session: Mock, active: dict[str, int]) -> list[dict[str, str]]:
         return models
 
-    async def fake_files(session: Mock, model_id: str, sem: asyncio.Semaphore) -> list[dict[str, Any]]:
+    async def fake_files(session: Mock, model_id: str, sem: asyncio.Semaphore, cache_dir: Path | None = None) -> list[dict[str, Any]]:
         return [{"rfilename": "model-Q4_K_M.gguf", "size": 1024**3}]
 
     with (
@@ -491,7 +520,7 @@ async def test_main_drops_repo_without_gguf_files(capsys: pytest.CaptureFixture[
     async def fake_collect(session: Mock, active: dict[str, int]) -> list[dict[str, str]]:
         return models
 
-    async def fake_files(session: Mock, model_id: str, sem: asyncio.Semaphore) -> list[dict[str, Any]]:
+    async def fake_files(session: Mock, model_id: str, sem: asyncio.Semaphore, cache_dir: Path | None = None) -> list[dict[str, Any]]:
         return [{"rfilename": "config.json", "size": 100}]
 
     with (
@@ -518,7 +547,9 @@ async def test_main_distinguishes_failed_fetch_from_empty_repo(capsys: pytest.Ca
     async def fake_collect(session: Mock, active: dict[str, int]) -> list[dict[str, str]]:
         return models
 
-    async def fake_files(session: Mock, model_id: str, sem: asyncio.Semaphore) -> list[dict[str, Any]] | None:
+    async def fake_files(
+        session: Mock, model_id: str, sem: asyncio.Semaphore, cache_dir: Path | None = None
+    ) -> list[dict[str, Any]] | None:
         if model_id == "org/model-empty":
             return [{"rfilename": "config.json", "size": 100}]
         if model_id == "org/model-failed":
@@ -549,7 +580,9 @@ async def test_main_aborts_when_fetch_failure_rate_exceeds_threshold(capsys: pyt
     async def fake_collect(session: Mock, active: dict[str, int]) -> list[dict[str, str]]:
         return models
 
-    async def fake_files(session: Mock, model_id: str, sem: asyncio.Semaphore) -> list[dict[str, Any]] | None:
+    async def fake_files(
+        session: Mock, model_id: str, sem: asyncio.Semaphore, cache_dir: Path | None = None
+    ) -> list[dict[str, Any]] | None:
         # 3/10 = 30% failure, above the 10% threshold.
         if model_id in ("org/model-0", "org/model-1", "org/model-2"):
             return None
@@ -580,7 +613,7 @@ async def test_main_output_writes_file_and_preserves_other_key(tmp_path: Path) -
     async def fake_collect(session: Mock, active: dict[str, int]) -> list[dict[str, str]]:
         return models
 
-    async def fake_files(session: Mock, model_id: str, sem: asyncio.Semaphore) -> list[dict[str, Any]]:
+    async def fake_files(session: Mock, model_id: str, sem: asyncio.Semaphore, cache_dir: Path | None = None) -> list[dict[str, Any]]:
         return [{"rfilename": "model-Q4_K_M.gguf", "size": 1024**3}]
 
     with (
@@ -600,6 +633,8 @@ async def test_main_output_writes_file_and_preserves_other_key(tmp_path: Path) -
             "url": "https://huggingface.co/org/model-GGUF/resolve/main/model-Q4_K_M.gguf",
             "size": "1.1GB",
             "jinja": False,
+            "supports_vision": None,
+            "has_mmproj": None,
         }
     ]
     assert data["other_key"] == ["unrelated"]
@@ -626,7 +661,7 @@ async def test_main_output_preserves_jinja_flag_for_reappearing_entry(tmp_path: 
     async def fake_collect(session: Mock, active: dict[str, int]) -> list[dict[str, str]]:
         return [{"id": "org/model-GGUF"}]
 
-    async def fake_files(session: Mock, model_id: str, sem: asyncio.Semaphore) -> list[dict[str, Any]]:
+    async def fake_files(session: Mock, model_id: str, sem: asyncio.Semaphore, cache_dir: Path | None = None) -> list[dict[str, Any]]:
         return [{"rfilename": "model-Q4_K_M.gguf", "size": 1024**3}]
 
     with (
@@ -646,6 +681,8 @@ async def test_main_output_preserves_jinja_flag_for_reappearing_entry(tmp_path: 
             "url": "https://huggingface.co/org/model-GGUF/resolve/main/model-Q4_K_M.gguf",
             "size": "1.1GB",
             "jinja": True,
+            "supports_vision": None,
+            "has_mmproj": None,
         }
     ]
 
@@ -658,7 +695,7 @@ async def test_main_output_overwrites_llms_key(tmp_path: Path) -> None:
     async def fake_collect(session: Mock, active: dict[str, int]) -> list[dict[str, str]]:
         return [{"id": "org/new-model-GGUF"}]
 
-    async def fake_files(session: Mock, model_id: str, sem: asyncio.Semaphore) -> list[dict[str, Any]]:
+    async def fake_files(session: Mock, model_id: str, sem: asyncio.Semaphore, cache_dir: Path | None = None) -> list[dict[str, Any]]:
         return [{"rfilename": "new-model-Q4_K_M.gguf", "size": 1024**3}]
 
     with (
@@ -674,3 +711,27 @@ async def test_main_output_overwrites_llms_key(tmp_path: Path) -> None:
     data = json.loads(output_path.read_text())
     names = [e["name"] for e in data["llms"]]
     assert names == ["org/new-model-GGUF-q4-k-m"]
+
+
+@pytest.mark.asyncio
+async def test_main_passes_default_cache_dir_to_fetch_model_files() -> None:
+    seen: list[Path | None] = []
+
+    async def fake_collect(session: Mock, active: dict[str, int]) -> list[dict[str, str]]:
+        return [{"id": "org/model-GGUF"}]
+
+    async def fake_files(session: Mock, model_id: str, sem: asyncio.Semaphore, cache_dir: Path | None = None) -> list[dict[str, Any]]:
+        seen.append(cache_dir)
+        return [{"rfilename": "model-Q4_K_M.gguf", "size": 1024**3}]
+
+    with (
+        patch("scripts.get_llamacpp_models.collect_gguf_models", side_effect=fake_collect),
+        patch("scripts.get_llamacpp_models.fetch_model_files", side_effect=fake_files),
+        patch(
+            "aiohttp.ClientSession",
+            return_value=AsyncMock(__aenter__=AsyncMock(return_value=MagicMock()), __aexit__=AsyncMock(return_value=False)),
+        ),
+    ):
+        await main(1, 0, 0, raw=True)
+
+    assert seen == [DEFAULT_MODEL_DETAIL_CACHE_DIR]

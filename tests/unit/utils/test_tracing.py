@@ -11,9 +11,11 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from opentelemetry.trace import SpanContext
 from opentelemetry.trace.status import StatusCode
 from pydantic import BaseModel
 
+from server.utils.failed_span import get_failed_span_context
 from server.utils.tracing import FuncArgs, InfraTracer, McpInstruments, OtlpLoggingManager
 
 
@@ -118,6 +120,12 @@ def _patch_otlp_logging_context_managers():
     ]
 
 
+def test_otlp_logging_manager_configured_state_defaults() -> None:
+    manager = OtlpLoggingManager()
+    assert manager.configured_endpoint is None
+    assert manager.configured_enabled is False
+
+
 def test_setup_otlp_logging_creates_provider_with_service_name() -> None:
     cfg = _make_config(endpoint="http://otel:4317")
     patches = _patch_otlp_logging_context_managers()
@@ -185,6 +193,18 @@ def test_setup_otlp_logging_attaches_handler_to_root_and_uvicorn_loggers() -> No
         assert logger_call == call(handler)
 
 
+def test_setup_otlp_logging_records_configured_endpoint_and_enabled() -> None:
+    cfg = _make_config(endpoint="http://otel:4317")
+    patches = _patch_otlp_logging_context_managers()
+    manager = OtlpLoggingManager()
+
+    with patches[0], patches[1], patches[2], patches[3], patches[4], patch("server.utils.tracing.logging.getLogger"):
+        manager.setup(cfg)
+
+    assert manager.configured_endpoint == "http://otel:4317"
+    assert manager.configured_enabled is True
+
+
 @pytest.mark.asyncio
 async def test_teardown_otlp_logging_noop_when_no_handler() -> None:
     manager = OtlpLoggingManager()
@@ -224,6 +244,35 @@ async def test_teardown_otlp_logging_shuts_down_old_provider() -> None:
 
     assert provider.shutdown.call_count == 1
     assert manager._provider is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_teardown_otlp_logging_records_configured_enabled_false_on_success() -> None:
+    manager = OtlpLoggingManager()
+    manager._handler = MagicMock()  # pyright: ignore[reportPrivateUsage]
+    manager._provider = MagicMock()  # pyright: ignore[reportPrivateUsage]
+    manager.configured_enabled = True
+
+    with patch("server.utils.tracing.logging.getLogger"):
+        await manager.teardown()
+
+    assert manager.configured_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_teardown_otlp_logging_records_configured_enabled_false_even_when_provider_shutdown_fails() -> None:
+    """DFINFRA-314 swallows the shutdown failure, so teardown() never raises here anymore."""
+    manager = OtlpLoggingManager()
+    manager._handler = MagicMock()  # pyright: ignore[reportPrivateUsage]
+    provider = MagicMock()
+    provider.shutdown.side_effect = RuntimeError("boom")
+    manager._provider = provider  # pyright: ignore[reportPrivateUsage]
+    manager.configured_enabled = True
+
+    with patch("server.utils.tracing.logging.getLogger"):
+        await manager.teardown()  # must not raise
+
+    assert manager.configured_enabled is False
 
 
 @pytest.mark.asyncio
@@ -374,6 +423,24 @@ def test_get_config_returns_config_when_set() -> None:
     t.config = cfg
 
     assert t._get_config() is cfg  # pyright: ignore[reportPrivateUsage]
+
+
+def test_is_active_false_when_no_provider() -> None:
+    t = InfraTracer("svc")
+    assert t.is_active is False
+
+
+def test_is_active_true_when_provider_exists() -> None:
+    t = InfraTracer("svc")
+    t._provider = MagicMock()  # pyright: ignore[reportPrivateUsage]
+    assert t.is_active is True
+
+
+def test_is_active_true_when_only_meter_provider_exists() -> None:
+    """mcp_instruments() can build _meter_provider without span() building _provider."""
+    t = InfraTracer("svc")
+    t._meter_provider = MagicMock()  # pyright: ignore[reportPrivateUsage]
+    assert t.is_active is True
 
 
 def test_get_config_raises_when_not_set() -> None:
@@ -672,6 +739,44 @@ async def test_trace_request_re_raises_exception_and_ends_span() -> None:
 
     assert span.record_exception.call_count == 1
     assert span.end.call_count == 1
+
+
+@pytest.mark.asyncio
+@patch("server.utils.tracing.trace.set_span_in_context")
+async def test_trace_request_remembers_failed_span_on_request(mock_set_span_in_context: MagicMock):
+    t = _make_tracer_with_config(enabled=True)
+    span = _make_span()
+    span_context = SpanContext(trace_id=0x0AF7651916CD43DD8448EB211C80319C, span_id=0x00F067AA0BA902B7, is_remote=False)
+    span.get_span_context.return_value = span_context
+    _mock_tracer = MagicMock()
+    _mock_tracer.start_span.return_value = span
+    t.tracer = _mock_tracer
+    t._tracer_endpoint = t.config.otel_exporter_otlp_endpoint  # pyright: ignore[reportPrivateUsage, reportOptionalMemberAccess]
+    request = _make_request()
+
+    @t.trace_request()
+    async def handler(request: Request) -> None:
+        raise ValueError("fail")
+
+    with pytest.raises(ValueError, match="fail"):
+        await handler(request)
+
+    assert get_failed_span_context(request) is span_context
+
+
+@pytest.mark.asyncio
+async def test_trace_request_does_not_remember_span_when_tracing_disabled():
+    t = _make_tracer_with_config(enabled=False)
+    request = _make_request()
+
+    @t.trace_request()
+    async def handler(request: Request) -> None:
+        raise ValueError("fail")
+
+    with pytest.raises(ValueError, match="fail"):
+        await handler(request)
+
+    assert get_failed_span_context(request) is None
 
 
 @pytest.mark.asyncio

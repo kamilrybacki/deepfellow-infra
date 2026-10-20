@@ -5,7 +5,6 @@
 
 import asyncio
 import json
-import logging
 import re
 import shutil
 from collections.abc import Sequence
@@ -16,7 +15,7 @@ from typing import Any, Literal, TypedDict
 
 import aiohttp
 from fastapi import HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from scripts.get_huggingface_models import fetch_registry_entries
 from server.applicationcontext import get_base_url
@@ -66,14 +65,14 @@ from server.utils.core import (
     convert_size_to_bytes,
     normalize_name,
     try_parse_pydantic,
+    with_legacy_key_carried_over,
 )
 from server.utils.files import get_model_dir_context_window
 from server.utils.hardware import HardwarePartInfo
 from server.utils.loading import Progress
+from server.utils.logger import logger
 from server.utils.registry_client import image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fetch_huggingface_model_size
-
-logger = logging.getLogger("uvicorn.error")
 
 # Qwen3-Reranker-family models refuse to start with `--is-embedding`; every other reranker in the
 # registry is a cross-encoder, which accepts (and defaults to) it.
@@ -115,7 +114,7 @@ _TOOL_CALL_PARSER_HINTS: tuple[tuple[str, str], ...] = (
 # release process would generate. Unlike vLLM, SGLang's reranker fetch allows generative
 # candidates, tagging each with `is_generative` instead of dropping it.
 _SGLANG_FETCH_PLAN: list[tuple[int, int, int, str, bool]] = [
-    (200, 100, 50, "llm", False),
+    (200, 200, 50, "llm", False),
     (50, 30, 30, "reranker", True),
     (10, 0, 10, "embedding", False),
 ]
@@ -139,6 +138,11 @@ class SglangModel(BaseModel):
     # model has no such metadata (e.g. a hand-added custom model), so callers fall back to the
     # by-name Qwen3-Reranker-family heuristic.
     is_generative_reranker: bool | None = None
+    # Best-effort, derived from the HF repo's `config.architectures` at catalog-build time (see
+    # `classify_modality_support`). None means unresolved (e.g. a hand-added custom model, or a
+    # non-"llm" registry entry, for which modality support isn't computed).
+    supports_vision: bool | None = None
+    supports_audio: bool | None = None
 
 
 class SglangCustomModel(BaseModel):
@@ -158,8 +162,13 @@ class SglangRerankerRegistryEntry(SglangRegistryEntry, total=False):
     is_generative: bool
 
 
+class SglangLlmRegistryEntry(SglangRegistryEntry, total=False):
+    supports_vision: bool
+    supports_audio: bool
+
+
 class SglangRegistry(TypedDict, total=False):
-    llms: list[SglangRegistryEntry]
+    llms: list[SglangLlmRegistryEntry]
     rerankers: list[SglangRerankerRegistryEntry]
     embeddings: list[SglangRegistryEntry]
 
@@ -181,6 +190,8 @@ def _read_models() -> dict[str, SglangModel]:
                 hf_id=entry["name"],
                 size=entry["size"],
                 model_type="llm",
+                supports_vision=entry.get("supports_vision"),
+                supports_audio=entry.get("supports_audio"),
             )
         for entry in registry.get("rerankers", []):
             map[entry["name"]] = SglangModel(
@@ -199,7 +210,7 @@ def _read_models() -> dict[str, SglangModel]:
 
 
 _const = SglangConst(
-    image=DockerImage(name="lmsysorg/sglang:v0.5.19-cu129", size="18.0 GB"),
+    image=DockerImage(name="lmsysorg/sglang:v0.5.21-cu130", size="15.2 GB"),
     models=_read_models(),
 )
 
@@ -231,8 +242,10 @@ class SglangOptions(BaseModel):
 
 
 class SglangModelOptions(BaseModel):
+    rename: str | None = None
     alias: str | None = None
-    gpu_memory_utilization: float | None = None
+    gpu_memory_utilization: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    gpu_priority: float | None = Field(default=None, ge=0.01, le=1)
     max_model_length: int | None = None
     quantization: str | None = None
     extra_args: dict[str, str] = {}
@@ -257,6 +270,7 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
     gpu_memory_utilization = 0
     _default_gpu_memory_utilization = 0.9
     _gpu_memory_free_safety_margin = 0.9
+    _min_gpu_memory_utilization = 0.01
     _vram_cache: dict[tuple[str, str], float]
     _installing: set[tuple[str, str]]
 
@@ -347,6 +361,19 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
             if model_id not in self.models[instance] and (definition := self._get_persisted_model_definition(instance, model_id)):
                 self._restore_model_definition(instance, model_id, definition)
 
+        # An installed model's registration keeps the supports_vision/supports_audio it was
+        # registered with at install time; a catalog refresh (e.g. a `classify_modality_support`
+        # fix, or a regenerated static catalog) can correct those values in the catalog without
+        # anything else re-registering the model, so re-sync them here.
+        if installed:
+            for model_id in installed_ids:
+                model_info = installed.models.get(model_id)
+                model = self.models[instance].get(model_id)
+                if model_info and model and model_info.registration_id:
+                    self.endpoint_registry.update_modality_support(
+                        model_info.registration_id, supports_vision=model.supports_vision, supports_audio=model.supports_audio
+                    )
+
     async def sync_models(self, instance: str) -> None:  # noqa: ARG002
         """Trigger a background catalog refresh (fire-and-forget; matches the base no-blocking sync contract)."""
         with suppress(HTTPException):
@@ -407,7 +434,10 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
     def get_model_spec(self, instance: str, model_type: str) -> ModelSpecification:
         """Return the model specification."""
         fields = [
-            ModelField(type="text", name="alias", description="Model alias", required=False),
+            ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
+            ModelField(
+                type="text", name="alias", description="Additional name for the model, the original name keeps working", required=False
+            ),
         ]
         if options := self.instances_info[instance].config.options:
             if "hardware" not in options.spec:
@@ -417,9 +447,9 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
             if (isinstance(hardware, bool) and hardware is True) or (isinstance(hardware, str) and hardware.startswith("GPU")):
                 fields.append(
                     ModelField(
-                        type="number",
-                        name="gpu_memory_utilization",
-                        description="Gpu usage (in range 0.00 - 1.00). Left blank, defaults to the fraction of VRAM currently free.",
+                        type="gpu-priority",
+                        name="gpu_priority",
+                        description="Share of currently-free GPU memory (0.01 - 1.00) to reserve for this model.",
                         required=False,
                     ),
                 )
@@ -499,6 +529,7 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                     capacity=x.capacity,
                     capacity_known=x.capacity_known,
                     gpu_memory_utilization=x.gpu_memory_utilization,
+                    container_name=x.docker.container_name,
                 )
                 for x in info.models.values()
             ]
@@ -510,8 +541,12 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
     def get_hardware_unsupported_reason(self) -> str | None:
         """Return why SGLang can't run here. SGLang is GPU-only: no supported GPU means it can't run at all."""
         if not self._supported_gpus:
-            return "Your hardware doesn't support this service.\nThere are not any graphic cards."
+            return "Your hardware doesn't support this service.\nThere are not any graphic cards. Restart Infra if this has changed."
         return None
+
+    def get_default_docker_image_name(self) -> str | None:
+        """Return the default docker image, for the upfront platform-compatibility check."""
+        return _const.image.name
 
     def is_given_hardware_support_gpu(self, hardware_specification: str | bool | None) -> bool:
         """Return is gpu will be used. SGLang is GPU-only: no supported GPU means the service can't run at all."""
@@ -535,7 +570,12 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
         options.spec["hardware"] = self.canonicalize_hardware_spec(options.spec["hardware"])
         await self.validate_docker_image_version(options.spec.get("image_version"), options.spec.get("hardware"))
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
+    async def _install_instance(
+        self,
+        instance: str,
+        options: InstallServiceIn,
+        container_name_override: str | None = None,  # noqa: ARG002
+    ) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self.load_default_models(instance)
 
@@ -672,6 +712,8 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                             has_docker=True,
                             is_loaded=is_loaded,
                             vram_estimate_gb=vram_estimate_gb,
+                            supports_vision=model.supports_vision,
+                            supports_audio=model.supports_audio,
                         )
                     )
 
@@ -700,6 +742,8 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
             has_docker=True,
             is_loaded=is_loaded,
             vram_estimate_gb=vram_estimate_gb,
+            supports_vision=model.supports_vision,
+            supports_audio=model.supports_audio,
         )
 
     async def _download_model(self, stream: Stream[StreamChunk], model: SglangModel, model_dir: Path) -> Path | None:
@@ -761,6 +805,15 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
             raise HTTPException(500, f"Downloader doesn't return filepath in {model_dir} of {model.hf_id} model")
         return local_model_path
 
+    def _carry_over_edited_install_options(self, old_options: InstallModelIn, new_options: InstallModelIn) -> InstallModelIn:
+        """Keep a legacy absolute `gpu_memory_utilization` across an edit.
+
+        The edit form only renders `gpu_priority`, so without this a model installed with the old absolute
+        key would silently lose it on any edit (even one touching only prefix/envs) and be re-sized.
+        """
+        spec = with_legacy_key_carried_over(old_options.spec, new_options.spec, "gpu_memory_utilization", "gpu_priority")
+        return new_options if spec is new_options.spec else new_options.model_copy(update={"spec": spec})
+
     async def _get_default_gpu_memory_utilization(self) -> float:
         """Size the default utilization to the fraction of VRAM currently free.
 
@@ -769,18 +822,48 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
         """
         stats = await self.hardware.get_realtime_stats(force_refresh=True)
         if not stats or stats.total_vram_gb <= 0:
+            logger.warning(
+                f"SGLang: GPU stats unavailable, assuming {self._default_gpu_memory_utilization} of total VRAM is free; "
+                "a gpu_priority share is applied to that and may exceed the memory actually free"
+            )
             return self._default_gpu_memory_utilization
         free_fraction = max(0.0, stats.total_vram_gb - stats.used_vram_gb) / stats.total_vram_gb
         return round(min(self._default_gpu_memory_utilization, free_fraction * self._gpu_memory_free_safety_margin), 2)
 
     async def _get_gpu_memory_utilization(
-        self, instance: str, model_id: str, parsed_model_options: SglangModelOptions, model: SglangModel
+        self, instance: str, model_id: str, parsed_model_options: SglangModelOptions, model: SglangModel, *, reserve: bool = True
     ) -> float:
-        gpu_memory_utilization = parsed_model_options.gpu_memory_utilization or model.gpu_memory_utilization
+        """Size the utilization for a model; `reserve=False` only validates, without taking the share."""
+        gpu_memory_utilization = parsed_model_options.gpu_memory_utilization
+        if gpu_memory_utilization is not None and gpu_memory_utilization <= 0:
+            # A persisted 0 (the old free-text field allowed it) used to mean "unset" - keep it that way
+            # rather than launching the engine with no memory, which fails to start.
+            gpu_memory_utilization = None
+        if gpu_memory_utilization is None and parsed_model_options.gpu_priority is None:
+            # An explicit priority must win over the model definition's own default utilization.
+            gpu_memory_utilization = model.gpu_memory_utilization
         if gpu_memory_utilization is None:
-            gpu_memory_utilization = self._get_persisted_model_gpu_memory_utilization(instance, model_id)
+            gpu_memory_utilization = self._get_persisted_model_gpu_memory_utilization(instance, model_id, parsed_model_options.gpu_priority)
+        if gpu_memory_utilization is None and parsed_model_options.gpu_priority is not None:
+            available = await self._get_default_gpu_memory_utilization()
+            gpu_memory_utilization = round(parsed_model_options.gpu_priority * available, 2)
+            if gpu_memory_utilization < self._min_gpu_memory_utilization:
+                raise HTTPException(
+                    422,
+                    (
+                        f"GPU priority {parsed_model_options.gpu_priority} of the currently free VRAM ({available}) "
+                        f"gives {gpu_memory_utilization} utilization, below the minimum {self._min_gpu_memory_utilization}. "
+                        "Raise the priority or free up GPU memory."
+                    ),
+                )
         if gpu_memory_utilization is None:
             gpu_memory_utilization = await self._get_default_gpu_memory_utilization()
+            if gpu_memory_utilization < self._min_gpu_memory_utilization:
+                raise HTTPException(
+                    422,
+                    f"Not enough free GPU memory: only {gpu_memory_utilization} of VRAM is free. "
+                    "Wait for running installs to finish or free up GPU memory.",
+                )
         if self.gpu_memory_utilization + gpu_memory_utilization > 1:
             raise HTTPException(
                 422,
@@ -791,6 +874,8 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                     f"which is {self.gpu_memory_utilization + gpu_memory_utilization - 1} more that 1."
                 ),
             )
+        if not reserve:
+            return gpu_memory_utilization
         self.gpu_memory_utilization += gpu_memory_utilization
         msg = f"SGLang gpu utilization = {self.gpu_memory_utilization}"
         logger.debug(msg)
@@ -941,6 +1026,7 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
         context_window: int | None,
         max_context_window: int | None,
         capacity: int | None,
+        registered_alias: str | None = None,
     ) -> RegistrationId:
         """Register the model in the endpoint registry based on its type."""
         # SGLang always sizes a real, finite `max_running_requests` from KV-cache memory at startup;
@@ -952,7 +1038,9 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                 model=registered_name,
                 props=ModelProps(private=True, type="rerank", endpoints=["/v1/rerank"]),
                 options=ProxyOptions(url=f"{model_info.base_url}/v1/rerank", rewrite_model_to=model_id),
-                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), capacity_state=capacity_state),
+                registration_options=RegistrationOptions(
+                    origin="local", alias=registered_alias, owned_by=self.get_type(), capacity_state=capacity_state
+                ),
                 normalize_sglang_response=True,
             )
         if model.model_type == "embedding":
@@ -960,7 +1048,9 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                 model=registered_name,
                 props=ModelProps(private=True, type="embedding", endpoints=EMBEDDINGS_ENDPOINTS),
                 options=ProxyOptions(url=f"{model_info.base_url}/v1/embeddings", rewrite_model_to=model_id),
-                registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), capacity_state=capacity_state),
+                registration_options=RegistrationOptions(
+                    origin="local", alias=registered_alias, owned_by=self.get_type(), capacity_state=capacity_state
+                ),
             )
         return self.endpoint_registry.register_chat_completion_as_proxy(
             model=registered_name,
@@ -970,13 +1060,17 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                 endpoints=LLM_ENDPOINTS,
                 context_window=context_window,
                 max_context_window=max_context_window,
+                supports_vision=model.supports_vision,
+                supports_audio=model.supports_audio,
             ),
             chat_completions=ProxyOptions(url=f"{model_info.base_url}/v1/chat/completions", rewrite_model_to=model_id),
             completions=ProxyOptions(url=f"{model_info.base_url}/v1/completions", rewrite_model_to=model_id),
             responses=ProxyOptions(url=f"{model_info.base_url}/v1/responses", rewrite_model_to=model_id),
             messages=ProxyOptions(url=f"{model_info.base_url}/v1/messages", rewrite_model_to=model_id),
             ollama_chat=None,
-            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type(), capacity_state=capacity_state),
+            registration_options=RegistrationOptions(
+                origin="local", alias=registered_alias, owned_by=self.get_type(), capacity_state=capacity_state
+            ),
         )
 
     @staticmethod
@@ -1009,7 +1103,7 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
         return max(1, raw_concurrency)
 
     async def _install_model(
-        self, instance: str, model_id: str, options: InstallModelIn
+        self, instance: str, model_id: str, options: InstallModelIn, container_name_override: str | None = None
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_model_options = try_parse_pydantic(SglangModelOptions, options.spec) if options.spec else SglangModelOptions()
 
@@ -1025,19 +1119,19 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
         self._installing.add(key)
         model = self.models[instance][model_id]
 
-        gpu_memory_utilization: float | None = None
         try:
-            gpu_memory_utilization = await self._get_gpu_memory_utilization(instance, model_id, parsed_model_options, model)
+            # Fail fast (before a long download) on options that can never fit; the share is really taken in `func`.
+            await self._get_gpu_memory_utilization(instance, model_id, parsed_model_options, model, reserve=False)
             max_model_length = parsed_model_options.max_model_length or model.max_model_len or None
             quantization = await self._get_quantization(parsed_model_options, model)
         except BaseException:
-            self._release_gpu_utilization(gpu_memory_utilization)
             self._installing.discard(key)
             raise
 
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
             model_info: ModelInstalledInfo | None = None
             docker_options: DockerOptions | None = None
+            gpu_memory_utilization: float | None = None
             adopted = False
             try:
                 model_id_fixed = model.hf_id.replace("/", "-")
@@ -1057,56 +1151,62 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                     f"{model_cache_dir}:{docker_model_path}/.cache",
                 ]
 
-                sglang_command = self._build_sglang_command(
-                    docker_model_path=docker_model_path,
-                    model_id=model_id,
-                    model=model,
-                    opts=parsed_model_options,
-                    quantization=quantization,
-                    gpu_memory_utilization=gpu_memory_utilization,
-                    max_model_length=max_model_length,
-                )
+                # Sizing and the container start/health wait are serialized: once the previous container is healthy its
+                # weights are in `used_vram_gb`, so the next model is sized from a measurement that already includes it.
+                # Downloading stays outside the lock, so installs still download in parallel.
+                async with self.hardware.gpu_load_lock:
+                    gpu_memory_utilization = await self._get_gpu_memory_utilization(instance, model_id, parsed_model_options, model)
+                    sglang_command = self._build_sglang_command(
+                        docker_model_path=docker_model_path,
+                        model_id=model_id,
+                        model=model,
+                        opts=parsed_model_options,
+                        quantization=quantization,
+                        gpu_memory_utilization=gpu_memory_utilization,
+                        max_model_length=max_model_length,
+                    )
 
-                env_vars = dict(model.env_vars or {})
-                env_vars["HF_HUB_OFFLINE"] = "1"
-                env_vars["HF_HOME"] = self.hugging_face_cache_path
-                env_vars.update(parsed_model_options.extra_envs)
+                    env_vars = dict(model.env_vars or {})
+                    env_vars["HF_HUB_OFFLINE"] = "1"
+                    env_vars["HF_HOME"] = self.hugging_face_cache_path
+                    env_vars.update(parsed_model_options.extra_envs)
 
-                image = self._get_image(info.options.spec.get("image_version") if info.options else None)
+                    image = self._get_image(info.options.spec.get("image_version") if info.options else None)
 
-                subnet = self.docker_service.get_docker_subnet()
-                service_name = f"{self.get_service_id(instance)}-{normalize_name(model_id)}"
-                docker_options = DockerOptions(
-                    name=service_name,
-                    container_name=self.docker_service.get_docker_container_name(service_name),
-                    image=image.name,
-                    command=" ".join(sglang_command),
-                    image_port=30000,
-                    env_vars=env_vars,
-                    restart="unless-stopped",
-                    volumes=volumes,
-                    hardware=self.get_specified_hardware_parts(info.parsed_options.hardware),
-                    shm_size=model.shm_size,
-                    ulimits=model.ulimits,
-                    subnet=subnet,
-                    healthcheck={
-                        "test": "curl --fail http://localhost:30000/health_generate || exit 1",
-                        "interval": "80s",
-                        "timeout": "60s",
-                        "retries": "3",
-                        "start_period": "240s",
-                    },
-                )
-                docker_exposed_port, restarted, adopted = await self._start_container_with_embedding_fallback(
-                    docker_options, sglang_command
-                )
+                    subnet = self.docker_service.get_docker_subnet()
+                    service_name = f"{self.get_service_id(instance)}-{normalize_name(model_id)}"
+                    docker_options = DockerOptions(
+                        name=service_name,
+                        container_name=container_name_override or self.docker_service.get_docker_container_name(service_name),
+                        image=image.name,
+                        command=sglang_command,
+                        image_port=30000,
+                        env_vars=env_vars,
+                        restart="unless-stopped",
+                        volumes=volumes,
+                        hardware=self.get_specified_hardware_parts(info.parsed_options.hardware),
+                        shm_size=model.shm_size,
+                        ulimits=model.ulimits,
+                        subnet=subnet,
+                        healthcheck={
+                            "test": "curl --fail http://localhost:30000/health_generate || exit 1",
+                            "interval": "80s",
+                            "timeout": "60s",
+                            "retries": "3",
+                            "start_period": "240s",
+                        },
+                    )
+                    docker_exposed_port, restarted, adopted = await self._start_container_with_embedding_fallback(
+                        docker_options, sglang_command
+                    )
 
                 capacity, capacity_known = await self._resolve_model_capacity(
                     instance, model_id, "SGLang", docker_options.container_name or "", restarted, self._parse_max_concurrency
                 )
 
-                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
-                container_host = self.docker_service.get_container_host(subnet, docker_options.name)
+                registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
+                registered_alias = parsed_model_options.alias
+                container_host = self.docker_service.get_container_host(subnet, docker_options)
                 container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
                 if model.model_type == "llm":
                     max_context_window = await get_model_dir_context_window(local_model_path)
@@ -1134,6 +1234,7 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
                     model_info=model_info,
                     model=model,
                     registered_name=registered_name,
+                    registered_alias=registered_alias,
                     model_id=model_id,
                     context_window=context_window,
                     max_context_window=max_context_window,
@@ -1172,8 +1273,7 @@ class SglangService(Base2Service[InstalledInfo, DownloadedInfo]):
             if not (self._is_embedding_mismatch_error(str(exc)) and "--is-embedding" in sglang_command):
                 raise self._describe_install_failure(exc) from exc
 
-        sglang_command.remove("--is-embedding")
-        docker_options.command = " ".join(sglang_command)
+        docker_options.command = [arg for arg in sglang_command if arg != "--is-embedding"]
         try:
             return await self.docker_service.install_and_run_docker(docker_options)
         except Exception as retry_exc:

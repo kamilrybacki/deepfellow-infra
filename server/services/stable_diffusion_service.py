@@ -52,7 +52,7 @@ from server.models.services import (
     ServiceSpecification,
     UninstallServiceIn,
 )
-from server.services.base2_service import Base2Service, CustomModel, Instance, InstanceConfig, ModelConfig
+from server.services.base2_service import Base2Service, CustomModel, Instance, InstanceConfig, ModelConfig, default_gpu_cpu_image_name
 from server.utils.core import (
     DownloadedPacket,
     PreDownloadPacket,
@@ -200,6 +200,7 @@ class SDOptions(BaseModel):
 
 
 class SDModelOptions(BaseModel):
+    rename: str | None = None
     alias: str | None = None
 
 
@@ -267,7 +268,10 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
         """Return the model specification."""
         return ModelSpecification(
             fields=[
-                ModelField(type="text", name="alias", description="Model alias", required=False),
+                ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
+                ModelField(
+                    type="text", name="alias", description="Additional name for the model, the original name keeps working", required=False
+                ),
             ]
         )
 
@@ -315,6 +319,7 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
             if info
             else [],
             custom=custom,
+            container_name=info.docker.container_name if info else None,
         )
 
     def _restore_model_definition(self, instance: str, model_id: str, definition: dict[str, Any]) -> None:
@@ -346,18 +351,30 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
     def _get_image(self, gpu: bool) -> DockerImage:
         return _const.images["gpu"] if gpu else _const.images["cpu"]
 
+    def get_default_docker_image_name(self) -> str | None:
+        """Return the default docker image, for the upfront platform-compatibility check."""
+        return default_gpu_cpu_image_name(self._supported_gpus, self._get_image)
+
+    def get_hardware_unsupported_reason(self) -> str | None:
+        """Return why Stable Diffusion Next can't run here. It is not supported on macOS at all."""
+        if platform.system() == "Darwin":
+            return "This service is incompatible with your machine (not supported on macOS)."
+        return None
+
     def _load_download_info(self, data: dict[str, Any]) -> DownloadedInfo:
         return DownloadedInfo(**data)
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
+    async def _install_instance(
+        self, instance: str, options: InstallServiceIn, container_name_override: str | None = None
+    ) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self.load_default_models(instance)
 
         if "hardware" not in options.spec:
             options.spec["hardware"] = options.spec.get("gpu", self.docker_service.has_gpu_support)
         options.spec["hardware"] = self.canonicalize_hardware_spec(options.spec["hardware"])
-        if platform.system() == "Darwin":
-            raise HTTPException(400, "Stable Diffusion Next is not supported on macOS")
+        if reason := self.get_hardware_unsupported_reason():
+            raise HTTPException(400, reason)
         parsed_options = try_parse_pydantic(SDOptions, options.spec)
         volumes = [
             f"{self._get_working_models_dir()}:/mnt/models",
@@ -376,7 +393,7 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
             name = f"{self.get_service_id(instance)}"
             docker_options = DockerOptions(
                 name=name,
-                container_name=self.docker_service.get_docker_container_name(name),
+                container_name=container_name_override or self.docker_service.get_docker_container_name(name),
                 image=image.name,
                 env_vars={
                     "SD_DOCS": "true",
@@ -397,7 +414,7 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
             )
             docker_exposed_port, _, _ = await self.docker_service.install_and_run_docker(docker_options)
 
-            host = self.docker_service.get_container_host(subnet, docker_options.name)
+            host = self.docker_service.get_container_host(subnet, docker_options)
             port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
 
             proxy_registration_id = (
@@ -634,7 +651,11 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
         return local_model_path, filename
 
     async def _install_model(
-        self, instance: str, model_id: str, options: InstallModelIn
+        self,
+        instance: str,
+        model_id: str,
+        options: InstallModelIn,
+        container_name_override: str | None = None,  # noqa: ARG002
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_model_options = try_parse_pydantic(SDModelOptions, options.spec) if options.spec else SDModelOptions()
         info = self.get_instance_installed_info(instance)
@@ -658,7 +679,8 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
 
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
 
-                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
+                registered_alias = parsed_model_options.alias
                 model_path = local_model_path.absolute()
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
@@ -675,7 +697,7 @@ class StableDiffusionService(Base2Service[InstalledInfo, DownloadedInfo]):
                             model=registered_name,
                             props=ModelProps(private=True, type=model.type, endpoints=IMG_ENDPOINTS),
                             endpoint=SimpleEndpoint(on_request=_stable_diffusion_handler(info.base_url, model_filename)),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                            registration_options=RegistrationOptions(origin="local", alias=registered_alias, owned_by=self.get_type()),
                         )
 
                     await self.refresh_models(instance)

@@ -57,18 +57,6 @@ LICENSE_HEADER = f"{LICENSE_LINE_MIT}\n{COPYRIGHT_LINE_TEMPLATE.format(year=get_
 # Pattern to match the copyright line with any year - once set, the year is never checked or bumped
 COPYRIGHT_HEADER_PATTERN = re.compile(r"# SPDX-FileCopyrightText: \d{4} Simplito sp\. z o\.o\.\s*$", re.MULTILINE)
 
-# Pattern to match the old DFFL prose header, so `--fix` can migrate files to the SPDX header
-OLD_LICENSE_HEADER_PATTERN = re.compile(
-    r"# DeepFellow Software Framework\.\s*\n"
-    r"# Copyright © \d{4} Simplito sp\. z o\.o\.\s*\n"
-    r"#\s*\n"
-    r"# This file is part of the DeepFellow Software Framework \(https://deepfellow\.ai\)\.\s*\n"
-    r"# This software is Licensed under the DeepFellow Free License\.\s*\n"
-    r"#\s*\n"
-    r"# See the License for the specific language governing permissions and\s*\n"
-    r"# limitations under the License\.\n*"
-)
-
 DEFAULT_EXCLUDES = frozenset({".git", ".uv-cache"})
 
 
@@ -183,13 +171,11 @@ def insert_header_lines(content: str, header_lines: list[str]) -> str:
 
 
 def fix_file_header(filepath: Path, root: Path | None = None) -> bool:
-    """Remove a stale DFFL header if present and add whichever SPDX line(s) are missing."""
+    """Add whichever SPDX line(s) are missing."""
     try:
         content = filepath.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return False
-
-    content = OLD_LICENSE_HEADER_PATTERN.sub("", content, count=1)
 
     expected_line = license_line_for(filepath, root)
     expected_pattern = EE_LICENSE_HEADER_PATTERN if is_ee_path(filepath, root) else LICENSE_HEADER_PATTERN

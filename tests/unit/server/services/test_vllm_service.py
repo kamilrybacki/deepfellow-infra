@@ -4,21 +4,25 @@
 import asyncio
 import json
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
+import aiohttp
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from scripts.get_huggingface_models import ModelIncompatibleError
 from server.docker import ContainerStatus
 from server.models.models import AddCustomModelIn, InstallModelIn, ListModelsFilters, UninstallModelIn
 from server.models.services import GpuStats, InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import CustomModel, Instance, InstanceConfig, ModelConfig
+from server.services.finetune_service import FinetuneService
 from server.services.model_catalog_refresh import huggingface_refresh_guard
 from server.services.vllm_service import (
+    AdapterMetadata,
     DownloadedInfo,
     InstalledInfo,
     ModelInstalledInfo,
@@ -27,6 +31,7 @@ from server.services.vllm_service import (
     VllmOptions,
     VllmService,
     _const,  # pyright: ignore[reportPrivateUsage]
+    _round_up_lora_rank,  # pyright: ignore[reportPrivateUsage]
 )
 from server.utils.core import (
     CommandResult,
@@ -37,8 +42,10 @@ from server.utils.core import (
     StreamChunkProgress,
     SuccessDownloadPacket,
 )
+from server.utils.docker_image_version import newest_docker_tag
 from server.utils.exceptions import AppError
 from server.utils.hardware import NvidiaGpuInfo
+from tests.unit.server.real_docker_tags import real_tags
 
 
 @pytest.fixture
@@ -48,6 +55,11 @@ def deps() -> dict[str, Any]:
     hw.gpus = []
     hw.nvidia_gpus = []
     hw.intel_gpus = []
+    hw.gpu_load_lock = asyncio.Lock()
+    finetune_service = MagicMock(spec=FinetuneService)
+    finetune_service.get_installed_base_url.return_value = "http://df-finetune:8333"
+    services_manager = MagicMock()
+    services_manager.services = {"finetune": finetune_service}
     return {
         "config": MagicMock(),
         "endpoint_registry": MagicMock(),
@@ -55,6 +67,7 @@ def deps() -> dict[str, Any]:
         "model_downloader": MagicMock(),
         "docker_service": MagicMock(),
         "hardware": hw,
+        "services_manager": services_manager,
     }
 
 
@@ -79,6 +92,7 @@ def _make_model_installed_info(
 ) -> ModelInstalledInfo:
     docker = MagicMock()
     docker.name = f"df-vllm-{model_id}"
+    docker.container_name = f"df-vllm-{model_id}"
     return ModelInstalledInfo(
         id=model_id,
         registered_name=model_id,
@@ -93,6 +107,23 @@ def _make_model_installed_info(
         gpu_memory_utilization=gpu_memory_utilization,
         model_type=model_type,  # type: ignore[arg-type]
     )
+
+
+def _mock_adapter_registry_session_cls(status: int, json_data: dict[str, Any] | None = None) -> MagicMock:
+    """Build a mock `aiohttp.ClientSession` class whose `session.get(url)` yields a mock response."""
+    mock_response = AsyncMock()
+    mock_response.status = status
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = AsyncMock(return_value=json_data or {})
+    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+    mock_response.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session = AsyncMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    mock_session.get = MagicMock(return_value=mock_response)
+
+    return MagicMock(return_value=mock_session)
 
 
 def _setup_install_mocks(svc: VllmService, deps: dict[str, Any], hardware: str | bool | None = False) -> InstalledInfo:
@@ -161,24 +192,24 @@ def test_get_model_spec_baseline_fields(svc: VllmService) -> None:
     spec = svc.get_model_spec("default", "llm")
 
     field_names = [f.name for f in spec.fields]
-    for expected in ("alias", "max_model_length", "quantization", "extra_args", "extra_envs"):
+    for expected in ("rename", "max_model_length", "quantization", "extra_args", "extra_envs"):
         assert expected in field_names
 
 
-def test_get_model_spec_adds_gpu_memory_utilization_for_gpu_hardware(svc: VllmService) -> None:
+def test_get_model_spec_adds_gpu_priority_for_gpu_hardware(svc: VllmService) -> None:
     svc.instances_info["default"].config.options = InstallServiceIn(spec={"hardware": True})
 
     spec = svc.get_model_spec("default", "llm")
 
-    field_names = [f.name for f in spec.fields]
-    assert "gpu_memory_utilization" in field_names
+    field = next(f for f in spec.fields if f.name == "gpu_priority")
+    assert field.type == "gpu-priority"
 
 
-def test_get_model_spec_omits_gpu_memory_utilization_for_cpu_hardware(svc: VllmService) -> None:
+def test_get_model_spec_omits_gpu_priority_for_cpu_hardware(svc: VllmService) -> None:
     spec = svc.get_model_spec("default", "llm")
 
     field_names = [f.name for f in spec.fields]
-    assert "gpu_memory_utilization" not in field_names
+    assert "gpu_priority" not in field_names
 
 
 def test_get_model_spec_reranker_default_extra_args(svc: VllmService) -> None:
@@ -206,6 +237,33 @@ def test_model_installed_info_get_info() -> None:
     info = model.get_info()
 
     assert info.registration_id == "reg-42"
+
+
+def test_model_installed_info_get_info_keeps_legacy_gpu_memory_utilization_spec_key() -> None:
+    model = _make_model_installed_info()
+    model.options.spec = {"gpu_memory_utilization": 0.5}
+
+    info = model.get_info()
+
+    assert info.spec == {"gpu_memory_utilization": 0.5}
+
+
+def test_carry_over_edited_install_options_keeps_legacy_absolute_utilization(svc: VllmService) -> None:
+    """The edit form only renders gpu_priority, so a legacy absolute value must survive an unrelated edit."""
+    old = InstallModelIn(spec={"gpu_memory_utilization": 0.3, "prefix": "old"})
+    new = InstallModelIn(spec={"prefix": "new"})
+
+    result = svc._carry_over_edited_install_options(old, new)  # pyright: ignore[reportPrivateUsage]
+
+    assert result.spec == {"prefix": "new", "gpu_memory_utilization": 0.3}
+    assert new.spec == {"prefix": "new"}
+
+
+def test_carry_over_edited_install_options_lets_new_priority_replace_legacy_value(svc: VllmService) -> None:
+    old = InstallModelIn(spec={"gpu_memory_utilization": 0.3})
+    new = InstallModelIn(spec={"gpu_priority": 0.5})
+
+    assert svc._carry_over_edited_install_options(old, new) is new  # pyright: ignore[reportPrivateUsage]
 
 
 def test_get_installed_info_returns_spec_when_installed(svc: VllmService) -> None:
@@ -246,6 +304,17 @@ def test_generate_instance_config_with_info(svc: VllmService) -> None:
     assert len(config.models or []) == 1
 
 
+def test_generate_instance_config_persists_resolved_container_name(svc: VllmService) -> None:
+    """Resolved container name round-trips into the persisted ModelConfig."""
+    info = _make_installed_info()
+    info.models["m1"] = _make_model_installed_info("m1")
+    info.models["m1"].docker.container_name = "pinned-container-name"
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert (config.models or [])[0].container_name == "pinned-container-name"
+
+
 def test_generate_instance_config_embeds_definition_when_in_registry(svc: VllmService) -> None:
     info = _make_installed_info()
     info.models["m1"] = _make_model_installed_info("m1")
@@ -266,6 +335,10 @@ def test_generate_instance_config_embeds_definition_when_in_registry(svc: VllmSe
         "size": "1 GB",
         "custom": None,
         "model_type": "llm",
+        "adapter_id": None,
+        "lora_rank": None,
+        "supports_vision": None,
+        "supports_audio": None,
     }
 
 
@@ -286,11 +359,88 @@ def test_restore_model_definition_reinstates_model(svc: VllmService) -> None:
     assert svc.models["default"]["ghost-model"] == VllmModel(hf_id="ghost-model", size="2 GB")
 
 
+def test_reload_instance_models_syncs_installed_registration_modality_support(svc: VllmService, deps: dict[str, Any]) -> None:
+    """A catalog refresh must re-sync an already-installed model's registered modality support.
+
+    Otherwise a fix that corrects `classify_modality_support`'s output (or a regenerated static
+    catalog) never reaches a model that was already installed before the refresh - it would keep
+    whatever was captured at install time forever.
+    """
+    installed = _make_installed_info()
+    model_id = next(iter(svc.models["default"]))
+    installed.models[model_id] = _make_model_installed_info(model_id, registration_id="reg-1")
+    svc.instances_info["default"].installed = installed
+
+    refreshed_model = svc.models["default"][model_id].model_copy(update={"supports_vision": True, "supports_audio": True})
+
+    with patch.dict(_const.models, {model_id: refreshed_model}):
+        svc._reload_instance_models("default")  # pyright: ignore[reportPrivateUsage]
+
+    deps["endpoint_registry"].update_modality_support.assert_called_once_with("reg-1", supports_vision=True, supports_audio=True)
+
+
+def test_reload_instance_models_skips_sync_when_not_registered(svc: VllmService, deps: dict[str, Any]) -> None:
+    """No registration id (e.g. a model mid-install) means nothing to update yet."""
+    installed = _make_installed_info()
+    model_id = next(iter(svc.models["default"]))
+    installed.models[model_id] = _make_model_installed_info(model_id, registration_id="")
+    svc.instances_info["default"].installed = installed
+
+    svc._reload_instance_models("default")  # pyright: ignore[reportPrivateUsage]
+
+    deps["endpoint_registry"].update_modality_support.assert_not_called()
+
+
 def test_load_download_info(svc: VllmService) -> None:
     result = svc._load_download_info({"model_path": "/tmp/x"})  # pyright: ignore[reportPrivateUsage]
 
     assert isinstance(result, DownloadedInfo)
     assert result.model_path == "/tmp/x"
+
+
+@pytest.fixture(autouse=True)
+def _x86_host() -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]
+    with patch("platform.machine", return_value="x86_64"):
+        yield
+
+
+@pytest.mark.parametrize("machine", ["arm64", "aarch64"])
+def test_arm_host_without_gpu_is_supported_despite_no_avx512(deps: dict[str, Any], machine: str) -> None:
+    deps["hardware"].cpu.avx512 = False
+    deps["hardware"].gpus = []
+    svc = VllmService(**deps)
+
+    with patch("platform.machine", return_value=machine):
+        assert svc.get_hardware_unsupported_reason() is None
+        assert "cpu" in svc.get_size()
+
+
+def _hardware_option_values(svc: VllmService) -> list[str]:
+    field = next(f for f in svc.get_spec().fields if f.name == "hardware")
+    return [v if isinstance(v, str) else v.value for v in field.values or []]
+
+
+def test_get_spec_hides_cpu_option_on_x86_without_avx512_even_with_gpu(deps: dict[str, Any]) -> None:
+    deps["hardware"].cpu.avx512 = False
+    deps["hardware"].gpus = [MagicMock(spec=NvidiaGpuInfo)]
+    svc = VllmService(**deps)
+
+    options = _hardware_option_values(svc)
+
+    assert "CPU" not in options
+
+
+@pytest.mark.parametrize("machine", ["arm64", "aarch64"])
+@patch("platform.machine")
+def test_get_spec_offers_cpu_option_on_arm_without_avx512(mock_machine: MagicMock, deps: dict[str, Any], machine: str) -> None:
+    mock_machine.return_value = machine
+    deps["hardware"].cpu.avx512 = False
+    deps["hardware"].gpus = []
+    svc = VllmService(**deps)
+
+    options = _hardware_option_values(svc)
+
+    assert "CPU" in options
 
 
 def test_is_given_hardware_support_gpu_raises_400_no_avx512_no_gpu(deps: dict[str, Any]) -> None:
@@ -400,6 +550,24 @@ def test_add_custom_model_registers_revision(svc: VllmService) -> None:
     svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
 
     assert svc.models["default"]["my-model-rev"].revision == "quantized-awq"
+
+
+def test_add_custom_model_registers_adapter_fields(svc: VllmService) -> None:
+    custom = CustomModel(
+        id="c-1c",
+        data={
+            "id": "pirate-bot",
+            "hf_id": "Qwen/Qwen3-8B",
+            "size": "16GB",
+            "adapter_id": "pirate-llama",
+            "lora_rank": 16,
+        },
+    )
+
+    svc._add_custom_model("default", custom)  # pyright: ignore[reportPrivateUsage]
+
+    assert svc.models["default"]["pirate-bot"].adapter_id == "pirate-llama"
+    assert svc.models["default"]["pirate-bot"].lora_rank == 16
 
 
 def test_add_custom_model_duplicate_raises_400(svc: VllmService) -> None:
@@ -679,8 +847,183 @@ async def test_get_gpu_memory_utilization_reuses_persisted_value_instead_of_live
     deps["hardware"].get_realtime_stats.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_applies_priority_to_available_vram(svc: VllmService, deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.45
+    assert svc.gpu_memory_utilization == 0.45
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_applies_priority_to_currently_free_vram(svc: VllmService, deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.4
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=4.0, gpus=None))
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.27
+    assert svc.gpu_memory_utilization == pytest.approx(0.67)
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_priority_path_still_enforces_total_limit(svc: VllmService, deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.95
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_priority=0.5)
+
+    with pytest.raises(HTTPException) as exc:
+        await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc.value.status_code == 422
+    assert svc.gpu_memory_utilization == 0.95
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_rejects_priority_that_rounds_below_minimum(svc: VllmService, deps: dict[str, Any]) -> None:
+    """A tiny priority (or almost no free VRAM) must not start the engine with 0 utilization."""
+    svc.gpu_memory_utilization = 0.0
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=9.5, gpus=None))
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_priority=0.01)
+
+    with pytest.raises(HTTPException) as exc:
+        await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc.value.status_code == 422
+    assert svc.gpu_memory_utilization == 0.0
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_priority_wins_over_model_default(svc: VllmService, deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = VllmModel(hf_id="google/test", size="1GB", gpu_memory_utilization=0.8)
+    opts = VllmModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.45
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_explicit_absolute_value_wins_over_priority(svc: VllmService, deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_memory_utilization=0.3, gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.3
+    deps["hardware"].get_realtime_stats.assert_not_called()
+
+
+@pytest.mark.parametrize("priority", [0.0, 0.005, -0.1, 1.5])
+def test_model_options_reject_out_of_range_gpu_priority(priority: float) -> None:
+    with pytest.raises(ValidationError):
+        VllmModelOptions(gpu_priority=priority)
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_priority_never_exceeds_available_vram(svc: VllmService, deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_priority=1.0)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.9
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_reuses_persisted_value_over_priority(svc: VllmService, deps: dict[str, Any]) -> None:
+    """A persisted value must win over recomputing from priority, for the same reload-stability reason as the default."""
+    svc.gpu_memory_utilization = 0.0
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id="google/test", options=InstallModelIn(spec={"gpu_priority": 1.0}), gpu_memory_utilization=0.33)]
+    )
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_priority=1.0)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.33
+    deps["hardware"].get_realtime_stats.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_recomputes_when_priority_changed(svc: VllmService, deps: dict[str, Any]) -> None:
+    """A persisted value computed for a different priority must not silently override the new one."""
+    svc.gpu_memory_utilization = 0.0
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id="google/test", options=InstallModelIn(spec={"gpu_priority": 1.0}), gpu_memory_utilization=0.9)]
+    )
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.45
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_reuses_persisted_value_for_string_priority(svc: VllmService, deps: dict[str, Any]) -> None:
+    """The persisted spec is the raw request body, so a priority sent as a string must still match its parsed value."""
+    svc.gpu_memory_utilization = 0.0
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id="google/test", options=InstallModelIn(spec={"gpu_priority": "0.5"}), gpu_memory_utilization=0.33)]
+    )
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.33
+    deps["hardware"].get_realtime_stats.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_treats_legacy_zero_as_unset(svc: VllmService, deps: dict[str, Any]) -> None:
+    """The old free-text field allowed 0, which used to mean "unset" - it must not launch the engine with no memory."""
+    svc.gpu_memory_utilization = 0.0
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions(gpu_memory_utilization=0)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.9
+
+
+def test_get_persisted_model_gpu_memory_utilization_returns_none_for_unparseable_priority(svc: VllmService) -> None:
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id="google/test", options=InstallModelIn(spec={"gpu_priority": "high"}), gpu_memory_utilization=0.33)]
+    )
+
+    assert svc._get_persisted_model_gpu_memory_utilization("default", "google/test", None) is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_get_persisted_model_gpu_memory_utilization_returns_none_when_priority_was_reset(svc: VllmService) -> None:
+    """Resetting a priority back to unset must re-derive the default, not reuse the value sized for the old priority."""
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id="google/test", options=InstallModelIn(spec={"gpu_priority": 0.5}), gpu_memory_utilization=0.33)]
+    )
+
+    assert svc._get_persisted_model_gpu_memory_utilization("default", "google/test", None) is None  # pyright: ignore[reportPrivateUsage]
+
+
 def test_get_persisted_model_gpu_memory_utilization_returns_none_for_untracked_instance(svc: VllmService) -> None:
-    assert svc._get_persisted_model_gpu_memory_utilization("no-such-instance", "model") is None  # pyright: ignore[reportPrivateUsage]
+    assert svc._get_persisted_model_gpu_memory_utilization("no-such-instance", "model", None) is None  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
@@ -731,6 +1074,25 @@ def test_register_model_endpoint_llm_calls_chat_completion_proxy(svc: VllmServic
 
     assert deps["endpoint_registry"].register_chat_completion_as_proxy.call_count == 1
     assert deps["endpoint_registry"].register_rerank_as_proxy.call_count == 0
+
+
+def test_register_model_endpoint_forwards_modality_support(svc: VllmService, deps: dict[str, Any]) -> None:
+    model = VllmModel(hf_id="org/vlm", size="1GB", model_type="llm", supports_vision=True, supports_audio=None)
+    model_info = _make_model_installed_info("org/vlm", model_type="llm")
+
+    svc._register_model_endpoint(  # pyright: ignore[reportPrivateUsage]
+        model_info=model_info,
+        model=model,
+        registered_name="org/vlm",
+        model_id="org/vlm",
+        context_window=4096,
+        max_context_window=4096,
+        capacity=None,
+    )
+
+    call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
+    assert call_kwargs["props"].supports_vision is True
+    assert call_kwargs["props"].supports_audio is None
 
 
 def test_register_model_endpoint_reranker_calls_rerank_proxy(svc: VllmService, deps: dict[str, Any]) -> None:
@@ -819,6 +1181,17 @@ def test_get_image_false_returns_cpu_image(svc: VllmService) -> None:
     assert image == _const.images["cpu"]
 
 
+def test_get_default_docker_image_name_no_gpu_returns_cpu_image(svc: VllmService) -> None:
+    assert svc.get_default_docker_image_name() == _const.images["cpu"].name
+
+
+def test_get_default_docker_image_name_with_gpu_returns_gpu_image(deps: dict[str, Any]) -> None:
+    deps["hardware"].gpus = [MagicMock(spec=NvidiaGpuInfo)]
+    svc = VllmService(**deps)
+
+    assert svc.get_default_docker_image_name() == _const.images["gpu"].name
+
+
 @pytest.mark.asyncio
 async def test_install_model_returns_already_installed(svc: VllmService) -> None:
     installed = _make_installed_info()
@@ -880,6 +1253,36 @@ async def test_install_model_appends_revision_suffix_to_model_dir(svc: VllmServi
 
 
 @pytest.mark.asyncio
+@patch.object(VllmService, "get_specified_hardware_parts", return_value=[])
+@patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000")
+@patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096)
+@patch.object(VllmService, "_download_model_or_set_progress", new_callable=AsyncMock)
+async def test_install_model_passes_json_extra_arg_verbatim(
+    mock_download_model_or_set_progress: AsyncMock,
+    mock_get_model_dir_context_window: AsyncMock,
+    mock_get_base_url: MagicMock,
+    mock_get_specified_hardware_parts: MagicMock,
+    svc: VllmService,
+    deps: dict[str, Any],
+    tmp_path: Path,
+):
+    _setup_install_mocks(svc, deps)
+    mock_download_model_or_set_progress.return_value = tmp_path / "model"
+    model_id = next(iter(svc.models["default"]))
+    json_value = '{"method":"mtp","num_speculative_tokens":3}'
+    spec = {"extra_args": {"--speculative-config": json_value}}
+
+    promise = await svc._install_model("default", model_id, InstallModelIn(spec=spec))  # pyright: ignore[reportPrivateUsage]
+    await promise.wait()
+
+    assert deps["docker_service"].install_and_run_docker.call_count == 1
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert isinstance(docker_options.command, list)
+    idx = docker_options.command.index("--speculative-config")
+    assert docker_options.command[idx + 1] == json_value
+
+
+@pytest.mark.asyncio
 async def test_install_model_dedups_download_by_revision_aware_key(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
     """Two custom models sharing an hf_id but differing only by revision must not share a download dedup key.
 
@@ -900,6 +1303,116 @@ async def test_install_model_dedups_download_by_revision_aware_key(svc: VllmServ
 
     download_key = mock_download.call_args.args[1]
     assert download_key == "google-gemma-3-270m-it--quantized_awq"
+
+
+@pytest.mark.asyncio
+async def test_install_model_uses_container_name_override_when_given(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    _setup_install_mocks(svc, deps)
+    model_id = next(iter(svc.models["default"]))
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}), "pinned-name")  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "pinned-name"
+    deps["docker_service"].get_docker_container_name.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_install_model_falls_back_to_generated_container_name(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    _setup_install_mocks(svc, deps)
+    model_id = next(iter(svc.models["default"]))
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == deps["docker_service"].get_docker_container_name.return_value
+
+
+@pytest.mark.asyncio
+async def test_install_model_downloads_and_mounts_lora_adapter(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """A model with `adapter_id` set must fetch the two safetensors files from the adapter registry,
+    mount them into the container, and pass the resolved rank/path to the vLLM command."""
+    _setup_install_mocks(svc, deps)
+    svc.models["default"]["pirate-bot"] = VllmModel(hf_id="Qwen/Qwen3-8B", size="16GB", adapter_id="pirate-llama", lora_rank=16)
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = "http://df-finetune:8333"
+    download_calls: list[tuple[str, str | None]] = []
+
+    def mock_adapter_downloader_cls(secret: str) -> MagicMock:
+        downloader = MagicMock()
+
+        async def mock_download(  # type: ignore[misc]
+            download_url: str, model_dir: Path, temp_dir: Path, filename: str | None = None, revision: str | None = None
+        ):
+            download_calls.append((download_url, filename))
+            yield SuccessDownloadPacket(local_path=model_dir / (filename or "file"), filename=filename or "file")
+
+        downloader.download = mock_download
+        return downloader
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch("server.services.vllm_service.AdapterRegistryDownloader", side_effect=mock_adapter_downloader_cls),
+        patch.object(
+            svc,
+            "_fetch_adapter_metadata",
+            new_callable=AsyncMock,
+            return_value=AdapterMetadata(base_model="Qwen/Qwen3-8B", rank=16, created=1_700_000_000),
+        ),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", "pirate-bot", InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    urls = {url for url, _ in download_calls}
+    assert urls == {
+        "http://df-finetune:8333/v1/adapters/pirate-llama/safetensors/adapter_config.json",
+        "http://df-finetune:8333/v1/adapters/pirate-llama/safetensors/adapter_model.safetensors",
+    }
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert any("adapter-pirate_llama" in volume and "/mnt/hf/loras/pirate_llama" in volume for volume in docker_options.volumes)
+    assert "--enable-lora" in docker_options.command
+    command = docker_options.command
+    assert isinstance(command, list)
+    assert command[command.index("--lora-modules") + 1] == "pirate-bot=/mnt/hf/loras/pirate_llama"
+    assert command[command.index("--max-lora-rank") + 1] == "16"
+    assert svc.models_downloaded["pirate-bot"].adapter_path is not None
+
+
+@pytest.mark.asyncio
+async def test_install_model_raises_400_when_adapter_registry_not_configured(
+    svc: VllmService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    _setup_install_mocks(svc, deps)
+    svc.models["default"]["pirate-bot"] = VllmModel(hf_id="Qwen/Qwen3-8B", size="16GB", adapter_id="pirate-llama", lora_rank=16)
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = None
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+    ):
+        promise = await svc._install_model("default", "pirate-bot", InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(HTTPException) as exc_info:
+            await promise.wait()
+
+    assert exc_info.value.status_code == 400
 
 
 def test_purge_stale_download_removes_old_directory_when_path_changed(svc: VllmService, tmp_path: Path) -> None:
@@ -925,6 +1438,31 @@ def test_purge_stale_download_keeps_directory_when_path_unchanged(svc: VllmServi
 
 def test_purge_stale_download_noop_when_nothing_downloaded_yet(svc: VllmService, tmp_path: Path) -> None:
     svc._purge_stale_download("custom-model", tmp_path / "model")  # pyright: ignore[reportPrivateUsage]
+
+
+def test_purge_stale_download_removes_old_adapter_directory_when_adapter_changed(svc: VllmService, tmp_path: Path) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    old_adapter_dir = tmp_path / "adapter-old"
+    old_adapter_dir.mkdir()
+    new_adapter_dir = tmp_path / "adapter-new"
+    svc.models_downloaded["custom-model"] = DownloadedInfo(model_path=str(model_dir), adapter_path=str(old_adapter_dir))
+
+    svc._purge_stale_download("custom-model", model_dir, new_adapter_dir)  # pyright: ignore[reportPrivateUsage]
+
+    assert not old_adapter_dir.exists()
+
+
+def test_purge_stale_download_keeps_adapter_directory_when_unchanged(svc: VllmService, tmp_path: Path) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    svc.models_downloaded["custom-model"] = DownloadedInfo(model_path=str(model_dir), adapter_path=str(adapter_dir))
+
+    svc._purge_stale_download("custom-model", model_dir, adapter_dir)  # pyright: ignore[reportPrivateUsage]
+
+    assert adapter_dir.exists()
 
 
 @pytest.mark.asyncio
@@ -1122,7 +1660,7 @@ async def test_install_model_records_model_as_downloaded(svc: VllmService, deps:
 
 
 @pytest.mark.asyncio
-async def test_install_model_uses_alias_as_registered_name(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+async def test_install_model_uses_rename_as_registered_name(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
     installed = _setup_install_mocks(svc, deps)
     model_id = next(iter(svc.models["default"]))
 
@@ -1132,7 +1670,7 @@ async def test_install_model_uses_alias_as_registered_name(svc: VllmService, dep
         patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
         patch.object(svc, "get_specified_hardware_parts", return_value=[]),
     ):
-        promise = await svc._install_model("default", model_id, InstallModelIn(spec={"alias": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={"rename": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
         await promise.wait()
 
     assert installed.models[model_id].registered_name == "my-alias"
@@ -1338,6 +1876,44 @@ async def test_install_model_retries_with_suggested_max_len_on_kv_cache_error(
     assert deps["docker_service"].install_and_run_docker.call_count == 2
     register_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
     assert register_kwargs["props"].context_window == 110256
+
+
+@pytest.mark.asyncio
+@patch.object(VllmService, "get_specified_hardware_parts")
+@patch.object(VllmService, "is_given_hardware_support_gpu", return_value=True)
+@patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000")
+@patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=131072)
+@patch.object(VllmService, "_download_model_or_set_progress", new_callable=AsyncMock)
+async def test_install_model_keeps_json_extra_arg_verbatim_on_kv_cache_retry(
+    mock_download_model_or_set_progress: AsyncMock,
+    mock_get_model_dir_context_window: AsyncMock,
+    mock_get_base_url: MagicMock,
+    mock_is_given_hardware_support_gpu: MagicMock,
+    mock_get_specified_hardware_parts: MagicMock,
+    deps: dict[str, Any],
+    tmp_path: Path,
+):
+    nvidia = MagicMock(spec=NvidiaGpuInfo)
+    deps["hardware"].gpus = [nvidia]
+    gpu_svc = VllmService(**deps)
+    _setup_install_mocks(gpu_svc, deps, hardware=True)
+    kv_cache_error = AppError("the estimated maximum model length is 110256.")
+    deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=[kv_cache_error, (8000, True, False)])
+    deps["docker_service"].stop_docker = AsyncMock()
+    mock_download_model_or_set_progress.return_value = tmp_path / "model"
+    mock_get_specified_hardware_parts.return_value = [nvidia]
+    model_id = next(iter(gpu_svc.models["default"]))
+    json_value = '{"method":"mtp","num_speculative_tokens":3}'
+    spec = {"gpu_memory_utilization": 0.5, "extra_args": {"--speculative-config": json_value}}
+
+    promise = await gpu_svc._install_model("default", model_id, InstallModelIn(spec=spec))  # pyright: ignore[reportPrivateUsage]
+    await promise.wait()
+
+    assert deps["docker_service"].install_and_run_docker.call_count == 2
+    retried_command = deps["docker_service"].install_and_run_docker.call_args.args[0].command
+    assert isinstance(retried_command, list)
+    assert retried_command[retried_command.index("--max-model-len") + 1] == "110256"
+    assert retried_command[retried_command.index("--speculative-config") + 1] == json_value
 
 
 @pytest.mark.asyncio
@@ -1623,6 +2199,26 @@ async def test_uninstall_model_purges_files_and_downloaded_entry(svc: VllmServic
 
     assert not model_dir.exists()
     assert "test-model" not in svc.models_downloaded
+
+
+@pytest.mark.asyncio
+async def test_uninstall_model_purges_adapter_directory(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    installed = _make_installed_info()
+    model_dir = tmp_path / "model-dir"
+    model_dir.mkdir()
+    adapter_dir = tmp_path / "adapter-dir"
+    adapter_dir.mkdir()
+    model_info = _make_model_installed_info("pirate-bot")
+    model_info.model_path = model_dir
+    installed.models["pirate-bot"] = model_info
+    svc.instances_info["default"].installed = installed
+    svc.models_downloaded["pirate-bot"] = DownloadedInfo(model_path=str(model_dir), adapter_path=str(adapter_dir))
+    deps["docker_service"].uninstall_docker = AsyncMock()
+
+    await svc._uninstall_model("default", "pirate-bot", UninstallModelIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert not adapter_dir.exists()
+    assert "pirate-bot" not in svc.models_downloaded
 
 
 @pytest.mark.asyncio
@@ -1987,6 +2583,68 @@ def test_build_vllm_command_no_gpu_with_model_length(svc: VllmService, tmp_path:
     assert "2048" in cmd
 
 
+def test_build_vllm_command_adds_lora_flags_when_adapter_given(svc: VllmService, tmp_path: Path) -> None:
+    opts = VllmModelOptions.model_construct(extra_args={})
+    adapter_path = tmp_path / "adapter"
+
+    cmd = svc._build_vllm_command(  # pyright: ignore[reportPrivateUsage]
+        docker_model_path=tmp_path / "model",
+        model_id="pirate-bot",
+        opts=opts,
+        quantization=None,
+        gpu_memory_utilization=None,
+        user_model_length=None,
+        use_gpu=True,
+        docker_adapter_path=adapter_path,
+        lora_rank=16,
+    )
+
+    assert "--enable-lora" in cmd
+    assert "--lora-modules" in cmd
+    assert f"pirate-bot={adapter_path}" in cmd
+    assert "--max-lora-rank" in cmd
+    assert "16" in cmd
+
+
+def test_build_vllm_command_adds_lora_flags_without_rank_when_adapter_given_but_no_rank(svc: VllmService, tmp_path: Path) -> None:
+    opts = VllmModelOptions.model_construct(extra_args={})
+    adapter_path = tmp_path / "adapter"
+
+    cmd = svc._build_vllm_command(  # pyright: ignore[reportPrivateUsage]
+        docker_model_path=tmp_path / "model",
+        model_id="pirate-bot",
+        opts=opts,
+        quantization=None,
+        gpu_memory_utilization=None,
+        user_model_length=None,
+        use_gpu=True,
+        docker_adapter_path=adapter_path,
+        lora_rank=None,
+    )
+
+    assert "--enable-lora" in cmd
+    assert "--lora-modules" in cmd
+    assert "--max-lora-rank" not in cmd
+
+
+def test_build_vllm_command_omits_lora_flags_when_no_adapter(svc: VllmService, tmp_path: Path) -> None:
+    opts = VllmModelOptions.model_construct(extra_args={})
+
+    cmd = svc._build_vllm_command(  # pyright: ignore[reportPrivateUsage]
+        docker_model_path=tmp_path / "model",
+        model_id="google/test",
+        opts=opts,
+        quantization=None,
+        gpu_memory_utilization=None,
+        user_model_length=None,
+        use_gpu=True,
+    )
+
+    assert "--enable-lora" not in cmd
+    assert "--lora-modules" not in cmd
+    assert "--max-lora-rank" not in cmd
+
+
 @pytest.mark.asyncio
 async def test_download_model_raises_500_when_no_success_packet(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
     model = VllmModel(hf_id="google/test", size="100MB")
@@ -2218,11 +2876,138 @@ async def test_resolve_custom_model_size_returns_none_on_exception(svc: VllmServ
 
 
 @pytest.mark.asyncio
-async def test_validate_custom_model_skips_when_no_hf_id(svc: VllmService, deps: dict[str, Any]) -> None:
-    with patch("server.services.vllm_service.validate_model_compatibility", new=AsyncMock()) as mock_validate:
+async def test_validate_custom_model_raises_when_neither_hf_id_nor_adapter_id(svc: VllmService, deps: dict[str, Any]) -> None:
+    with (
+        patch("server.services.vllm_service.validate_model_compatibility", new=AsyncMock()) as mock_validate,
+        pytest.raises(HTTPException) as exc_info,
+    ):
         await svc._validate_custom_model({})  # pyright: ignore[reportPrivateUsage]
 
+    assert exc_info.value.status_code == 400
     mock_validate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_validate_custom_model_resolves_hf_id_and_rank_from_adapter_registry(svc: VllmService, deps: dict[str, Any]) -> None:
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = "http://df-finetune:8333"
+    deps["config"].adapter_registry_secret.get_secret_value.return_value = "secret-token"
+    mock_session_cls = _mock_adapter_registry_session_cls(
+        200, {"base_model": "Qwen/Qwen3-8B", "formats": ["safetensors"], "lora": {"rank": 16}}
+    )
+    spec: dict[str, Any] = {"adapter_id": "pirate-llama", "skip_validation": True}
+
+    with patch("server.services.vllm_service.aiohttp.ClientSession", mock_session_cls):
+        await svc._validate_custom_model(spec)  # pyright: ignore[reportPrivateUsage]
+
+    assert spec["hf_id"] == "Qwen/Qwen3-8B"
+    assert spec["lora_rank"] == 16
+    mock_session_cls.return_value.get.assert_called_once_with("http://df-finetune:8333/v1/adapters/pirate-llama")
+
+
+@pytest.mark.asyncio
+async def test_validate_custom_model_returns_when_adapter_resolution_leaves_hf_id_unset(svc: VllmService) -> None:
+    spec: dict[str, Any] = {"adapter_id": "pirate-llama"}
+
+    with patch.object(svc, "_resolve_adapter_metadata", new=AsyncMock()):
+        await svc._validate_custom_model(spec)  # pyright: ignore[reportPrivateUsage]
+
+    assert spec == {"adapter_id": "pirate-llama"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [aiohttp.ClientError("connection refused"), TimeoutError()])
+async def test_resolve_adapter_metadata_raises_on_client_error(svc: VllmService, deps: dict[str, Any], error: Exception) -> None:
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = "http://df-finetune:8333"
+    mock_session_cls = MagicMock()
+    mock_session = AsyncMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    mock_session.get = MagicMock(side_effect=error)
+    mock_session_cls.return_value = mock_session
+
+    with (
+        patch("server.services.vllm_service.aiohttp.ClientSession", mock_session_cls),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc._resolve_adapter_metadata({}, "pirate-llama")  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_resolve_adapter_metadata_raises_when_finetune_not_installed(svc: VllmService, deps: dict[str, Any]) -> None:
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = None
+
+    with pytest.raises(HTTPException) as exc_info:
+        await svc._resolve_adapter_metadata({}, "pirate-llama")  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_resolve_adapter_metadata_raises_on_404(svc: VllmService, deps: dict[str, Any]) -> None:
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = "http://df-finetune:8333"
+    mock_session_cls = _mock_adapter_registry_session_cls(404)
+
+    with (
+        patch("server.services.vllm_service.aiohttp.ClientSession", mock_session_cls),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc._resolve_adapter_metadata({}, "missing-adapter")  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_resolve_adapter_metadata_raises_when_no_safetensors_format(svc: VllmService, deps: dict[str, Any]) -> None:
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = "http://df-finetune:8333"
+    mock_session_cls = _mock_adapter_registry_session_cls(200, {"base_model": "Qwen/Qwen3-8B", "formats": ["gguf"], "lora": {"rank": 16}})
+
+    with (
+        patch("server.services.vllm_service.aiohttp.ClientSession", mock_session_cls),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc._resolve_adapter_metadata({}, "gguf-only-adapter")  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"formats": ["safetensors"], "lora": {}},
+        {"base_model": "Qwen/Qwen3-8B", "formats": ["safetensors"], "lora": {"rank": "16"}},
+        {"base_model": "Qwen/Qwen3-8B", "formats": ["safetensors"], "lora": {"rank": True}},
+        {"base_model": "Qwen/Qwen3-8B", "formats": ["safetensors"], "lora": {"rank": 0}},
+    ],
+)
+async def test_resolve_adapter_metadata_raises_when_missing_base_model_or_invalid_rank(
+    svc: VllmService, deps: dict[str, Any], payload: dict[str, Any]
+) -> None:
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = "http://df-finetune:8333"
+    mock_session_cls = _mock_adapter_registry_session_cls(200, payload)
+
+    with (
+        patch("server.services.vllm_service.aiohttp.ClientSession", mock_session_cls),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc._resolve_adapter_metadata({}, "incomplete-adapter")  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_validate_custom_model_does_not_call_adapter_registry_when_adapter_id_absent(svc: VllmService, deps: dict[str, Any]) -> None:
+    mock_session_cls = _mock_adapter_registry_session_cls(200, {})
+
+    with (
+        patch("server.services.vllm_service.aiohttp.ClientSession", mock_session_cls),
+        patch("server.services.vllm_service.validate_model_compatibility", new=AsyncMock(return_value=None)),
+    ):
+        await svc._validate_custom_model({"hf_id": "org/model"})  # pyright: ignore[reportPrivateUsage]
+
+    mock_session_cls.return_value.get.assert_not_called()
 
 
 @pytest.mark.parametrize("skip_validation", [True, "true", "True", "1", "yes"])
@@ -3346,3 +4131,424 @@ async def test_sync_models_logs_warning_when_background_refresh_fails(svc: VllmS
         await asyncio.sleep(0)  # let the fire-and-forget task run
 
     mock_logger.warning.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_edit_model_install_options_keeps_legacy_gpu_utilization(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """An edit through the form (which only renders gpu_priority) must not drop a model's legacy absolute utilization."""
+    _setup_install_mocks(svc, deps)
+    deps["service_provider"].save_service_config = AsyncMock()
+    deps["service_provider"].dismiss_warnings_matching = AsyncMock()
+    deps["service_provider"].dismiss_warnings_matching_any = AsyncMock()
+    deps["docker_service"].uninstall_docker = AsyncMock()
+    model_id = next(iter(svc.models["default"]))
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.vllm_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+        patch("server.services.vllm_service.validate_model_compatibility", new=AsyncMock(return_value=None)),
+    ):
+        install_promise = await svc.install_model("default", model_id, InstallModelIn(spec={"gpu_memory_utilization": 0.3}))
+        await install_promise.wait()
+
+        was_installed, promise = await svc.edit_model_install_options("default", model_id, InstallModelIn(spec={"alias": "renamed"}))
+        result = await promise.wait()
+
+    assert was_installed is True
+    assert result.status == "OK"
+    installed = svc.get_instance_installed_info("default").models[model_id]
+    assert installed.options.spec == {"alias": "renamed", "gpu_memory_utilization": 0.3}
+
+
+def _write_cached_adapter(tmp_path: Path, created: str | None = None) -> Path:
+    adapter_dir = tmp_path / "adapter-pirate_llama"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text("{}")
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"old-weights")
+    if created is not None:
+        (adapter_dir / ".registry_created").write_text(created)
+    return adapter_dir
+
+
+def _mock_adapter_downloader(download_calls: list[str]) -> Callable[..., AsyncIterator[SuccessDownloadPacket]]:
+    async def mock_download(  # type: ignore[misc]
+        download_url: str, model_dir: Path, temp_dir: Path, filename: str | None = None, revision: str | None = None
+    ) -> AsyncIterator[SuccessDownloadPacket]:
+        download_calls.append(download_url)
+        yield SuccessDownloadPacket(local_path=model_dir / (filename or "file"), filename=filename or "file")
+
+    return mock_download
+
+
+def _adapter_model(lora_rank: int = 16) -> VllmModel:
+    return VllmModel(hf_id="Qwen/Qwen3-8B", size="16GB", adapter_id="pirate-llama", lora_rank=lora_rank)
+
+
+_ADAPTER_BASE_URL = "http://df-finetune:8333/v1/adapters/pirate-llama/safetensors"
+
+
+@pytest.mark.asyncio
+async def test_download_adapter_uses_on_disk_copy_when_registry_unavailable(svc: VllmService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """A reload at startup can run before the Finetune service has loaded - it must not need it."""
+    adapter_dir = _write_cached_adapter(tmp_path, created="1700000000")
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = None
+    model = _adapter_model()
+
+    with patch("server.services.vllm_service.AdapterRegistryDownloader") as downloader_cls:
+        local_dir, docker_dir = await svc._download_adapter(model, "pirate-llama", tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    assert local_dir == adapter_dir
+    assert docker_dir == Path(svc.hugging_face_cache_path) / "loras" / "pirate_llama"
+    assert (adapter_dir / "adapter_model.safetensors").read_bytes() == b"old-weights"
+    assert model.lora_rank == 16
+    downloader_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_download_adapter_keeps_on_disk_copy_when_registry_created_matches(svc: VllmService, tmp_path: Path) -> None:
+    _write_cached_adapter(tmp_path, created="1700000000")
+    metadata = AdapterMetadata(base_model="Qwen/Qwen3-8B", rank=16, created=1_700_000_000)
+
+    with (
+        patch.object(svc, "_fetch_adapter_metadata", new_callable=AsyncMock, return_value=metadata),
+        patch("server.services.vllm_service.AdapterRegistryDownloader") as downloader_cls,
+    ):
+        await svc._download_adapter(_adapter_model(), "pirate-llama", tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    downloader_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_download_adapter_redownloads_all_files_and_refreshes_rank_when_registry_created_differs(
+    svc: VllmService, tmp_path: Path
+) -> None:
+    """An adapter retrained under the same id must not be served from stale weights with a stale rank."""
+    adapter_dir = _write_cached_adapter(tmp_path, created="1700000000")
+    metadata = AdapterMetadata(base_model="Qwen/Qwen3-8B", rank=64, created=1_800_000_000)
+    download_calls: list[str] = []
+    model = _adapter_model(lora_rank=16)
+
+    with (
+        patch.object(svc, "_fetch_adapter_metadata", new_callable=AsyncMock, return_value=metadata),
+        patch("server.services.vllm_service.AdapterRegistryDownloader") as downloader_cls,
+    ):
+        downloader_cls.return_value.download = _mock_adapter_downloader(download_calls)
+        await svc._download_adapter(model, "pirate-llama", tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    assert download_calls == [f"{_ADAPTER_BASE_URL}/adapter_config.json", f"{_ADAPTER_BASE_URL}/adapter_model.safetensors"]
+    # the real downloader skips existing files, so the stale ones must be removed before downloading
+    assert not (adapter_dir / "adapter_model.safetensors").exists()
+    assert not (adapter_dir / "adapter_config.json").exists()
+    assert (adapter_dir / ".registry_created").read_text() == "1800000000"
+    assert model.lora_rank == 64
+
+
+@pytest.mark.asyncio
+async def test_download_adapter_redownloads_when_marker_missing(svc: VllmService, tmp_path: Path) -> None:
+    adapter_dir = _write_cached_adapter(tmp_path)
+    metadata = AdapterMetadata(base_model="Qwen/Qwen3-8B", rank=16, created=1_700_000_000)
+    download_calls: list[str] = []
+
+    with (
+        patch.object(svc, "_fetch_adapter_metadata", new_callable=AsyncMock, return_value=metadata),
+        patch("server.services.vllm_service.AdapterRegistryDownloader") as downloader_cls,
+    ):
+        downloader_cls.return_value.download = _mock_adapter_downloader(download_calls)
+        await svc._download_adapter(_adapter_model(), "pirate-llama", tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    assert len(download_calls) == 2
+    assert (adapter_dir / ".registry_created").read_text() == "1700000000"
+
+
+@pytest.mark.asyncio
+async def test_download_adapter_trusts_on_disk_copy_when_registry_created_unknown(svc: VllmService, tmp_path: Path) -> None:
+    adapter_dir = _write_cached_adapter(tmp_path)
+    metadata = AdapterMetadata(base_model="Qwen/Qwen3-8B", rank=16, created=None)
+
+    with (
+        patch.object(svc, "_fetch_adapter_metadata", new_callable=AsyncMock, return_value=metadata),
+        patch("server.services.vllm_service.AdapterRegistryDownloader") as downloader_cls,
+    ):
+        await svc._download_adapter(_adapter_model(), "pirate-llama", tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    downloader_cls.assert_not_called()
+    assert not (adapter_dir / ".registry_created").exists()
+
+
+@pytest.mark.asyncio
+async def test_download_adapter_fetches_only_missing_files(svc: VllmService, tmp_path: Path) -> None:
+    adapter_dir = tmp_path / "adapter-pirate_llama"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text("{}")
+    (adapter_dir / ".registry_created").write_text("1700000000")
+    metadata = AdapterMetadata(base_model="Qwen/Qwen3-8B", rank=16, created=1_700_000_000)
+    download_calls: list[str] = []
+
+    with (
+        patch.object(svc, "_fetch_adapter_metadata", new_callable=AsyncMock, return_value=metadata),
+        patch("server.services.vllm_service.AdapterRegistryDownloader") as downloader_cls,
+    ):
+        downloader_cls.return_value.download = _mock_adapter_downloader(download_calls)
+        await svc._download_adapter(_adapter_model(), "pirate-llama", tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    assert download_calls == [f"{_ADAPTER_BASE_URL}/adapter_model.safetensors"]
+
+
+@pytest.mark.asyncio
+async def test_download_adapter_raises_when_files_missing_and_registry_unavailable(
+    svc: VllmService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = None
+
+    with pytest.raises(HTTPException) as exc_info:
+        await svc._download_adapter(_adapter_model(), "pirate-llama", tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_download_adapter_raises_when_base_model_changed(svc: VllmService, tmp_path: Path) -> None:
+    _write_cached_adapter(tmp_path, created="1700000000")
+    metadata = AdapterMetadata(base_model="meta-llama/Llama-3.1-8B", rank=16, created=1_800_000_000)
+
+    with (
+        patch.object(svc, "_fetch_adapter_metadata", new_callable=AsyncMock, return_value=metadata),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc._download_adapter(_adapter_model(), "pirate-llama", tmp_path)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+    assert "meta-llama/Llama-3.1-8B" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("created", "expected"), [(1_700_000_000, 1_700_000_000), (0, None), (None, None), (True, None)])
+async def test_fetch_adapter_metadata_normalizes_created(
+    svc: VllmService, deps: dict[str, Any], created: object, expected: int | None
+) -> None:
+    deps["services_manager"].services["finetune"].get_installed_base_url.return_value = "http://df-finetune:8333"
+    payload = {"formats": ["safetensors"], "base_model": "Qwen/Qwen3-8B", "lora": {"rank": 16}, "created": created}
+    mock_session_cls = _mock_adapter_registry_session_cls(200, payload)
+
+    with patch("server.services.vllm_service.aiohttp.ClientSession", mock_session_cls):
+        metadata = await svc._fetch_adapter_metadata("pirate-llama")  # pyright: ignore[reportPrivateUsage]
+
+    assert metadata == AdapterMetadata(base_model="Qwen/Qwen3-8B", rank=16, created=expected)
+
+
+def test_purge_stale_download_keeps_old_adapter_directory_used_by_another_model(svc: VllmService, tmp_path: Path) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    shared_adapter_dir = tmp_path / "adapter-shared"
+    shared_adapter_dir.mkdir()
+    svc.models_downloaded["custom-model"] = DownloadedInfo(model_path=str(model_dir), adapter_path=str(shared_adapter_dir))
+    svc.models_downloaded["other-model"] = DownloadedInfo(model_path=str(model_dir), adapter_path=str(shared_adapter_dir))
+
+    svc._purge_stale_download("custom-model", model_dir, tmp_path / "adapter-new")  # pyright: ignore[reportPrivateUsage]
+
+    assert shared_adapter_dir.exists()
+
+
+def test_purge_stale_download_keeps_old_model_directory_used_by_another_model(svc: VllmService, tmp_path: Path) -> None:
+    shared_model_dir = tmp_path / "shared-model"
+    shared_model_dir.mkdir()
+    svc.models_downloaded["custom-model"] = DownloadedInfo(model_path=str(shared_model_dir))
+    svc.models_downloaded["other-model"] = DownloadedInfo(model_path=str(shared_model_dir))
+
+    svc._purge_stale_download("custom-model", tmp_path / "new-model")  # pyright: ignore[reportPrivateUsage]
+
+    assert shared_model_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_uninstall_model_purge_keeps_directories_used_by_another_model(
+    svc: VllmService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    """Two adapters on the same base model share its weights; purging one must not break the other."""
+    shared_model_dir = tmp_path / "model-dir"
+    shared_model_dir.mkdir()
+    shared_adapter_dir = tmp_path / "adapter-dir"
+    shared_adapter_dir.mkdir()
+    svc.instances_info["default"].installed = _make_installed_info()
+    svc.models_downloaded["pirate-bot"] = DownloadedInfo(model_path=str(shared_model_dir), adapter_path=str(shared_adapter_dir))
+    svc.models_downloaded["pirate-bot-2"] = DownloadedInfo(model_path=str(shared_model_dir), adapter_path=str(shared_adapter_dir))
+    deps["docker_service"].uninstall_docker = AsyncMock()
+
+    await svc._uninstall_model("default", "pirate-bot", UninstallModelIn(purge=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert shared_model_dir.exists()
+    assert shared_adapter_dir.exists()
+    assert "pirate-bot" not in svc.models_downloaded
+    assert "pirate-bot-2" in svc.models_downloaded
+
+
+@pytest.mark.parametrize(
+    ("rank", "expected"),
+    [(1, 1), (4, 8), (8, 8), (12, 16), (16, 16), (300, 320), (512, 512), (1024, 1024)],
+)
+def test_round_up_lora_rank(rank: int, expected: int) -> None:
+    assert _round_up_lora_rank(rank) == expected
+
+
+def test_build_vllm_command_rounds_lora_rank_up_to_vllm_allowed_value(svc: VllmService, tmp_path: Path) -> None:
+    cmd = svc._build_vllm_command(  # pyright: ignore[reportPrivateUsage]
+        docker_model_path=tmp_path / "model",
+        model_id="pirate-bot",
+        opts=VllmModelOptions.model_construct(extra_args={}),
+        quantization=None,
+        gpu_memory_utilization=None,
+        user_model_length=None,
+        use_gpu=True,
+        docker_adapter_path=tmp_path / "adapter",
+        lora_rank=12,
+    )
+
+    assert cmd[cmd.index("--max-lora-rank") + 1] == "16"
+
+
+@pytest.mark.asyncio
+async def test_resolve_adapter_metadata_raises_when_rank_above_vllm_maximum(svc: VllmService) -> None:
+    mock_session_cls = _mock_adapter_registry_session_cls(
+        200, {"base_model": "Qwen/Qwen3-8B", "formats": ["safetensors"], "lora": {"rank": 1024}}
+    )
+
+    with (
+        patch("server.services.vllm_service.aiohttp.ClientSession", mock_session_cls),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc._resolve_adapter_metadata({}, "huge-adapter")  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.parametrize("utilization", [-0.1, 1.5, float("nan"), float("inf")])
+def test_model_options_reject_invalid_legacy_gpu_memory_utilization(utilization: float) -> None:
+    with pytest.raises(ValidationError):
+        VllmModelOptions(gpu_memory_utilization=utilization)
+
+
+@pytest.mark.asyncio
+async def test_get_default_gpu_memory_utilization_warns_when_stats_unavailable(svc: VllmService, deps: dict[str, Any]) -> None:
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=None)
+
+    with patch("server.services.vllm_service.logger") as mock_logger:
+        result = await svc._get_default_gpu_memory_utilization()  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.9
+    mock_logger.warning.assert_called_once()
+
+
+def test_get_persisted_model_gpu_memory_utilization_prefers_value_kept_across_an_edit(svc: VllmService) -> None:
+    svc._edit_kept_gpu_utilization[("default", "google/test")] = 0.4  # pyright: ignore[reportPrivateUsage]
+
+    assert svc._get_persisted_model_gpu_memory_utilization("default", "google/test", 0.5) == 0.4  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_second_install_is_sized_only_after_the_first_container_is_healthy(deps: dict[str, Any], tmp_path: Path) -> None:
+    nvidia = MagicMock(spec=NvidiaGpuInfo)
+    deps["hardware"].gpus = [nvidia]
+    svc = VllmService(**deps)
+    loaded = False
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def stats(*_args: Any, **_kwargs: Any) -> GpuStats:
+        return GpuStats(total_vram_gb=10.0, used_vram_gb=4.0 if loaded else 0.0, gpus=None)
+
+    async def run_docker(options: Any) -> tuple[int, bool, bool]:
+        nonlocal loaded
+        if not first_started.is_set():
+            first_started.set()
+            await release_first.wait()  # the first container is still loading its weights
+            loaded = True
+        return 8000, True, False
+
+    deps["hardware"].get_realtime_stats = stats
+    deps["docker_service"].install_and_run_docker = run_docker
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "container"
+    svc.instances_info["default"].installed = _make_installed_info(hardware=True)
+    first_id, second_id = list(svc.models["default"])[:2]
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_get_quantization", new=AsyncMock(return_value=None)),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[nvidia]),
+        patch.object(svc, "is_given_hardware_support_gpu", return_value=True),
+    ):
+        first = await svc._install_model("default", first_id, InstallModelIn(spec={"gpu_memory_utilization": 0.4}))  # pyright: ignore[reportPrivateUsage]
+        second = await svc._install_model("default", second_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        first_task = asyncio.create_task(first.wait())
+        second_task = asyncio.create_task(second.wait())
+        await first_started.wait()
+        for _ in range(20):
+            await asyncio.sleep(0)  # the second one downloads meanwhile, but must wait for the first before sizing
+        assert svc.gpu_memory_utilization == 0.4  # nothing reserved for the second yet: no double counting while loading
+        release_first.set()
+        await asyncio.gather(first_task, second_task)
+
+    models = svc.instances_info["default"].installed.models  # pyright: ignore[reportOptionalMemberAccess]
+    assert models[second_id].gpu_memory_utilization == 0.54  # 0.9 * the 0.6 left once the first model is loaded
+    assert svc.gpu_memory_utilization == pytest.approx(0.94)
+
+
+@pytest.mark.asyncio
+async def test_cpu_install_does_not_wait_for_the_gpu_load_lock(deps: dict[str, Any], tmp_path: Path) -> None:
+    svc = VllmService(**deps)
+
+    async def run_docker(options: Any) -> tuple[int, bool, bool]:
+        return 8000, True, False
+
+    deps["docker_service"].install_and_run_docker = run_docker
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "container"
+    svc.instances_info["default"].installed = _make_installed_info(hardware=False)
+    model_id = next(iter(svc.models["default"]))
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_get_quantization", new=AsyncMock(return_value=None)),
+        patch("server.services.vllm_service.get_base_url", return_value="http://localhost:8000"),
+        patch.object(svc, "is_given_hardware_support_gpu", return_value=False),
+    ):
+        async with deps["hardware"].gpu_load_lock:  # a GPU model is loading right now
+            promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+            await asyncio.wait_for(promise.wait(), timeout=5)
+
+    assert model_id in svc.instances_info["default"].installed.models  # pyright: ignore[reportOptionalMemberAccess]
+
+
+def test_vllm_and_sglang_share_the_gpu_load_lock_of_hardware(deps: dict[str, Any]) -> None:
+    assert VllmService(**deps).hardware.gpu_load_lock is deps["hardware"].gpu_load_lock
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_raises_422_when_default_is_below_minimum(svc: VllmService, deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=10.0, gpus=None))
+    model = VllmModel(hf_id="google/test", size="1GB")
+    opts = VllmModelOptions()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 422
+    assert "Not enough free GPU memory" in exc_info.value.detail
+    assert svc.gpu_memory_utilization == 0.0
+
+
+@pytest.mark.parametrize(
+    ("installed", "max_cuda", "expected"),
+    [
+        ("v0.29.0-cu129-ubuntu2404", None, "v0.31.0-cu129-ubuntu2404"),
+        ("v0.29.0-cu129-ubuntu2404", (13, 4), "v0.31.0-cu129-ubuntu2404"),
+        ("v0.29.0-cu129", None, "v0.31.0-cu129"),
+    ],
+)
+def test_newest_tag_in_the_real_docker_hub_list(svc: VllmService, installed: str, max_cuda: tuple[int, int] | None, expected: str) -> None:
+    tags = svc.filter_docker_tags(real_tags("vllm"), "GPU")
+    assert newest_docker_tag(tags, installed, max_cuda) == expected

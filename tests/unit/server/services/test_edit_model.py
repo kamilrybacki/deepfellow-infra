@@ -48,6 +48,7 @@ def deps() -> dict[str, Any]:
         "model_downloader": MagicMock(),
         "docker_service": docker_svc,
         "hardware": MagicMock(gpus=[]),
+        "services_manager": MagicMock(),
     }
 
 
@@ -477,3 +478,51 @@ async def test_edit_model_install_options_logs_original_failure_when_rollback_su
             await svc.edit_model_install_options("default", "my-custom", InstallModelIn(spec={"prefix": "new-prefix"}))
         mock_logger.exception.assert_called_once()
         assert "failed to reinstall model" in mock_logger.exception.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_edit_model_install_options_reinstalls_with_carried_over_options(svc: CustomService) -> None:
+    """The `_carry_over_edited_install_options` hook sees the old options and its result is what gets reinstalled."""
+    await _add_and_install(svc)
+    carried = InstallModelIn(spec={"prefix": "new-prefix", "kept": "yes"})
+
+    with patch.object(svc, "_carry_over_edited_install_options", return_value=carried) as hook:
+        _, promise = await svc.edit_model_install_options("default", "my-custom", InstallModelIn(spec={"prefix": "new-prefix"}))
+        await promise.wait()
+
+    old_options, new_options = hook.call_args.args
+    assert old_options.spec == {"prefix": "my-custom"}
+    assert new_options.spec == {"prefix": "new-prefix"}
+    assert _installed_models(svc)["my-custom"].options.spec == {"prefix": "new-prefix", "kept": "yes"}
+
+
+async def _edit_capturing_kept_utilization(svc: CustomService, old_spec: dict[str, Any], new_spec: dict[str, Any]) -> float | None:
+    await _add_and_install(svc)
+    installed = _installed_models(svc)["my-custom"]
+    installed.options = InstallModelIn(spec=old_spec)
+    installed.gpu_memory_utilization = 0.4  # pyright: ignore[reportAttributeAccessIssue]
+    seen: list[float | None] = []
+
+    async def fake_install(instance: str, model_id: str, options: InstallModelIn) -> MagicMock:
+        seen.append(svc._edit_kept_gpu_utilization.get((instance, model_id)))  # pyright: ignore[reportPrivateUsage]
+        return MagicMock()
+
+    with patch.object(svc, "_install_model_and_wait", side_effect=fake_install):
+        await svc.edit_model_install_options("default", "my-custom", InstallModelIn(spec=new_spec))
+
+    assert ("default", "my-custom") not in svc._edit_kept_gpu_utilization  # pyright: ignore[reportPrivateUsage]
+    return seen[0]
+
+
+@pytest.mark.asyncio
+async def test_edit_model_install_options_keeps_gpu_utilization_when_priority_unchanged(svc: CustomService) -> None:
+    kept = await _edit_capturing_kept_utilization(svc, {"gpu_priority": "0.5"}, {"gpu_priority": 0.5, "prefix": "new-prefix"})
+
+    assert kept == 0.4
+
+
+@pytest.mark.asyncio
+async def test_edit_model_install_options_drops_gpu_utilization_when_priority_changed(svc: CustomService) -> None:
+    kept = await _edit_capturing_kept_utilization(svc, {"gpu_priority": 0.5}, {"gpu_priority": 0.8})
+
+    assert kept is None

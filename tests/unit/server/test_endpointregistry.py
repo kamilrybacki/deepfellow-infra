@@ -63,6 +63,8 @@ def make_props(
     endpoints: list[str] | None = None,
     context_window: int | None = None,
     max_context_window: int | None = None,
+    supports_vision: bool | None = None,
+    supports_audio: bool | None = None,
 ) -> ModelProps:
     return ModelProps(
         private=private,
@@ -70,6 +72,8 @@ def make_props(
         endpoints=endpoints or ["chat"],
         context_window=context_window,
         max_context_window=max_context_window,
+        supports_vision=supports_vision,
+        supports_audio=supports_audio,
     )
 
 
@@ -161,6 +165,65 @@ def test_add_model_creates_registration_and_returns_id():
     assert rid is not None
     assert "gpt-4" in ep.models
     assert rid in ep.models["gpt-4"]
+
+
+def test_add_model_with_alias_makes_model_reachable_under_both_names():
+    ep = make_endpoint()
+
+    rid = ep.add_model(
+        "gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local", alias="smart")
+    )
+
+    original = ep.get_model("gpt-4")
+    aliased = ep.get_model("smart")
+    assert original is not None
+    assert original is aliased
+    assert original.id == rid
+    assert {m.id for m in ep.get_models()} == {"gpt-4", "smart"}
+
+
+def test_add_model_alias_equal_to_model_id_is_ignored():
+    ep = make_endpoint()
+
+    ep.add_model("gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local", alias="gpt-4"))
+
+    assert list(ep.models) == ["gpt-4"]
+    assert len(ep.models["gpt-4"]) == 1
+
+
+def test_remove_model_with_alias_removes_both_names():
+    ep = make_endpoint()
+    rid = ep.add_model(
+        "gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local", alias="smart")
+    )
+
+    ep.remove_model("gpt-4", rid)
+
+    assert ep.models == {}
+    assert rid not in ep.registry
+
+
+def test_remove_model_with_alias_keeps_alias_for_other_registrations():
+    ep = make_endpoint()
+    first = ep.add_model(
+        "gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local", alias="smart")
+    )
+    second = ep.add_model(
+        "gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local", alias="smart")
+    )
+
+    ep.remove_model("gpt-4", first)
+
+    assert list(ep.models["smart"]) == [second]
+
+
+def test_list_models_reports_aliased_registration_once_under_primary_name():
+    ep = make_endpoint()
+    ep.add_model("gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local", alias="smart"))
+
+    listed = ep.list_models()
+
+    assert [m.name for m in listed] == ["gpt-4"]
 
 
 def test_add_model_uses_provided_registration_id():
@@ -1095,6 +1158,152 @@ def test_get_max_context_window_ignores_registrations_without_a_window():
     assert ep.get_max_context_window(ep.models["gpt-4"]) == 16000
 
 
+def test_get_model_supports_vision_true_when_any_registration_true():
+    ep = make_endpoint()
+    ep.add_model(
+        "vlm",
+        make_props(supports_vision=None),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-1"),
+    )
+    ep.add_model(
+        "vlm",
+        make_props(supports_vision=True),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-2"),
+    )
+
+    assert ep.get_model_supports_vision(ep.models["vlm"]) is True
+
+
+def test_get_model_supports_vision_false_when_all_registrations_false():
+    ep = make_endpoint()
+    ep.add_model(
+        "text-only",
+        make_props(supports_vision=False),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-1"),
+    )
+    ep.add_model(
+        "text-only",
+        make_props(supports_vision=False),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-2"),
+    )
+
+    assert ep.get_model_supports_vision(ep.models["text-only"]) is False
+
+
+def test_get_model_supports_vision_none_when_mixed_none_and_false():
+    ep = make_endpoint()
+    ep.add_model(
+        "unknown-model",
+        make_props(supports_vision=None),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-1"),
+    )
+    ep.add_model(
+        "unknown-model",
+        make_props(supports_vision=False),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-2"),
+    )
+
+    assert ep.get_model_supports_vision(ep.models["unknown-model"]) is None
+
+
+def test_get_model_supports_vision_none_when_undeclared():
+    ep = make_endpoint()
+    ep.add_model(
+        "custom-model",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "custom",
+        RegistrationOptions(origin="local", id="id-1"),
+    )
+
+    assert ep.get_model_supports_vision(ep.models["custom-model"]) is None
+
+
+def test_get_model_supports_audio_true_when_any_registration_true():
+    ep = make_endpoint()
+    ep.add_model(
+        "alm",
+        make_props(supports_audio=None),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-1"),
+    )
+    ep.add_model(
+        "alm",
+        make_props(supports_audio=True),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-2"),
+    )
+
+    assert ep.get_model_supports_audio(ep.models["alm"]) is True
+
+
+def test_build_api_model_includes_modality_support():
+    ep = make_endpoint()
+    ep.add_model(
+        "vlm",
+        make_props(supports_vision=True, supports_audio=False),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-1"),
+    )
+
+    api_model = ep._build_api_model("vlm", ep.models["vlm"])  # pyright: ignore[reportPrivateUsage]
+
+    assert api_model.props.supports_vision is True
+    assert api_model.props.supports_audio is False
+
+
+def test_build_api_model_sums_usage_and_capacity_across_registrations():
+    ep = make_endpoint()
+    for reg_id, usage in (("id-1", 2), ("id-2", 3)):
+        ep.add_model(
+            "llm-a",
+            make_props(),
+            SimpleEndpoint(on_request=AsyncMock()),
+            "llm",
+            RegistrationOptions(origin="local", id=reg_id, usage=usage, capacity_state=4),
+        )
+
+    api_model = ep._build_api_model("llm-a", ep.models["llm-a"])  # pyright: ignore[reportPrivateUsage]
+
+    assert api_model.usage == 5
+    assert api_model.capacity == 8
+
+
+def test_build_api_model_capacity_is_none_when_any_registration_is_not_finite():
+    ep = make_endpoint()
+    ep.add_model(
+        "llm-b",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-1", capacity_state=4),
+    )
+    ep.add_model(
+        "llm-b",
+        make_props(),
+        SimpleEndpoint(on_request=AsyncMock()),
+        "llm",
+        RegistrationOptions(origin="local", id="id-2", capacity_state="unbounded"),
+    )
+
+    assert ep._build_api_model("llm-b", ep.models["llm-b"]).capacity is None  # pyright: ignore[reportPrivateUsage]
+
+
 def test_get_models_returns_api_model_list():
     ep = make_endpoint()
     ep.add_model("gpt-4", make_props(), SimpleEndpoint(on_request=AsyncMock()), "llm", RegistrationOptions(origin="local"))
@@ -1934,6 +2143,38 @@ def test_update_warm_does_not_propagate_when_unchanged():
     assert reg.parent_infra.send_warm.call_count == 0  # pyright: ignore[reportAttributeAccessIssue]
 
 
+def test_update_modality_support_updates_props_in_place():
+    reg = make_registry()
+    ep = make_chat_endpoint()
+    rid = reg.register_chat_completion(
+        "gpt-4", make_props(supports_vision=None, supports_audio=None), ep, RegistrationOptions(origin="local")
+    )
+
+    reg.update_modality_support(rid, supports_vision=True, supports_audio=False)
+
+    props = reg.registry[rid].registered_model.props
+    assert props.supports_vision is True
+    assert props.supports_audio is False
+
+
+def test_update_modality_support_no_op_for_unknown_id():
+    reg = make_registry()
+    reg.update_modality_support("nonexistent", supports_vision=True, supports_audio=True)  # must not raise
+
+
+def test_update_modality_support_is_no_op_when_unchanged():
+    reg = make_registry()
+    ep = make_chat_endpoint()
+    rid = reg.register_chat_completion(
+        "gpt-4", make_props(supports_vision=True, supports_audio=None), ep, RegistrationOptions(origin="local")
+    )
+    original_props = reg.registry[rid].registered_model.props
+
+    reg.update_modality_support(rid, supports_vision=True, supports_audio=None)
+
+    assert reg.registry[rid].registered_model.props is original_props
+
+
 def test_update_models_sends_models_list_when_changed():
     reg = make_registry()
     new_model = Model(id="new-id", name="gpt-4", type="llm", props=make_props(), usage=0)
@@ -2108,7 +2349,7 @@ def test_register_proxy_llm_partial_v2_only():
 def test_register_proxy_unknown_type_logs_warning(caplog: pytest.LogCaptureFixture) -> None:
     reg = make_registry()
 
-    with caplog.at_level(logging.WARNING, logger="uvicorn.error"):
+    with caplog.at_level(logging.WARNING, logger="uvicorn"):
         reg._register_proxy(  # pyright: ignore[reportPrivateUsage]
             "x", "unknown-type", make_props(), "http://example.com/", "key", RegistrationOptions(origin="http://example.com/")
         )
@@ -4462,7 +4703,7 @@ async def test_post_json_responses_logs_and_passes_through_on_invalid_json(caplo
     opts = ProxyOptions(url="http://example.com/v1/responses")
 
     with (
-        caplog.at_level(logging.WARNING, logger="uvicorn.error"),
+        caplog.at_level(logging.WARNING, logger="uvicorn"),
         patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response),
     ):
         result = await post_json_responses(ResponsesRequest(model="gemma4:e4b", stream=False), opts, store)
@@ -4560,7 +4801,7 @@ async def test_post_json_rerank_sglang_logs_and_passes_through_on_malformed_body
     opts = ProxyOptions(url="http://example.com/v1/rerank")
 
     with (
-        caplog.at_level(logging.WARNING, logger="uvicorn.error"),
+        caplog.at_level(logging.WARNING, logger="uvicorn"),
         patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=mock_http_response),
     ):
         result = await post_json_rerank_sglang(RerankRequest(model="m", query="q", documents=[]), opts)
@@ -4695,3 +4936,133 @@ async def test_post_json_responses_captures_only_dict_items_from_output_list() -
 
     assert store.get("rs_871851") is not None
     assert store.get("fc_1") is not None
+
+
+@pytest.mark.asyncio
+async def test_register_mcp_endpoint_as_proxy_forwards_full_path_when_requested():
+    reg = make_registry()
+    opts = ProxyOptions(url="http://child.example.com/mcp", forward_full_path=True)
+    reg.register_mcp_endpoint_as_proxy("duck", make_props(), opts, None)
+    ep = reg.mcp_endpoints.get_model("duck")
+    request = MagicMock()
+    request.headers = {}
+    request.method = "POST"
+    request.path_params = {"full_path": "duck/mcp"}
+    request.stream = lambda: _async_byte_stream(b"")
+    request.url.query = ""
+
+    with patch("server.endpointregistry.make_http_request", new_callable=AsyncMock, return_value=MagicMock()) as mock_req:
+        await ep.endpoint.on_request(request)  # pyright: ignore[reportOptionalMemberAccess]
+
+    assert mock_req.call_args.kwargs["url"] == "http://child.example.com/mcp/duck/mcp"
+
+
+def test_register_proxy_mcp_forwards_protocol_headers_and_full_path():
+    reg = make_registry()
+
+    with patch.object(reg, "register_mcp_endpoint_as_proxy") as mock_register:
+        reg._register_proxy("duck", "mcp", make_props(), "http://child.example.com/", "key", None)  # pyright: ignore[reportPrivateUsage]
+
+    options = mock_register.call_args.kwargs["options"]
+    assert options.url == "http://child.example.com/mcp"
+    assert options.forward_full_path is True
+    assert options.allowed_request_headers == ["accept", "mcp-session-id"]
+    assert options.allowed_response_headers == ["accept", "mcp-session-id", "www-authenticate"]
+
+
+def test_register_proxy_mcp_uses_sse_proxy_for_sse_transport():
+    reg = make_registry()
+    props = make_props(type="mcp")
+    props.transport = "sse"
+
+    with (
+        patch.object(reg, "register_mcp_sse_endpoint_as_proxy") as mock_sse,
+        patch.object(reg, "register_mcp_endpoint_as_proxy") as mock_http,
+    ):
+        reg._register_proxy("duck", "mcp", props, "http://child.example.com/", "key", None)  # pyright: ignore[reportPrivateUsage]
+
+    assert mock_http.call_count == 0
+    assert mock_sse.call_args.kwargs["options"].url == "http://child.example.com/mcp/duck/sse"
+
+
+def test_list_models_reports_registration_health():
+    reg = make_registry()
+    reg.register_mcp_endpoint(
+        "duck", make_props(type="mcp"), McpEndpoint(on_request=AsyncMock()), RegistrationOptions(origin="local", healthy=True)
+    )
+
+    assert [m.healthy for m in reg.list_models()] == [True]
+
+
+def test_update_models_registers_mcp_as_healthy_from_peer():
+    reg = make_registry()
+    model = Model(id="mcp-id", name="duck", type="mcp", props=make_props(type="mcp"), usage=0, healthy=True)
+
+    reg.update_models([], [model], "http://child.example.com/", "key")
+
+    assert [m.id for m in reg.mcp_endpoints.get_healthy_models()] == ["duck"]
+
+
+def test_update_models_applies_health_and_props_change_in_place():
+    reg = make_registry()
+    old = Model(id="mcp-id", name="duck", type="mcp", props=make_props(type="mcp"), usage=0)
+    reg.update_models([], [old], "http://child.example.com/", "key")
+    reg.parent_infra.send_models_list.reset_mock()  # pyright: ignore[reportAttributeAccessIssue]
+    new = old.model_copy(update={"healthy": True, "props": make_props(type="mcp", endpoints=["/mcp/duck/mcp"])})
+
+    with patch.object(reg, "_register_proxy") as mock_register:
+        reg.update_models([old], [new], "http://child.example.com/", "key")
+
+    assert mock_register.call_count == 0
+    assert [m.id for m in reg.mcp_endpoints.get_healthy_models()] == ["duck"]
+    assert reg.registry["mcp-id"].registered_model.props.endpoints == ["/mcp/duck/mcp"]
+    assert reg.parent_infra.send_models_list.call_count == 1  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_update_models_reregisters_mcp_proxy_when_transport_changes():
+    reg = make_registry()
+    old = Model(id="mcp-id", name="duck", type="mcp", props=make_props(type="mcp"), usage=0, healthy=True)
+    reg.update_models([], [old], "http://child.example.com/", "key")
+    sse_props = make_props(type="mcp")
+    sse_props.transport = "sse"
+    new = old.model_copy(update={"props": sse_props})
+
+    with patch.object(reg, "_register_proxy") as mock_register:
+        reg.update_models([old], [new], "http://child.example.com/", "key")
+
+    assert mock_register.call_count == 1
+    assert mock_register.call_args.kwargs["props"].transport == "sse"
+
+
+@pytest.mark.asyncio
+async def test_register_mcp_endpoint_as_proxy_rejects_parent_dir_segments_in_full_path():
+    reg = make_registry()
+    opts = ProxyOptions(url="http://child.example.com/mcp", forward_full_path=True)
+    reg.register_mcp_endpoint_as_proxy("duck", make_props(), opts, None)
+    ep = reg.mcp_endpoints.get_model("duck")
+    request = MagicMock()
+    request.headers = {}
+    request.method = "POST"
+    request.path_params = {"full_path": "duck/../../admin"}
+    request.url.query = ""
+
+    with (
+        patch("server.endpointregistry.make_http_request", new_callable=AsyncMock) as mock_req,
+        pytest.raises(HTTPException) as exc,
+    ):
+        await ep.endpoint.on_request(request)  # pyright: ignore[reportOptionalMemberAccess]
+
+    assert exc.value.status_code == 400
+    assert mock_req.call_count == 0
+
+
+def test_register_proxy_mcp_sse_url_uses_model_name_prefix():
+    reg = make_registry()
+    props = make_props(type="mcp")
+    props.transport = "sse"
+
+    with patch.object(reg, "register_mcp_sse_endpoint_as_proxy") as mock_sse:
+        reg._register_proxy("my-prefix", "mcp", props, "http://child.example.com", "key", None)  # pyright: ignore[reportPrivateUsage]
+
+    assert mock_sse.call_args.kwargs["options"].url == "http://child.example.com/mcp/my-prefix/sse"
+    assert mock_sse.call_args.kwargs["url"] == "my-prefix"

@@ -6,13 +6,14 @@
 import asyncio
 import hashlib
 import json
-import logging
 import shutil
+import time
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal, NamedTuple, TypedDict
+from urllib.parse import urlparse
 
 import aiofiles
 import aiohttp
@@ -49,6 +50,7 @@ from server.models.services import (
 )
 from server.services.base2_service import Base2Service, CustomModel, Instance, InstanceConfig, ModelConfig
 from server.utils.core import (
+    CommandFailedError,
     DownloadedPacket,
     PreDownloadPacket,
     PromiseWithProgress,
@@ -64,7 +66,13 @@ from server.utils.core import (
 from server.utils.files import detect_context_window_from_path
 from server.utils.hardware import GpuInfo, HardwarePartInfo, IntelGpuInfo
 from server.utils.loading import Progress
-from server.utils.ollama import raise_ollama_pull_error
+from server.utils.logger import logger
+from server.utils.ollama import (
+    GGUF_QUANTIZATION_UNSUPPORTED_MESSAGE,
+    get_ollama_create_error_message,
+    raise_ollama_pull_error,
+    supports_gguf_quantization,
+)
 from server.utils.ollama_catalog import OllamaCatalogClient
 from server.utils.registry_client import image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fetch_ollama_ref_bytes, fmt_size
@@ -78,14 +86,38 @@ from server.utils.vram_calculator import (
     parse_parameter_count,
 )
 
-logger = logging.getLogger("uvicorn.error")
-
 _PROGRESS_LOG_STEP = 0.1  # log every ~10% of progress so the console isn't flooded with updates
 _WARMTH_POLL_INTERVAL_SECONDS = 15  # matches the staleness already tolerated for the UI's loaded-model display
 
+_OLLAMA_VERSION_TIMEOUT_SECONDS = 5  # the version pre-check is best-effort; a slow Ollama just skips it
+_DEFAULT_KV_CACHE_TYPE = "f16"  # matches Ollama's own real default when an instance doesn't set one
+_DEFAULT_NUM_PARALLEL = 1  # conservative stand-in for Ollama's real "auto" (0) behavior, not a reproduction of it
+
+_SHOW_TIMEOUT_SECONDS = 5  # /api/show should be near-instant (local metadata lookup); don't let a hung instance stall list calls
+_SHOW_FAILURE_CACHE_SECONDS = 30  # how long a failed /api/show is remembered, so a down instance isn't re-hit on every list call
+
 
 type Quantization = Literal[
-    "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q3_K_S", "q3_K_M", "q3_K_L", "q4_K_S", "q4_K_M", "q5_K_S", "q5_K_M", "q6_K"
+    # GGUF sources (Ollama < 0.34.1)
+    "q4_0",
+    "q4_1",
+    "q5_0",
+    "q5_1",
+    "q8_0",
+    "q3_K_S",
+    "q3_K_M",
+    "q3_K_L",
+    "q4_K_S",
+    "q4_K_M",
+    "q5_K_S",
+    "q5_K_M",
+    "q6_K",
+    # safetensors sources (Ollama >= 0.34.1)
+    "int4",
+    "int8",
+    "nvfp4",
+    "mxfp4",
+    "mxfp8",
 ]
 
 
@@ -196,6 +228,7 @@ class OllamaOptions(BaseModel):
 
 
 class OllamaModelOptions(BaseModel):
+    rename: str | None = None
     alias: str | None = None
     alive_time: int | Annotated[str, StringConstraints(pattern=r"^(\d+[smh])?$", strict=True)] = ""
     context_length: int | None = None
@@ -266,11 +299,30 @@ class LoadedModelInfo(NamedTuple):
     """Ollama's own live measurement of VRAM usage for this model (via /api/ps size_vram), if reported."""
 
 
+@dataclass
+class ModelCapabilities:
+    """Modality support resolved from Ollama's `/api/show` `capabilities` list.
+
+    `None` means unresolved (the field couldn't be determined, e.g. the instance's Ollama
+    version doesn't report `capabilities`, or `/api/show` failed) - not "unsupported".
+    """
+
+    supports_vision: bool | None = None
+    supports_audio: bool | None = None
+
+
 class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
     models: dict[str, dict[str, OllamaModel]]
     _dynamic_models: dict[str, OllamaModel]
     default_context_length: int
     _arch_cache: dict[tuple[str, str], ArchParams]
+    _capabilities_cache: dict[tuple[str, str], ModelCapabilities]
+    _show_failure_at: dict[tuple[str, str], float]
+    """Monotonic timestamp of the last failed `/api/show` fetch, keyed like `_capabilities_cache`.
+
+    Lets `_get_capabilities`/`_get_arch_params` skip re-hitting a down/hung instance for
+    `_SHOW_FAILURE_CACHE_SECONDS` instead of retrying on every call.
+    """
     _vram_cache: dict[tuple[str, str], float]
     _installing: set[tuple[str, str]]
     _warmth_poll_tasks: dict[str, asyncio.Task[None]]
@@ -286,6 +338,8 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         self.load_default_models("default")
         self.default_context_length = self.get_default_context_value()
         self._arch_cache = {}
+        self._capabilities_cache = {}
+        self._show_failure_at = {}
         self._vram_cache = {}
         self._installing = set()
         self._warmth_poll_tasks = {}
@@ -352,7 +406,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                     name="num_parallel",
                     description="Maximum number of parallel requests (OLLAMA_NUM_PARALLEL)",
                     required=False,
-                    default="1",
+                    default=str(_DEFAULT_NUM_PARALLEL),
                 ),
                 ServiceField(
                     type="text",
@@ -375,7 +429,8 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                 ServiceField(
                     type="text",
                     name="kv_cache_type",
-                    description="Quantization type for the K/V cache (default: f16, available: q4_0, q8_0) (OLLAMA_KV_CACHE_TYPE)",
+                    description=f"Quantization type for the K/V cache (default: {_DEFAULT_KV_CACHE_TYPE}, available: q4_0, q8_0) "
+                    "(OLLAMA_KV_CACHE_TYPE)",
                     required=False,
                 ),
                 ServiceField(
@@ -400,7 +455,10 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         """Return the model specification."""
         return ModelSpecification(
             fields=[
-                ModelField(type="text", name="alias", description="Model alias", required=False),
+                ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
+                ModelField(
+                    type="text", name="alias", description="Additional name for the model, the original name keeps working", required=False
+                ),
                 ModelField(
                     type="text",
                     name="alive_time",
@@ -429,7 +487,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                     placeholder="FROM gemma3:1b\nPARAMETER num_ctx 8192",
                     required=False,
                 ),
-                CustomModelField(type="text", name="quantization", description="Quantization", placeholder="q4_0", required=False),
+                CustomModelField(type="text", name="quantization", description="Quantization", placeholder="int4", required=False),
                 CustomModelField(type="text", name="size", description="Model size", placeholder="1 GB", required=False),
             ]
         )
@@ -461,8 +519,8 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             if not instance_info.installed:
                 return None
             compose_filepath = self.docker_service.get_docker_compose_file_path(instance_info.installed.docker.name)
-            service_name = instance_info.installed.docker.name
-            result = await self.docker_service.run_command_docker_compose(compose_filepath, service_name, f"stat -c%s {path}")
+            service_name = instance_info.installed.docker.service_name
+            result = await self.docker_service.run_command_docker_compose(compose_filepath, service_name, ["stat", "-c%s", path])
             return int(result.strip())
         except Exception:
             return None
@@ -523,6 +581,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             if info
             else [],
             custom=custom,
+            container_name=info.docker.container_name if info else None,
         )
 
     def _restore_model_definition(self, instance: str, model_id: str, definition: dict[str, Any]) -> None:
@@ -533,6 +592,10 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             base = _const.image.name.split(":")[0]
             return DockerImage(name=f"{base}:{image_version}", size=_const.image.size)
         return _const.image
+
+    def get_default_docker_image_name(self) -> str | None:
+        """Return the default docker image, for the upfront platform-compatibility check."""
+        return self._get_image().name
 
     async def get_docker_tags(self, hardware: str | None) -> list[str]:
         """Fetch available Docker image tags from Docker Hub for the Ollama image."""
@@ -577,7 +640,9 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         await self.validate_docker_image_version(options.spec.get("image_version"), options.spec.get("hardware"))
         try_parse_pydantic(OllamaOptions, options.spec)
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
+    async def _install_instance(
+        self, instance: str, options: InstallServiceIn, container_name_override: str | None = None
+    ) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self.load_default_models(instance)
 
@@ -599,7 +664,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             service_name = f"{self.get_service_id(instance)}"
             docker_options = DockerOptions(
                 name=service_name,
-                container_name=self.docker_service.get_docker_container_name(service_name),
+                container_name=container_name_override or self.docker_service.get_docker_container_name(service_name),
                 image=image.name,
                 image_port=11434,
                 hardware=hardware,
@@ -616,7 +681,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                 },
             )
             docker_exposed_port, _, _ = await self.docker_service.install_and_run_docker(docker_options)
-            container_host = self.docker_service.get_container_host(subnet, docker_options.name)
+            container_host = self.docker_service.get_container_host(subnet, docker_options)
             container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
             info = InstalledInfo(
                 instance_name=instance,
@@ -746,6 +811,54 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             raise HTTPException(400, "Cannot remove custom model, it is in use, uninstall it first.")
         del self.models[instance][parsed.id]
 
+    async def _fetch_show_info(self, instance: str, base_url: str, model_name: str) -> None:
+        """Fetch `/api/show` once and populate both the arch-params and capabilities caches from it.
+
+        Kept as a single POST shared by `_get_arch_params` and `_get_capabilities` so callers that
+        need both (e.g. the VRAM estimate path plus capability detection) don't double-fetch. A
+        bounded timeout keeps a down/hung instance from stalling callers on aiohttp's 300s default;
+        a failure is remembered for `_SHOW_FAILURE_CACHE_SECONDS` so repeated lookups within that
+        window don't keep re-hitting the network.
+        """
+        cache_key = (instance, model_name)
+        try:
+            result = await fetch_from(f"{base_url}/api/show", method="POST", data={"name": model_name}, timeout=_SHOW_TIMEOUT_SECONDS)
+            if result.status_code != 200:
+                self._show_failure_at[cache_key] = time.monotonic()
+                return
+            data = json.loads(result.data)
+            info = data.get("model_info", {})
+            arch = info.get("general.architecture", "")
+            params = ArchParams(
+                hidden_size=info.get(f"{arch}.embedding_length") or 0,
+                num_attention_heads=info.get(f"{arch}.attention.head_count") or 1,
+                num_key_value_heads=info.get(f"{arch}.attention.head_count_kv"),
+                num_hidden_layers=info.get(f"{arch}.block_count") or 0,
+                sliding_window=info.get(f"{arch}.attention.sliding_window"),
+            )
+
+            if params.hidden_size and params.num_hidden_layers:
+                self._arch_cache[cache_key] = params
+
+            # Modern Ollama reports a top-level "capabilities" list (e.g. ["completion", "vision",
+            # "tools"]). When present it's authoritative for vision support; Ollama doesn't publicly
+            # document an "audio" tag, so its absence must stay unresolved (None) rather than False.
+            capabilities = data.get("capabilities")
+            if isinstance(capabilities, list):
+                self._capabilities_cache[cache_key] = ModelCapabilities(
+                    supports_vision="vision" in capabilities,
+                    supports_audio=True if "audio" in capabilities else None,
+                )
+            else:
+                self._capabilities_cache[cache_key] = ModelCapabilities()
+            self._show_failure_at.pop(cache_key, None)
+        except Exception:
+            self._show_failure_at[cache_key] = time.monotonic()
+
+    def _show_recently_failed(self, cache_key: tuple[str, str]) -> bool:
+        failed_at = self._show_failure_at.get(cache_key)
+        return failed_at is not None and time.monotonic() - failed_at < _SHOW_FAILURE_CACHE_SECONDS
+
     async def _get_arch_params(self, instance: str, base_url: str, model_name: str) -> ArchParams | None:
         """Fetch architecture parameters for a model from the Ollama /api/show endpoint.
 
@@ -753,28 +866,18 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         Returns None if the request fails or the response is missing critical fields.
         """
         cache_key = (instance, model_name)
-        if cache_key in self._arch_cache:
-            return self._arch_cache[cache_key]
+        if cache_key not in self._arch_cache and not self._show_recently_failed(cache_key):
+            await self._fetch_show_info(instance, base_url, model_name)
 
-        with suppress(Exception):
-            result = await fetch_from(f"{base_url}/api/show", method="POST", data={"name": model_name})
-            if result.status_code == 200:
-                data = json.loads(result.data)
-                info = data.get("model_info", {})
-                arch = info.get("general.architecture", "")
-                params = ArchParams(
-                    hidden_size=info.get(f"{arch}.embedding_length") or 0,
-                    num_attention_heads=info.get(f"{arch}.attention.head_count") or 1,
-                    num_key_value_heads=info.get(f"{arch}.attention.head_count_kv"),
-                    num_hidden_layers=info.get(f"{arch}.block_count") or 0,
-                    sliding_window=info.get(f"{arch}.attention.sliding_window"),
-                )
+        return self._arch_cache.get(cache_key)
 
-                if params.hidden_size and params.num_hidden_layers:
-                    self._arch_cache[cache_key] = params
-                    return params
+    async def _get_capabilities(self, instance: str, base_url: str, model_name: str) -> ModelCapabilities:
+        """Return resolved modality support for a model, fetching/caching via `/api/show` if needed."""
+        cache_key = (instance, model_name)
+        if cache_key not in self._capabilities_cache and not self._show_recently_failed(cache_key):
+            await self._fetch_show_info(instance, base_url, model_name)
 
-        return None
+        return self._capabilities_cache.get(cache_key, ModelCapabilities())
 
     async def _get_model_sizes(self, base_url: str) -> dict[str, ModelSize]:
         """Return {model_name: ModelSize} for all models known to the Ollama instance."""
@@ -805,6 +908,8 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         bytes_weight: float | None = None,
         num_parallel: int | None = None,
         quantization_level: str | None = None,
+        *,
+        kv_cache_type: str | None = None,
     ) -> float | None:
         arch = await self._get_arch_params(instance, base_url, model_name)
 
@@ -812,8 +917,8 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             return None
 
         try:
-            cache_bit = parse_cache_type_bits(self.config.ollama_kv_cache_type)
-            num_parallel = num_parallel or self.config.ollama_num_parallel
+            cache_bit = parse_cache_type_bits(kv_cache_type or _DEFAULT_KV_CACHE_TYPE)
+            num_parallel = num_parallel or _DEFAULT_NUM_PARALLEL
             quant_overhead = get_quant_overhead(quantization_level)
             env_margin = self.config.ollama_vram_overhead_factor
             estimate = estimate_vram_gb(
@@ -839,7 +944,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                 try:
                     await self._sync_warm_state(instance, info.installed)
                 except Exception:
-                    logger.exception(f"{self.get_id(instance)} warmth poll tick failed")  # noqa: G004
+                    logger.exception(f"{self.get_id(instance)} warmth poll tick failed")
 
         def _forget_if_current(finished: asyncio.Task[None]) -> None:
             # Only drop the dict entry if it still points at this task: a restart may have
@@ -847,7 +952,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             if self._warmth_poll_tasks.get(instance) is finished:
                 del self._warmth_poll_tasks[instance]
             if not finished.cancelled() and (exc := finished.exception()):
-                logger.error(f"{self.get_id(instance)} warmth poll task died unexpectedly", exc_info=exc)  # noqa: G004
+                logger.error(f"{self.get_id(instance)} warmth poll task died unexpectedly", exc_info=exc)
 
         task = asyncio.create_task(_poll_loop())
         task.add_done_callback(_forget_if_current)
@@ -926,6 +1031,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         sizes: dict[str, ModelSize],
         base_url: str,
         num_parallel: int | None,
+        kv_cache_type: str | None,
     ) -> tuple[bool, float | None]:
         """Return (is_loaded, vram_estimate_gb) for a model.
 
@@ -938,7 +1044,16 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             self._vram_cache.pop(cache_key, None)
             size_bytes, parameters, bpw, quantization_level = sizes.get(ollama_name, ModelSize(0, None, None, None))
             vram_estimate = await self._get_vram_estimate(
-                instance, base_url, ollama_name, size_bytes, model_context, parameters, bpw, num_parallel, quantization_level
+                instance,
+                base_url,
+                ollama_name,
+                size_bytes,
+                model_context,
+                parameters,
+                bpw,
+                num_parallel,
+                quantization_level,
+                kv_cache_type=kv_cache_type,
             )
             return False, vram_estimate
 
@@ -952,7 +1067,16 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         num_ctx = loaded.context_length or model_context
         size_bytes, parameters, bpw, quantization_level = sizes.get(ollama_name, ModelSize(0, None, None, None))
         vram_estimate = await self._get_vram_estimate(
-            instance, base_url, ollama_name, size_bytes, num_ctx, parameters, bpw, num_parallel, quantization_level
+            instance,
+            base_url,
+            ollama_name,
+            size_bytes,
+            num_ctx,
+            parameters,
+            bpw,
+            num_parallel,
+            quantization_level,
+            kv_cache_type=kv_cache_type,
         )
 
         if vram_estimate is not None:
@@ -986,7 +1110,10 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                 if filters.installed is None or filters.installed == bool(installed):
                     is_loaded: bool | None = None
                     vram_estimate: float | None = None
+                    capabilities = ModelCapabilities()
                     ollama_name: str = (info.models[model_id].internal_name if model_id in info.models else None) or model_id
+                    if model_id in info.models and loaded_info is not None:
+                        capabilities = await self._get_capabilities(instance_name, info.base_url, ollama_name)
                     if loaded_info is not None and model_id in info.models:
                         is_loaded, vram_estimate = await self._resolve_vram_info(
                             instance_name,
@@ -996,6 +1123,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                             sizes,
                             info.base_url,
                             info.parsed_options.num_parallel,
+                            info.parsed_options.kv_cache_type,
                         )
                     out_list.append(
                         RetrieveModelOut(
@@ -1010,6 +1138,8 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                             has_docker=False,
                             is_loaded=is_loaded,
                             vram_estimate_gb=vram_estimate,
+                            supports_vision=capabilities.supports_vision,
+                            supports_audio=capabilities.supports_audio,
                         )
                     )
 
@@ -1031,7 +1161,10 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         sizes = await self._get_model_sizes(info.base_url)
         is_loaded: bool | None = None
         vram_estimate: float | None = None
+        capabilities = ModelCapabilities()
         ollama_name: str = (info.models[model_id].internal_name if model_id in info.models else None) or model_id
+        if model_id in info.models and loaded_info is not None:
+            capabilities = await self._get_capabilities(instance, info.base_url, ollama_name)
         if loaded_info is not None:
             is_loaded, vram_estimate = await self._resolve_vram_info(
                 instance,
@@ -1041,6 +1174,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                 sizes,
                 info.base_url,
                 info.parsed_options.num_parallel,
+                info.parsed_options.kv_cache_type,
             )
         return RetrieveModelOut(
             id=model_id,
@@ -1054,6 +1188,8 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             has_docker=False,
             is_loaded=is_loaded,
             vram_estimate_gb=vram_estimate,
+            supports_vision=capabilities.supports_vision,
+            supports_audio=capabilities.supports_audio,
         )
 
     async def _download_with_ollama(self, stream: Stream[StreamChunk], base_url: str, model_id: str, model_size: str) -> None:
@@ -1102,9 +1238,9 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
     async def create_model_from_modelfile(self, info: InstalledInfo, model: str, model_path: str, quantization: str | None) -> str:
         """Send message to ollama to create model from Modelfile.."""
         compose_filepath = self.docker_service.get_docker_compose_file_path(info.docker.name)
-        service_name = info.docker.name
-        quantization_param = f"-q {quantization} " if quantization else ""
-        cmd = f"ollama create {quantization_param}{model} -f {model_path}"
+        service_name = info.docker.service_name
+        quantization_args = ["-q", quantization] if quantization else []
+        cmd = ["ollama", "create", *quantization_args, model, "-f", model_path]
         return await self.docker_service.run_command_docker_compose(compose_filepath, service_name, cmd)
 
     async def _download_with_downloader(
@@ -1249,6 +1385,8 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             )
             model_context: int | None = None
             modelfile = OllamaModelFile.parse(modelfile_recipe)
+            if model.quantization:
+                await self._reject_unsupported_quantization_source(instance_info.base_url, modelfile)
             for line in modelfile.lines:
                 if isinstance(line, OllamaModelFileLine):
                     if line.value.startswith(("http://", "https://")):
@@ -1296,18 +1434,65 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             raise
         except Exception as e:
             self._remove_paths(paths_to_remove_on_error)
-            raise HTTPException(status_code=400, detail="Cannot install modelfile") from e
+            stderr = e.stderr if isinstance(e, CommandFailedError) else ""
+            message = get_ollama_create_error_message(stderr) or "Cannot install modelfile"
+            raise HTTPException(status_code=400, detail=message) from e
+
+    async def _reject_unsupported_quantization_source(self, base_url: str, modelfile: OllamaModelFile) -> None:
+        """Raise a friendly 400 before any download if this Ollama version can't quantize the modelfile's FROM source.
+
+        Since Ollama 0.34.1 `ollama create -q` only works for safetensors imports, so a GGUF file or a model referenced
+        by name always fails. Older versions (or an unknown version) are left to Ollama; its error is mapped afterwards.
+        """
+        from_values = [line.value for line in modelfile.lines if isinstance(line, OllamaModelFileLine) and line.instruction == "FROM"]
+        if not any(self._is_gguf_or_named_source(value) for value in from_values):
+            return
+        ollama_version = await self._get_ollama_version(base_url)
+        if ollama_version is not None and supports_gguf_quantization(ollama_version) is False:
+            raise HTTPException(status_code=400, detail=GGUF_QUANTIZATION_UNSUPPORTED_MESSAGE)
+
+    @staticmethod
+    def _is_gguf_or_named_source(from_value: str) -> bool:
+        """Return whether a FROM value is a GGUF file or a model name, i.e. anything but a (safetensors) directory or file."""
+        if from_value.startswith(("http://", "https://")):
+            return Path(urlparse(from_value).path).suffix == ".gguf"
+        if from_value.startswith(("./", "/")):
+            return Path(from_value).suffix == ".gguf"
+        return True
+
+    @staticmethod
+    async def _get_ollama_version(base_url: str) -> str | None:
+        """Return the Ollama instance's version from `/api/version`, or None if it can't be read."""
+        with suppress(Exception):
+            result = await fetch_from(f"{base_url}/api/version", timeout=_OLLAMA_VERSION_TIMEOUT_SECONDS)
+            if result.status_code == 200:
+                ollama_version = json.loads(result.data).get("version")
+                return ollama_version if isinstance(ollama_version, str) else None
+        return None
 
     def get_default_context_window(self, model_context: int | None, service_context: int) -> int:
         """Return minimum default context length from model or service context length."""
         return min(model_context, service_context) if model_context else service_context
 
     async def _install_model(  # noqa: C901
-        self, instance: str, model_id: str, options: InstallModelIn
+        self,
+        instance: str,
+        model_id: str,
+        options: InstallModelIn,
+        container_name_override: str | None = None,  # noqa: ARG002
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
-        self._arch_cache.pop((instance, model_id), None)
         parsed_model_options = try_parse_pydantic(OllamaModelOptions, options.spec) if options.spec else OllamaModelOptions()
         info = self.get_instance_installed_info(instance)
+
+        # Cache entries are written under the resolved internal name (e.g. `<id>-customcontextlength`
+        # for a custom-context install, see below), not `model_id` - evict both so a previous
+        # install's real cache entry doesn't survive as stale data for the new one.
+        previous_internal_name = info.models[model_id].internal_name if model_id in info.models else None
+        self._arch_cache.pop((instance, model_id), None)
+        self._capabilities_cache.pop((instance, model_id), None)
+        if previous_internal_name and previous_internal_name != model_id:
+            self._arch_cache.pop((instance, previous_internal_name), None)
+            self._capabilities_cache.pop((instance, previous_internal_name), None)
 
         if not self.models.get(instance):
             self.models[instance] = {}
@@ -1362,7 +1547,8 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                         {"model": model_id, "keep_alive": parsed_model_options.alive_time},
                     )
 
-                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
+                registered_alias = parsed_model_options.alias
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
                     type=model.type,
@@ -1380,20 +1566,23 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                     context_window = model_form_context_window or service_form_context_window or default_context_window
                     context_window = min(context_window, max_context_window)
                     # `or` (not `is not None`) is intentional here: Ollama's OLLAMA_NUM_PARALLEL=0 means
-                    # "auto", so an explicit 0 must fall through to the configured default just like None does.
+                    # "auto", so an explicit 0 must fall through to the fallback of 1 just like None does.
                     #
-                    # WARNING for reviewers: `self.config.ollama_num_parallel` is a *conservative
-                    # approximation* of "auto", not Ollama's real behavior. Ollama's own auto-scaling
-                    # picks up to 4 concurrent requests depending on available VRAM at load time; this
-                    # gateway has no visibility into that and cannot replicate it, so it substitutes its
-                    # own configured default (1 unless overridden) instead. Pros: never overcommits VRAM
-                    # by assuming a higher concurrency than what's actually available - safe by
-                    # construction. Cons: on hardware where Ollama would genuinely auto-scale to 2-4, this
-                    # under-reports capacity and causes earlier-than-necessary spillover to other
-                    # backends. If this is set to 4, the CHANGELOG default is now wrong, but treat this as
-                    # accepted routing-side conservatism, not a bug, unless the user explicitly wants
-                    # capacity to track Ollama's real auto behavior.
-                    capacity = info.parsed_options.num_parallel or self.config.ollama_num_parallel
+                    # WARNING for reviewers: the fallback of `1` is a *conservative approximation* of
+                    # "auto", not Ollama's real behavior. Ollama's own auto-scaling picks up to 4
+                    # concurrent requests depending on available VRAM at load time; this gateway has no
+                    # visibility into that and cannot replicate it, so it substitutes a fixed default
+                    # instead. Pros: never overcommits VRAM by assuming a higher concurrency than what's
+                    # actually available - safe by construction. Cons: on hardware where Ollama would
+                    # genuinely auto-scale to 2-4, this under-reports capacity and causes
+                    # earlier-than-necessary spillover to other backends. Treat this as accepted
+                    # routing-side conservatism, not a bug, unless the user explicitly wants capacity to
+                    # track Ollama's real auto behavior.
+                    capacity = info.parsed_options.num_parallel or _DEFAULT_NUM_PARALLEL
+                    # The model is already pulled into Ollama's local store by this point (either via
+                    # the modelfile install above or the plain pull), so `/api/show` can resolve its
+                    # real modality support instead of registering with permanently-unknown values.
+                    capabilities = await self._get_capabilities(instance, info.base_url, internal_name)
                     # Ollama lazily loads a model into memory on its first inference request, so a
                     # freshly-installed model is never warm yet - registering it as warm here would win
                     # ranking over an actually-warm instance and route the first requests into a cold load.
@@ -1408,6 +1597,8 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 endpoints=LLM_ENDPOINTS,
                                 context_window=context_window,
                                 max_context_window=max_context_window,
+                                supports_vision=capabilities.supports_vision,
+                                supports_audio=capabilities.supports_audio,
                             ),
                             chat_completions=ProxyOptions(url=f"{info.base_url}/v1/chat/completions", rewrite_model_to=rewrite_model_to),
                             completions=ProxyOptions(url=f"{info.base_url}/v1/completions", rewrite_model_to=rewrite_model_to),
@@ -1415,7 +1606,7 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                             messages=ProxyOptions(url=f"{info.base_url}/v1/messages", rewrite_model_to=rewrite_model_to),
                             ollama_chat=ProxyOptions(url=f"{info.base_url}/api/chat", rewrite_model_to=rewrite_model_to),
                             registration_options=RegistrationOptions(
-                                origin="local", owned_by=self.get_type(), capacity_state=capacity, warm=False
+                                origin="local", alias=registered_alias, owned_by=self.get_type(), capacity_state=capacity, warm=False
                             ),
                         )
                     if model.type == "embedding":
@@ -1427,10 +1618,12 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 endpoints=EMBEDDINGS_ENDPOINTS,
                                 context_window=context_window,
                                 max_context_window=max_context_window,
+                                supports_vision=capabilities.supports_vision,
+                                supports_audio=capabilities.supports_audio,
                             ),
                             options=ProxyOptions(url=f"{info.base_url}/v1/embeddings", rewrite_model_to=rewrite_model_to),
                             registration_options=RegistrationOptions(
-                                origin="local", owned_by=self.get_type(), capacity_state=capacity, warm=False
+                                origin="local", alias=registered_alias, owned_by=self.get_type(), capacity_state=capacity, warm=False
                             ),
                         )
                     if model.type == "txt2img":
@@ -1442,10 +1635,12 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 endpoints=IMG_ENDPOINTS,
                                 context_window=context_window,
                                 max_context_window=max_context_window,
+                                supports_vision=capabilities.supports_vision,
+                                supports_audio=capabilities.supports_audio,
                             ),
                             options=ProxyOptions(url=f"{info.base_url}/v1/images/generations", rewrite_model_to=rewrite_model_to),
                             registration_options=RegistrationOptions(
-                                origin="local", owned_by=self.get_type(), capacity_state=capacity, warm=False
+                                origin="local", alias=registered_alias, owned_by=self.get_type(), capacity_state=capacity, warm=False
                             ),
                         )
                     input_stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
@@ -1475,7 +1670,6 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
         return PromiseWithProgress(func=func)
 
     async def _uninstall_model(self, instance: str, model_id: str, options: UninstallModelIn) -> None:  # noqa: C901
-        self._arch_cache.pop((instance, model_id), None)
         info = self.get_instance_installed_info(instance)
         if (instance, model_id) in self._installing:
             raise HTTPException(409, f"Model {model_id!r} is currently being installed; cancel the install before deleting")
@@ -1491,6 +1685,15 @@ class OllamaService(Base2Service[InstalledInfo, DownloadedInfo]):
             if model.type == "txt2img":
                 self.endpoint_registry.unregister_image_generations(model.registered_name, model.registration_id)
             await self._unload_model_from_vram(model_id, ollama_name, info.base_url)
+
+        # Cache entries are written under the resolved internal name (`ollama_name`), not
+        # `model_id` - evict both so a custom-context install's real cache entry doesn't survive
+        # as stale data (e.g. serving wrong capabilities after a tag change and reinstall).
+        self._arch_cache.pop((instance, model_id), None)
+        self._capabilities_cache.pop((instance, model_id), None)
+        if ollama_name != model_id:
+            self._arch_cache.pop((instance, ollama_name), None)
+            self._capabilities_cache.pop((instance, ollama_name), None)
 
         if options.purge and model_id in self.models_downloaded:
             model = self.models[instance][model_id]

@@ -4,7 +4,6 @@
 """Lifecycle."""
 
 import asyncio
-import logging
 import os
 import re
 import subprocess
@@ -24,10 +23,10 @@ from server.model_tester import ModelTester
 from server.portservice import PortService
 from server.serviceprovider import ServiceProvider
 from server.services.claude_service import ClaudeService
-from server.services.coqui_service import CoquiService
 from server.services.custom_service import CustomService
 from server.services.deepseek_service import DeepSeekService
 from server.services.docker_model_runner_service import DockerModelRunnerService
+from server.services.finetune_service import FinetuneService
 from server.services.googleai_service import GoogleAIService
 from server.services.kimi_service import KimiService
 from server.services.llamacpp_service import LLamacppService
@@ -46,13 +45,13 @@ from server.services_manager import ServicesManager
 from server.task_manager import TaskManager
 from server.utils.exceptions import AppStartError
 from server.utils.hardware import Hardware
+from server.utils.logger import logger
 from server.utils.model_downloader import ModelDownloader
+from server.utils.sentry import sentry
 from server.utils.tracing import OtlpLoggingManager, tracer
 from server.websockets.infra_websocket_server import InfraWebsocketServer
 from server.websockets.parent_infra import ParentInfra
 from server.websockets.parent_infra_group import ParentInfraGroup
-
-logger = logging.getLogger("uvicorn.error")
 
 
 @asynccontextmanager
@@ -75,6 +74,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             raise AppStartError("Config error. Check your .env file and config.json.") from e
 
         tracer.config = config
+        try:
+            await sentry.reconfigure(config)
+        except Exception:
+            # Error tracking must never block startup; the next config update retries it.
+            logger.warning("Sentry error tracking could not be set up and is off", exc_info=True)
         app.state.otlp_logging = otlp_logging = OtlpLoggingManager()
         if config.otel_logging_enabled:
             otlp_logging.setup(config)
@@ -91,7 +95,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         app.state.task_manager = task_manager = TaskManager()
         app.state.service_provider = service_provider = ServiceProvider(config)
         parents = [ParentInfra(config, task_manager, config.connect_to_mesh_url)] if config.connect_to_mesh_url else []
-        app.state.parent_infra = parent_infra = ParentInfraGroup(parents)
+        app.state.parent_infra = parent_infra = ParentInfraGroup(
+            parents, configured_mesh_url=config.connect_to_mesh_url, configured_mesh_key=config.connect_to_mesh_key
+        )
         app.state.services_manager = services_manager = ServicesManager(external_only=config.external_only)
         app.state.model_tester = model_tester = ModelTester()
         app.state.endpoint_registry = endpoint_registry = EndpointRegistry(config, parent_infra, model_tester, metrics_registry)
@@ -104,7 +110,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         app.state.docker_service = docker_service = await create_docker_service(port_service, config)
         app.state.model_downloader = model_downloader = ModelDownloader(app.state.config)
 
-        model_input = (config, endpoint_registry, service_provider, model_downloader, docker_service, hardware)
+        model_input = (config, endpoint_registry, service_provider, model_downloader, docker_service, hardware, services_manager)
 
         # Register services
         if config.external_only:
@@ -113,10 +119,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             assert_external_only_registration(services_manager)
         else:
             services_manager.register_service(ClaudeService(*model_input))
-            services_manager.register_service(CoquiService(*model_input))
             services_manager.register_service(CustomService(*model_input))
             services_manager.register_service(DeepSeekService(*model_input))
             services_manager.register_service(DockerModelRunnerService(*model_input))
+            services_manager.register_service(FinetuneService(*model_input))
             services_manager.register_service(GoogleAIService(*model_input))
             services_manager.register_service(KimiService(*model_input))
             services_manager.register_service(LLamacppService(*model_input))
@@ -131,11 +137,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             services_manager.register_service(StableDiffusionService(*model_input))
             services_manager.register_service(VllmService(*model_input))
 
+        await services_manager.resolve_platform_compatibility()
+
         # Load functions
         await context.load_services()
-        task_manager.add_task(parent_infra.run())
+        task_manager.add_task_safe(parent_infra.run(), "lifecycle.parent_infra")
     except AppStartError as e:
-        logger.error(str(e))  # noqa: TRY400
+        logger.error(str(e))
         os._exit(1)
     yield
     # Shutdown: stop all services gracefully if enabled
@@ -145,6 +153,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         await services_manager.stop_all_services()
     await tracer.shutdown()
     await otlp_logging.teardown()
+    await sentry.shutdown()
 
 
 def assert_external_only_registration(services_manager: ServicesManager) -> None:

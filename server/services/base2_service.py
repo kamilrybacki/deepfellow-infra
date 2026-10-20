@@ -4,16 +4,15 @@
 """Base2 service."""
 
 import asyncio
-import logging
 import shutil
 import time
 import uuid
 from abc import abstractmethod
-from collections.abc import Awaitable, Callable, Sequence
-from contextlib import suppress
+from collections.abc import Awaitable, Callable, Iterator, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Generic, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar, cast
 
 from fastapi import HTTPException
 from pydantic import BaseModel
@@ -54,8 +53,13 @@ from server.utils.core import (
     convert_size_to_bytes,
     is_own_cancellation,
 )
+from server.utils.exceptions import DockerImageAuthorizationError, DockerImageDoesNotExistError
 from server.utils.hardware import GpuInfo, Hardware, HardwarePartInfo, NvidiaGpuInfo
+from server.utils.logger import logger
 from server.utils.model_downloader import ModelDownloader
+
+if TYPE_CHECKING:
+    from server.services_manager import ServicesManager
 
 
 class ModelConfig(BaseModel):
@@ -65,6 +69,8 @@ class ModelConfig(BaseModel):
     capacity: int | None = None
     capacity_known: bool = False
     gpu_memory_utilization: float | None = None
+    # Resolved container name, pinned so a live container_name_suffix change doesn't rename it on restart.
+    container_name: str | None = None
 
 
 class CustomModel(BaseModel):
@@ -97,6 +103,8 @@ class InstanceConfig(BaseModel):
     options: InstallServiceIn | None = None
     models: list[ModelConfig] | None = None
     custom: list[CustomModel] | None = None
+    # Same purpose as ModelConfig.container_name, for single-container-per-instance services (e.g. Ollama).
+    container_name: str | None = None
 
 
 class ServiceConfig(BaseModel):
@@ -113,9 +121,6 @@ class _HasModels(Protocol):
     """Structural view of every service's ``InstalledInfo``: it always carries a ``models`` mapping."""
 
     models: dict[str, Any]
-
-
-logger = logging.getLogger("uvicorn.error")
 
 
 class InstallingModel:
@@ -315,6 +320,11 @@ _RECONCILE_DEAD_THRESHOLD = 3
 # awaited separately once a promise exists. A generous bound for setup work specifically, so a
 # genuinely hung service doesn't leave every caller waiting forever with no way to notice or recover.
 _INSTALL_STATUS_WAIT_TIMEOUT_SECONDS = 30
+# Bounds resolve_platform_compatibility()'s registry lookup at app startup. A single lookup normally
+# takes ~1-1.5s; this is generous headroom for a slow registry, not a normal-case budget - without it,
+# a hung connection (rather than an outright error) would block the whole app from ever starting, since
+# lifecycle.py awaits every service's check before accepting requests.
+_PLATFORM_CHECK_TIMEOUT_SECONDS = 20
 _CANCEL_WAIT_TIMEOUT_SECONDS = 30
 # Bounds how long a caller waits for install_instance()'s pre-promise setup work (Docker
 # image/registry checks) to settle - not the install itself, which can legitimately run far longer
@@ -334,6 +344,20 @@ _INSTANCE_INSTALL_STATUS_WAIT_TIMEOUT_SECONDS = 30
 # the synchronous-failure path, not the far more common case of _install_instance()'s own promise
 # failing later (see the async `on_failure` path, whose rollback isn't bound by this timeout at all).
 _INSTANCE_UPDATE_STATUS_WAIT_TIMEOUT_SECONDS = 120
+# Bounds cancel_instance_install()'s wait for a triggered DFINFRA-318 rollback to settle. Deliberately
+# separate from _INSTANCE_UPDATE_STATUS_WAIT_TIMEOUT_SECONDS above (used for the short pre-promise setup
+# wait): a rollback re-runs a full _install_instance(), comparable in duration to the original
+# install/update, not to setup - reusing the shorter setup timeout here made this wait time out
+# routinely rather than rarely.
+_INSTANCE_CANCEL_ROLLBACK_WAIT_TIMEOUT_SECONDS = 300
+
+
+def default_gpu_cpu_image_name(supported_gpus: Sequence[GpuInfo], get_image: Callable[[bool], DockerImage]) -> str:
+    """Shared `get_default_docker_image_name()` body for services whose `_get_image(gpu: bool)` picks a fixed GPU/CPU image pair.
+
+    Selects the GPU image whenever a GPU is supported.
+    """
+    return get_image(bool(supported_gpus)).name
 
 
 class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  # noqa: UP046
@@ -342,6 +366,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
     service_provider: ServiceProvider
     model_downloader: ModelDownloader
     docker_service: DockerService
+    services_manager: "ServicesManager"
     models: dict[str, dict[str, Any]]
     models_downloaded: dict[str, DownloadInfoType]
     service_downloaded: bool
@@ -355,12 +380,18 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
     _crash_poll_state: dict[tuple[str, str], int]
     _failed_models: dict[str, set[str]]
     _warning_tasks: set["asyncio.Task[None]"]
+    _platform_unsupported_reason: str | None
+    """Cached result of `resolve_platform_compatibility()`, run once at app startup. `None` means
+    either the check hasn't found an incompatibility, or `get_default_docker_image_name()` returns
+    `None` (no check performed for this service), or the check couldn't complete (fails open)."""
 
     _persists_model_definitions: bool = True
     """Override to False for services whose ``_generate_instance_config`` never populates ``ModelConfig.definition``
     (e.g. it has no registry snapshot to persist). Otherwise ``load_service`` treats every model as needing a
     backfill save on every startup, forever."""
     _edit_locks: dict[tuple[str, str], asyncio.Lock]
+    # GPU utilization of a model being re-installed by an edit, so the reinstall (or a rollback) keeps its current size.
+    _edit_kept_gpu_utilization: dict[tuple[str, str], float]
 
     def __init__(
         self,
@@ -370,6 +401,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         model_downloader: ModelDownloader,
         docker_service: DockerService,
         hardware: Hardware,
+        services_manager: "ServicesManager",
     ):
         super().__init__()
         self.config = config
@@ -378,6 +410,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         self.model_downloader = model_downloader
         self.docker_service = docker_service
         self.hardware = hardware
+        self.services_manager = services_manager
         self.models = {}
         self.models_downloaded = {}
         self.service_downloaded = False
@@ -388,6 +421,8 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         self._failed_models = {}
         self._warning_tasks = set()
         self._edit_locks = {}
+        self._edit_kept_gpu_utilization = {}
+        self._platform_unsupported_reason = None
         self._after_init()
 
     def _after_init(self) -> None:
@@ -411,7 +446,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
                 try:
                     await self._reconcile_instance_models(instance, info.installed)
                 except Exception:
-                    logger.exception(f"{self.get_id(instance)} reconciliation tick failed")  # noqa: G004
+                    logger.exception(f"{self.get_id(instance)} reconciliation tick failed")
 
         self._reconciliation_tasks[instance] = asyncio.create_task(_reconcile_loop())
 
@@ -472,11 +507,11 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             except Exception:
                 # Keep bookkeeping intact and retry teardown on the next tick rather than releasing VRAM
                 # for a container we couldn't confirm is actually gone.
-                logger.exception(f"{self.get_id(instance)} failed to tear down dead container for model {model_id}, will retry")  # noqa: G004
+                logger.exception(f"{self.get_id(instance)} failed to tear down dead container for model {model_id}, will retry")
                 continue
 
             self._crash_poll_state.pop(key, None)
-            logger.warning(f"{self.get_id(instance)} model {model_id} container is dead, released VRAM bookkeeping")  # noqa: G004
+            logger.warning(f"{self.get_id(instance)} model {model_id} container is dead, released VRAM bookkeeping")
 
     async def _get_docker_logs(self, container_name: str) -> str:
         """Return raw docker logs output, with TTL caching per container.
@@ -672,9 +707,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             # an ordinary successful cancellation, and a real setup failure that happens to coincide
             # with someone clicking cancel would vanish without a trace.
             if not (isinstance(e, HTTPException) and e.status_code == 409):
-                logger.exception(
-                    f"{self.get_id(instance)} pending setup for model {model_id} failed independently of the cancel request"  # noqa: G004
-                )
+                logger.exception(f"{self.get_id(instance)} pending setup for model {model_id} failed independently of the cancel request")
             self._pop_installing_if_current(instance, installing, model_id=model_id)
             return
 
@@ -710,6 +743,10 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         setup phase of `_install_instance()` is short and already bounded by `Utils.run_command`'s own
         kill-on-cancel, so a cancel request arriving during that window simply waits for it to settle
         (bounded by the reservation's own `timeout_seconds`) instead of interrupting it.
+
+        Cancelling an update may trigger DFINFRA-318's automatic rollback - this method waits for it to
+        settle before returning, so a caller never observes "not installing" before the true final
+        state (reverted, or fully uninstalled) is known.
         """
         installing = self.get_instance_info(instance).installing
 
@@ -728,7 +765,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             # rejected (reject() already turns any CancelledError into a clean HTTPException(409)) -
             # either way, there's no real promise left to cancel.
             if not (isinstance(e, HTTPException) and e.status_code == 409):
-                logger.exception(f"{self.get_id(instance)} install/update setup failed independently of the cancel request")  # noqa: G004
+                logger.exception(f"{self.get_id(instance)} install/update setup failed independently of the cancel request")
             self._pop_installing_if_current(instance, installing)
             return
 
@@ -741,6 +778,32 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         await asyncio.gather(*tasks, return_exceptions=True)
 
         promise.progress.close()
+
+        # `chained_promise` isn't a child of `promise` for an update (see resolve_with_chain()), so
+        # cancelling `promise` doesn't cancel the rollback too - it keeps running here. This is the
+        # only place that can wait for a cancellation-triggered rollback's outcome. For a plain
+        # install, `chained_promise` is already a child of `promise` and already finished above.
+        #
+        # Shielded: `asyncio.wait_for()` cancels whatever it's timing out on - and since
+        # `chained_promise._future` is shared with any other reader (a later cancel retry, or a
+        # progress-stream reattachment), an unshielded timeout here would cancel that shared future
+        # too, permanently poisoning it for everyone else even though the rollback itself keeps running
+        # unaffected in the background. `shield()` lets our own wait time out without touching it.
+        assert installing.chained_promise is not None
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(installing.chained_promise.wait()), timeout=_INSTANCE_CANCEL_ROLLBACK_WAIT_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            raise HTTPException(504, f"Timed out waiting for {self.get_id(instance)}'s cancellation to fully settle.") from None
+        except asyncio.CancelledError:
+            # chained_promise's future routinely ends up cancelled here (see DFINFRA-318's the_func) -
+            # expected, not a sign this request was cancelled. Only propagate this call's own cancellation.
+            if is_own_cancellation():
+                raise  # pragma: no cover - coverage.py can't trace a bare raise here; see test above
+        except Exception:
+            # Already recorded via on_failure()/_rollback_after_failed_update()'s own logging.
+            pass
 
         self._pop_installing_if_current(instance, installing)
 
@@ -770,19 +833,43 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         match = next((m for m in persisted.config.models or [] if m.model_id == model_id), None)
         return (match.capacity, match.capacity_known) if match else (None, False)
 
-    def _get_persisted_model_gpu_memory_utilization(self, instance: str, model_id: str) -> float | None:
+    @staticmethod
+    def _parse_gpu_priority(spec: dict[str, Any] | None) -> float | None:
+        """Read `gpu_priority` from a raw spec, where it may be a string (e.g. "0.5") since specs are stored as request bodies."""
+        raw = (spec or {}).get("gpu_priority")
+        if raw is None:
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _get_persisted_model_gpu_memory_utilization(self, instance: str, model_id: str, gpu_priority: float | None) -> float | None:
         """Look up the last-persisted auto-computed GPU utilization for a model, from a prior successful install.
 
         Reusing this avoids spurious docker-compose diffs on reload: the auto-tuned default is sized off
         currently-free VRAM (see `VllmService._get_default_gpu_memory_utilization`), which keeps shrinking
         once the model's own container is already running and holding memory, making every reload look like
         a config change and forcing an unnecessary container restart.
+
+        Only reused while `gpu_priority` matches the one it was computed for - otherwise a changed priority
+        (e.g. an edit of a model that failed to load, whose persisted entry survives) would be silently ignored.
+        An options edit that left the priority unchanged also lands here, via the value kept across its uninstall.
         """
+        if (kept := self._edit_kept_gpu_utilization.get((instance, model_id))) is not None:
+            return kept
         persisted = self.instances_info.get(instance)
         if not persisted:
             return None
         match = next((m for m in persisted.config.models or [] if m.model_id == model_id), None)
-        return match.gpu_memory_utilization if match else None
+        if match is None:
+            return None
+        persisted_priority = self._parse_gpu_priority(match.options.spec)
+        if persisted_priority != gpu_priority or (
+            persisted_priority is None and (match.options.spec or {}).get("gpu_priority") is not None
+        ):
+            return None
+        return match.gpu_memory_utilization
 
     def _record_warning_in_background(self, message: str, *, instance: str | None = None, model_id: str | None = None) -> None:
         """Fire-and-forget a warning write from a synchronous callback, e.g. a promise's on_error."""
@@ -800,13 +887,17 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         if self._warning_tasks:
             await asyncio.gather(*self._warning_tasks, return_exceptions=True)
 
-    async def load_model(self, instance: str, model: ModelConfig) -> None:
-        """Load single model."""
-        logger.info(f"{self.get_id(instance)} loading model {model.model_id}")  # noqa: G004
+    async def load_model(self, instance: str, model: ModelConfig, *, derive_container_name: bool = False) -> None:
+        """Load single model.
+
+        derive_container_name re-derives the name instead of pinning the persisted one - set for an
+        explicit reinstall's own reload, not for restoring a config as-is (startup, rollback).
+        """
+        logger.info(f"{self.get_id(instance)} loading model {model.model_id}")
         try:
             if model.model_id not in self.models.get(instance, {}) and model.definition:
                 logger.warning(
-                    f"{self.get_id(instance)} model {model.model_id} missing from current registry, restoring from persisted definition"  # noqa: G004
+                    f"{self.get_id(instance)} model {model.model_id} missing from current registry, restoring from persisted definition"
                 )
                 self._restore_model_definition(instance, model.model_id, model.definition)
 
@@ -818,10 +909,13 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             # response - but with no-op bookkeeping callbacks, since this method already has its own
             # separate success/failure handling below. Routing through install_model() directly
             # would run both, double-recording the warning on failure.
-            promise = await self._reserve_and_install(instance, model.model_id, model.options, on_success, lambda _e: None)
+            container_name_override = None if derive_container_name else model.container_name
+            promise = await self._reserve_and_install(
+                instance, model.model_id, model.options, on_success, lambda _e: None, container_name_override=container_name_override
+            )
             await promise.wait()
         except Exception as exc:
-            logger.exception(f"{self.get_id(instance)} get error while loading model {model.model_id}")  # noqa: G004
+            logger.exception(f"{self.get_id(instance)} get error while loading model {model.model_id}")
             self._failed_models.setdefault(instance, set()).add(model.model_id)
             try:
                 await self.service_provider.add_warning(
@@ -831,7 +925,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
                     model_id=model.model_id,
                 )
             except Exception:
-                logger.exception(f"{self.get_id(instance)} failed to record warning for model {model.model_id}")  # noqa: G004
+                logger.exception(f"{self.get_id(instance)} failed to record warning for model {model.model_id}")
             return
 
         if instance_failures := self._failed_models.get(instance):
@@ -839,7 +933,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         try:
             await self.service_provider.dismiss_warnings_matching(self.get_type(), instance=instance, model_id=model.model_id)
         except Exception:
-            logger.exception(f"{self.get_id(instance)} failed to dismiss warnings for model {model.model_id} after successful load")  # noqa: G004
+            logger.exception(f"{self.get_id(instance)} failed to dismiss warnings for model {model.model_id} after successful load")
 
     async def load_instance(self, instance: str, instance_data: InstanceConfig) -> None:
         """Load instance of service."""
@@ -858,7 +952,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
                     # load_service gathers all of a service's instances without return_exceptions=True,
                     # every other instance of this service too - down with it. Matches load_model's
                     # per-model warning-and-continue pattern just above.
-                    logger.exception(f"{self.get_id(instance)} failed to register custom model {model_id} while loading")  # noqa: G004
+                    logger.exception(f"{self.get_id(instance)} failed to register custom model {model_id} while loading")
                     try:
                         await self.service_provider.add_warning(
                             self.get_type(),
@@ -867,11 +961,11 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
                             model_id=model_id,
                         )
                     except Exception:
-                        logger.exception(f"{self.get_id(instance)} failed to record warning for custom model {model_id}")  # noqa: G004
+                        logger.exception(f"{self.get_id(instance)} failed to record warning for custom model {model_id}")
 
         promise = await self.install_instance(instance, instance_data.options, instance_data, save=False, run_after_install=False)
         await promise.wait()
-        logger.info(f"{self.get_id(instance)} service checked")  # noqa: G004
+        logger.info(f"{self.get_id(instance)} service checked")
         tasks = [asyncio.create_task(self.load_model(instance, model)) for model in instance_data.models or []]
         await asyncio.gather(*tasks)
         await self._after_install(instance)
@@ -891,8 +985,55 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             tasks = [asyncio.create_task(self.load_instance(name, instance)) for name, instance in cfg.instances.items()]
             await asyncio.gather(*tasks)
             if needs_backfill:
-                logger.info(f"{self.get_type()} backfilling model definitions into persisted config")  # noqa: G004
+                logger.info(f"{self.get_type()} backfilling model definitions into persisted config")
                 await self._save()
+            elif unpinned := self._instances_with_unpinned_container_names(cfg.instances):
+                logger.info(f"{self.get_type()} backfilling container names into persisted config")
+                await self._backfill_container_names(unpinned)
+
+    async def _backfill_container_names(self, instances: list[str]) -> None:
+        """Save to pin the container names resolved on load, without letting a failed save fail the load itself.
+
+        The service did load fine, so a failed save must not surface as "Service failed to load" - it gets its own
+        per-instance warning instead (a service-level one would be auto-dismissed right after the load succeeds),
+        since the names stay unpinned, and a container_name_suffix change would rename them, until the next save.
+        """
+        try:
+            await self._save()
+        except Exception as exc:
+            logger.exception(f"{self.get_type()} failed to save container names into persisted config")
+            for instance in instances:
+                try:
+                    await self.service_provider.add_warning(
+                        self.get_type(),
+                        f"Container names of instance '{instance}' could not be saved to services.json: {exc}. Until the next "
+                        "successful save, changing container_name_suffix and restarting will rename its containers.",
+                        instance=instance,
+                    )
+                except Exception:
+                    logger.exception(f"{self.get_id(instance)} failed to record warning for unsaved container names")
+
+    def _instances_with_unpinned_container_names(self, persisted: dict[str, InstanceConfig]) -> list[str]:
+        """Instances for which loading resolved a container name the persisted config doesn't pin yet.
+
+        Non-empty for a services.json written before container names were pinned - without saving right away,
+        the name would stay unpinned until some unrelated save, so a container_name_suffix change in the
+        meantime would rename the container on the next restart. Compares against the freshly generated
+        config rather than just checking for None, so services with no container at all don't re-save on
+        every startup.
+        """
+        unpinned: list[str] = []
+        for name, persisted_instance in persisted.items():
+            info = self.instances_info.get(name)
+            if info is None or info.installed is None:
+                continue
+            live = self._generate_instance_config(name, info.installed, info.config.custom)
+            unpinned_model_ids = {m.model_id for m in persisted_instance.models or [] if m.container_name is None}
+            if (persisted_instance.container_name is None and live.container_name is not None) or any(
+                m.model_id in unpinned_model_ids and m.container_name is not None for m in live.models or []
+            ):
+                unpinned.append(name)
+        return unpinned
 
     @abstractmethod
     def _load_download_info(self, data: dict[str, Any]) -> DownloadInfoType:
@@ -904,6 +1045,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             generated = self._generate_instance_config(instance_name, instance.installed, instance.config.custom)
             generated.models = self._preserve_failed_models(instance_name, generated.models or [])
             instance.config.models = generated.models
+            instance.config.options = generated.options
             instances_config[instance_name] = generated
         cfg = self.service_config(instances_config)
         await self.service_provider.save_service_config(self.get_type(), cfg.model_dump())
@@ -967,7 +1109,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             try:
                 await self.service_provider.dismiss_warnings_matching_any(self.get_type(), [(None, None), (instance, None)])
             except Exception:
-                logger.exception(f"{self.get_id(instance)} failed to dismiss warnings after successful install")  # noqa: G004
+                logger.exception(f"{self.get_id(instance)} failed to dismiss warnings after successful install")
             return InstallServiceOut(status="OK")
 
         def on_error(e: Exception) -> None:
@@ -975,7 +1117,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             self._record_warning_in_background(f"Service instance '{instance}' failed to install: {e}", instance=instance)
 
         try:
-            promise = await self._install_instance(instance, options)
+            promise = await self._install_instance(instance, options, instance_config.container_name if instance_config else None)
         except BaseException as e:
             self.instances_info[instance].installing = None
             reservation.reject(e)
@@ -1028,7 +1170,9 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             """
             self._record_warning_in_background(f"Service instance '{instance}' failed to update: {e}", instance=instance)
             if previous_options is not None and self.instances_info[instance].installed is None:
-                reverted = await self._rollback_after_failed_update(instance, previous_options, preserved_models, e)
+                reverted = await self._rollback_after_failed_update(
+                    instance, previous_options, preserved_models, e, previous_container_name=previous_config.container_name
+                )
                 self._append_rollback_outcome(e, reverted)
             else:
                 self.instances_info[instance].installing = None
@@ -1059,7 +1203,9 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             # restore. Awaited inline (this whole method is itself awaited by its caller) so the caller
             # doesn't get a response before the instance's true final state is known.
             if uninstalled and previous_options is not None:
-                reverted = await self._rollback_after_failed_update(instance, previous_options, preserved_models, e)
+                reverted = await self._rollback_after_failed_update(
+                    instance, previous_options, preserved_models, e, previous_container_name=previous_config.container_name
+                )
                 self._append_rollback_outcome(e, reverted)
             else:
                 self.instances_info[instance].installing = None
@@ -1076,15 +1222,16 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         """Shared post-reinstall bookkeeping for a reinstall that just succeeded.
 
         Used by both the original update's own reinstall and a rollback's restore of the previous
-        installation - `context` ("update"/"rollback") only distinguishes the two in log output, so a
-        dismiss-warnings failure logged here is still traceable to which flow it happened in. `installing`
-        is always cleared, even if a step here fails, so neither caller can leave the instance stuck
-        permanently rejecting every future install/update as "currently installing".
+        installation - `context` ("update"/"rollback") distinguishes the two in log output, and also
+        picks whether preserved models re-derive their container name ("update") or keep their pinned
+        one ("rollback"). `installing` is always cleared, even if a step here fails, so neither caller
+        can leave the instance stuck permanently rejecting every future install/update as "currently
+        installing".
         """
         try:
             self.instances_info[instance].installed = data
             for model in preserved_models:
-                await self.load_model(instance, model)
+                await self.load_model(instance, model, derive_container_name=context == "update")
             await self._after_install(instance)
             await self._save()
         finally:
@@ -1092,15 +1239,23 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         try:
             await self.service_provider.dismiss_warnings_matching_any(self.get_type(), [(None, None), (instance, None)])
         except Exception:
-            logger.exception(f"{self.get_id(instance)} failed to dismiss warnings after successful {context}")  # noqa: G004
+            logger.exception(f"{self.get_id(instance)} failed to dismiss warnings after successful {context}")
 
     async def _rollback_after_failed_update(
-        self, instance: str, previous_options: InstallServiceIn, preserved_models: list[ModelConfig], original_error: BaseException
+        self,
+        instance: str,
+        previous_options: InstallServiceIn,
+        preserved_models: list[ModelConfig],
+        original_error: BaseException,
+        *,
+        previous_container_name: str | None,
     ) -> bool:
         """Best-effort restore of the pre-update installation after `update_instance()`'s reinstall step failed.
 
         Re-runs `_install_instance` with the options captured before the uninstall and reloads the
         preserved models onto the recreated container - mirroring `update_instance()`'s own success path.
+        `previous_container_name` pins the instance container back to its pre-update name, just like the
+        preserved models keep theirs - a restore must not pick up a suffix changed since the original install.
         If the restore itself fails too, the instance is genuinely gone: that's surfaced as a distinct,
         more prominent warning so it isn't mistaken for the original, potentially transient, update
         failure.
@@ -1109,9 +1264,9 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         itself also failed - the caller uses this to tell the client which of the two actually happened
         (see `_append_rollback_outcome`).
         """
-        logger.warning(f"{self.get_id(instance)} update failed ({original_error}); attempting to restore the previous installation")  # noqa: G004
+        logger.warning(f"{self.get_id(instance)} update failed ({original_error}); attempting to restore the previous installation")
         try:
-            promise = await self._install_instance(instance, previous_options)
+            promise = await self._install_instance(instance, previous_options, previous_container_name)
             data = await promise.wait()
         except asyncio.CancelledError:
             # Never swallow cancellation (e.g. app shutdown) - but still clear `installing` first, so
@@ -1120,7 +1275,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             self.instances_info[instance].installing = None
             raise
         except Exception as rollback_error:
-            logger.exception(f"{self.get_id(instance)} rollback after a failed update also failed; instance left fully uninstalled")  # noqa: G004
+            logger.exception(f"{self.get_id(instance)} rollback after a failed update also failed; instance left fully uninstalled")
             self.instances_info[instance].installing = None
             self._record_warning_in_background(
                 f"Service instance '{instance}' failed to update ({original_error}) and the automatic rollback to its previous "
@@ -1137,7 +1292,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             # configuration again) - only the bookkeeping after it failed. Distinguished from the
             # "rollback itself failed" case above since it's a much smaller problem: the caller still
             # gets told the instance was reverted, plus a heads-up that something needs a look.
-            logger.exception(f"{self.get_id(instance)} rollback reinstall succeeded but its post-install bookkeeping failed")  # noqa: G004
+            logger.exception(f"{self.get_id(instance)} rollback reinstall succeeded but its post-install bookkeeping failed")
             self._record_warning_in_background(
                 f"Service instance '{instance}' failed to update ({original_error}) and was reverted to its previous "
                 "installation, but finishing the restore ran into a problem afterwards - check the service's state.",
@@ -1193,8 +1348,10 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         """
 
     @abstractmethod
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfoType, StreamChunk]:
-        """Install service."""
+    async def _install_instance(
+        self, instance: str, options: InstallServiceIn, container_name_override: str | None = None
+    ) -> PromiseWithProgress[InstalledInfoType, StreamChunk]:
+        """Install service. container_name_override, if set, must be used verbatim - see InstanceConfig.container_name."""
 
     async def uninstall_instance(self, instance: str, options: UninstallServiceIn) -> None:
         """Uninstall the service."""
@@ -1345,6 +1502,30 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             if effective_prefix == prefix:
                 raise HTTPException(400, f"Prefix '{prefix}' is already in use by model '{mid}'.")
 
+    @contextmanager
+    def _keep_gpu_allocation(self, instance: str, model_id: str, installed_models: dict[str, Any]) -> Iterator[Callable[[bool], None]]:
+        """Keep a model's current GPU utilization across an uninstall/reinstall edit, clearing it on exit.
+
+        The uninstall drops the model's persisted entry, so without this every reinstall (and rollback) would
+        re-derive the size from whatever VRAM is free at that moment. Yields a toggle: `set_active(False)` hides
+        the kept value (e.g. for an install whose gpu_priority changed), `set_active(True)` restores it (rollbacks).
+        """
+        key = (instance, model_id)
+        installed = installed_models.get(model_id)
+        kept = getattr(installed, "gpu_memory_utilization", None) if installed is not None else None
+
+        def set_active(active: bool) -> None:
+            if kept and active:
+                self._edit_kept_gpu_utilization[key] = kept
+            else:
+                self._edit_kept_gpu_utilization.pop(key, None)
+
+        set_active(True)
+        try:
+            yield set_active
+        finally:
+            self._edit_kept_gpu_utilization.pop(key, None)
+
     async def edit_model(  # noqa: C901
         self, instance: str, custom_model_id: CustomModelId, new_definition: AddCustomModelIn
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk] | None:
@@ -1381,57 +1562,62 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             install_options: InstallModelIn | None = installed_models[model_id].options if was_installed else None
             old_data = dict(model.data)
 
-            if was_installed:
-                await self.uninstall_model(instance, model_id, UninstallModelIn(purge=False))
-
-            try:
-                await self.update_custom_model(instance, custom_model_id, new_definition)
-            except Exception:
-                logger.exception(f"{self.get_id(instance)} failed to apply new definition for model {model_id} while editing")  # noqa: G004
+            with self._keep_gpu_allocation(instance, model_id, installed_models):
                 if was_installed:
-                    assert install_options is not None
+                    await self.uninstall_model(instance, model_id, UninstallModelIn(purge=False))
+
+                try:
+                    await self.update_custom_model(instance, custom_model_id, new_definition)
+                except Exception:
+                    logger.exception(f"{self.get_id(instance)} failed to apply new definition for model {model_id} while editing")
+                    if was_installed:
+                        assert install_options is not None
+                        try:
+                            await self._install_model_and_wait(instance, model_id, install_options)
+                        except Exception:
+                            logger.exception(f"{self.get_id(instance)} failed to roll back model {model_id} after a failed edit")
+                    raise
+
+                if not was_installed:
+                    return None
+
+                assert install_options is not None
+                # Read the prefix `update_custom_model` actually computed for the model now sitting in the
+                # registry - not `new_definition.spec.get("default_prefix")`. `default_prefix` is optional
+                # for MCP `user`/`proxy` models and the WebUI sends it as absent whenever the field is
+                # cleared; `_update_custom_model` still falls back to `normalize_name(id)` in that case and
+                # writes that as the model's new `default_prefix`, which the raw request body never reflects.
+                updated_model = self.models.get(instance, {}).get(model_id)
+                new_default_prefix = getattr(updated_model, "default_prefix", None)
+                reinstall_options = install_options
+                if (
+                    install_options.spec is not None
+                    and new_default_prefix is not None
+                    and install_options.spec.get("prefix") != new_default_prefix
+                ):
+                    # The install-time `prefix` starts out equal to the definition's `default_prefix` (set by
+                    # `_install_model` when "prefix" is absent from the install spec) and there's no user-facing
+                    # way to diverge a custom-backed model's `prefix` from that - `edit_model_install_options`
+                    # (the only path that edits `prefix` directly) is only reachable for catalog models with no
+                    # `CustomModel` definition, mutually exclusive with this one. So `prefix` must always follow
+                    # `default_prefix` here, or editing it would silently do nothing to the registered endpoint.
+                    # `install_options` itself is left untouched so a rollback below reinstalls with the prefix
+                    # that actually matches the restored (old) definition.
+                    reinstall_options = install_options.model_copy(update={"spec": {**install_options.spec, "prefix": new_default_prefix}})
+                try:
+                    return await self._install_model_and_wait(instance, model_id, reinstall_options)
+                except Exception:
+                    logger.exception(f"{self.get_id(instance)} failed to reinstall model {model_id} while editing")
                     try:
+                        await self.update_custom_model(instance, custom_model_id, AddCustomModelIn(spec=old_data))
                         await self._install_model_and_wait(instance, model_id, install_options)
                     except Exception:
-                        logger.exception(f"{self.get_id(instance)} failed to roll back model {model_id} after a failed edit")  # noqa: G004
-                raise
+                        logger.exception(f"{self.get_id(instance)} failed to roll back model {model_id} after a failed reinstall")
+                    raise
 
-            if not was_installed:
-                return None
-
-            assert install_options is not None
-            # Read the prefix `update_custom_model` actually computed for the model now sitting in the
-            # registry - not `new_definition.spec.get("default_prefix")`. `default_prefix` is optional
-            # for MCP `user`/`proxy` models and the WebUI sends it as absent whenever the field is
-            # cleared; `_update_custom_model` still falls back to `normalize_name(id)` in that case and
-            # writes that as the model's new `default_prefix`, which the raw request body never reflects.
-            updated_model = self.models.get(instance, {}).get(model_id)
-            new_default_prefix = getattr(updated_model, "default_prefix", None)
-            reinstall_options = install_options
-            if (
-                install_options.spec is not None
-                and new_default_prefix is not None
-                and install_options.spec.get("prefix") != new_default_prefix
-            ):
-                # The install-time `prefix` starts out equal to the definition's `default_prefix` (set by
-                # `_install_model` when "prefix" is absent from the install spec) and there's no user-facing
-                # way to diverge a custom-backed model's `prefix` from that - `edit_model_install_options`
-                # (the only path that edits `prefix` directly) is only reachable for catalog models with no
-                # `CustomModel` definition, mutually exclusive with this one. So `prefix` must always follow
-                # `default_prefix` here, or editing it would silently do nothing to the registered endpoint.
-                # `install_options` itself is left untouched so a rollback below reinstalls with the prefix
-                # that actually matches the restored (old) definition.
-                reinstall_options = install_options.model_copy(update={"spec": {**install_options.spec, "prefix": new_default_prefix}})
-            try:
-                return await self._install_model_and_wait(instance, model_id, reinstall_options)
-            except Exception:
-                logger.exception(f"{self.get_id(instance)} failed to reinstall model {model_id} while editing")  # noqa: G004
-                try:
-                    await self.update_custom_model(instance, custom_model_id, AddCustomModelIn(spec=old_data))
-                    await self._install_model_and_wait(instance, model_id, install_options)
-                except Exception:
-                    logger.exception(f"{self.get_id(instance)} failed to roll back model {model_id} after a failed reinstall")  # noqa: G004
-                raise
+    def _carry_over_edited_install_options(self, old_options: InstallModelIn, new_options: InstallModelIn) -> InstallModelIn:  # noqa: ARG002
+        """Carry install options the edit form can't express from `old_options` into `new_options` (override hook)."""
+        return new_options
 
     async def edit_model_install_options(
         self, instance: str, model_id: str, new_options: InstallModelIn
@@ -1456,24 +1642,31 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             installed_models = cast("_HasModels", info.installed).models if info.installed else {}
             was_installed = model_id in installed_models
             old_options: InstallModelIn | None = installed_models[model_id].options if was_installed else None
+            if old_options is not None:
+                new_options = self._carry_over_edited_install_options(old_options, new_options)
 
-            if was_installed:
-                await self.uninstall_model(instance, model_id, UninstallModelIn(purge=False))
-
-            try:
-                promise = await self._install_model_and_wait(instance, model_id, new_options)
-            except Exception:
-                logger.exception(f"{self.get_id(instance)} failed to reinstall model {model_id} with new install options")  # noqa: G004
+            with self._keep_gpu_allocation(instance, model_id, installed_models) as set_kept_active:
                 if was_installed:
-                    assert old_options is not None
-                    try:
-                        await self._install_model_and_wait(instance, model_id, old_options)
-                    except Exception:
-                        logger.exception(
-                            f"{self.get_id(instance)} failed to roll back model {model_id} after a failed install-options edit"  # noqa: G004
-                        )
-                raise
-            return was_installed, promise
+                    await self.uninstall_model(instance, model_id, UninstallModelIn(purge=False))
+
+                # A changed gpu_priority must be re-sized from scratch; an unchanged one keeps the current allocation.
+                if self._parse_gpu_priority(new_options.spec) != self._parse_gpu_priority(old_options.spec if old_options else None):
+                    set_kept_active(False)
+                try:
+                    promise = await self._install_model_and_wait(instance, model_id, new_options)
+                except Exception:
+                    logger.exception(f"{self.get_id(instance)} failed to reinstall model {model_id} with new install options")
+                    if was_installed:
+                        assert old_options is not None
+                        set_kept_active(True)
+                        try:
+                            await self._install_model_and_wait(instance, model_id, old_options)
+                        except Exception:
+                            logger.exception(
+                                f"{self.get_id(instance)} failed to roll back model {model_id} after a failed install-options edit"
+                            )
+                    raise
+                return was_installed, promise
 
     async def _reserve_and_install(
         self,
@@ -1482,6 +1675,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         options: InstallModelIn,
         on_success: Callable[[InstallModelOut], Awaitable[InstallModelOut]],
         on_error: Callable[[Exception], None],
+        container_name_override: str | None = None,
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         """Reserve model_id for install, or join an already-in-progress reservation for it.
 
@@ -1490,6 +1684,8 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         one sees the same reservation, instead of racing a duplicate install or fabricating a
         result. on_success/on_error carry each caller's own post-install bookkeeping; reservation
         cleanup itself always happens here regardless of what they do.
+
+        container_name_override: only load_model() passes this, to pin the persisted name - see ModelConfig.container_name.
         """
         installing_model_progress = self.get_instance_info(instance).installing_model_progress
 
@@ -1520,7 +1716,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         # Run _install_model() as its own task (rather than awaiting it inline) so cancel_model_install(),
         # called from a completely different request, has something real to cancel even before this
         # produces a promise - not just something to wait on.
-        reservation.pending_task = asyncio.create_task(self._install_model(instance, model_id, options))
+        reservation.pending_task = asyncio.create_task(self._install_model(instance, model_id, options, container_name_override))
         try:
             promise = await reservation.pending_task
         except BaseException as e:
@@ -1549,7 +1745,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             try:
                 await self.service_provider.dismiss_warnings_matching(self.get_type(), instance=instance, model_id=model_id)
             except Exception:
-                logger.exception(f"{self.get_id(instance)} failed to dismiss warnings for model {model_id} after successful install")  # noqa: G004
+                logger.exception(f"{self.get_id(instance)} failed to dismiss warnings for model {model_id} after successful install")
             msg = f"{model_id} model installed."
             logger.debug(msg)
             return data
@@ -1562,9 +1758,9 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
 
     @abstractmethod
     async def _install_model(
-        self, instance: str, model_id: str, options: InstallModelIn
+        self, instance: str, model_id: str, options: InstallModelIn, container_name_override: str | None = None
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
-        """Install the model."""
+        """Install the model. container_name_override, if set, must be used verbatim - see ModelConfig.container_name."""
 
     async def uninstall_model(self, instance: str, model_id: str, options: UninstallModelIn) -> None:
         """Uninstall the model."""
@@ -1574,7 +1770,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         try:
             await self.service_provider.dismiss_warnings_matching(self.get_type(), instance=instance, model_id=model_id)
         except Exception:
-            logger.exception(f"{self.get_id(instance)} failed to dismiss warnings for model {model_id} after uninstall")  # noqa: G004
+            logger.exception(f"{self.get_id(instance)} failed to dismiss warnings for model {model_id} after uninstall")
         await self._save()
 
     @abstractmethod
@@ -1736,6 +1932,57 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
         if len(warnings) > 0 and not ignore_warning:
             raise HTTPException(400, {"warnings": warnings})
 
+    def get_default_docker_image_name(self) -> str | None:
+        """Return the docker image this service would install by default, or None to skip the upfront platform check.
+
+        Used once at app startup by `resolve_platform_compatibility()` to check whether the image is
+        published for the host's OS/architecture. Override per service with the same image already
+        used (with no I/O) to pick the default install target, e.g. `_get_image(...).name`.
+        """
+        return None
+
+    async def resolve_platform_compatibility(self) -> None:
+        """Resolve, once, whether this service's default docker image supports the host platform.
+
+        Called during app startup, before the server accepts requests. Populates
+        `_platform_unsupported_reason`, read synchronously by `get_disabled_reason()` afterwards.
+        A registry lookup that fails, or times out, is logged and swallowed - the service is then
+        treated as compatible, matching how GPU-detection failures already degrade gracefully
+        rather than blocking startup. Skipped entirely when hardware already disables the service,
+        since `get_disabled_reason()` would discard the platform result anyway.
+        """
+        if self.get_hardware_unsupported_reason():
+            return
+        image = self.get_default_docker_image_name()
+        if not image:
+            return
+        try:
+            platforms = await asyncio.wait_for(self.docker_service.get_image_platforms(image), timeout=_PLATFORM_CHECK_TIMEOUT_SECONDS)
+        except (DockerImageDoesNotExistError, DockerImageAuthorizationError) as err:
+            # Unrelated to platform compatibility (a missing/inaccessible image) - nothing useful
+            # to report as a hardware mismatch, so leave the service looking compatible.
+            logger.warning("Could not resolve platform compatibility for %s (%s): %s; treating as compatible", self.get_type(), image, err)
+            return
+        except Exception:
+            logger.exception("Could not resolve platform compatibility for %s (%s); treating as compatible", self.get_type(), image)
+            return
+        if platforms and self.docker_service.host_platform not in platforms:
+            # A clean, user-facing summary - deliberately not the raw warning text (image name,
+            # digest, full platform list), which reads as an unreadable wall of technical detail
+            # in the webui tooltip (DFINFRA-365).
+            arch = (
+                self.docker_service.host_platform.split("/")[1]
+                if "/" in self.docker_service.host_platform
+                else self.docker_service.host_platform
+            )
+            self._platform_unsupported_reason = (
+                f"This service is incompatible with your machine ({arch} is not supported). Restart Infra if this has changed."
+            )
+
+    def get_disabled_reason(self) -> str | None:
+        """Return why this service can't be installed here, combining hardware and platform checks."""
+        return self.get_hardware_unsupported_reason() or self._platform_unsupported_reason
+
     @property
     def _supported_gpus(self) -> list[GpuInfo]:
         """Return GPUs supported by this service. Override to include non-NVIDIA GPUs."""
@@ -1792,7 +2039,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
     def add_hardware_field_to_spec(
         self,
         fields: list[ServiceField] | None = None,
-        add_cpu_option_only_on_avx512_support: bool = False,
+        cpu_supported: bool = True,
     ) -> list[ServiceField]:
         """Add hardware (CPU/GPU/GPUs) field to specification."""
         fields = fields or []
@@ -1806,7 +2053,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             options.append(OneOfOption(value="GPUs", label="All GPUs"))
             default = "GPUs"
         options.extend([f"GPU | {gpu.long_name}" for gpu in gpus])
-        if not add_cpu_option_only_on_avx512_support or self.hardware.cpu.avx512:
+        if cpu_supported:
             options.append("CPU")
             if default is None:
                 default = "CPU"
@@ -1819,7 +2066,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
     def add_hardware_field_to_model_spec(
         self,
         fields: list[ModelField] | None = None,
-        add_cpu_option_only_on_avx512_support: bool = False,
+        cpu_supported: bool = True,
     ) -> list[ModelField]:
         """Add hardware (CPU/GPU/GPUs) field to specification."""
         fields = fields or []
@@ -1833,7 +2080,7 @@ class Base2Service(Generic[InstalledInfoType, DownloadInfoType], BaseService):  
             options.append(OneOfOption(value="GPUs", label="All GPUs"))
             default = "GPUs"
         options.extend([f"GPU | {gpu.long_name}" for gpu in gpus])
-        if not add_cpu_option_only_on_avx512_support or self.hardware.cpu.avx512:
+        if cpu_supported:
             options.append("CPU")
             if default is None:
                 default = "CPU"

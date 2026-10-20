@@ -21,9 +21,23 @@ from server.services.remote_service import (
     InstalledInfo,
     LiveModelEntry,
     ModelInstalledInfo,
+    RemoteCustomModel,
     RemoteModel,
+    RemoteModelType,
     get_model_props,
 )
+
+
+def _make_model_installed_info(model_id: str = "gpt-4o", registration_id: str = "reg-1") -> ModelInstalledInfo:
+    return ModelInstalledInfo(
+        id=model_id,
+        registered_name=model_id,
+        type="llm",
+        options=InstallModelIn(spec={}),
+        completions=True,
+        legacy_completions=True,
+        registration_id=registration_id,
+    )
 
 
 @pytest.fixture
@@ -35,6 +49,7 @@ def deps() -> dict[str, Any]:
         "model_downloader": MagicMock(),
         "docker_service": MagicMock(),
         "hardware": MagicMock(gpus=[]),
+        "services_manager": MagicMock(),
     }
 
 
@@ -266,6 +281,40 @@ def test_get_model_props_respects_disabled_endpoints() -> None:
     assert "/v1/completions" not in props.endpoints
 
 
+@pytest.mark.parametrize(
+    ("model_type", "expected"),
+    [
+        ("embedding", ["/v1/embeddings"]),
+        ("stt", ["/v1/audio/transcriptions"]),
+        ("tts", ["/v1/audio/speech"]),
+        ("txt2img", ["/v1/images/generations"]),
+    ],
+)
+def test_get_model_props_non_llm_advertises_only_its_own_endpoint(model_type: RemoteModelType, expected: list[str]) -> None:
+    """LLM flags default to True, so a non-LLM model must not inherit the conversational endpoints from them."""
+    model = RemoteModel(type=model_type)
+
+    props = get_model_props(model)
+
+    assert props.endpoints == expected
+
+
+def test_get_model_props_custom_embedding_advertises_embeddings() -> None:
+    model = RemoteCustomModel(id="my-embedder", type="embedding")
+
+    props = get_model_props(model)
+
+    assert props.endpoints == ["/v1/embeddings"]
+
+
+def test_get_model_props_unresolved_type_advertises_no_endpoints() -> None:
+    model = RemoteModel(type=None)
+
+    props = get_model_props(model)
+
+    assert props.endpoints == []
+
+
 def test_base_service_options_headers_raises_not_implemented() -> None:
     opts = BaseServiceOptions(api_url="https://example.com")
 
@@ -274,16 +323,9 @@ def test_base_service_options_headers_raises_not_implemented() -> None:
 
 
 def test_model_installed_info_get_info_returns_model_info() -> None:
-    options = InstallModelIn(spec={"alias": "test"})
-    info = ModelInstalledInfo(
-        id="gpt-4o",
-        registered_name="gpt-4o",
-        type="llm",
-        options=options,
-        completions=True,
-        legacy_completions=True,
-        registration_id="reg-1",
-    )
+    options = InstallModelIn(spec={"rename": "test"})
+    info = _make_model_installed_info()
+    info.options = options
 
     result = info.get_info()
 
@@ -299,11 +341,11 @@ def test_openai_get_spec_has_api_url_and_api_key_fields(openai_svc: OpenAIServic
     assert "api_key" in field_names
 
 
-def test_openai_get_model_spec_has_alias_field(openai_svc: OpenAIService) -> None:
+def test_openai_get_model_spec_has_rename_field(openai_svc: OpenAIService) -> None:
     spec = openai_svc.get_model_spec()
 
     field_names = [f.name for f in spec.fields]
-    assert "alias" in field_names
+    assert "rename" in field_names
 
 
 def test_openai_get_custom_model_spec_not_none_and_has_id_field(openai_svc: OpenAIService) -> None:
@@ -743,13 +785,40 @@ async def test_install_model_registers_correct_endpoint(
 
 
 @pytest.mark.asyncio
-async def test_install_model_with_alias_uses_alias_as_registered_name(
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "https://api.openai.com",
+        "https://api.openai.com/",
+        "https://api.openai.com/v1",
+        "https://api.openai.com/v1/",
+    ],
+)
+async def test_install_model_builds_correct_embeddings_url(
+    openai_svc: OpenAIService,
+    deps: dict[str, Any],
+    api_url: str,
+) -> None:
+    """The proxy URL must always land on `/v1/embeddings`, whether or not the user's api_url already
+    includes the `/v1` suffix or a trailing slash themselves.
+    """
+    openai_svc.instances_info["default"].installed = _make_installed(api_url=api_url)
+
+    promise = await openai_svc._install_model("default", "text-embedding-ada-002", InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+    await promise.wait()
+
+    options = deps["endpoint_registry"].register_embeddings_as_proxy.call_args.kwargs["options"]
+    assert options.url == "https://api.openai.com/v1/embeddings"
+
+
+@pytest.mark.asyncio
+async def test_install_model_with_rename_uses_rename_as_registered_name(
     openai_svc: OpenAIService,
     deps: dict[str, Any],
 ) -> None:
     openai_svc.instances_info["default"].installed = _make_installed()
 
-    promise = await openai_svc._install_model("default", "gpt-4o", InstallModelIn(spec={"alias": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
+    promise = await openai_svc._install_model("default", "gpt-4o", InstallModelIn(spec={"rename": "my-alias"}))  # pyright: ignore[reportPrivateUsage]
     await promise.wait()
 
     installed_info = openai_svc.instances_info["default"].installed

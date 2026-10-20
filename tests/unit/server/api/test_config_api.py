@@ -25,6 +25,7 @@ from server.core.dependencies import (
     get_parent_infra,
     get_task_manager,
 )
+from server.utils.sentry import SentryManager
 
 
 @pytest.fixture
@@ -42,10 +43,10 @@ def config() -> MagicMock:
     mock.storage_services_dir = ""
     mock.hugging_face_token = SecretStr("")
     mock.civitai_token = SecretStr("")
-    mock.adapter_registry_url = ""
     mock.adapter_registry_secret = SecretStr("")
     mock.log_payloads = ""
     mock.container_name_prefix = ""
+    mock.container_name_suffix = ""
     mock.compose_prefix = "df_"
     mock.stop_containers_on_shutdown = ""
     mock.metrics_username = ""
@@ -59,8 +60,9 @@ def config() -> MagicMock:
     mock.otel_exporter_otlp_endpoint = "http://localhost:4317"
     mock.otel_tracing_enabled = False
     mock.otel_logging_enabled = False
-    mock.ollama_kv_cache_type = "f16"
-    mock.ollama_num_parallel = 1
+    mock.sentry_enabled = False
+    mock.sentry_dsn = SecretStr("")
+    mock.sentry_environment = ""
     mock.ollama_vram_overhead_factor = 1.0
     return mock
 
@@ -69,6 +71,9 @@ def config() -> MagicMock:
 def parent_infra() -> MagicMock:
     mock = MagicMock()
     mock.reconfigure = AsyncMock()
+    # Must match `config`'s initial values, so `mesh_changed` starts out "unchanged".
+    mock.configured_mesh_url = ""
+    mock.configured_mesh_key = SecretStr("")
     return mock
 
 
@@ -86,7 +91,19 @@ def config_lock() -> asyncio.Lock:
 def otlp_logging() -> MagicMock:
     mock = MagicMock()
     mock.reconfigure = AsyncMock()
+    # Must match `config`'s initial values, so `otel_logging_changed` starts out "unchanged".
+    mock.configured_enabled = False
+    mock.configured_endpoint = "http://localhost:4317"
     return mock
+
+
+@pytest.fixture(autouse=True)
+def sentry_manager(config: MagicMock) -> Generator[SentryManager]:
+    manager = SentryManager()
+    # Start from `config`'s Sentry settings already applied, as after startup, so `sentry_changed` starts out "unchanged".
+    asyncio.run(manager.reconfigure(config))
+    with patch("server.api.config.sentry", manager):
+        yield manager
 
 
 @pytest.fixture
@@ -243,6 +260,58 @@ def test_update_config_invalid_value_returns_400(client: TestClient, auth_header
     assert mock_persist.call_count == 0
 
 
+@pytest.mark.parametrize("suffix", ["bad/name", "a" * 33, "_Prod"])
+def test_update_config_rejects_container_name_suffix_docker_disallows(client: TestClient, auth_header: dict[str, str], suffix: str) -> None:
+    with patch("server.api.config.dynamic_config.persist_settings") as mock_persist:
+        resp = client.put("/admin/config", json={"container_name_suffix": suffix}, headers=auth_header)
+
+    assert resp.status_code == 400
+    assert mock_persist.call_count == 0
+
+
+def test_update_config_rejects_new_container_name_suffix_while_legacy_prefix_set(
+    client: TestClient, config: MagicMock, auth_header: dict[str, str]
+) -> None:
+    """The legacy prefix wins in get_docker_container_name(), so the suffix would be silently ignored."""
+    config.container_name_prefix = "df_"
+
+    with patch("server.api.config.dynamic_config.persist_settings") as mock_persist:
+        resp = client.put("/admin/config", json={"container_name_suffix": "_myinstance"}, headers=auth_header)
+
+    assert resp.status_code == 400
+    assert "DF_CONTAINER_NAME_PREFIX" in resp.json()["detail"]
+    assert mock_persist.call_count == 0
+
+
+@pytest.mark.parametrize(("current_suffix", "new_suffix"), [("_mine", ""), ("_mine", "_mine")])
+def test_update_config_allows_clearing_or_resending_suffix_while_legacy_prefix_set(
+    client: TestClient, config: MagicMock, auth_header: dict[str, str], current_suffix: str, new_suffix: str
+) -> None:
+    config.container_name_prefix = "df_"
+    config.container_name_suffix = current_suffix
+
+    with patch("server.api.config.dynamic_config.persist_settings") as mock_persist:
+        resp = client.put("/admin/config", json={"container_name_suffix": new_suffix}, headers=auth_header)
+
+    assert resp.status_code == 200
+    assert mock_persist.call_count == 1
+
+
+def test_update_config_container_name_suffix_persists_and_applies_change(
+    client: TestClient, config: MagicMock, auth_header: dict[str, str]
+) -> None:
+    with patch("server.api.config.dynamic_config.persist_settings") as mock_persist:
+        resp = client.put("/admin/config", json={"container_name_suffix": "_myinstance"}, headers=auth_header)
+
+    assert resp.status_code == 200
+    assert mock_persist.call_count == 1
+    assert mock_persist.call_args[0][1].container_name_suffix == "_myinstance"
+    assert config.container_name_suffix == "_myinstance"
+
+    entries = {e["key"]: e for e in resp.json()["entries"]}
+    assert entries["DF_CONTAINER_NAME_SUFFIX"]["value"] == "_myinstance"
+
+
 def test_update_config_persists_and_applies_change(client: TestClient, config: MagicMock, auth_header: dict[str, str]) -> None:
     with patch("server.api.config.dynamic_config.persist_settings") as mock_persist:
         resp = client.put("/admin/config", json={"metrics_username": "newname"}, headers=auth_header)
@@ -287,6 +356,7 @@ def test_update_config_otel_tracing_disabled_shuts_down_tracer(client: TestClien
     config.otel_tracing_enabled = True
     with patch("server.api.config.dynamic_config.persist_settings"), patch("server.api.config.tracer") as mock_tracer:
         mock_tracer.shutdown = AsyncMock()
+        mock_tracer.is_active = True
         resp = client.put("/admin/config", json={"otel_tracing_enabled": False}, headers=auth_header)
 
     assert resp.status_code == 200
@@ -371,14 +441,14 @@ def test_update_config_hugging_face_token_change_refreshes_downloaders(
     model_downloader.create_downloaders.assert_called_once_with(config)
 
 
-def test_update_config_adapter_registry_change_refreshes_downloaders(
-    client: TestClient, config: MagicMock, model_downloader: MagicMock, auth_header: dict[str, str]
+def test_update_config_adapter_registry_secret_change_does_not_refresh_downloaders(
+    client: TestClient, model_downloader: MagicMock, auth_header: dict[str, str]
 ) -> None:
     with patch("server.api.config.dynamic_config.persist_settings"):
-        resp = client.put("/admin/config", json={"adapter_registry_url": "http://new-registry"}, headers=auth_header)
+        resp = client.put("/admin/config", json={"adapter_registry_secret": "new-secret"}, headers=auth_header)
 
     assert resp.status_code == 200
-    model_downloader.create_downloaders.assert_called_once_with(config)
+    model_downloader.create_downloaders.assert_not_called()
 
 
 def test_update_config_reconfigure_failure_returns_502(
@@ -407,7 +477,7 @@ def test_update_config_persist_failure_returns_502(client: TestClient, config: M
 
 @pytest.mark.asyncio
 async def test_update_config_serializes_concurrent_writes(
-    config: MagicMock, parent_infra: MagicMock, task_manager: MagicMock, auth_header: dict[str, str]
+    config: MagicMock, parent_infra: MagicMock, task_manager: MagicMock, otlp_logging: MagicMock, auth_header: dict[str, str]
 ) -> None:
     """Two concurrent PUTs must not interleave their read-merge-write critical sections.
 
@@ -438,7 +508,7 @@ async def test_update_config_serializes_concurrent_writes(
     app.dependency_overrides[get_parent_infra] = lambda: parent_infra
     app.dependency_overrides[get_task_manager] = lambda: task_manager
     app.dependency_overrides[get_config_lock] = lambda: shared_lock
-    app.dependency_overrides[get_otlp_logging] = lambda: MagicMock()
+    app.dependency_overrides[get_otlp_logging] = lambda: otlp_logging
     app.dependency_overrides[get_infra_websocket_server] = lambda: MagicMock()
     app.dependency_overrides[get_model_downloader] = lambda: MagicMock()
 
@@ -469,3 +539,225 @@ def test_update_config_preserves_unset_secret_field(client: TestClient, config: 
 
     assert resp.status_code == 200
     assert mock_persist.call_args[0][1].mesh_key.get_secret_value() == "existing-mesh-secret"
+
+
+def test_update_config_mesh_reconfigure_retry_after_failure_re_attempts_reconfigure(
+    client: TestClient, parent_infra: MagicMock, auth_header: dict[str, str]
+) -> None:
+    """A retry must not silently skip a mesh reconfigure that failed."""
+    parent_infra.reconfigure = AsyncMock(side_effect=[RuntimeError("mesh unreachable"), None])
+
+    with patch("server.api.config.dynamic_config.persist_settings"):
+        first = client.put("/admin/config", json={"connect_to_mesh_url": "ws://new.example"}, headers=auth_header)
+        second = client.put("/admin/config", json={"connect_to_mesh_url": "ws://new.example"}, headers=auth_header)
+
+    assert first.status_code == 502
+    assert second.status_code == 200
+    assert parent_infra.reconfigure.await_count == 2
+
+
+def test_update_config_otel_logging_reconfigure_retry_after_failure_re_attempts_reconfigure(
+    client: TestClient, otlp_logging: MagicMock, auth_header: dict[str, str]
+) -> None:
+    """A retry must not silently skip an OTEL logging reconfigure that failed."""
+    otlp_logging.reconfigure = AsyncMock(side_effect=[RuntimeError("otlp collector unreachable"), None])
+
+    with patch("server.api.config.dynamic_config.persist_settings"):
+        first = client.put("/admin/config", json={"otel_logging_enabled": True}, headers=auth_header)
+        second = client.put("/admin/config", json={"otel_logging_enabled": True}, headers=auth_header)
+
+    assert first.status_code == 502
+    assert second.status_code == 200
+    assert otlp_logging.reconfigure.await_count == 2
+
+
+def test_update_config_tracer_shutdown_retried_when_still_active_after_prior_failure(
+    client: TestClient, config: MagicMock, auth_header: dict[str, str]
+) -> None:
+    """Tracer shutdown is checked against live provider state, not a flag."""
+    config.otel_tracing_enabled = False
+    with patch("server.api.config.dynamic_config.persist_settings"), patch("server.api.config.tracer") as mock_tracer:
+        mock_tracer.shutdown = AsyncMock()
+        mock_tracer.is_active = True  # a live provider left over from a prior, partially-failed attempt
+        resp = client.put("/admin/config", json={"metrics_username": "newname"}, headers=auth_header)
+
+    assert resp.status_code == 200
+    assert mock_tracer.shutdown.call_count == 1
+
+
+def test_update_config_unrelated_change_skips_reconfigure_but_broadcasts_ancestors(
+    client: TestClient,
+    parent_infra: MagicMock,
+    otlp_logging: MagicMock,
+    infra_websocket_server: MagicMock,
+    auth_header: dict[str, str],
+) -> None:
+    with patch("server.api.config.dynamic_config.persist_settings"):
+        resp = client.put("/admin/config", json={"hugging_face_token": "new-hf-token"}, headers=auth_header)
+
+    assert resp.status_code == 200
+    parent_infra.reconfigure.assert_not_awaited()
+    assert otlp_logging.reconfigure.call_count == 0
+    infra_websocket_server.broadcast_ancestors_to_children.assert_called_once()
+
+
+# --- sentry settings ---
+
+SENTRY_DSN = "https://publickey@sentry.example.com/42"
+
+
+def test_get_config_lists_sentry_settings_with_masked_dsn(client: TestClient, config: MagicMock, auth_header: dict[str, str]) -> None:
+    config.sentry_dsn = SecretStr(SENTRY_DSN)
+
+    resp = client.get("/admin/config", headers=auth_header)
+
+    entries = {e["key"]: e for e in resp.json()["entries"]}
+    assert entries["DF_SENTRY_ENABLED"]["value"] == "False"
+    assert entries["DF_SENTRY_ENABLED"]["is_editable"] is True
+    assert entries["DF_SENTRY_DSN"]["value"] == "••••••••"
+    assert entries["DF_SENTRY_DSN"]["is_secret"] is True
+    assert entries["DF_SENTRY_ENVIRONMENT"]["value"] == ""
+    assert SENTRY_DSN not in resp.text
+
+
+def test_reveal_returns_sentry_dsn(client: TestClient, config: MagicMock, auth_header: dict[str, str]) -> None:
+    config.sentry_dsn = SecretStr(SENTRY_DSN)
+
+    resp = client.get("/admin/config/DF_SENTRY_DSN/reveal", headers=auth_header)
+
+    assert resp.status_code == 200
+    assert resp.json()["value"] == SENTRY_DSN
+
+
+@pytest.mark.parametrize("dsn", ["not-a-dsn", "https://sentry.example.com/42", "https://key@sentry.example.com:notaport/42"])
+@patch("server.api.config.dynamic_config.persist_settings")
+def test_update_config_rejects_malformed_sentry_dsn(
+    mock_persist_settings: MagicMock, client: TestClient, config: MagicMock, auth_header: dict[str, str], dsn: str
+) -> None:
+    resp = client.put("/admin/config", json={"sentry_dsn": dsn}, headers=auth_header)
+
+    assert resp.status_code == 400
+    assert "Invalid Sentry DSN" in resp.json()["detail"]
+    assert mock_persist_settings.call_count == 0
+    assert config.sentry_dsn.get_secret_value() == ""
+
+
+@patch("server.utils.sentry.sentry_sdk.init")
+@patch("server.api.config.dynamic_config.persist_settings")
+def test_update_config_accepts_empty_sentry_dsn(
+    mock_persist_settings: MagicMock, mock_init: MagicMock, client: TestClient, config: MagicMock, auth_header: dict[str, str]
+) -> None:
+    config.sentry_dsn = SecretStr(SENTRY_DSN)
+
+    resp = client.put("/admin/config", json={"sentry_enabled": True, "sentry_dsn": ""}, headers=auth_header)
+
+    assert resp.status_code == 200
+    assert mock_persist_settings.call_count == 1
+    assert config.sentry_dsn.get_secret_value() == ""
+    assert mock_init.call_count == 0
+
+
+@patch("server.utils.sentry.sentry_sdk.init")
+@patch("server.api.config.dynamic_config.persist_settings")
+def test_update_config_ignores_stored_malformed_sentry_dsn_for_unrelated_change(
+    mock_persist_settings: MagicMock,
+    mock_init: MagicMock,
+    client: TestClient,
+    config: MagicMock,
+    sentry_manager: SentryManager,
+    auth_header: dict[str, str],
+) -> None:
+    config.sentry_enabled = True
+    config.sentry_dsn = SecretStr("not-a-dsn")
+    asyncio.run(sentry_manager.reconfigure(config))
+
+    resp = client.put("/admin/config", json={"metrics_username": "newname"}, headers=auth_header)
+
+    assert resp.status_code == 200
+    assert mock_persist_settings.call_count == 1
+    assert mock_init.call_count == 0
+
+
+@patch("server.utils.sentry.sentry_sdk.init")
+@patch("server.api.config.dynamic_config.persist_settings")
+def test_update_config_sentry_change_reconfigures_sentry(
+    mock_persist_settings: MagicMock, mock_init: MagicMock, client: TestClient, auth_header: dict[str, str]
+) -> None:
+    resp = client.put("/admin/config", json={"sentry_enabled": True, "sentry_dsn": SENTRY_DSN}, headers=auth_header)
+
+    assert resp.status_code == 200
+    assert mock_init.call_count == 1
+    assert mock_init.call_args.kwargs["dsn"] == SENTRY_DSN
+
+
+@patch("server.utils.sentry.sentry_sdk.init")
+@patch("server.api.config.dynamic_config.persist_settings")
+def test_update_config_unrelated_change_skips_sentry_reconfigure(
+    mock_persist_settings: MagicMock, mock_init: MagicMock, client: TestClient, auth_header: dict[str, str]
+) -> None:
+    client.put("/admin/config", json={"sentry_enabled": True, "sentry_dsn": SENTRY_DSN}, headers=auth_header)
+
+    resp = client.put("/admin/config", json={"metrics_username": "newname"}, headers=auth_header)
+
+    assert resp.status_code == 200
+    assert mock_init.call_count == 1
+
+
+@patch("server.utils.sentry.sentry_sdk.init")
+@patch("server.api.config.dynamic_config.persist_settings")
+def test_update_config_retries_failed_sentry_reconfigure_on_next_update(
+    mock_persist_settings: MagicMock, mock_init: MagicMock, client: TestClient, auth_header: dict[str, str]
+) -> None:
+    mock_init.side_effect = [RuntimeError("init failed"), None]
+
+    first = client.put("/admin/config", json={"sentry_enabled": True, "sentry_dsn": SENTRY_DSN}, headers=auth_header)
+    second = client.put("/admin/config", json={"metrics_username": "newname"}, headers=auth_header)
+
+    assert first.status_code == 502
+    assert second.status_code == 200
+    assert mock_init.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [{"sentry_enabled": True}, {"sentry_environment": "staging"}],
+)
+@patch("server.api.config.dynamic_config.persist_settings")
+def test_update_config_rejects_enabling_sentry_over_stored_malformed_dsn(
+    mock_persist_settings: MagicMock, client: TestClient, config: MagicMock, auth_header: dict[str, str], updates: dict[str, object]
+) -> None:
+    config.sentry_enabled = "sentry_environment" in updates
+    config.sentry_dsn = SecretStr("not-a-dsn")
+
+    resp = client.put("/admin/config", json=updates, headers=auth_header)
+
+    assert resp.status_code == 400
+    assert "Invalid Sentry DSN" in resp.json()["detail"]
+    assert mock_persist_settings.call_count == 0
+
+
+@patch("server.utils.sentry.sentry_sdk.init")
+@patch("server.api.config.dynamic_config.persist_settings")
+def test_update_config_allows_disabling_sentry_with_stored_malformed_dsn(
+    mock_persist_settings: MagicMock, mock_init: MagicMock, client: TestClient, config: MagicMock, auth_header: dict[str, str]
+) -> None:
+    config.sentry_enabled = True
+    config.sentry_dsn = SecretStr("not-a-dsn")
+
+    resp = client.put("/admin/config", json={"sentry_enabled": False}, headers=auth_header)
+
+    assert resp.status_code == 200
+    assert mock_persist_settings.call_count == 1
+    assert config.sentry_enabled is False
+
+
+@patch("server.utils.sentry.sentry_sdk.init")
+@patch("server.api.config.dynamic_config.persist_settings")
+def test_update_config_allows_enabling_sentry_without_dsn(
+    mock_persist_settings: MagicMock, mock_init: MagicMock, client: TestClient, config: MagicMock, auth_header: dict[str, str]
+) -> None:
+    resp = client.put("/admin/config", json={"sentry_enabled": True}, headers=auth_header)
+
+    assert resp.status_code == 200
+    assert mock_persist_settings.call_count == 1
+    assert mock_init.call_count == 0

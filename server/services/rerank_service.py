@@ -119,6 +119,7 @@ class RerankOptions(BaseModel):
 
 
 class RerankModelOptions(BaseModel):
+    rename: str | None = None
     alias: str | None = None
     alive_time: int | None = None
     preload: bool | None = None
@@ -194,7 +195,10 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
         """Return the model specification."""
         return ModelSpecification(
             fields=[
-                ModelField(type="text", name="alias", description="Model alias", required=False),
+                ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
+                ModelField(
+                    type="text", name="alias", description="Additional name for the model, the original name keeps working", required=False
+                ),
                 ModelField(
                     type="text",
                     name="alive_time",
@@ -243,6 +247,7 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
             if info
             else [],
             custom=custom,
+            container_name=info.docker.container_name if info else None,
         )
 
     def _restore_model_definition(self, instance: str, model_id: str, definition: dict[str, Any]) -> None:
@@ -253,10 +258,16 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
             return _const.images["gpu"]
         return _const.images["cpu"]
 
+    def get_default_docker_image_name(self) -> str | None:
+        """Return the default docker image, for the upfront platform-compatibility check."""
+        return self._get_image(self.get_specified_hardware_parts(None)).name
+
     def _load_download_info(self, data: dict[str, Any]) -> DownloadedInfo:
         return DownloadedInfo(**data)
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
+    async def _install_instance(
+        self, instance: str, options: InstallServiceIn, container_name_override: str | None = None
+    ) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self.load_default_models(instance)
 
@@ -284,7 +295,7 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
             docker_options = DockerOptions(
                 name=name,
                 env_vars=envs,
-                container_name=self.docker_service.get_docker_container_name(name),
+                container_name=container_name_override or self.docker_service.get_docker_container_name(name),
                 image=image.name,
                 image_port=8089,
                 hardware=hardware_parts,
@@ -301,7 +312,7 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
                 },
             )
             docker_exposed_port, _, _ = await self.docker_service.install_and_run_docker(docker_options)
-            container_host = self.docker_service.get_container_host(subnet, docker_options.name)
+            container_host = self.docker_service.get_container_host(subnet, docker_options)
             container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
             info = InstalledInfo(
                 docker=docker_options,
@@ -460,7 +471,11 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
                     break
 
     async def _install_model(  # noqa: C901
-        self, instance: str, model_id: str, options: InstallModelIn
+        self,
+        instance: str,
+        model_id: str,
+        options: InstallModelIn,
+        container_name_override: str | None = None,  # noqa: ARG002
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_model_options = try_parse_pydantic(RerankModelOptions, options.spec) if options.spec else RerankModelOptions()
         info = self.get_instance_installed_info(instance)
@@ -487,7 +502,8 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
                 await self._download_model_or_set_progress(stream, model, model_id, model_dir)
 
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
-                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
+                registered_alias = parsed_model_options.alias
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
                     type=model.type,
@@ -505,7 +521,7 @@ class RerankService(Base2Service[InstalledInfo, DownloadedInfo]):
                                 endpoints=["/v1/rerank"],
                             ),
                             options=ProxyOptions(url=f"{info.base_url}/v1/rerank", rewrite_model_to=model_id),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                            registration_options=RegistrationOptions(origin="local", alias=registered_alias, owned_by=self.get_type()),
                         )
                     stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
 

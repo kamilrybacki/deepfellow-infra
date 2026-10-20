@@ -14,6 +14,7 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
+from server.docker import DockerOptions
 from server.models.models import InstallModelIn, ListModelsFilters, UninstallModelIn
 from server.models.services import InstallServiceIn, UninstallServiceIn
 from server.services.base2_service import CustomModel, Instance, InstanceConfig, ModelConfig
@@ -21,6 +22,7 @@ from server.services.ollama_service import (
     DownloadedInfo,
     InstalledInfo,
     LoadedModelInfo,
+    ModelCapabilities,
     ModelInstalledInfo,
     OllamaModel,
     OllamaModelFile,
@@ -30,9 +32,20 @@ from server.services.ollama_service import (
     OllamaService,
     _const,  # pyright: ignore[reportPrivateUsage]
 )
-from server.utils.core import DownloadedPacket, FetchResult, PreDownloadPacket, Stream, StreamChunkProgress
+from server.utils.core import (
+    CommandFailedError,
+    DownloadedPacket,
+    FetchResult,
+    PreDownloadPacket,
+    Stream,
+    StreamChunkProgress,
+    try_parse_pydantic,
+)
+from server.utils.docker_image_version import newest_docker_tag
 from server.utils.hardware import IntelGpuInfo, NvidiaGpuInfo
+from server.utils.ollama import GGUF_QUANTIZATION_UNSUPPORTED_MESSAGE
 from server.utils.vram_calculator import ArchParams
+from tests.unit.server.real_docker_tags import real_tags
 
 if TYPE_CHECKING:
     from server.models.api import ModelProps
@@ -41,6 +54,7 @@ if TYPE_CHECKING:
 def _make_installed_info(svc: OllamaService, instance: str = "default") -> InstalledInfo:
     docker = MagicMock()
     docker.name = f"ollama-{instance}"
+    docker.container_name = f"ollama-{instance}"
     return InstalledInfo(
         instance_name=instance,
         docker=docker,
@@ -54,11 +68,20 @@ def _make_installed_info(svc: OllamaService, instance: str = "default") -> Insta
     )
 
 
+def _make_model_installed_info(model_id: str = "my-llm", registration_id: str = "reg-1") -> ModelInstalledInfo:
+    return ModelInstalledInfo(
+        id=model_id,
+        registered_name=model_id,
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id=registration_id,
+        internal_name=None,
+    )
+
+
 @pytest.fixture
 def deps() -> dict[str, Any]:
     config = MagicMock()
-    config.ollama_kv_cache_type = "f16"
-    config.ollama_num_parallel = 1
     config.ollama_vram_overhead_factor = 1.0
     return {
         "config": config,
@@ -67,6 +90,7 @@ def deps() -> dict[str, Any]:
         "model_downloader": MagicMock(),
         "docker_service": MagicMock(),
         "hardware": MagicMock(gpus=[], total_vram_gb=8.0),
+        "services_manager": MagicMock(),
     }
 
 
@@ -124,11 +148,11 @@ def test_spec_all_optional_fields_not_required(svc: OllamaService) -> None:
             assert field.required is False, f"Field {field.name!r} should be optional"
 
 
-def test_model_spec_has_alias_alive_time_context(svc: OllamaService) -> None:
+def test_model_spec_has_rename_alive_time_context(svc: OllamaService) -> None:
     spec = svc.get_model_spec()
 
     field_names = {f.name for f in spec.fields}
-    assert {"alias", "alive_time", "context_length"} <= field_names
+    assert {"rename", "alive_time", "context_length"} <= field_names
 
 
 def test_custom_model_spec_not_none(svc: OllamaService) -> None:
@@ -162,10 +186,17 @@ def test_model_options_invalid_alive_time_raises(bad_value: str) -> None:
         OllamaModelOptions(alive_time=bad_value)
 
 
-def test_model_options_alias_defaults_none() -> None:
+def test_model_options_rename_defaults_none() -> None:
     opts = OllamaModelOptions()
 
-    assert opts.alias is None
+    assert opts.rename is None
+
+
+def test_model_options_alias_is_separate_from_rename() -> None:
+    opts = try_parse_pydantic(OllamaModelOptions, {"alias": "extra-name"})
+
+    assert opts.alias == "extra-name"
+    assert opts.rename is None
 
 
 def test_model_options_context_length_defaults_none() -> None:
@@ -442,6 +473,10 @@ def test_get_image_returns_const_image(svc: OllamaService) -> None:
     assert svc._get_image() == _const.image  # pyright: ignore[reportPrivateUsage]
 
 
+def test_get_default_docker_image_name(svc: OllamaService) -> None:
+    assert svc.get_default_docker_image_name() == _const.image.name
+
+
 def test_load_download_info_returns_dataclass(svc: OllamaService) -> None:
     result = svc._load_download_info({})  # pyright: ignore[reportPrivateUsage]
 
@@ -470,6 +505,22 @@ def test_generate_instance_config_with_info(svc: OllamaService) -> None:
 
     assert config.options == info.options
     assert len(config.models or []) == 1
+
+
+def test_generate_instance_config_persists_resolved_container_name(svc: OllamaService) -> None:
+    """Resolved container name round-trips into the persisted InstanceConfig."""
+    info = _make_installed_info(svc)
+    info.docker.container_name = "pinned-container-name"
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert config.container_name == "pinned-container-name"
+
+
+def test_generate_instance_config_no_info_has_no_container_name(svc: OllamaService) -> None:
+    config = svc._generate_instance_config("default", None, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert config.container_name is None
 
 
 def test_generate_instance_config_embeds_definition_when_in_registry(svc: OllamaService) -> None:
@@ -523,14 +574,7 @@ def test_restore_model_definition_reinstates_model(svc: OllamaService) -> None:
 
 
 def test_model_installed_info_get_info() -> None:
-    model = ModelInstalledInfo(
-        id="my-llm",
-        registered_name="my-llm",
-        type="llm",
-        options=InstallModelIn(spec={}),
-        registration_id="reg-42",
-        internal_name=None,
-    )
+    model = _make_model_installed_info(registration_id="reg-42")
 
     info = model.get_info()
 
@@ -748,7 +792,7 @@ async def test_create_model_from_modelfile_calls_docker_compose_run(svc: OllamaS
     await svc.create_model_from_modelfile(installed, "my-model", "/root/.ollama/Modelfile", None)
 
     cmd = deps["docker_service"].run_command_docker_compose.call_args[0][2]
-    assert "ollama create" in cmd
+    assert cmd == ["ollama", "create", "my-model", "-f", "/root/.ollama/Modelfile"]
 
 
 @pytest.mark.asyncio
@@ -760,7 +804,19 @@ async def test_create_model_from_modelfile_includes_quantization_flag(svc: Ollam
     await svc.create_model_from_modelfile(installed, "my-model", "/root/.ollama/Modelfile", "q4_0")
 
     cmd = deps["docker_service"].run_command_docker_compose.call_args[0][2]
-    assert "-q q4_0" in cmd
+    assert cmd == ["ollama", "create", "-q", "q4_0", "my-model", "-f", "/root/.ollama/Modelfile"]
+
+
+@pytest.mark.asyncio
+async def test_create_model_from_modelfile_passes_model_name_as_single_argument(svc: OllamaService, deps: dict[str, Any]) -> None:
+    installed = _make_installed_info(svc)
+    deps["docker_service"].run_command_docker_compose = AsyncMock(return_value="")
+    deps["docker_service"].get_docker_compose_file_path.return_value = Path("/path/docker-compose.yml")
+
+    await svc.create_model_from_modelfile(installed, "evil -f /etc/passwd", "/root/.ollama/Modelfile", None)
+
+    cmd = deps["docker_service"].run_command_docker_compose.call_args[0][2]
+    assert cmd == ["ollama", "create", "evil -f /etc/passwd", "-f", "/root/.ollama/Modelfile"]
 
 
 @pytest.mark.asyncio
@@ -1009,6 +1065,26 @@ async def test_install_from_modelfile_downloads_https_asset(svc: OllamaService, 
 
 
 @pytest.mark.asyncio
+async def test_install_from_modelfile_https_non_gguf_asset_skips_quantization_check(svc: OllamaService, tmp_path: Path) -> None:
+    model_id = "my-model"
+    model = OllamaModel(id=model_id, size="1GB", type="llm", hash="abc", context=4096, quantization="q4_K_M")
+    instance_info = _make_installed_info(svc)
+
+    with (
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "save_modelfile", new_callable=AsyncMock, return_value="/root/.ollama/Modelfile"),
+        patch.object(svc, "create_model_from_modelfile", new_callable=AsyncMock, return_value="") as mock_create,
+        patch("server.services.ollama_service.detect_context_window_from_path", new_callable=AsyncMock, return_value=None),
+    ):
+        await svc._install_from_modelfile(  # pyright: ignore[reportPrivateUsage]
+            MagicMock(), model_id, "FROM https://example.com/model.safetensors", model_id, instance_info, model
+        )
+
+    mock_create.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_install_from_modelfile_raises_400_for_missing_local_path(svc: OllamaService, tmp_path: Path) -> None:
     model_id = "my-model"
     model = OllamaModel(id=model_id, size="1GB", type="llm", hash="abc", context=4096)
@@ -1108,6 +1184,30 @@ async def test_install_model_registers_llm_endpoint(svc: OllamaService, deps: di
 
 
 @pytest.mark.asyncio
+async def test_install_model_registers_llm_endpoint_with_resolved_capabilities(svc: OllamaService, deps: dict[str, Any]) -> None:
+    """The model is already pulled by install time, so `/api/show` can resolve real capabilities
+    instead of registering with permanently-unknown `supports_vision`/`supports_audio`."""
+    installed = _make_installed_info(svc)
+    svc.instances_info["default"].installed = installed
+    svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm", hash="abc", context=4096)
+
+    with (
+        patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
+        patch.object(
+            svc, "_get_capabilities", new_callable=AsyncMock, return_value=ModelCapabilities(supports_vision=True, supports_audio=None)
+        ) as mock_capabilities,
+    ):
+        mock_fetch.return_value = FetchResult(status_code=200, data="")
+        promise = await svc._install_model("default", "test-llm", InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    mock_capabilities.assert_called_once()
+    call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
+    assert call_kwargs["props"].supports_vision is True
+    assert call_kwargs["props"].supports_audio is None
+
+
+@pytest.mark.asyncio
 async def test_install_model_registers_embedding_endpoint(svc: OllamaService, deps: dict[str, Any]) -> None:
     installed = _make_installed_info(svc)
     svc.instances_info["default"].installed = installed
@@ -1150,7 +1250,7 @@ async def test_install_model_marks_model_as_downloaded(svc: OllamaService) -> No
 
 
 @pytest.mark.asyncio
-async def test_install_model_uses_alias_as_registered_name(svc: OllamaService) -> None:
+async def test_install_model_uses_rename_as_registered_name(svc: OllamaService) -> None:
     installed = _make_installed_info(svc)
     svc.instances_info["default"].installed = installed
     svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm", hash="abc", context=4096)
@@ -1158,7 +1258,7 @@ async def test_install_model_uses_alias_as_registered_name(svc: OllamaService) -
     with patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
         mock_fetch.return_value = FetchResult(status_code=200, data="")
         promise = await svc._install_model(  # pyright: ignore[reportPrivateUsage]
-            "default", "test-llm", InstallModelIn(spec={"alias": "my-alias"})
+            "default", "test-llm", InstallModelIn(spec={"rename": "my-alias"})
         )
         await promise.wait()
 
@@ -1180,6 +1280,67 @@ async def test_install_model_generates_context_modelfile_for_llm_with_custom_con
     modelfile_recipe: str = mock_install.call_args.args[2]
     assert "num_ctx 8192" in modelfile_recipe
     assert "FROM test-llm" in modelfile_recipe
+
+
+@pytest.mark.asyncio
+async def test_install_model_evicts_cache_under_previous_internal_name(svc: OllamaService, deps: dict[str, Any]) -> None:
+    """Re-installing a model previously installed with a custom-context internal name must evict
+    the cache entry actually written under that internal name, not just under `model_id`."""
+    installed = _make_installed_info(svc)
+    installed.models["test-llm"] = ModelInstalledInfo(
+        id="test-llm",
+        registered_name="test-llm",
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+        internal_name="test-llm-customcontextlength",
+    )
+    svc.instances_info["default"].installed = installed
+    svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm", hash="abc", context=4096)
+    svc._arch_cache[("default", "test-llm-customcontextlength")] = ArchParams(  # pyright: ignore[reportPrivateUsage]
+        hidden_size=4096, num_attention_heads=32, num_key_value_heads=8, num_hidden_layers=32
+    )
+    svc._capabilities_cache[("default", "test-llm-customcontextlength")] = ModelCapabilities(  # pyright: ignore[reportPrivateUsage]
+        supports_vision=True
+    )
+
+    with patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=200, data="")
+        promise = await svc._install_model("default", "test-llm", InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    assert ("default", "test-llm-customcontextlength") not in svc._arch_cache  # pyright: ignore[reportPrivateUsage]
+    assert ("default", "test-llm-customcontextlength") not in svc._capabilities_cache  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_uninstall_model_evicts_cache_under_internal_name(svc: OllamaService) -> None:
+    """A custom-context install's cache entry is written under its internal name, not `model_id` -
+    uninstalling it must evict that same key so a later reinstall doesn't serve stale capabilities."""
+    installed = _make_installed_info(svc)
+    installed.models["test-llm"] = ModelInstalledInfo(
+        id="test-llm",
+        registered_name="test-llm",
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+        internal_name="test-llm-customcontextlength",
+    )
+    svc.instances_info["default"].installed = installed
+    svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm", hash="abc", context=4096)
+    svc._arch_cache[("default", "test-llm-customcontextlength")] = ArchParams(  # pyright: ignore[reportPrivateUsage]
+        hidden_size=4096, num_attention_heads=32, num_key_value_heads=8, num_hidden_layers=32
+    )
+    svc._capabilities_cache[("default", "test-llm-customcontextlength")] = ModelCapabilities(  # pyright: ignore[reportPrivateUsage]
+        supports_vision=True
+    )
+
+    with patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch:
+        mock_fetch.return_value = FetchResult(status_code=200, data="")
+        await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=False))  # pyright: ignore[reportPrivateUsage]
+
+    assert ("default", "test-llm-customcontextlength") not in svc._arch_cache  # pyright: ignore[reportPrivateUsage]
+    assert ("default", "test-llm-customcontextlength") not in svc._capabilities_cache  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
@@ -1326,7 +1487,7 @@ async def test_uninstall_model_logs_warning_when_unload_from_vram_raises(svc: Ol
 
     with (
         patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
-        caplog.at_level("WARNING", logger="uvicorn.error"),
+        caplog.at_level("WARNING", logger="uvicorn"),
     ):
         mock_fetch.side_effect = ConnectionError("boom")
         await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=False))  # pyright: ignore[reportPrivateUsage]
@@ -1349,7 +1510,7 @@ async def test_uninstall_model_logs_warning_when_unload_from_vram_fails(svc: Oll
 
     with (
         patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
-        caplog.at_level("WARNING", logger="uvicorn.error"),
+        caplog.at_level("WARNING", logger="uvicorn"),
     ):
         mock_fetch.return_value = FetchResult(status_code=500, data="boom")
         await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=False))  # pyright: ignore[reportPrivateUsage]
@@ -1375,7 +1536,7 @@ async def test_uninstall_model_logs_warning_when_delete_raises(svc: OllamaServic
     with (
         patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
         patch.object(svc, "remove_modelfile", new_callable=AsyncMock),
-        caplog.at_level("WARNING", logger="uvicorn.error"),
+        caplog.at_level("WARNING", logger="uvicorn"),
     ):
         mock_fetch.side_effect = [FetchResult(status_code=200, data=""), ConnectionError("boom")]
         await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=True))  # pyright: ignore[reportPrivateUsage]
@@ -1402,7 +1563,7 @@ async def test_uninstall_model_logs_warning_when_delete_fails(svc: OllamaService
     with (
         patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock) as mock_fetch,
         patch.object(svc, "remove_modelfile", new_callable=AsyncMock),
-        caplog.at_level("WARNING", logger="uvicorn.error"),
+        caplog.at_level("WARNING", logger="uvicorn"),
     ):
         mock_fetch.side_effect = [FetchResult(status_code=200, data=""), FetchResult(status_code=500, data="boom")]
         await svc._uninstall_model("default", "test-llm", UninstallModelIn(purge=True))  # pyright: ignore[reportPrivateUsage]
@@ -1430,6 +1591,49 @@ async def test_install_instance_calls_docker_and_returns_installed_info(svc: Oll
 
     assert isinstance(result, InstalledInfo)
     assert deps["docker_service"].install_and_run_docker.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_install_instance_uses_container_name_override_when_given(svc: OllamaService, deps: dict[str, Any]) -> None:
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "df-ollama"
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(11434, True, False))
+    deps["docker_service"].get_container_host.return_value = "localhost"
+    deps["docker_service"].get_container_port.return_value = 11434
+    options = InstallServiceIn(spec={})
+
+    with (
+        patch.object(svc, "_download_image_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_verify_docker_image", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_instance("default", options, "pinned-name")  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "pinned-name"
+    deps["docker_service"].get_docker_container_name.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_install_instance_falls_back_to_generated_container_name(svc: OllamaService, deps: dict[str, Any]) -> None:
+    deps["docker_service"].get_docker_subnet.return_value = None
+    deps["docker_service"].get_docker_container_name.return_value = "df-ollama"
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(11434, True, False))
+    deps["docker_service"].get_container_host.return_value = "localhost"
+    deps["docker_service"].get_container_port.return_value = 11434
+    options = InstallServiceIn(spec={})
+
+    with (
+        patch.object(svc, "_download_image_or_set_progress", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_verify_docker_image", new_callable=AsyncMock),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_instance("default", options)  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == deps["docker_service"].get_docker_container_name.return_value
 
 
 @pytest.mark.asyncio
@@ -1881,6 +2085,72 @@ async def test_install_from_modelfile_detects_context_for_local_relative_from_pa
 
 
 @pytest.mark.asyncio
+async def test_install_from_modelfile_local_non_gguf_path_skips_quantization_check(svc: OllamaService, tmp_path: Path) -> None:
+    model_id = "my-model"
+    model = OllamaModel(id=model_id, size="1GB", type="llm", hash="abc", context=4096, quantization="q4_K_M")
+    instance_info = _make_installed_info(svc)
+    local_file = tmp_path / "main" / "model.bin"
+    local_file.parent.mkdir(parents=True)
+    local_file.write_bytes(b"")
+
+    with (
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "save_modelfile", new_callable=AsyncMock, return_value="/root/.ollama/Modelfile"),
+        patch.object(svc, "create_model_from_modelfile", new_callable=AsyncMock, return_value="") as mock_create,
+        patch("server.services.ollama_service.detect_context_window_from_path", new_callable=AsyncMock, return_value=None),
+    ):
+        await svc._install_from_modelfile(  # pyright: ignore[reportPrivateUsage]
+            MagicMock(), model_id, "FROM ./model.bin", model_id, instance_info, model
+        )
+
+    mock_create.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_install_from_modelfile_adapter_line_is_not_treated_as_quantization_source(svc: OllamaService, tmp_path: Path) -> None:
+    """An ADAPTER line looks like a named model but must not be mistaken for the FROM source when checking quantization."""
+    model_id = "my-model"
+    model = OllamaModel(id=model_id, size="1GB", type="llm", hash="abc", context=4096, quantization="q4_K_M")
+    instance_info = _make_installed_info(svc)
+    (tmp_path / "main" / "model-dir").mkdir(parents=True)
+
+    with (
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+        patch.object(OllamaService, "is_model_installed", new_callable=AsyncMock, return_value=True),
+        patch.object(OllamaService, "_get_ollama_version", new_callable=AsyncMock, return_value="0.34.1") as mock_version,
+        patch("server.services.ollama_service.detect_context_window_from_path", new_callable=AsyncMock, return_value=None),
+        patch.object(svc, "save_modelfile", new_callable=AsyncMock, return_value="/root/.ollama/Modelfile"),
+        patch.object(svc, "create_model_from_modelfile", new_callable=AsyncMock, return_value="") as mock_create,
+    ):
+        await svc._install_from_modelfile(  # pyright: ignore[reportPrivateUsage]
+            MagicMock(), model_id, "FROM ./model-dir\nADAPTER my-lora", model_id, instance_info, model
+        )
+
+    mock_version.assert_not_called()
+    mock_create.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_install_from_modelfile_quantization_with_no_from_source_is_allowed(svc: OllamaService, tmp_path: Path) -> None:
+    """No FROM line at all (only ADAPTER) leaves the source undetermined, so the pre-flight check must not block it."""
+    model_id = "my-model"
+    model = OllamaModel(id=model_id, size="1GB", type="llm", hash="abc", context=4096, quantization="q4_K_M")
+    instance_info = _make_installed_info(svc)
+
+    with (
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+        patch.object(OllamaService, "is_model_installed", new_callable=AsyncMock, return_value=True),
+        patch.object(svc, "save_modelfile", new_callable=AsyncMock, return_value="/root/.ollama/Modelfile"),
+        patch.object(svc, "create_model_from_modelfile", new_callable=AsyncMock, return_value="") as mock_create,
+    ):
+        await svc._install_from_modelfile(  # pyright: ignore[reportPrivateUsage]
+            MagicMock(), model_id, "ADAPTER my-lora", model_id, instance_info, model
+        )
+
+    mock_create.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_install_from_modelfile_raises_400_on_client_connector_error(svc: OllamaService, tmp_path: Path) -> None:
     model_id = "my-model"
     model = OllamaModel(id=model_id, size="1GB", type="llm", hash="abc", context=4096)
@@ -1917,6 +2187,182 @@ async def test_install_from_modelfile_reraises_http_exception_with_original_stat
         )
 
     assert exc_info.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_install_from_modelfile_surfaces_quantization_error_from_ollama_create(svc: OllamaService, tmp_path: Path) -> None:
+    """Defense in depth: even without a pre-flight match, Ollama's own quantization error is translated, not swallowed."""
+    model_id = "my-model"
+    model = OllamaModel(id=model_id, size="1GB", type="llm", hash="abc", context=4096, quantization="q4_K_M")
+    instance_info = _make_installed_info(svc)
+    stderr = "Error: 500 Internal Server Error: quantization is only supported for F16 and F32 models"
+    create_error = CommandFailedError(1, ["ollama", "create"], "", stderr)
+
+    with (
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+        patch.object(OllamaService, "is_model_installed", new_callable=AsyncMock, return_value=True),
+        patch.object(OllamaService, "_get_ollama_version", new_callable=AsyncMock, return_value=None),
+        patch.object(svc, "save_modelfile", new_callable=AsyncMock, return_value="/root/.ollama/Modelfile"),
+        patch.object(svc, "create_model_from_modelfile", new_callable=AsyncMock, side_effect=create_error),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc._install_from_modelfile(  # pyright: ignore[reportPrivateUsage]
+            MagicMock(), model_id, "FROM llama3", model_id, instance_info, model
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "already quantized" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "modelfile",
+    ["FROM https://example.com/model.gguf", "FROM https://example.com/model.gguf?download=true", "FROM llama3", "FROM llama3:8b"],
+)
+async def test_install_from_modelfile_rejects_gguf_or_named_quantization_source_before_download_on_new_ollama(
+    svc: OllamaService, tmp_path: Path, modelfile: str
+) -> None:
+    model_id = "my-model"
+    model = OllamaModel(id=model_id, size="1GB", type="llm", hash="abc", context=4096, quantization="q4_K_M")
+    instance_info = _make_installed_info(svc)
+
+    with (
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+        patch.object(OllamaService, "_get_ollama_version", new_callable=AsyncMock, return_value="0.34.1"),
+        patch.object(OllamaService, "is_model_installed", new_callable=AsyncMock, return_value=False),
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock) as mock_dl,  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "create_model_from_modelfile", new_callable=AsyncMock) as mock_create,
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc._install_from_modelfile(MagicMock(), model_id, modelfile, model_id, instance_info, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == GGUF_QUANTIZATION_UNSUPPORTED_MESSAGE
+    mock_dl.assert_not_called()
+    mock_create.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_install_from_modelfile_rejects_local_gguf_quantization_source_on_new_ollama(svc: OllamaService, tmp_path: Path) -> None:
+    model_id = "my-model"
+    model = OllamaModel(id=model_id, size="1GB", type="llm", hash="abc", context=4096, quantization="q4_K_M")
+    instance_info = _make_installed_info(svc)
+    local_file = tmp_path / "main" / "model.gguf"
+    local_file.parent.mkdir(parents=True)
+    local_file.write_bytes(b"")
+
+    with (
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+        patch.object(OllamaService, "_get_ollama_version", new_callable=AsyncMock, return_value="0.35.0"),
+        patch.object(svc, "create_model_from_modelfile", new_callable=AsyncMock) as mock_create,
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc._install_from_modelfile(  # pyright: ignore[reportPrivateUsage]
+            MagicMock(), model_id, "FROM ./model.gguf", model_id, instance_info, model
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == GGUF_QUANTIZATION_UNSUPPORTED_MESSAGE
+    mock_create.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ollama_version", ["0.34.0", None, "not-a-version"])
+async def test_install_from_modelfile_leaves_gguf_quantization_to_ollama_on_old_or_unknown_version(
+    svc: OllamaService, tmp_path: Path, ollama_version: str | None
+) -> None:
+    """Ollama <= 0.34.0 can still quantize F16/F32 GGUF sources, and an unknown version must not block the install."""
+    model_id = "my-model"
+    model = OllamaModel(id=model_id, size="1GB", type="llm", hash="abc", context=4096, quantization="q4_K_M")
+    instance_info = _make_installed_info(svc)
+
+    with (
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+        patch.object(OllamaService, "_get_ollama_version", new_callable=AsyncMock, return_value=ollama_version),
+        patch.object(OllamaService, "is_model_installed", new_callable=AsyncMock, return_value=True),
+        patch.object(svc, "save_modelfile", new_callable=AsyncMock, return_value="/root/.ollama/Modelfile"),
+        patch.object(svc, "create_model_from_modelfile", new_callable=AsyncMock, return_value="") as mock_create,
+    ):
+        await svc._install_from_modelfile(  # pyright: ignore[reportPrivateUsage]
+            MagicMock(), model_id, "FROM llama3", model_id, instance_info, model
+        )
+
+    mock_create.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_install_from_modelfile_without_quantization_does_not_check_ollama_version(svc: OllamaService, tmp_path: Path) -> None:
+    model_id = "my-model"
+    model = OllamaModel(id=model_id, size="1GB", type="llm", hash="abc", context=4096)
+    instance_info = _make_installed_info(svc)
+
+    with (
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+        patch.object(OllamaService, "_get_ollama_version", new_callable=AsyncMock, return_value="0.34.1") as mock_version,
+        patch.object(OllamaService, "is_model_installed", new_callable=AsyncMock, return_value=True),
+        patch.object(svc, "save_modelfile", new_callable=AsyncMock, return_value="/root/.ollama/Modelfile"),
+        patch.object(svc, "create_model_from_modelfile", new_callable=AsyncMock, return_value="") as mock_create,
+    ):
+        await svc._install_from_modelfile(  # pyright: ignore[reportPrivateUsage]
+            MagicMock(), model_id, "FROM llama3", model_id, instance_info, model
+        )
+
+    mock_version.assert_not_called()
+    mock_create.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_install_from_modelfile_surfaces_new_ollama_quantization_error_from_ollama_create(svc: OllamaService, tmp_path: Path) -> None:
+    """If the pre-check can't tell (unknown version), Ollama >= 0.34.1's own rejection is still translated."""
+    model_id = "my-model"
+    model = OllamaModel(id=model_id, size="1GB", type="llm", hash="abc", context=4096, quantization="q4_K_M")
+    instance_info = _make_installed_info(svc)
+    stderr = "Error: create-time quantization is only supported for safetensors imports; quantize GGUF models before importing"
+    create_error = CommandFailedError(1, ["ollama", "create"], "", stderr)
+
+    with (
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),  # pyright: ignore[reportPrivateUsage]
+        patch.object(OllamaService, "is_model_installed", new_callable=AsyncMock, return_value=True),
+        patch.object(OllamaService, "_get_ollama_version", new_callable=AsyncMock, return_value=None),
+        patch.object(svc, "save_modelfile", new_callable=AsyncMock, return_value="/root/.ollama/Modelfile"),
+        patch.object(svc, "create_model_from_modelfile", new_callable=AsyncMock, side_effect=create_error),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await svc._install_from_modelfile(  # pyright: ignore[reportPrivateUsage]
+            MagicMock(), model_id, "FROM llama3", model_id, instance_info, model
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == GGUF_QUANTIZATION_UNSUPPORTED_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_get_ollama_version_returns_version_from_api() -> None:
+    with patch(
+        "server.services.ollama_service.fetch_from",
+        new_callable=AsyncMock,
+        return_value=FetchResult(status_code=200, data='{"version": "0.34.1"}'),
+    ) as mock_fetch:
+        result = await OllamaService._get_ollama_version("http://localhost:11434")  # pyright: ignore[reportPrivateUsage]
+
+    assert result == "0.34.1"
+    mock_fetch.assert_called_once_with("http://localhost:11434/api/version", timeout=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fetch_result",
+    [FetchResult(status_code=500, data=""), FetchResult(status_code=200, data="not json"), FetchResult(status_code=200, data="{}")],
+)
+async def test_get_ollama_version_returns_none_when_unreadable(fetch_result: FetchResult) -> None:
+    with patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock, return_value=fetch_result):
+        assert await OllamaService._get_ollama_version("http://localhost:11434") is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_get_ollama_version_returns_none_on_connection_error() -> None:
+    with patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock, side_effect=OSError("refused")):
+        assert await OllamaService._get_ollama_version("http://localhost:11434") is None  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
@@ -1992,7 +2438,7 @@ async def test_install_model_registers_capacity_from_num_parallel(svc: OllamaSer
 
 
 @pytest.mark.asyncio
-async def test_install_model_registers_capacity_falls_back_to_config_default(svc: OllamaService, deps: dict[str, Any]) -> None:
+async def test_install_model_registers_capacity_falls_back_to_default(svc: OllamaService, deps: dict[str, Any]) -> None:
     installed = _make_installed_info(svc)
     svc.instances_info["default"].installed = installed
     svc.models["default"]["test-llm"] = OllamaModel(id="test-llm", size="1GB", type="llm", hash="abc", context=4096, modelfile=None)
@@ -2002,11 +2448,11 @@ async def test_install_model_registers_capacity_falls_back_to_config_default(svc
         await promise.wait()
 
     call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
-    assert call_kwargs["registration_options"].capacity_state == deps["config"].ollama_num_parallel
+    assert call_kwargs["registration_options"].capacity_state == 1
 
 
 @pytest.mark.asyncio
-async def test_install_model_registers_capacity_falls_back_to_config_default_when_num_parallel_is_zero(
+async def test_install_model_registers_capacity_falls_back_to_default_when_num_parallel_is_zero(
     svc: OllamaService, deps: dict[str, Any]
 ) -> None:
     """`OLLAMA_NUM_PARALLEL=0` means "auto", not "zero concurrency" - it must not saturate the instance."""
@@ -2020,7 +2466,7 @@ async def test_install_model_registers_capacity_falls_back_to_config_default_whe
         await promise.wait()
 
     call_kwargs = deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
-    assert call_kwargs["registration_options"].capacity_state == deps["config"].ollama_num_parallel
+    assert call_kwargs["registration_options"].capacity_state == 1
 
 
 @pytest.mark.asyncio
@@ -2449,9 +2895,28 @@ async def test_local_file_size_bytes_no_docker_path_but_installed_uses_docker_ex
     deps["docker_service"].run_command_docker_compose = AsyncMock(return_value="12345\n")
 
     with patch.object(svc, "_get_working_dir", return_value=tmp_path):  # pyright: ignore[reportPrivateUsage]
-        result = await svc._local_file_size_bytes("/other/path/model.bin", "default")  # pyright: ignore[reportPrivateUsage]
+        result = await svc._local_file_size_bytes("/other/path/my model.bin", "default")  # pyright: ignore[reportPrivateUsage]
 
     assert result == 12345
+    cmd = deps["docker_service"].run_command_docker_compose.call_args[0][2]
+    assert cmd == ["stat", "-c%s", "/other/path/my model.bin"]
+
+
+@pytest.mark.asyncio
+async def test_compose_exec_targets_suffixed_service_key(svc: OllamaService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """A suffixed container's compose service is keyed by its container name, so `exec` must target that, not `name`."""
+    installed = _make_installed_info(svc)
+    installed.docker = DockerOptions(name="ollama-default", container_name="ollama-default_abc123", image="ollama", image_port=11434)
+    svc.instances_info["default"].installed = installed
+    deps["docker_service"].get_docker_compose_file_path.return_value = "/path/to/compose.yaml"
+    deps["docker_service"].run_command_docker_compose = AsyncMock(return_value="12345\n")
+
+    with patch.object(svc, "_get_working_dir", return_value=tmp_path):  # pyright: ignore[reportPrivateUsage]
+        await svc._local_file_size_bytes("/other/path/model.bin", "default")  # pyright: ignore[reportPrivateUsage]
+    await svc.create_model_from_modelfile(installed, "my-model", "/root/.ollama/Modelfile", None)
+
+    services = [c.args[1] for c in deps["docker_service"].run_command_docker_compose.call_args_list]
+    assert services == ["ollama-default_abc123", "ollama-default_abc123"]
 
 
 @pytest.mark.asyncio
@@ -2553,7 +3018,7 @@ async def test_resolve_vram_info_cache_hit(svc: OllamaService) -> None:
     loaded_info = {"llama3": LoadedModelInfo(context_length=4096, vram_gb=None)}
 
     is_loaded, vram = await svc._resolve_vram_info(  # pyright: ignore[reportPrivateUsage]
-        "default", "llama3", None, loaded_info, {}, "http://localhost:11434", None
+        "default", "llama3", None, loaded_info, {}, "http://localhost:11434", None, None
     )
 
     assert is_loaded is True
@@ -2568,7 +3033,7 @@ async def test_resolve_vram_info_vram_estimate_none_not_cached(svc: OllamaServic
 
     with patch.object(svc, "_get_vram_estimate", new_callable=AsyncMock, return_value=None):
         is_loaded, vram = await svc._resolve_vram_info(  # pyright: ignore[reportPrivateUsage]
-            "default", "llama3", None, loaded_info, {}, "http://localhost:11434", None
+            "default", "llama3", None, loaded_info, {}, "http://localhost:11434", None, None
         )
 
     assert is_loaded is True
@@ -2585,7 +3050,7 @@ async def test_resolve_vram_info_not_loaded_returns_formula_estimate(svc: Ollama
 
     with patch.object(svc, "_get_vram_estimate", new_callable=AsyncMock, return_value=4.5) as mock_estimate:
         is_loaded, vram = await svc._resolve_vram_info(  # pyright: ignore[reportPrivateUsage]
-            "default", "llama3", 4096, loaded_info, {}, "http://localhost:11434", None
+            "default", "llama3", 4096, loaded_info, {}, "http://localhost:11434", None, None
         )
 
     assert is_loaded is False
@@ -2602,7 +3067,7 @@ async def test_resolve_vram_info_not_loaded_estimate_none(svc: OllamaService) ->
 
     with patch.object(svc, "_get_vram_estimate", new_callable=AsyncMock, return_value=None):
         is_loaded, vram = await svc._resolve_vram_info(  # pyright: ignore[reportPrivateUsage]
-            "default", "llama3", None, loaded_info, {}, "http://localhost:11434", None
+            "default", "llama3", None, loaded_info, {}, "http://localhost:11434", None, None
         )
 
     assert is_loaded is False
@@ -2864,6 +3329,83 @@ async def test_get_model_resolves_vram_when_loaded_info_available(svc: OllamaSer
 
     assert result.id == model_id
     assert result.is_loaded is False
+
+
+@pytest.mark.asyncio
+async def test_get_model_resolves_capabilities_when_registered(svc: OllamaService) -> None:
+    installed = _make_installed_info(svc)
+    model_id = next(iter(svc.models["default"]))
+    installed.models[model_id] = ModelInstalledInfo(
+        id=model_id,
+        registered_name=model_id,
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+        internal_name=None,
+    )
+    svc.instances_info["default"].installed = installed
+
+    with (
+        patch.object(svc, "_get_loaded_models", new_callable=AsyncMock, return_value={}),
+        patch.object(svc, "_get_model_sizes", new_callable=AsyncMock, return_value={}),
+        patch.object(svc, "_get_capabilities", new_callable=AsyncMock, return_value=ModelCapabilities(supports_vision=True)),
+    ):
+        result = await svc.get_model("default", model_id)
+
+    assert result.supports_vision is True
+
+
+@pytest.mark.asyncio
+async def test_get_model_skips_capabilities_when_loaded_info_unavailable(svc: OllamaService) -> None:
+    """A failed `/api/ps` for this call must not still trigger a slow `/api/show` lookup."""
+    installed = _make_installed_info(svc)
+    model_id = next(iter(svc.models["default"]))
+    installed.models[model_id] = ModelInstalledInfo(
+        id=model_id,
+        registered_name=model_id,
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+        internal_name=None,
+    )
+    svc.instances_info["default"].installed = installed
+
+    with (
+        patch.object(svc, "_get_loaded_models", new_callable=AsyncMock, return_value=None),
+        patch.object(svc, "_get_model_sizes", new_callable=AsyncMock, return_value={}),
+        patch.object(svc, "_get_capabilities", new_callable=AsyncMock) as mock_capabilities,
+    ):
+        result = await svc.get_model("default", model_id)
+
+    mock_capabilities.assert_not_called()
+    assert result.supports_vision is None
+
+
+@pytest.mark.asyncio
+async def test_list_models_skips_capabilities_when_loaded_info_unavailable(svc: OllamaService) -> None:
+    """A failed `/api/ps` for this call must not still trigger a slow `/api/show` lookup."""
+    installed = _make_installed_info(svc)
+    model_id = next(iter(svc.models["default"]))
+    installed.models[model_id] = ModelInstalledInfo(
+        id=model_id,
+        registered_name=model_id,
+        type="llm",
+        options=InstallModelIn(spec={}),
+        registration_id="reg-1",
+        internal_name=None,
+    )
+    svc.instances_info["default"].installed = installed
+
+    with (
+        patch.object(svc, "_get_loaded_models", new_callable=AsyncMock, return_value=None),
+        patch.object(svc, "_get_model_sizes", new_callable=AsyncMock, return_value={}),
+        patch.object(svc, "_get_capabilities", new_callable=AsyncMock) as mock_capabilities,
+    ):
+        result = await svc.list_models("default", ListModelsFilters())
+
+    mock_capabilities.assert_not_called()
+    resolved = next(m for m in result.list if m.id == model_id)
+    assert resolved.supports_vision is None
 
 
 @pytest.mark.asyncio
@@ -3291,3 +3833,18 @@ async def test_install_model_registration_failure_skips_rollback_when_already_re
             await promise.wait()
 
     assert model_id not in installed.models
+
+
+@pytest.mark.parametrize("quantization", ["q4_K_M", "int4", "int8", "nvfp4", "mxfp4", "mxfp8"])
+def test_ollama_model_accepts_gguf_and_safetensors_quantization(quantization: str) -> None:
+    data = {"id": "m", "size": "1GB", "type": "llm", "hash": "abc", "context": 4096, "quantization": quantization}
+
+    model = OllamaModel.model_validate(data)
+
+    assert model.quantization == quantization
+
+
+@pytest.mark.parametrize(("installed", "expected"), [("0.12.3-rocm", "0.40.3-rocm"), ("0.34.1", "0.40.3")])
+def test_newest_tag_in_the_real_docker_hub_list(svc: OllamaService, installed: str, expected: str) -> None:
+    tags = svc.filter_docker_tags(real_tags("ollama"), "GPU")
+    assert newest_docker_tag(tags, installed) == expected

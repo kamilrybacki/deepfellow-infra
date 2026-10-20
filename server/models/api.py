@@ -3,7 +3,6 @@
 
 """Models for chat completions."""
 
-import logging
 from abc import abstractmethod
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, Union
@@ -14,7 +13,7 @@ from fastapi import File as FastApiFile
 from fastapi import UploadFile
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 LLM_ENDPOINTS = ["/v1/completions", "/v1/chat/completions", "/v1/responses", "/v1/messages", "/api/chat"]
 LLM_SUFFIX_MAP: tuple[tuple[str, str], ...] = (
@@ -423,6 +422,9 @@ class ModelProps(BaseModel):
     prefix: str | None = None
     transport: str | None = None
     tools: list[McpToolInfo] = []
+    # `None` means the capability is unknown/not yet resolved for this backend; `True`/`False` means resolved.
+    supports_vision: bool | None = None
+    supports_audio: bool | None = None
 
 
 type ModelType = Literal["llm", "embedding", "tts", "stt", "rerank", "txt2img", "mcp", "custom"]
@@ -443,6 +445,7 @@ class Model(BaseModel):
     capacity: int | None = None
     capacity_known: bool = False
     warm: bool = False
+    healthy: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -492,6 +495,15 @@ class ApiModel(BaseModel):
     created: int
     owned_by: str
     props: ModelProps
+    usage: int = 0
+    """Requests in flight for this model, summed across its registrations.
+
+    Live for local models and close to live (with some lag) for models from child nodes. For models received from a
+    parent/ancestor (`owned_by="mesh-ancestor"`) it is only the value reported when the model was registered, because
+    usage updates are sent upward only and are never refreshed downward.
+    """
+    capacity: int | None = None
+    """Total concurrency limit summed across registrations; `None` if any registration is unbounded or unknown."""
 
 
 class ApiModels(BaseModel):

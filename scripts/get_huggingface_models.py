@@ -20,7 +20,14 @@ from urllib.parse import quote
 
 import aiohttp
 
-from scripts.utils.hf_common import get_json_with_retry, is_embedding, is_gguf
+from scripts.utils.hf_common import (
+    DEFAULT_MODEL_DETAIL_CACHE_DIR,
+    HF_API,
+    get_json_with_retry,
+    get_model_detail_cached,
+    is_embedding,
+    is_gguf,
+)
 
 # ruff: noqa: T201
 
@@ -31,7 +38,6 @@ from scripts.utils.hf_common import get_json_with_retry, is_embedding, is_gguf
 # configured outside the server, so both fall back to `lastResort` there too.
 logger = logging.getLogger("uvicorn.error")
 
-HF_API = "https://huggingface.co/api"
 LLM_TAGS = ["text-generation", "text2text-generation", "image-text-to-text"]
 CONCURRENCY = 10  # parallel size-fetch requests
 PAGE_SIZE = 100  # max models per API page (HF limit)
@@ -69,6 +75,30 @@ def is_llm(model: dict[str, Any]) -> bool:
     """
     name = model.get("id", "").lower()
     return not NON_LLM_TASK_WORDS.search(name) and "ocr" not in name
+
+
+CI_FIXTURE_ORG_PREFIXES = ("trl-internal-testing/", "peft-internal-testing/")
+MLX_RE = re.compile(r"\bmlx\b", re.IGNORECASE)
+
+
+def is_test_fixture(model: dict[str, Any]) -> bool:
+    """Detect CI fixtures and test repos (tiny random-weight checkpoints).
+
+    These dominate the downloads ranking because HuggingFace's counter measures CI traffic, but their
+    weights are random so they are useless to serve. Matched by org prefix and the "tiny-random" name.
+    """
+    name = model.get("id", "").lower()
+    return name.startswith(CI_FIXTURE_ORG_PREFIXES) or "tiny-random" in name
+
+
+def is_mlx(model: dict[str, Any]) -> bool:
+    """Detect MLX builds (Apple-silicon only), which neither vLLM nor SGLang can load.
+
+    "mlx" is matched as a token so it is found in "Qwen3.5-9B-MLX-4bit" and "Bonsai-27B-mlx-1bit"
+    but not buried inside an unrelated word.
+    """
+    name = model.get("id", "").lower()
+    return name.startswith("mlx-community/") or bool(MLX_RE.search(name.replace("_", "-")))
 
 
 def is_reranker(model: dict[str, Any]) -> bool:
@@ -125,6 +155,46 @@ def is_supported_cross_encoder(architectures: list[str]) -> bool:
     multi-vector ranking head) fail to load in vLLM even though they match the name heuristic.
     """
     return any(a.endswith("ForSequenceClassification") for a in architectures)
+
+
+# Best-effort allowlist of known vision-language / audio-language model architecture class names
+# (and name substrings) reported in a HF repo's `config.architectures`. Not exhaustive - new VLM/ALM
+# architectures show up in HF constantly - just covers the common families well enough to flag
+# vision/audio support in the catalog without any extra network calls.
+_VISION_ARCHITECTURE_SUBSTRINGS = ("VL",)
+_VISION_ARCHITECTURES = {
+    "LlavaForConditionalGeneration",
+    "LlavaNextForConditionalGeneration",
+    "Qwen2VLForConditionalGeneration",
+    "Qwen2_5_VLForConditionalGeneration",
+    "MllamaForConditionalGeneration",
+    "Idefics2ForConditionalGeneration",
+    "PaliGemmaForConditionalGeneration",
+    "InternVLChatModel",
+    "MiniCPMV",
+}
+_AUDIO_ARCHITECTURES = {
+    "Qwen2AudioForConditionalGeneration",
+    "UltravoxModel",
+    "Qwen2_5OmniModel",
+    "Qwen2AudioModel",
+}
+
+
+def classify_modality_support(architectures: list[str]) -> tuple[bool | None, bool | None]:
+    """Best-effort (supports_vision, supports_audio) from a HF repo's `config.architectures`.
+
+    Matches against a short, known-incomplete allowlist of vision-language/audio-language model
+    architecture class names. A match is a confident `True`; anything else - no match, or an
+    empty/missing `architectures` list - is `None` (unknown), never `False`: this allowlist is
+    known-incomplete, so a miss doesn't mean the model actually lacks the capability, only that
+    it couldn't be confirmed from data already fetched for the catalog (no extra HTTP requests).
+    """
+    supports_vision = (
+        True if any(a in _VISION_ARCHITECTURES or any(sub in a for sub in _VISION_ARCHITECTURE_SUBSTRINGS) for a in architectures) else None
+    )
+    supports_audio = True if any(a in _AUDIO_ARCHITECTURES for a in architectures) else None
+    return supports_vision, supports_audio
 
 
 async def has_chat_template(
@@ -273,7 +343,7 @@ async def collect_llm_models(session: aiohttp.ClientSession, active: dict[str, i
     for batch in results:
         for m in batch:
             mid = m["id"]
-            if mid not in seen and is_llm(m) and not is_gguf(m):
+            if mid not in seen and is_llm(m) and not is_gguf(m) and not is_test_fixture(m) and not is_mlx(m):
                 seen.add(mid)
                 models.append(m)
     return models
@@ -331,7 +401,11 @@ async def collect_embedding_models(session: aiohttp.ClientSession, active: dict[
 
 
 async def fetch_model_details(
-    session: aiohttp.ClientSession, model_id: str, sem: asyncio.Semaphore, check_chat_template: bool = False
+    session: aiohttp.ClientSession,
+    model_id: str,
+    sem: asyncio.Semaphore,
+    check_chat_template: bool = False,
+    cache_dir: Path | None = None,
 ) -> tuple[str, str, list[str] | None, bool]:
     """Return (model_id, human_readable_size, architectures, has_chat_template).
 
@@ -342,16 +416,20 @@ async def fetch_model_details(
     rate limiting), as opposed to `[]` when it succeeded but the model genuinely reports none —
     `_drop_unsupported_models` needs to tell these apart so a fetch failure doesn't get treated as
     "confirmed not a cross-encoder" and silently kept with fabricated data.
+
+    `cache_dir` is forwarded to `get_model_detail_cached` - see its docstring for why caching is
+    opt-in rather than on by default.
     """
     async with sem:
         try:
-            data = await get_json_with_retry(session, f"{HF_API}/models/{model_id}", {"blobs": "true"})
+            data = await get_model_detail_cached(session, model_id, cache_dir=cache_dir)
             siblings = data.get("siblings", [])
             total = sum(f.get("size", 0) for f in siblings if f.get("size"))
             architectures = data.get("config", {}).get("architectures") or []
             chat_ok = await has_chat_template(session, model_id, siblings) if check_chat_template else True
             return model_id, fmt_size(total) if total else "N/A", architectures, chat_ok
         except Exception:
+            logger.warning("Failed to fetch details for %s; it will be dropped from the catalog", model_id, exc_info=True)
             return model_id, "N/A", None, False
 
 
@@ -431,7 +509,9 @@ async def fetch_registry_entries(
     log(f"Fetching disk sizes for {len(models)} unique models concurrently (max {CONCURRENCY} at a time)...")
     sem = asyncio.Semaphore(CONCURRENCY)
     check_chat_template = registry_key == "llms"
-    details = await asyncio.gather(*[fetch_model_details(session, m["id"], sem, check_chat_template) for m in models])
+    details = await asyncio.gather(
+        *[fetch_model_details(session, m["id"], sem, check_chat_template, cache_dir=DEFAULT_MODEL_DETAIL_CACHE_DIR) for m in models]
+    )
     sizes = {mid: size for mid, size, _, _ in details}
     architectures = {mid: arch for mid, _, arch, _ in details}
     chat_capable = {mid: chat_ok for mid, _, _, chat_ok in details}
@@ -445,6 +525,10 @@ async def fetch_registry_entries(
         entry: dict[str, Any] = {"name": mid, "size": size}
         if registry_key == "rerankers":
             entry["is_generative"] = not is_supported_cross_encoder(architectures.get(mid) or [])
+        if registry_key == "llms":
+            supports_vision, supports_audio = classify_modality_support(architectures.get(mid) or [])
+            entry["supports_vision"] = supports_vision
+            entry["supports_audio"] = supports_audio
         entries.append(entry)
     entries.sort(key=lambda e: e["name"].casefold())
     return registry_key, entries

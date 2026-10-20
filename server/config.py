@@ -3,16 +3,11 @@
 
 """Config."""
 
-import logging
 import os
 from pathlib import Path
 
-from pydantic import AliasChoices, Field, SecretStr, ValidationError, field_validator
+from pydantic import AliasChoices, Field, SecretStr, ValidationError
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
-
-from server.utils.validators import clamp_non_positive_to_one
-
-logger = logging.getLogger("uvicorn.error")
 
 
 class ConfigError(Exception):
@@ -39,10 +34,15 @@ class AppSettings(BaseSettings):
     compose_prefix: str = "df_"
     external_only: bool = False
 
+    docker_hub_token: str = ""
+
+    ollama_vram_overhead_factor: float = Field(default=1.0, validation_alias=AliasChoices("OLLAMA_VRAM_OVERHEAD_FACTOR"))
+
     # --- Everything below is dynamic: populated from config.json, mutable at runtime. ---
 
     name: str = ""
     infra_url: str = ""
+    container_name_suffix: str = ""
 
     mesh_key: SecretStr = SecretStr("")  # key to connect subinfra through ws
     infra_api_key: SecretStr = SecretStr("")  # key to call /v1/ endpoints
@@ -53,12 +53,9 @@ class AppSettings(BaseSettings):
 
     hugging_face_token: SecretStr = SecretStr("")
     civitai_token: SecretStr = SecretStr("")
-    adapter_registry_url: str = ""
     adapter_registry_secret: SecretStr = SecretStr("")
     log_payloads: str = ""
     stop_containers_on_shutdown: str = ""
-
-    docker_hub_token: str = ""
 
     mcp_sse_session_ttl_seconds: int = 300
     mcp_sse_max_sessions: int = 128
@@ -73,17 +70,11 @@ class AppSettings(BaseSettings):
     otel_tracing_enabled: bool = False
     otel_logging_enabled: bool = False
 
-    ollama_kv_cache_type: str = Field(default="f16", validation_alias=AliasChoices("OLLAMA_KV_CACHE_TYPE"))
-    ollama_num_parallel: int = Field(default=1, validation_alias=AliasChoices("OLLAMA_NUM_PARALLEL"))
-    ollama_vram_overhead_factor: float = Field(default=1.0, validation_alias=AliasChoices("OLLAMA_VRAM_OVERHEAD_FACTOR"))
-
-    @field_validator("ollama_num_parallel")
-    @classmethod
-    def _clamp_ollama_num_parallel(cls, value: int) -> int:
-        """Clamp non-positive values to 1 instead of rejecting them, since 0 ("auto") is a valid Ollama value."""
-        return clamp_non_positive_to_one(
-            value, logger, 'OLLAMA_NUM_PARALLEL=%r is non-positive; clamping to 1 instead of Ollama\'s real 0 ("auto", up to 4) behavior.'
-        )
+    # Sentry is configured only through config.json / `PUT /admin/config`: the aliases can't match any
+    # real environment variable, so `DF_SENTRY_*` is never read, not even to seed a fresh config.json.
+    sentry_enabled: bool = Field(default=False, validation_alias="__DF_SENTRY_ENABLED_NOT_SETTABLE_VIA_ENV__")
+    sentry_dsn: SecretStr = Field(default=SecretStr(""), validation_alias="__DF_SENTRY_DSN_NOT_SETTABLE_VIA_ENV__")
+    sentry_environment: str = Field(default="", validation_alias="__DF_SENTRY_ENVIRONMENT_NOT_SETTABLE_VIA_ENV__")
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -143,6 +134,11 @@ class AppSettings(BaseSettings):
 def get_main_dir() -> Path:
     """Get main dir of the application."""
     return Path(__file__).resolve().parent.parent
+
+
+def get_services_json_path(config: AppSettings) -> Path:
+    """Return the path of services.json, the installed-services state persisted by ServiceProvider."""
+    return (config.get_storage_dir() / "./services.json").resolve()
 
 
 def load_config() -> AppSettings:

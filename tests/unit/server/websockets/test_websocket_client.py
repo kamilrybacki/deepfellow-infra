@@ -297,7 +297,7 @@ async def test_loop_logs_and_continues_when_close_fails_during_disconnect(caplog
     with (
         patch.object(_wc_module, "websockets", mock_ws_module),
         patch("asyncio.sleep", new=AsyncMock()),
-        caplog.at_level("ERROR", logger="uvicorn.error"),
+        caplog.at_level("ERROR", logger="uvicorn"),
     ):
         await client.loop()  # should not raise
 

@@ -10,6 +10,9 @@ test *FLAGS:
 ntest *FLAGS:
     uv run pytest --showlocals --tb=auto -ra --cov server --cov-branch --cov-report=term-missing --no-cov-on-fail -n auto {{FLAGS}}
 
+test-live *FLAGS:
+    DF_TEST_LIVE_REGISTRIES=1 uv run pytest tests/integration -v --no-cov {{FLAGS}}
+
 ruff *FLAGS:
     uv run ruff check server/ scripts/ tests/ deploy/helm/deepfellow/files/ deploy/helm/deepfellow/ci/ {{FLAGS}}
 
@@ -43,7 +46,10 @@ todo:
 license-check *FLAGS:
     uv run scripts/check_license_header.py {{FLAGS}}
 
-check: license-check ruff ruff-format pyright auth-static auth-runtime
+example-env-check *FLAGS:
+    uv run python -m scripts.check_example_env {{FLAGS}}
+
+check: license-check ruff ruff-format pyright auth-static auth-runtime example-env-check
 
 ui-rebuild:
    (cd $(git rev-parse --show-toplevel)/webui && npm run buildx)
@@ -185,7 +191,7 @@ clear-ollama-cache:
     uv run python -m scripts.get_ollama_models --clear-cache
 
 get-vllm-models *FLAGS:
-    uv run python -m scripts.get_huggingface_models --type llm --top-by-downloads 200 --top-by-likes 100 --top-by-trending 50 --output static/vllm-min.json {{FLAGS}}
+    uv run python -m scripts.get_huggingface_models --type llm --top-by-downloads 200 --top-by-likes 200 --top-by-trending 50 --output static/vllm-min.json {{FLAGS}}
     uv run python -m scripts.get_huggingface_models --type reranker --top-by-downloads 10 --top-by-trending 10 --output static/vllm-min.json {{FLAGS}}
     uv run python -m scripts.get_huggingface_models --type embedding --top-by-downloads 10 --top-by-trending 10 --output static/vllm-min.json {{FLAGS}}
 
@@ -193,11 +199,11 @@ get-llamacpp-models *FLAGS:
     uv run python -m scripts.get_llamacpp_models --top-by-downloads 200 --top-by-likes 100 --top-by-trending 50 --output static/llamacpp-min.json {{FLAGS}}
 
 get-sglang-models *FLAGS:
-    uv run python -m scripts.get_huggingface_models --type llm --top-by-downloads 200 --top-by-likes 100 --top-by-trending 50 --output static/sglang-min.json {{FLAGS}}
+    uv run python -m scripts.get_huggingface_models --type llm --top-by-downloads 200 --top-by-likes 200 --top-by-trending 50 --output static/sglang-min.json {{FLAGS}}
     uv run python -m scripts.get_huggingface_models --type reranker --top-by-downloads 50 --top-by-likes 30 --top-by-trending 30 --allow-generative-rerankers --output static/sglang-min.json {{FLAGS}}
     uv run python -m scripts.get_huggingface_models --type embedding --top-by-downloads 10 --top-by-trending 10 --output static/sglang-min.json {{FLAGS}}
 
-# static/ holds nine *-min.json registries; these four are the generated ones. coqui, docker-model-runner,
+# static/ holds eight *-min.json registries; these four are the generated ones. docker-model-runner,
 # rerank, speaches and stable-diffusion are maintained by hand and are deliberately not touched here — a new
 # service joins this list only once it has its own get-*-models recipe.
 #

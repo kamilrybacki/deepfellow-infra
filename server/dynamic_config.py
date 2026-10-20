@@ -10,31 +10,17 @@ file to stay in sync with its own writes.
 """
 
 import json
-import logging
-import tomllib
-from functools import lru_cache
+import secrets
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
-from server.config import AppSettings, ConfigError, get_main_dir
+from server.config import AppSettings, ConfigError, get_services_json_path
+from server.utils.logger import logger
+from server.utils.version import get_infra_version
 
-logger = logging.getLogger("uvicorn.error")
-
-CURRENT_SCHEMA_VERSION = 2
-
-
-@lru_cache(maxsize=1)
-def get_infra_version() -> str:
-    """App version reported in config.json, for future migrations/diagnostics.
-
-    Read from `pyproject.toml` lazily (rather than at import time) and cached, since it never
-    changes for the lifetime of the process.
-    """
-    pyproject = get_main_dir() / "pyproject.toml"
-    with pyproject.open("rb") as f:
-        return tomllib.load(f)["project"]["version"]
+CURRENT_SCHEMA_VERSION = 3
 
 
 class DynamicSettings(BaseModel):
@@ -44,6 +30,13 @@ class DynamicSettings(BaseModel):
 
     name: str = ""
     infra_url: str = ""
+    # max_length: with docker_subnet a suffixed container name is the hostname DF Infra connects to, capped at 63
+    # chars per DNS label, and base names (e.g. "vllm-<instance>-<model>") already take a good part of that - a
+    # container whose full name doesn't fit is refused at install (DockerService.install_and_run_docker). Hence
+    # auto-generated suffixes are kept short: "_" + 6 random hex chars.
+    # Lowercase only: DNS names and compose project names are case-insensitive, so suffixes differing only in case
+    # would give two instances' containers the same hostname and compose project.
+    container_name_suffix: Annotated[str, Field(pattern=r"^[a-z0-9_-]*$", max_length=32)] = ""
 
     mesh_key: SecretStr = SecretStr("")
     infra_api_key: SecretStr = SecretStr("")
@@ -54,7 +47,6 @@ class DynamicSettings(BaseModel):
 
     hugging_face_token: SecretStr = SecretStr("")
     civitai_token: SecretStr = SecretStr("")
-    adapter_registry_url: str = ""
     adapter_registry_secret: SecretStr = SecretStr("")
     log_payloads: str = ""
     stop_containers_on_shutdown: str = ""
@@ -70,6 +62,10 @@ class DynamicSettings(BaseModel):
     otel_exporter_otlp_endpoint: str = "http://localhost:4317"
     otel_tracing_enabled: bool = False
     otel_logging_enabled: bool = False
+
+    sentry_enabled: bool = False
+    sentry_dsn: SecretStr = SecretStr("")
+    sentry_environment: str = ""
 
     def to_persistable_dict(self) -> dict[str, Any]:
         """Serialize with real secret values — for config.json and internal PUT-merge use only.
@@ -114,6 +110,11 @@ def _migrate(raw: dict[str, Any]) -> dict[str, Any]:
     config.json written by an unreleased build in the interim could still have it on disk, and
     `DynamicSettings`'s `extra="forbid"` would otherwise reject it outright.
 
+    v2 -> v3: drops `adapter_registry_url`. The df-finetune adapter registry's address is now
+    resolved live from the installed `deepfellow-finetune` Finetune-service container instead of a
+    manually configured URL (which drifted from the container's actual, dynamically assigned host
+    port) - same `extra="forbid"` concern as above for any config.json still carrying the old key.
+
     Raises `ConfigError` if `schema_version` is present but not an int, e.g. a hand-edited config.json.
     """
     schema_version = raw.get("schema_version", 1)
@@ -125,6 +126,11 @@ def _migrate(raw: dict[str, Any]) -> dict[str, Any]:
         if isinstance(settings, dict):
             settings.pop("custom_endpoint_read_timeout_seconds", None)
         raw["schema_version"] = 2
+    if schema_version < 3:
+        settings = raw.get("settings")
+        if isinstance(settings, dict):
+            settings.pop("adapter_registry_url", None)
+        raw["schema_version"] = 3
     return raw
 
 
@@ -173,6 +179,15 @@ def snapshot_dynamic_settings(config: AppSettings) -> DynamicSettings:
     return DynamicSettings(**{field_name: getattr(config, field_name) for field_name in DynamicSettings.model_fields})
 
 
+def _generate_container_name_suffix() -> str:
+    """Generate a default container-name suffix, disambiguating this instance from others on the same Docker host.
+
+    Random rather than derived from `DF_NAME` (which may be shared/default), and short, since with docker_subnet
+    the suffixed name must still fit a 63-char hostname.
+    """
+    return f"_{secrets.token_hex(3)}"
+
+
 def _build_legacy_defaults(config: AppSettings) -> DynamicSettings:
     """Build initial DynamicSettings from `config`, for the release that introduces config.json.
 
@@ -180,8 +195,16 @@ def _build_legacy_defaults(config: AppSettings) -> DynamicSettings:
     declarations, which still include every dynamic field (with a default). So any legacy `.env`
     value for a now-dynamic field (e.g. `DF_HUGGING_FACE_TOKEN`) is already present on `config` —
     no separate manual env parsing is needed, just snapshot it before config.json exists.
+
+    Raises ConfigError naming the offending variable(s) if a legacy value fails validation (e.g. an invalid
+    `DF_CONTAINER_NAME_SUFFIX`) - otherwise startup would only report a generic config error.
     """
-    settings = snapshot_dynamic_settings(config)
+    try:
+        settings = snapshot_dynamic_settings(config)
+    except ValidationError as e:
+        problems = "; ".join(f"DF_{'_'.join(str(part) for part in err['loc']).upper()}: {err['msg']}" for err in e.errors())
+        msg = f"Invalid value in .env - {problems}"
+        raise ConfigError(msg) from e
     if settings != DynamicSettings():
         logger.warning(
             "Seeding config.json from legacy .env values. These environment variables are no longer "
@@ -190,11 +213,32 @@ def _build_legacy_defaults(config: AppSettings) -> DynamicSettings:
     return settings
 
 
+def _should_auto_generate_container_name_suffix(config: AppSettings) -> bool:
+    """Whether a new config.json should get an auto-derived container_name_suffix.
+
+    Only for a genuinely fresh install. Skipped for an existing installation (services.json present, e.g.
+    an upgrade from before config.json existed), whose not-yet-pinned container names would otherwise be
+    re-derived with the new suffix and renamed; and while the legacy DF_CONTAINER_NAME_PREFIX is set,
+    which takes priority over any suffix anyway.
+    """
+    return not config.container_name_prefix and not get_services_json_path(config).exists()
+
+
 def load_or_init(config: AppSettings) -> None:
-    """Load config.json into `config`, creating it (seeded from legacy env if present) if absent."""
+    """Load config.json into `config`, creating it (seeded from legacy env if present) if absent.
+
+    On a genuinely fresh install with no `DF_CONTAINER_NAME_SUFFIX` set, auto-derives one (see
+    `_should_auto_generate_container_name_suffix`). An upgrade - into an existing config.json or not -
+    keeps the blank default so container names don't change.
+    """
     envelope = read_envelope(config)
     if envelope is None:
         settings = _build_legacy_defaults(config)
+        if not settings.container_name_suffix and _should_auto_generate_container_name_suffix(config):
+            # model_validate, not model_copy(update=...) - the latter skips validation, so a bad suffix would
+            # reach config.json and only fail on the next startup's read_envelope().
+            suffix = _generate_container_name_suffix()
+            settings = DynamicSettings.model_validate({**settings.model_dump(), "container_name_suffix": suffix})
         envelope = ConfigEnvelope(
             schema_version=CURRENT_SCHEMA_VERSION,
             infra_version=get_infra_version(),
@@ -202,6 +246,13 @@ def load_or_init(config: AppSettings) -> None:
         )
         write_envelope_atomic(config, envelope)
     apply_dynamic_settings(config, envelope.settings)
+    if config.container_name_prefix and config.container_name_suffix:
+        logger.warning(
+            "container_name_suffix %r is ignored while the legacy DF_CONTAINER_NAME_PREFIX %r is set. Remove "
+            "DF_CONTAINER_NAME_PREFIX from .env and restart to use the suffix - installed containers keep their names.",
+            config.container_name_suffix,
+            config.container_name_prefix,
+        )
 
 
 def persist_settings(config: AppSettings, settings: DynamicSettings) -> None:

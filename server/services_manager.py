@@ -4,7 +4,6 @@
 """Services manager."""
 
 import asyncio
-import logging
 import re
 from typing import Any
 
@@ -35,8 +34,7 @@ from server.serviceprovider import ServiceRawConfig
 from server.services.base2_service import Base2Service
 from server.services.base_service import BaseService
 from server.utils.core import PromiseWithProgress, StreamChunk
-
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 
 class ServicesManager:
@@ -85,6 +83,17 @@ class ServicesManager:
         drains = [service.drain_warning_tasks() for service in self.services.values() if isinstance(service, Base2Service)]
         if drains:
             await asyncio.gather(*drains)
+
+    async def resolve_platform_compatibility(self) -> None:
+        """Resolve every registered service's docker-image platform compatibility, in parallel.
+
+        Called once during app startup, before the server accepts requests - see
+        `Base2Service.resolve_platform_compatibility()`. Each service's own check already swallows
+        its own failures, so this never raises.
+        """
+        checks = [service.resolve_platform_compatibility() for service in self.services.values() if isinstance(service, Base2Service)]
+        if checks:
+            await asyncio.gather(*checks)
 
     async def load_service(self, service_id: str, service_cfg: ServiceRawConfig) -> None:
         """Load service."""

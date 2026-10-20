@@ -189,6 +189,7 @@ def test_send_warm_schedules_task_when_connected():
     infra.send_warm(warm)
 
     assert infra.task_manager.add_task_safe.call_count == 1  # pyright: ignore[reportAttributeAccessIssue]
+    infra.task_manager.add_task_safe.call_args[0][0].close()  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def test_send_warm_schedules_a_task_per_call_within_the_same_synchronous_burst():
@@ -202,6 +203,8 @@ def test_send_warm_schedules_a_task_per_call_within_the_same_synchronous_burst()
     infra.send_warm(WarmChangeRequest(id="r2", warm=True))
 
     assert infra.task_manager.add_task_safe.call_count == 2  # pyright: ignore[reportAttributeAccessIssue]
+    for coro_call in infra.task_manager.add_task_safe.call_args_list:  # pyright: ignore[reportAttributeAccessIssue]
+        coro_call[0][0].close()
 
 
 def test_send_warm_noop_when_previously_marked_unsupported():
@@ -305,12 +308,13 @@ def test_check_subinfra_connection_returns_false_when_key_invalid():
     assert infra.check_subinfra_connection(model) is False
 
 
-def test_check_subinfra_connection_returns_false_when_api_key_mismatch():
+@pytest.mark.parametrize("provided", ["wrong-key", "", "api-key-longer", "api-kez", "äpi-key"])
+def test_check_subinfra_connection_returns_false_when_api_key_mismatch(provided: str):
     infra = make_parent_infra()
     infra.one_time_key = MagicMock()
     infra.one_time_key.check.return_value = True
 
-    model = CheckMeshConnection(infra_api_key="wrong-key", connection_verifier="ck")
+    model = CheckMeshConnection(infra_api_key=provided, connection_verifier="ck")
 
     assert infra.check_subinfra_connection(model) is False
 

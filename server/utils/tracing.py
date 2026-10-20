@@ -33,8 +33,8 @@ from opentelemetry.trace import Span, Tracer
 from pydantic import BaseModel
 
 from server.config import AppSettings
-
-uvicorn_logger = logging.getLogger("uvicorn")
+from server.utils.failed_span import remember_failed_span
+from server.utils.logger import logger
 
 _OTEL_SHUTDOWN_TIMEOUT_MILLIS = 5000
 
@@ -54,6 +54,11 @@ class OtlpLoggingManager:
         self._handler: LoggingHandler | None = None
         self._provider: LoggerProvider | None = None
 
+        # Last confirmed-applied logging config, not `config` itself — `config` gets overwritten
+        # regardless of success, which would hide a still-pending change from a retry.
+        self.configured_endpoint: str | None = None
+        self.configured_enabled: bool = False
+
     def setup(self, config: AppSettings) -> None:
         """Attach an OTLP log handler to the root Python logger and non-propagating uvicorn loggers.
 
@@ -70,6 +75,10 @@ class OtlpLoggingManager:
         handler = self._handler = LoggingHandler(level=logging.DEBUG, logger_provider=provider)
         for name in _OTLP_LOG_HANDLER_LOGGER_NAMES:
             logging.getLogger(name).addHandler(handler)
+
+        # Only record success once attached, so a prior failure still shows as pending on retry.
+        self.configured_endpoint = config.otel_exporter_otlp_endpoint
+        self.configured_enabled = True
 
     def _shutdown_provider(self, provider: LoggerProvider) -> None:
         """Shut down a `LoggerProvider` without blocking the caller for up to the default 30s.
@@ -97,7 +106,7 @@ class OtlpLoggingManager:
         try:
             provider.shutdown()
         except Exception:
-            uvicorn_logger.warning("Failed to shut down OTel log provider", exc_info=True)
+            logger.warning("Failed to shut down OTel log provider", exc_info=True)
 
     async def teardown(self) -> None:
         """Detach the OTLP log handler previously attached by `setup()`, if any.
@@ -117,6 +126,9 @@ class OtlpLoggingManager:
         if self._provider is not None:
             await asyncio.to_thread(self._shutdown_provider, self._provider)
             self._provider = None
+
+        # _run_provider_shutdown() never raises, so this always reflects reality once reached.
+        self.configured_enabled = False
 
     async def reconfigure(self, config: AppSettings) -> None:
         """Apply an `otel_logging_enabled`/`otel_exporter_otlp_endpoint` change without a restart."""
@@ -165,6 +177,15 @@ class InfraTracer:
             raise RuntimeError(msg)
         return self.config
 
+    @property
+    def is_active(self) -> bool:
+        """Whether shutdown() still has a live provider to tear down.
+
+        Checks both independently — mcp_instruments() can build _meter_provider without span()
+        ever building _provider.
+        """
+        return self._provider is not None or self._meter_provider is not None
+
     def _shutdown_span_provider(self, provider: TracerProvider) -> None:
         """Shut down a `TracerProvider` without blocking the caller for up to the default 30s.
 
@@ -204,7 +225,7 @@ class InfraTracer:
         try:
             provider.shutdown()
         except Exception:
-            uvicorn_logger.warning("Failed to shut down OTel span provider", exc_info=True)
+            logger.warning("Failed to shut down OTel span provider", exc_info=True)
 
     def _shutdown_meter_provider(self, provider: MeterProvider) -> None:
         """Shut down a `MeterProvider`, swallowing any exception it raises.
@@ -221,7 +242,7 @@ class InfraTracer:
         try:
             provider.shutdown(timeout_millis=_OTEL_SHUTDOWN_TIMEOUT_MILLIS)
         except Exception:
-            uvicorn_logger.warning("Failed to shut down OTel meter provider", exc_info=True)
+            logger.warning("Failed to shut down OTel meter provider", exc_info=True)
 
     def _get_tracer(self) -> Tracer:
         otlp_endpoint = self._get_config().otel_exporter_otlp_endpoint
@@ -314,7 +335,7 @@ class InfraTracer:
         try:
             return self._get_mcp_instruments()
         except Exception:
-            uvicorn_logger.warning("Failed to initialize MCP OTel instruments; continuing without metrics", exc_info=True)
+            logger.warning("Failed to initialize MCP OTel instruments; continuing without metrics", exc_info=True)
             return None
 
     @contextlib.contextmanager
@@ -338,7 +359,7 @@ class InfraTracer:
         try:
             tracer_obj = self._get_tracer()
         except Exception:
-            uvicorn_logger.warning("Failed to initialize OTel tracer for span %r; continuing without tracing", name, exc_info=True)
+            logger.warning("Failed to initialize OTel tracer for span %r; continuing without tracing", name, exc_info=True)
             yield None
             return
         with tracer_obj.start_as_current_span(
@@ -439,6 +460,7 @@ class InfraTracer:
                     res = await func(*args, **kwargs)
                 except Exception as e:
                     span.record_exception(e)
+                    remember_failed_span(func_args.request, span.get_span_context())
                     span_end()
                     raise
                 else:

@@ -3,7 +3,6 @@
 
 """Models API."""
 
-import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Path, Query, Request
@@ -29,9 +28,8 @@ from server.models.models import (
 )
 from server.services_manager import ServicesManager
 from server.utils.core import convert_promise_with_progress_to_fastapi_response
+from server.utils.logger import logger
 from server.utils.tracing import tracer
-
-logger = logging.getLogger("uvicorn.error")
 
 router = APIRouter(prefix="/admin/services/{service_id}/models", tags=["Services"])
 

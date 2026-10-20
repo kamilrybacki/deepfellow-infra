@@ -159,6 +159,31 @@ async def get_nvidia_gpu_info_raw() -> str:
     return result.stdout
 
 
+_CUDA_VERSION_TTL = 600.0
+_cuda_version_cache: tuple[tuple[int, int] | None, float] | None = None
+
+
+def parse_nvidia_smi_cuda_version(output: str) -> tuple[int, int] | None:
+    """Parse the highest CUDA version the driver supports from the `nvidia-smi` header ("CUDA Version: 12.9")."""
+    match = re.search(r"CUDA (?:UMD )?Version:\s*(\d+)\.(\d+)", output)
+    return (int(match[1]), int(match[2])) if match else None
+
+
+async def get_nvidia_max_cuda_version() -> tuple[int, int] | None:
+    """Highest CUDA version supported by the host's NVIDIA driver, or None without a usable NVIDIA GPU. Cached for a while."""
+    global _cuda_version_cache  # process-wide cache, the driver does not change at runtime
+    if _cuda_version_cache and time.monotonic() - _cuda_version_cache[1] < _CUDA_VERSION_TTL:
+        return _cuda_version_cache[0]
+    cmd = ["docker", "run", "--gpus", "all", "--rm", "gcr.io/distroless/base", "nvidia-smi"]
+    try:
+        result = await Utils.run_command_for_success(cmd)
+        version = parse_nvidia_smi_cuda_version(result.stdout)
+    except (RuntimeError, OSError):
+        version = None
+    _cuda_version_cache = (version, time.monotonic())
+    return version
+
+
 def create_nvidia_gpu_info_list(raw_info: str) -> list[NvidiaGpuInfo]:
     """From raw info create list of Nvidia GPU Info."""
     gpus_info: list[NvidiaGpuInfo] = []
@@ -242,6 +267,7 @@ class Hardware:
     _intel_gpus: list[IntelGpuInfo]
     _realtime_stats_cache: GpuStats | None
     _realtime_stats_cache_ts: float
+    gpu_load_lock: asyncio.Lock
 
     def __init__(self) -> None:
         self.is_info_collected = False
@@ -253,6 +279,7 @@ class Hardware:
         self._total_vram_gb = 0
         self._realtime_stats_cache = None
         self._realtime_stats_cache_ts = 0.0
+        self.gpu_load_lock = asyncio.Lock()
 
     async def init_async(self) -> None:
         """Init async."""

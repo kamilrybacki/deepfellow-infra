@@ -15,7 +15,7 @@ All Python commands use `uv` via `just`. Run from the project root.
 | `just dev` | Start backend (localhost:8086, hot-reload, debug logging) |
 | `just test [FLAGS]` | Run pytest with coverage |
 | `just ntest [FLAGS]` | Same but parallel (`-n auto`) |
-| `just check` | Full lint suite: license headers, ruff, ruff-format, pyright, auth checks |
+| `just check` | Full lint suite: license headers, ruff, ruff-format, pyright, auth checks, example.env check |
 | `just ruff` | Lint Python files |
 | `just ruff-format` | Format Python files |
 | `just pyright` | Type-check with pyright |

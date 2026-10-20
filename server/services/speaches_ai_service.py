@@ -7,12 +7,12 @@ import asyncio
 import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 from langdetect import detect  # type: ignore
-from pydantic import BaseModel
+from pydantic import BaseModel, BeforeValidator, Field
 
 from server.applicationcontext import get_base_url
 from server.config import get_main_dir
@@ -35,12 +35,13 @@ from server.models.models import (
 from server.models.services import (
     InstallServiceIn,
     InstallServiceProgress,
+    ServiceField,
     ServiceOptions,
     ServiceSize,
     ServiceSpecification,
     UninstallServiceIn,
 )
-from server.services.base2_service import Base2Service, CustomModel, Instance, InstanceConfig, ModelConfig
+from server.services.base2_service import Base2Service, CustomModel, Instance, InstanceConfig, ModelConfig, default_gpu_cpu_image_name
 from server.utils.core import (
     DownloadedPacket,
     PreDownloadPacket,
@@ -178,11 +179,21 @@ class ModelInstalledInfo:
         return ModelInfo(spec=self.options.spec, registration_id=self.registration_id)
 
 
+def _empty_to_none(value: object) -> object:
+    return None if value == "" else value
+
+
+# An emptied optional form field arrives as "", which means unset (speaches' own default of 300 s).
+type OptionalModelTtl = Annotated[Annotated[int, Field(ge=-1)] | None, BeforeValidator(_empty_to_none)]
+
+
 class SpeachesAIOptions(BaseModel):
     hardware: str | bool | None = None
+    keep_alive: OptionalModelTtl = None
 
 
 class SpeachesAIModelOptions(BaseModel):
+    rename: str | None = None
     alias: str | None = None
 
 
@@ -253,13 +264,24 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
     def get_spec(self) -> ServiceSpecification:
         """Return the service specification."""
         fields = self.add_hardware_field_to_spec()
+        fields.append(
+            ServiceField(
+                type="text",
+                name="keep_alive",
+                description="The duration that models stay loaded in memory in seconds (default=300, instant_release=0, infinity=-1)",
+                required=False,
+            )
+        )
         return ServiceSpecification(fields=fields)
 
     def get_model_spec(self) -> ModelSpecification:
         """Return the model specification."""
         return ModelSpecification(
             fields=[
-                ModelField(type="text", name="alias", description="Model alias", required=False),
+                ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
+                ModelField(
+                    type="text", name="alias", description="Additional name for the model, the original name keeps working", required=False
+                ),
             ]
         )
 
@@ -300,6 +322,7 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
             if info
             else [],
             custom=custom,
+            container_name=info.docker.container_name if info else None,
         )
 
     def _restore_model_definition(self, instance: str, model_id: str, definition: dict[str, Any]) -> None:
@@ -307,6 +330,10 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
 
     def _get_image(self, gpu: bool) -> DockerImage:
         return _const.images["gpu"] if gpu else _const.images["cpu"]
+
+    def get_default_docker_image_name(self) -> str | None:
+        """Return the default docker image, for the upfront platform-compatibility check."""
+        return default_gpu_cpu_image_name(self._supported_gpus, self._get_image)
 
     def _load_download_info(self, data: dict[str, Any]) -> DownloadedInfo:
         return DownloadedInfo(**data)
@@ -316,13 +343,20 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
-        if not self.models.get(instance):
-            self.load_default_models(instance)
-
+    async def _validate_update_options(self, options: InstallServiceIn) -> None:
+        """Normalize the hardware spec and validate the options spec."""
         if "hardware" not in options.spec:
             options.spec["hardware"] = options.spec.get("gpu", self.docker_service.has_gpu_support)
         options.spec["hardware"] = self.canonicalize_hardware_spec(options.spec["hardware"])
+        try_parse_pydantic(SpeachesAIOptions, options.spec)
+
+    async def _install_instance(
+        self, instance: str, options: InstallServiceIn, container_name_override: str | None = None
+    ) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
+        if not self.models.get(instance):
+            self.load_default_models(instance)
+
+        await self._validate_update_options(options)
         parsed_options = try_parse_pydantic(SpeachesAIOptions, options.spec)
         volumes = [f"{self._get_hub_dir()}:/home/ubuntu/.cache/huggingface/hub"]
 
@@ -336,16 +370,18 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
             stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
             subnet = self.docker_service.get_docker_subnet()
             name = f"{self.get_service_id(instance)}"
+            env_vars = {"ENABLE_UI": "False"}
+            if parsed_options.keep_alive is not None:
+                env_vars["STT_MODEL_TTL"] = str(parsed_options.keep_alive)
+                env_vars["TTS_MODEL_TTL"] = str(parsed_options.keep_alive)
             docker_options = DockerOptions(
                 name=name,
-                container_name=f"{self.docker_service.get_docker_container_name(name)}",
+                container_name=container_name_override or self.docker_service.get_docker_container_name(name),
                 image=image.name,
                 image_port=8000,
                 hardware=self.get_specified_hardware_parts(parsed_options.hardware),
                 volumes=volumes,
-                env_vars={
-                    "ENABLE_UI": "False",
-                },
+                env_vars=env_vars,
                 restart="unless-stopped",
                 # user pinned to 0:0 - get_user_for_docker() returns the host uid:gid on rootful Docker, but the image's /home/ubuntu
                 # is 0750 ubuntu:ubuntu, so any uid other than 1000 cannot reach the venv on PATH - the container then dies with
@@ -371,7 +407,7 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
                         "Please update your NVIDIA GPU drivers to a newer version.",
                     ) from e
                 raise
-            container_host = self.docker_service.get_container_host(subnet, docker_options.name)
+            container_host = self.docker_service.get_container_host(subnet, docker_options)
             container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
             info = InstalledInfo(
                 docker=docker_options,
@@ -576,7 +612,11 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
                     break
 
     async def _install_model(  # noqa: C901
-        self, instance: str, model_id: str, options: InstallModelIn
+        self,
+        instance: str,
+        model_id: str,
+        options: InstallModelIn,
+        container_name_override: str | None = None,  # noqa: ARG002
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_model_options = try_parse_pydantic(SpeachesAIModelOptions, options.spec) if options.spec else SpeachesAIModelOptions()
         info = self.get_instance_installed_info(instance)
@@ -607,7 +647,8 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
 
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
 
-                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
+                registered_alias = parsed_model_options.alias
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
                     type=model.type,
@@ -634,14 +675,14 @@ class SpeachesAIService(Base2Service[InstalledInfo, DownloadedInfo]):
                             model=registered_name,
                             props=ModelProps(private=True, type=model.type, endpoints=TTS_ENDPOINTS),
                             endpoint=SimpleEndpoint(on_request=on_request),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                            registration_options=RegistrationOptions(origin="local", alias=registered_alias, owned_by=self.get_type()),
                         )
                     if model.type == "stt":
                         model_info.registration_id = self.endpoint_registry.register_audio_transcriptions_as_proxy(
                             model=registered_name,
                             props=ModelProps(private=True, type=model.type, endpoints=STT_ENDPOINTS),
                             options=ProxyOptions(url=f"{info.base_url}/v1/audio/transcriptions", rewrite_model_to=model_id),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                            registration_options=RegistrationOptions(origin="local", alias=registered_alias, owned_by=self.get_type()),
                         )
                     stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
                     self.models_downloaded[model_id] = DownloadedInfo(model_path=str(model_dir))

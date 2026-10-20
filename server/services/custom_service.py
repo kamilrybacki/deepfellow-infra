@@ -4,16 +4,18 @@
 """Custom service."""
 
 import asyncio
-import logging
+import copy
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Final
+from urllib.parse import urlsplit
 
 from fastapi import HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field, ValidationInfo, field_validator
 
 from server.applicationcontext import get_base_url
+from server.config import AppSettings
 from server.docker import DockerImage, DockerOptions
 from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
 from server.models.api import ModelProps
@@ -40,6 +42,7 @@ from server.models.services import (
     ServiceSpecification,
     UninstallServiceIn,
 )
+from server.serviceprovider import ServiceRawConfig
 from server.services.base2_service import Base2Service, CustomModel, Instance, InstanceConfig, ModelConfig
 from server.utils.core import (
     PromiseWithProgress,
@@ -51,13 +54,16 @@ from server.utils.core import (
 )
 from server.utils.docker_image_version import apply_image_version_override, docker_tags_model_field, split_image_repo_tag
 from server.utils.hardware import HardwarePartInfo, NvidiaGpuInfo
+from server.utils.logger import logger
 from server.utils.registry_client import RegistryUnavailableError, image_without_registry_prefix, registry_for
 from server.utils.size_fetcher import fmt_size
 
 # Token window accepted by BAAI/bge-m3, which the deepfellow-bge-m3 image serves unmodified.
 BGE_M3_CONTEXT_WINDOW = 8192
-
-logger = logging.getLogger("uvicorn.error")
+DOC_CHUNKER_PROXY_TIMEOUT_SECONDS: Final = 7200
+# This Infra's compose service name, as its containers on the docker subnet reach it. Not unique when several Infra instances
+# share one docker network: it resolves to any of them, so this Infra's key can reach the wrong one.
+DOC_CHUNKER_DEFAULT_GATEWAY_URL: Final = "http://infra:8086"
 
 type SrvCustomModelX = Callable[["CustomService", str | None], SrvCustomModel]
 type DockerOptionsOrCallable = DockerOptions | Callable[[InstallModelOptions], DockerOptions]
@@ -65,6 +71,24 @@ type DockerOptionsOrCallable = DockerOptions | Callable[[InstallModelOptions], D
 
 def _is_gpu_hardware(hardware_parts: Sequence[HardwarePartInfo]) -> bool:
     return any(isinstance(h, NvidiaGpuInfo) for h in hardware_parts)
+
+
+def _normalize_url(url: str) -> tuple[str, str | None, int | None, str] | None:
+    """Return the comparable parts of `url`, or None when it can't be parsed (e.g. a non-numeric port)."""
+    try:
+        parts = urlsplit(url.strip())
+        return parts.scheme.lower(), parts.hostname, parts.port, parts.path.rstrip("/")
+    except ValueError:
+        return None
+
+
+def _is_own_gateway_url(url: str, config: AppSettings) -> bool:
+    """Whether `url` is this Infra's subnet address or its public `infra_url` (literal match, no DNS)."""
+    normalized = _normalize_url(url)
+    if normalized is None:
+        return False
+    own_urls = [DOC_CHUNKER_DEFAULT_GATEWAY_URL, config.infra_url] if config.infra_url else [DOC_CHUNKER_DEFAULT_GATEWAY_URL]
+    return any(normalized == _normalize_url(own_url) for own_url in own_urls)
 
 
 def _model_default_image(model: "SrvCustomModel", hardware: str | None) -> str | None:
@@ -105,6 +129,10 @@ class SrvCustomModel:
     custom: CustomModelId | None = None
     description: str = ""
     repository_url: str | None = None
+    # Proxy read timeout used when the install leaves `proxy_timeout_seconds` empty; None falls back to
+    # the global `standard_proxy_timeout_seconds`. For services that answer only once a long job is done.
+    default_proxy_timeout_seconds: int | None = None
+    validate_install_options: Callable[[InstallModelOptions], None] | None = None
 
 
 class SrvCustomCustomModel(BaseModel):
@@ -162,6 +190,14 @@ class DownloadedInfo:
     image: str
 
 
+#: Built-in model ids that used to live in this service's catalog and have since moved to their own
+#: dedicated service, mapped to that service's id. A `services.json` written before the move can still
+#: list one as installed; without filtering it out here, `load_model` would treat it as a real failure
+#: (it's no longer in `_const.models`) and raise a permanent "failed to load" warning on every future
+#: startup instead of just quietly reflecting that it's gone from this catalog.
+_RETIRED_MODEL_IDS: dict[str, str] = {"deepfellow-finetune": "finetune"}
+
+
 class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
     models: dict[str, dict[str, "SrvCustomModel"]]
     _installing: set[tuple[str, str]]
@@ -170,6 +206,51 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
     def _after_init(self) -> None:
         self.load_default_models("default")
         self._installing = set()
+
+    async def load_service(self, config: ServiceRawConfig) -> None:
+        """Load service using the config, dropping any persisted entry for a retired model id.
+
+        A dropped entry's container keeps running (`restart: unless-stopped`), holding its GPU and host
+        port with nothing tracking it anymore, so it's torn down too, and the pruned config is saved
+        right away so that happens only once.
+        """
+        retired: set[str] = set()
+        instances = config.get("instances")
+        if isinstance(instances, dict):
+            for instance in instances.values():
+                if isinstance(instance, dict) and isinstance(instance.get("models"), list):
+                    kept: list[Any] = []
+                    for m in instance["models"]:
+                        if isinstance(m, dict) and m.get("model_id") in _RETIRED_MODEL_IDS:
+                            retired.add(m["model_id"])
+                        else:
+                            kept.append(m)
+                    instance["models"] = kept
+        await super().load_service(config)
+        if retired:
+            for model_id in sorted(retired):
+                await self._remove_retired_model_container(model_id)
+            await self._save()
+
+    async def _remove_retired_model_container(self, model_id: str) -> None:
+        """Best-effort teardown of a retired model's container; a failure must not abort startup.
+
+        The replacement service names its containers after its own service id (e.g. `finetune`, not
+        `deepfellow-finetune`), so this container is never one of its own. Data volumes are always
+        left in place.
+        """
+        container_name = self.docker_service.get_docker_container_name(model_id)
+        try:
+            await self.docker_service.uninstall_docker(DockerOptions(name=model_id, container_name=container_name, image="", image_port=0))
+        except Exception:
+            logger.warning("Failed to remove container %r of retired custom model %r", container_name, model_id, exc_info=True)
+            return
+        logger.info(
+            "Removed container %r of retired custom model %r; install the %r service instead",
+            container_name,
+            model_id,
+            _RETIRED_MODEL_IDS[model_id],
+        )
 
     def load_default_models(self, instance: str) -> None:
         """Load default models to instance."""
@@ -232,17 +313,18 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
             ]
         )
 
-    def get_proxy_timeout_field(self) -> ModelField:
+    def get_proxy_timeout_field(self, default: int | None = None) -> ModelField:
         """Field for the per-install proxy read timeout.
 
-        Left unset, it falls back to the global admin default as of install time — a later change to the
-        global default does not affect already-installed services.
+        Left unset, it falls back to `default` (the model's `default_proxy_timeout_seconds`) or, without
+        one, to the global admin default as of install time — a later change to the global default does
+        not affect already-installed services.
         """
+        fallback = f"{default}s" if default is not None else "the global default"
         return ModelField(
             type="number",
             name="proxy_timeout_seconds",
-            description="Seconds the proxy waits for a response from this service before timing out. "
-            "Leave empty to use the global default.",
+            description=f"Seconds the proxy waits for a response from this service before timing out. Leave empty to use {fallback}.",
             required=False,
         )
 
@@ -369,14 +451,23 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
     def _generate_instance_config(self, instance: str, info: InstalledInfo | None, custom: list[CustomModel] | None) -> InstanceConfig:  # noqa: ARG002
         return InstanceConfig(
             options=info.options if info else None,
-            models=[ModelConfig(model_id=x.id, options=x.options) for x in info.models.values()] if info else [],
+            models=[
+                ModelConfig(model_id=x.id, options=x.options, container_name=x.docker_options.container_name) for x in info.models.values()
+            ]
+            if info
+            else [],
             custom=custom,
         )
 
     def _load_download_info(self, data: dict[str, Any]) -> DownloadedInfo:
         return DownloadedInfo(**data)
 
-    async def _install_instance(self, instance: str, options: InstallServiceIn) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
+    async def _install_instance(
+        self,
+        instance: str,
+        options: InstallServiceIn,
+        container_name_override: str | None = None,  # noqa: ARG002
+    ) -> PromiseWithProgress[InstalledInfo, StreamChunk]:
         if not self.models.get(instance):
             self.load_default_models(instance)
 
@@ -496,6 +587,13 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
         command = docker_options.command if isinstance(docker_options.command, str) else None
         healthcheck = docker_options.healthcheck or {}
         hardware_spec = self.canonicalize_hardware_spec(install_spec["hardware"]) if "hardware" in install_spec else None
+        # A duplicate is persisted in services.json and can't follow key rotation, so it must not carry this Infra's key.
+        infra_api_key = self.config.infra_api_key.get_secret_value()
+        envs = (
+            {key: "" if infra_api_key and str(value) == infra_api_key else str(value) for key, value in docker_options.env_vars.items()}
+            if docker_options.env_vars
+            else None
+        )
         return {
             "id": model_id,
             "private": True,
@@ -515,7 +613,7 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
             # env vars to actual int/bool literals, not strings - `SrvCustomCustomModel.envs` is
             # `dict[str, str]`, so these must be stringified or add_custom_model's validation rejects
             # them ("envs.<key>: Input should be a valid string").
-            "envs": {key: str(value) for key, value in docker_options.env_vars.items()} if docker_options.env_vars else None,
+            "envs": envs,
             "healthcheck_cmd": healthcheck.get("test"),
             "healthcheck_start_period": healthcheck.get("start_period"),
             "description": model.description,
@@ -589,8 +687,12 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
             repository_url=model.repository_url,
         )
 
-    async def _install_model(
-        self, instance: str, model_id: str, options: InstallModelIn
+    async def _install_model(  # noqa: C901
+        self,
+        instance: str,
+        model_id: str,
+        options: InstallModelIn,
+        container_name_override: str | None = None,
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         info = self.get_instance_installed_info(instance)
         if not self.models.get(instance):
@@ -611,9 +713,18 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
         self._installing.add(key)
 
         try:
+            if model.validate_install_options:
+                model.validate_install_options(options.spec)
             await self.validate_docker_image_version_for_model(model_id, options.spec.get("image_version"), options.spec.get("hardware"))
             docker_options = model.options(options.spec) if isinstance(model.options, Callable) else model.options
             docker_options = apply_image_version_override(docker_options, options.spec.get("image_version"))
+            if container_name_override or not isinstance(model.options, Callable):
+                # Copy first - a static, non-callable model.options is shared across installs. Its container_name
+                # was derived when the model list was built, so re-derive it: a live suffix change must apply too.
+                docker_options = copy.copy(docker_options)
+                docker_options.container_name = container_name_override or self.docker_service.get_docker_container_name(
+                    docker_options.name
+                )
             await self._verify_docker_image(docker_options.image, options.ignore_warnings)
         except BaseException:
             self._installing.discard(key)
@@ -628,7 +739,7 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
                 await self._download_image_or_set_progress(stream, image)
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
                 docker_exposed_port, _, _ = await self.docker_service.install_and_run_docker(docker_options)
-                container_host = self.docker_service.get_container_host(subnet, docker_options.name)
+                container_host = self.docker_service.get_container_host(subnet, docker_options)
                 container_port = self.docker_service.get_container_port(subnet, docker_exposed_port, docker_options.image_port)
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
@@ -641,10 +752,14 @@ class CustomService(Base2Service[InstalledInfo, DownloadedInfo]):
                     prefix=parsed_model_options.prefix,
                     base_url=get_base_url(container_host, container_port),
                 )
-                proxy_timeout_seconds = (
-                    parsed_model_options.proxy_timeout_seconds
-                    if parsed_model_options.proxy_timeout_seconds is not None
-                    else self.config.standard_proxy_timeout_seconds
+                proxy_timeout_seconds = next(
+                    timeout
+                    for timeout in (
+                        parsed_model_options.proxy_timeout_seconds,
+                        model.default_proxy_timeout_seconds,
+                        self.config.standard_proxy_timeout_seconds,
+                    )
+                    if timeout is not None
                 )
                 try:
                     model_info.registration_id = self.endpoint_registry.register_custom_endpoint_as_proxy(
@@ -733,7 +848,7 @@ def create_bge_m3_model(custom_service: CustomService, subnet: str | None) -> Sr
         return DockerOptions(
             image_port=8070,
             name="deepfellow-bge-m3",
-            container_name="deepfellow-bge-m3",
+            container_name=custom_service.docker_service.get_docker_container_name("deepfellow-bge-m3", apply_legacy_prefix=False),
             image=image,
             restart="unless-stopped",
             hardware=hardware_parts,
@@ -821,7 +936,7 @@ def create_lemmatizer_model(custom_service: CustomService, subnet: str | None) -
         return DockerOptions(
             image_port=8090,
             name="df-lemmatizer",
-            container_name="df-lemmatizer",
+            container_name=custom_service.docker_service.get_docker_container_name("df-lemmatizer", apply_legacy_prefix=False),
             image=image,
             restart="unless-stopped",
             volumes=[f"{custom_service.get_working_dir()}/lemmatizer/cache/stanza:/root/.cache/stanza"],
@@ -878,7 +993,7 @@ def create_gliner_model(custom_service: CustomService, subnet: str | None) -> Sr
         return DockerOptions(
             image_port=8000,
             name="df-gliner",
-            container_name="df-gliner",
+            container_name=custom_service.docker_service.get_docker_container_name("df-gliner", apply_legacy_prefix=False),
             image=image,
             restart="unless-stopped",
             hardware=hardware_parts,
@@ -904,6 +1019,62 @@ def create_gliner_model(custom_service: CustomService, subnet: str | None) -> Sr
     )
 
 
+def _empty_to_none(value: object) -> object:
+    return None if value == "" else value
+
+
+# An emptied optional form field arrives as "", which doc-chunker reads as unset (its own default).
+type OptionalPositiveInt = Annotated[Annotated[int, Field(ge=1)] | None, BeforeValidator(_empty_to_none)]
+type OptionalNonNegativeInt = Annotated[Annotated[int, Field(ge=0)] | None, BeforeValidator(_empty_to_none)]
+
+
+class DocChunkerWorkerOptions(BaseModel):
+    """Worker split doc-chunker accepts; it refuses to start with any other.
+
+    Each field may be left unset, so doc-chunker falls back to its own default: max_concurrent is
+    then auto-sized from the container's CPU/RAM limits (unknown here, so the split can't be
+    checked against it), async_priority_workers 0, sync_only_workers 0.
+
+    Cross-field rules are field validators rather than a model validator so each error carries the
+    offending field - `format_pydantic_errors` reads the error location.
+    """
+
+    max_concurrent: OptionalPositiveInt = None
+    async_priority_workers: OptionalNonNegativeInt = None
+    sync_only_workers: OptionalNonNegativeInt = None
+
+    @field_validator("async_priority_workers")
+    @classmethod
+    def _async_priority_below_max_concurrent(cls, value: int | None, info: ValidationInfo) -> int | None:
+        max_concurrent = info.data.get("max_concurrent")
+        if max_concurrent is not None and value is not None and value >= max_concurrent:
+            msg = f"must be lower than max_concurrent ({max_concurrent})"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("sync_only_workers")
+    @classmethod
+    def _sync_only_fits_max_concurrent(cls, value: int | None, info: ValidationInfo) -> int | None:
+        max_concurrent = info.data.get("max_concurrent")
+        if max_concurrent is None or value is None:
+            return value
+        if value >= max_concurrent:
+            msg = f"must be lower than max_concurrent ({max_concurrent})"
+            raise ValueError(msg)
+        if "async_priority_workers" not in info.data:
+            return value  # async_priority_workers itself failed validation and already reports its own error
+        async_priority = info.data["async_priority_workers"] or 0  # unset uses doc-chunker's default of 0
+        if async_priority + value > max_concurrent:
+            msg = f"together with async_priority_workers ({async_priority}) must not exceed max_concurrent ({max_concurrent})"
+            raise ValueError(msg)
+        return value
+
+
+def validate_doc_chunker_workers(model_fields: InstallModelOptions) -> None:
+    """Reject a worker split doc-chunker would refuse to start with."""
+    try_parse_pydantic(DocChunkerWorkerOptions, model_fields)
+
+
 def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) -> SrvCustomModel:
     """Create doc-chunker model."""
     fields: list[ModelField] = custom_service.add_hardware_field_to_model_spec()
@@ -919,19 +1090,11 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
             ),
             ModelField(
                 type="number",
-                name="max_concurrent",
-                description="Max parallel conversion jobs",
-                required=False,
-                placeholder="2",
-                default="2",
-            ),
-            ModelField(
-                type="number",
                 name="document_timeout",
                 description="Timeout in seconds for a single document conversion",
                 required=False,
-                placeholder="600",
-                default="600",
+                placeholder="3600",
+                default="3600",
             ),
             ModelField(
                 type="number",
@@ -941,6 +1104,55 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
                 placeholder="120",
                 default="120",
             ),
+            ModelField(
+                type="number",
+                name="max_concurrent",
+                description=(
+                    "Workers | total parallel worker count. Workers not assigned as async priority or sync only "
+                    "take sync jobs first and async jobs when none is waiting"
+                ),
+                required=False,
+                placeholder="2",
+                default="2",
+            ),
+            ModelField(
+                type="number",
+                name="async_priority_workers",
+                description=(
+                    "Workers | workers that take queued async jobs first and sync jobs when no async job is waiting. "
+                    "Must be lower than max_concurrent; together with sync_only_workers must not exceed it"
+                ),
+                required=False,
+                placeholder="0",
+                default="0",
+            ),
+            ModelField(
+                type="number",
+                name="sync_only_workers",
+                description=(
+                    "Workers | workers reserved for sync jobs, never used by async jobs. "
+                    "Must be lower than max_concurrent; together with async_priority_workers must not exceed it"
+                ),
+                required=False,
+                placeholder="0",
+                default="0",
+            ),
+            ModelField(
+                type="number",
+                name="max_queued_jobs",
+                description="Async jobs | jobs that can wait in queue for a slot; above this limit new jobs are rejected",
+                required=False,
+                placeholder="100",
+                default="100",
+            ),
+            ModelField(
+                type="number",
+                name="job_result_ttl",
+                description="Async jobs | seconds a finished job's status and result stay available",
+                required=False,
+                placeholder="86400",
+                default="86400",
+            ),
             # Image description and speech-to-text both go through the same OpenAI-compatible
             # gateway, so they share one address and key. doc-chunker appends the endpoint paths
             # itself, and the model is chosen per request by the caller — neither belongs here.
@@ -949,13 +1161,17 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
                 name="infra_api_url",
                 description="Inference gateway | base URL of the OpenAI-compatible API used to describe images and transcribe audio. ",
                 required=True,
-                placeholder="http://infra:8086",
-                default="http://infra:8086",
+                placeholder=DOC_CHUNKER_DEFAULT_GATEWAY_URL,
+                default=DOC_CHUNKER_DEFAULT_GATEWAY_URL,
             ),
+            # Empty on purpose: this Infra's key is filled in only in generate_docker_options, never in the spec.
             ModelField(
                 type="text",
                 name="infra_api_key",
-                description="Inference gateway | API key, if the gateway requires one",
+                description=(
+                    "Inference gateway | API key, if the gateway requires one. Empty uses this Infra's key when the URL "
+                    "points at this Infra; after rotating it, restart Infra or reinstall doc-chunker."
+                ),
                 required=False,
                 placeholder="",
                 default="",
@@ -1000,32 +1216,43 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
                 placeholder="2",
                 default="2",
             ),
-            custom_service.get_proxy_timeout_field(),
+            custom_service.get_proxy_timeout_field(DOC_CHUNKER_PROXY_TIMEOUT_SECONDS),
         ]
     )
 
     def generate_docker_options(model_fields: InstallModelOptions) -> DockerOptions:
         hardware_parts = custom_service.get_specified_hardware_parts(model_fields.get("hardware"))
+        # An API install with an empty spec gets no field defaults.
+        gateway_url = str(model_fields.get("infra_api_url") or "").strip() or DOC_CHUNKER_DEFAULT_GATEWAY_URL
+        gateway_api_key = str(model_fields.get("infra_api_key") or "")
+        if not gateway_api_key and _is_own_gateway_url(gateway_url, custom_service.config):
+            # Read on every call, so a rotated key lands on the next container rebuild.
+            gateway_api_key = custom_service.config.infra_api_key.get_secret_value()
         image = (
-            "hub.simplito.com/deepfellow/doc-chunker-gpu:v1.0.3"
+            "hub.simplito.com/deepfellow/doc-chunker-gpu:v2.4.0"
             if _is_gpu_hardware(hardware_parts)
-            else "hub.simplito.com/deepfellow/doc-chunker-cpu:v1.0.3"
+            else "hub.simplito.com/deepfellow/doc-chunker-cpu:v2.4.0"
         )
         return DockerOptions(
             image_port=8000,
             name="doc_chunker",
-            container_name="doc_chunker",
+            container_name=custom_service.docker_service.get_docker_container_name("doc_chunker", apply_legacy_prefix=False),
             image=image,
             restart="unless-stopped",
-            volumes=[],
+            # DATA_DIR (default /var/lib/doc-chunker): registered tokenizers and async job uploads/results.
+            volumes=[f"{custom_service.get_working_dir()}/doc_chunker/data:/var/lib/doc-chunker"],
             hardware=hardware_parts,
             subnet=subnet,
             env_vars={
                 "MAX_CONCURRENT": model_fields.get("max_concurrent", 2),
-                "DOCUMENT_TIMEOUT": model_fields.get("document_timeout", 600),
+                "ASYNC_PRIORITY_WORKERS": model_fields.get("async_priority_workers", 0),
+                "SYNC_ONLY_WORKERS": model_fields.get("sync_only_workers", 0),
+                "MAX_QUEUED_JOBS": model_fields.get("max_queued_jobs", 100),
+                "JOB_RESULT_TTL": model_fields.get("job_result_ttl", 86400),
+                "DOCUMENT_TIMEOUT": model_fields.get("document_timeout", 3600),
                 "LIBREOFFICE_TIMEOUT": model_fields.get("libreoffice_timeout", 120),
-                "INFRA_API_URL": model_fields.get("infra_api_url", ""),
-                "INFRA_API_KEY": model_fields.get("infra_api_key", ""),
+                "INFRA_API_URL": gateway_url,
+                "INFRA_API_KEY": gateway_api_key,
                 "PICTURE_DESCRIPTION_PROMPT": model_fields.get("picture_description_prompt", "Describe this image in detail."),
                 "PICTURE_DESCRIPTION_API_MAX_TIME": model_fields.get("picture_description_api_max_time", "300"),
                 "PICTURE_DESCRIPTION_CONCURRENCY": model_fields.get("picture_description_concurrency", 4),
@@ -1049,63 +1276,8 @@ def create_doc_chunker_model(custom_service: CustomService, subnet: str | None) 
         size="15GB",
         options=generate_docker_options,
         description="Converts many data types (pdf, xlxs, mp3, etc.) into text chunks suitable for vector search.",
-    )
-
-
-def create_finetune_model(custom_service: CustomService, subnet: str | None) -> SrvCustomModel:
-    """Create finetune model."""
-    fields: list[ModelField] = custom_service.add_hardware_field_to_model_spec()
-    fields.extend(
-        [
-            ModelField(
-                type="text",
-                name="prefix",
-                description="Endpoint prefix",
-                required=True,
-                placeholder="deepfellow-finetune",
-                default="deepfellow-finetune",
-            ),
-            custom_service.get_proxy_timeout_field(),
-        ]
-    )
-
-    def generate_docker_options(model_fields: InstallModelOptions) -> DockerOptions:
-        hardware_parts = custom_service.get_specified_hardware_parts(model_fields.get("hardware"))
-        return DockerOptions(
-            image_port=8333,
-            name="deepfellow-finetune",
-            container_name=custom_service.docker_service.get_docker_container_name("deepfellow-finetune"),
-            image="hub.simplito.com/deepfellow/deepfellow-finetune:0.0.1",
-            restart="unless-stopped",
-            volumes=[
-                f"{custom_service.get_working_dir()}/deepfellow-finetune/models:/workspace/models",
-                f"{custom_service.get_working_dir()}/deepfellow-finetune/configs:/workspace/configs",
-                f"{custom_service.get_working_dir()}/deepfellow-finetune/data:/workspace/data",
-                f"{custom_service.get_working_dir()}/deepfellow-finetune/adapters:/workspace/adapters",
-            ],
-            hardware=hardware_parts,
-            subnet=subnet,
-            env_vars={
-                "HF_TOKEN": custom_service.config.hugging_face_token.get_secret_value(),
-            },
-            healthcheck={
-                "test": "wget -q --spider http://localhost:8333/health",
-                "interval": "30s",
-                "timeout": "10s",
-                "retries": "3",
-                "start_period": "30s",
-            },
-        )
-
-    return SrvCustomModel(
-        model_props=ModelProps(private=True, type="custom", endpoints=["/custom/deepfellow-finetune"]),
-        model_spec=ModelSpecification(fields=fields),
-        model_type="custom",
-        default_prefix="deepfellow-finetune",
-        size="8.56GB",
-        options=generate_docker_options,
-        description="LLM LoRA fine-tuning framework with an OpenAI-compatible fine-tuning job queue.",
-        repository_url="https://gitlab2.simplito.com/df/df-finetune",
+        default_proxy_timeout_seconds=DOC_CHUNKER_PROXY_TIMEOUT_SECONDS,
+        validate_install_options=validate_doc_chunker_workers,
     )
 
 
@@ -1149,7 +1321,6 @@ _const = CustomConst(
         "lemmatizer": create_lemmatizer_model,
         "gliner": create_gliner_model,
         "doc_chunker": create_doc_chunker_model,
-        "deepfellow-finetune": create_finetune_model,
         "deepfellow-bge-m3": create_bge_m3_model,
     }
 )

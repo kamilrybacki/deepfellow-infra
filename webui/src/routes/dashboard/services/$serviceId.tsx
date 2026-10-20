@@ -1,5 +1,7 @@
+import { FinetuneAdapters } from "@/components/FinetuneAdapters";
 import { ServiceModels } from "@/components/ServiceModels";
 import { SiteHeader } from "@/components/dashboard/site-header";
+import { apiClient } from "@/deepfellow/client";
 import { useRequireAuth } from "@/hooks/use-auth";
 /*
 DeepFellow Software Framework.
@@ -11,7 +13,10 @@ This software is Licensed under the DeepFellow Free License.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+import { useQuery } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
+
+const FINETUNE_SERVICE_TYPE = "finetune";
 
 export const Route = createFileRoute("/dashboard/services/$serviceId")({
   component: ServiceModelsPage,
@@ -20,6 +25,12 @@ export const Route = createFileRoute("/dashboard/services/$serviceId")({
 function ServiceModelsPage() {
   useRequireAuth();
   const { serviceId } = Route.useParams();
+  // Same query key as ServiceModels, so the cached service info is shared.
+  const serviceInfoQuery = useQuery({
+    queryKey: ["admin", "services", serviceId],
+    queryFn: () => apiClient.getAdminService(serviceId),
+  });
+  const isFinetune = serviceInfoQuery.data?.type === FINETUNE_SERVICE_TYPE;
 
   return (
     <>
@@ -32,7 +43,11 @@ function ServiceModelsPage() {
       <div className="flex flex-1 flex-col">
         <div className="@container/main flex flex-1 flex-col gap-2">
           <div className="flex flex-col gap-4 py-4 md:gap-6 md:py-6">
-            <ServiceModels serviceId={serviceId} />
+            {serviceInfoQuery.isPending ? null : isFinetune ? (
+              <FinetuneAdapters serviceId={serviceId} />
+            ) : (
+              <ServiceModels serviceId={serviceId} />
+            )}
           </div>
         </div>
       </div>

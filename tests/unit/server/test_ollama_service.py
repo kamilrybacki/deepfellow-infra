@@ -10,7 +10,7 @@ from fastapi import HTTPException
 
 from server.docker import DockerOptions
 from server.models.services import InstallServiceIn
-from server.services.ollama_service import InstalledInfo, LoadedModelInfo, ModelSize, OllamaOptions, OllamaService
+from server.services.ollama_service import InstalledInfo, LoadedModelInfo, ModelCapabilities, ModelSize, OllamaOptions, OllamaService
 from server.utils.core import FetchResult
 from server.utils.vram_calculator import ArchParams
 
@@ -25,12 +25,12 @@ _ARCH = ArchParams(
 def _make_service() -> OllamaService:
     svc = object.__new__(OllamaService)
     svc._arch_cache = {}  # pyright: ignore[reportPrivateUsage]
+    svc._capabilities_cache = {}  # pyright: ignore[reportPrivateUsage]
+    svc._show_failure_at = {}  # pyright: ignore[reportPrivateUsage]
     svc._vram_cache = {}  # pyright: ignore[reportPrivateUsage]
     svc._log_cache = {}  # pyright: ignore[reportPrivateUsage]
     svc._ps_query_failing = set()  # pyright: ignore[reportPrivateUsage]
     svc.config = MagicMock()
-    svc.config.ollama_kv_cache_type = "f16"
-    svc.config.ollama_num_parallel = 1
     svc.config.ollama_vram_overhead_factor = 1.0
     return svc
 
@@ -148,6 +148,88 @@ async def test_get_arch_params_fetch_exception_returns_none(mock_fetch: AsyncMoc
 
 @pytest.mark.asyncio
 @patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock)
+async def test_get_capabilities_vision_reported(mock_fetch: AsyncMock):
+    mock_fetch.return_value = _make_fetch_result(200, {"model_info": _LLAMA3_INFO, "capabilities": ["completion", "vision"]})
+    svc = _make_service()
+
+    result = await svc._get_capabilities("default", "http://localhost:11434", "llama3:latest")  # pyright: ignore[reportPrivateUsage]
+
+    assert result.supports_vision is True
+    assert result.supports_audio is None
+
+
+@pytest.mark.asyncio
+@patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock)
+async def test_get_capabilities_no_vision_or_capabilities_field(mock_fetch: AsyncMock):
+    mock_fetch.return_value = _make_fetch_result(200, {"model_info": _LLAMA3_INFO})
+    svc = _make_service()
+
+    result = await svc._get_capabilities("default", "http://localhost:11434", "llama3:latest")  # pyright: ignore[reportPrivateUsage]
+
+    assert result.supports_vision is None
+    assert result.supports_audio is None
+
+
+@pytest.mark.asyncio
+@patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock)
+async def test_get_capabilities_cached(mock_fetch: AsyncMock):
+    cached = ModelCapabilities(supports_vision=True, supports_audio=None)
+    svc = _make_service()
+    svc._capabilities_cache[("default", "llama3:latest")] = cached  # pyright: ignore[reportPrivateUsage]
+
+    result = await svc._get_capabilities("default", "http://localhost:11434", "llama3:latest")  # pyright: ignore[reportPrivateUsage]
+
+    assert result is cached
+    mock_fetch.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock)
+async def test_get_capabilities_uses_bounded_timeout(mock_fetch: AsyncMock):
+    """A down/hung instance must not stall behind aiohttp's 300s default for `/api/show`."""
+    mock_fetch.return_value = _make_fetch_result(200, {"model_info": _LLAMA3_INFO})
+    svc = _make_service()
+
+    await svc._get_capabilities("default", "http://localhost:11434", "llama3:latest")  # pyright: ignore[reportPrivateUsage]
+
+    assert mock_fetch.call_args.kwargs["timeout"] is not None
+    assert mock_fetch.call_args.kwargs["timeout"] <= 10
+
+
+@pytest.mark.asyncio
+@patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock)
+async def test_get_capabilities_caches_failure_and_skips_refetch(mock_fetch: AsyncMock):
+    """A failed `/api/show` must not be retried on every call within the failure-cache window."""
+    mock_fetch.side_effect = RuntimeError("connection refused")
+    svc = _make_service()
+
+    first = await svc._get_capabilities("default", "http://localhost:11434", "llama3:latest")  # pyright: ignore[reportPrivateUsage]
+    second = await svc._get_capabilities("default", "http://localhost:11434", "llama3:latest")  # pyright: ignore[reportPrivateUsage]
+
+    assert first.supports_vision is None
+    assert second.supports_vision is None
+    mock_fetch.assert_called_once()
+
+
+@pytest.mark.asyncio
+@patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock)
+async def test_get_capabilities_retries_after_failure_cache_expires(mock_fetch: AsyncMock):
+    mock_fetch.side_effect = RuntimeError("connection refused")
+    svc = _make_service()
+
+    await svc._get_capabilities("default", "http://localhost:11434", "llama3:latest")  # pyright: ignore[reportPrivateUsage]
+
+    with patch("server.services.ollama_service.time.monotonic", return_value=time.monotonic() + 3600):
+        mock_fetch.side_effect = None
+        mock_fetch.return_value = _make_fetch_result(200, {"model_info": _LLAMA3_INFO, "capabilities": ["completion", "vision"]})
+        result = await svc._get_capabilities("default", "http://localhost:11434", "llama3:latest")  # pyright: ignore[reportPrivateUsage]
+
+    assert result.supports_vision is True
+    assert mock_fetch.call_count == 2
+
+
+@pytest.mark.asyncio
+@patch("server.services.ollama_service.fetch_from", new_callable=AsyncMock)
 async def test_get_model_sizes_returns_sizes(mock_fetch: AsyncMock):
     mock_fetch.return_value = _make_fetch_result(
         200,
@@ -244,10 +326,9 @@ async def test_get_vram_estimate_custom_cache_type(mock_arch: AsyncMock, mock_es
     mock_arch.return_value = _ARCH
     mock_estimate.return_value = 7.0
     svc = _make_service()
-    svc.config.ollama_kv_cache_type = "q8_0"
 
     await svc._get_vram_estimate(  # pyright: ignore[reportPrivateUsage]
-        "default", "http://localhost:11434", "llama3:latest", 8 * 1024**3, num_ctx=4096
+        "default", "http://localhost:11434", "llama3:latest", 8 * 1024**3, num_ctx=4096, kv_cache_type="q8_0"
     )
 
     assert mock_estimate.call_count == 1
@@ -257,28 +338,26 @@ async def test_get_vram_estimate_custom_cache_type(mock_arch: AsyncMock, mock_es
 @pytest.mark.asyncio
 @patch("server.services.ollama_service.estimate_vram_gb")
 @patch("server.services.ollama_service.OllamaService._get_arch_params", new_callable=AsyncMock)
-async def test_get_vram_estimate_num_parallel_from_env(mock_arch: AsyncMock, mock_estimate: MagicMock):
+async def test_get_vram_estimate_defaults_cache_type_and_num_parallel(mock_arch: AsyncMock, mock_estimate: MagicMock):
     mock_arch.return_value = _ARCH
     mock_estimate.return_value = 7.0
     svc = _make_service()
-    svc.config.ollama_num_parallel = 4
 
     await svc._get_vram_estimate(  # pyright: ignore[reportPrivateUsage]
         "default", "http://localhost:11434", "llama3:latest", 8 * 1024**3, num_ctx=4096
     )
 
     assert mock_estimate.call_count == 1
-    assert mock_estimate.call_args.args == (_ARCH, 8 * 1024**3, 4096, 16, 4, None, None)
+    assert mock_estimate.call_args.args == (_ARCH, 8 * 1024**3, 4096, 16, 1, None, None)
 
 
 @pytest.mark.asyncio
 @patch("server.services.ollama_service.estimate_vram_gb")
 @patch("server.services.ollama_service.OllamaService._get_arch_params", new_callable=AsyncMock)
-async def test_get_vram_estimate_explicit_num_parallel_overrides_env(mock_arch: AsyncMock, mock_estimate: MagicMock):
+async def test_get_vram_estimate_explicit_num_parallel_overrides_default(mock_arch: AsyncMock, mock_estimate: MagicMock):
     mock_arch.return_value = _ARCH
     mock_estimate.return_value = 7.0
     svc = _make_service()
-    svc.config.ollama_num_parallel = 4
 
     await svc._get_vram_estimate(  # pyright: ignore[reportPrivateUsage]
         "default", "http://localhost:11434", "llama3:latest", 8 * 1024**3, num_ctx=4096, num_parallel=2
@@ -459,7 +538,14 @@ async def test_resolve_vram_info_not_loaded_returns_false_none():
     svc = _make_service()
 
     result = await svc._resolve_vram_info(  # pyright: ignore[reportPrivateUsage]
-        "default", "llama3:latest", 4096, loaded_info={}, sizes={}, base_url="http://localhost:11434", num_parallel=None
+        "default",
+        "llama3:latest",
+        4096,
+        loaded_info={},
+        sizes={},
+        base_url="http://localhost:11434",
+        num_parallel=None,
+        kv_cache_type=None,
     )
 
     assert result == (False, None)
@@ -480,6 +566,7 @@ async def test_resolve_vram_info_prefers_fresh_measured_vram_over_stale_cache():
             sizes={},
             base_url="http://localhost:11434",
             num_parallel=None,
+            kv_cache_type=None,
         )
 
     assert result == (True, 4.7)
@@ -501,6 +588,7 @@ async def test_resolve_vram_info_measured_zero_is_used_not_treated_as_missing():
             sizes={},
             base_url="http://localhost:11434",
             num_parallel=None,
+            kv_cache_type=None,
         )
 
     assert result == (True, 0.0)
@@ -521,6 +609,7 @@ async def test_resolve_vram_info_uses_cached_estimate_when_no_fresh_measurement(
             sizes={},
             base_url="http://localhost:11434",
             num_parallel=None,
+            kv_cache_type=None,
         )
 
     assert result == (True, 4.7)
@@ -541,6 +630,7 @@ async def test_resolve_vram_info_falls_back_to_estimate_when_not_cached():
             sizes=sizes,
             base_url="http://localhost:11434",
             num_parallel=2,
+            kv_cache_type="q8_0",
         )
 
     assert result == (True, 9.5)
@@ -556,6 +646,7 @@ async def test_resolve_vram_info_falls_back_to_estimate_when_not_cached():
         2,
         "Q4_K_M",
     )
+    assert mock_estimate.call_args.kwargs == {"kv_cache_type": "q8_0"}
 
 
 @pytest.mark.asyncio
@@ -571,6 +662,7 @@ async def test_resolve_vram_info_uses_model_context_as_fallback():
             sizes={},
             base_url="http://localhost:11434",
             num_parallel=None,
+            kv_cache_type=None,
         )
 
     assert result == (True, 5.0)
@@ -733,7 +825,7 @@ async def test_download_with_ollama_logs_progress_percentage(caplog: pytest.LogC
 
     with (
         patch("server.services.ollama_service.stream_fetch_from", side_effect=mock_stream),
-        caplog.at_level("INFO", logger="uvicorn.error"),
+        caplog.at_level("INFO", logger="uvicorn"),
     ):
         await svc._download_with_ollama(stream, "http://localhost:11434", "llama3", "4GB")  # pyright: ignore[reportPrivateUsage]
 

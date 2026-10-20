@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import ClientTimeout
+from aiohttp.streams import EMPTY_PAYLOAD
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -32,7 +33,10 @@ from server.utils.core import (
     load_json_registry,
     make_http_request,
     positive_context_window_or_none,
+    secrets_equal,
     stream_fetch_from,
+    with_legacy_key_carried_over,
+    with_legacy_key_migrated,
 )
 
 
@@ -432,6 +436,33 @@ def test_convert_size_to_bytes(size_str: str, expected: int | None):
     assert convert_size_to_bytes(size_str) == expected
 
 
+def test_with_legacy_key_carried_over_copies_legacy_key_into_new_spec():
+    result = with_legacy_key_carried_over({"gpu_memory_utilization": 0.5}, {"prefix": "p"}, "gpu_memory_utilization", "gpu_priority")
+    assert result == {"prefix": "p", "gpu_memory_utilization": 0.5}
+
+
+def test_with_legacy_key_carried_over_fills_empty_new_spec():
+    assert with_legacy_key_carried_over({"gpu_memory_utilization": 0.5}, None, "gpu_memory_utilization", "gpu_priority") == {
+        "gpu_memory_utilization": 0.5
+    }
+
+
+def test_with_legacy_key_carried_over_keeps_new_key_when_set():
+    new_spec = {"gpu_priority": 0.7}
+    assert with_legacy_key_carried_over({"gpu_memory_utilization": 0.5}, new_spec, "gpu_memory_utilization", "gpu_priority") is new_spec
+
+
+def test_with_legacy_key_carried_over_keeps_explicit_legacy_value():
+    new_spec = {"gpu_memory_utilization": 0.2}
+    assert with_legacy_key_carried_over({"gpu_memory_utilization": 0.5}, new_spec, "gpu_memory_utilization", "gpu_priority") is new_spec
+
+
+def test_with_legacy_key_carried_over_passes_through_when_old_spec_lacks_legacy_key():
+    new_spec = {"quantization": "fp8"}
+    assert with_legacy_key_carried_over({"gpu_priority": 0.5}, new_spec, "gpu_memory_utilization", "gpu_priority") is new_spec
+    assert with_legacy_key_carried_over(None, new_spec, "gpu_memory_utilization", "gpu_priority") is new_spec
+
+
 def test_load_json_registry_builds_from_valid_file(tmp_path: Path):
     path = tmp_path / "registry.json"
     path.write_text('{"models": ["a", "b"]}')
@@ -719,14 +750,14 @@ async def test_http_response_discard_releases_response_and_closes_session():
 
 @pytest.mark.asyncio
 async def test_make_http_request_success():
-    async def fake_iter_chunks():
-        yield (b"response body", False)
+    async def fake_iter_any():
+        yield b"response body"
 
     mock_resp = MagicMock()
     mock_resp.content_type = "text/plain"
     mock_resp.status = 200
     mock_resp.headers = {}
-    mock_resp.content.iter_chunks = fake_iter_chunks
+    mock_resp.content.iter_any = fake_iter_any
     mock_resp.release = AsyncMock()
 
     mock_session = MagicMock()
@@ -783,33 +814,34 @@ async def test_make_http_request_passes_timeout_when_given():
 
 
 @pytest.mark.asyncio
-async def test_make_http_request_skips_falsy_chunks():
-    """iter_chunks yields a falsy (empty) chunk — covers the False branch of 'if chunk' (559->558)."""
+async def test_make_http_request_repeated_bodiless_responses_terminate():
+    """Regression: aiohttp's shared EMPTY_PAYLOAD must end the body stream on every bodiless response, not only the first."""
 
-    async def fake_iter_chunks():
-        yield ()  # falsy — should be skipped
-        yield (b"real data", False)
+    async def collect_body(limit: int = 10) -> list[bytes]:
+        mock_resp = MagicMock()
+        mock_resp.content_type = "text/plain"
+        mock_resp.status = 204
+        mock_resp.headers = {}
+        mock_resp.content = EMPTY_PAYLOAD
+        mock_resp.release = AsyncMock()
 
-    mock_resp = MagicMock()
-    mock_resp.content_type = "text/plain"
-    mock_resp.status = 200
-    mock_resp.headers = {}
-    mock_resp.content.iter_chunks = fake_iter_chunks
-    mock_resp.release = AsyncMock()
+        mock_session = MagicMock()
+        mock_session.request = AsyncMock(return_value=mock_resp)
+        mock_session.close = AsyncMock()
 
-    mock_session = MagicMock()
-    mock_session.request = AsyncMock(return_value=mock_resp)
-    mock_session.close = AsyncMock()
+        with patch("server.utils.core.ClientSession", return_value=mock_session):
+            result = await make_http_request("http://example.com/", method="DELETE")
 
-    with patch("server.utils.core.ClientSession", return_value=mock_session):
-        result = await make_http_request("http://example.com/")
+        chunks = list[bytes]()
+        async for chunk in result.content:
+            chunks.append(chunk)
+            if len(chunks) >= limit:
+                break
+        await result.content.aclose()
+        return chunks
 
-    chunks = []
-    async for chunk in result.content:
-        chunks.append(chunk)
-
-    assert b"real data" in chunks
-    assert () not in chunks
+    assert await collect_body() == []
+    assert await collect_body() == []
 
 
 @pytest.mark.asyncio
@@ -851,10 +883,35 @@ def test_one_time_key_valid():
     assert otk._key is None  # type: ignore[attr-defined]
 
 
-def test_one_time_key_invalid():
+@pytest.mark.parametrize("provided", ["wrong-key", "", "a" * 64, "ł" * 32])
+def test_one_time_key_invalid(provided: str):
     otk = OneTimeKey()
-    _ = otk.key
-    assert otk.check("wrong-key") is False
+    key = otk.key
+    assert otk.check(provided) is False
+    assert otk._key == key  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("provided", ["", "some-key"])
+def test_one_time_key_returns_false_when_no_key_generated(provided: str):
+    otk = OneTimeKey()
+    assert otk.check(provided) is False
+
+
+@pytest.mark.parametrize(
+    ("provided", "expected", "result"),
+    [
+        ("secret", "secret", True),
+        ("", "", True),
+        ("zażółć", "zażółć", True),
+        ("secret", "secreT", False),
+        ("secret", "secret-longer", False),
+        ("", "secret", False),
+        ("secret", "", False),
+        ("sécret", "secret", False),
+    ],
+)
+def test_secrets_equal(provided: str, expected: str, result: bool):
+    assert secrets_equal(provided, expected) is result
 
 
 def test_one_time_key_consumed_after_correct_check():
@@ -1001,3 +1058,20 @@ async def test_sse_generator_reraises_cancellation_when_task_cancelling():
 def test_positive_context_window_or_none(value: int | None, expected: int | None) -> None:
     """A zero or negative window is an unknown window, not a small one."""
     assert positive_context_window_or_none(value) == expected
+
+
+def test_with_legacy_key_migrated_renames_old_key() -> None:
+    assert with_legacy_key_migrated({"alias": "x", "other": 1}, "alias", "rename") == {"rename": "x", "other": 1}
+
+
+def test_with_legacy_key_migrated_leaves_new_key_alone_when_already_present() -> None:
+    assert with_legacy_key_migrated({"rename": "x", "alias": "y"}, "alias", "rename") == {"rename": "x", "alias": "y"}
+
+
+def test_with_legacy_key_migrated_leaves_spec_alone_when_old_key_absent() -> None:
+    assert with_legacy_key_migrated({"other": 1}, "alias", "rename") == {"other": 1}
+
+
+def test_with_legacy_key_migrated_handles_none_and_empty_spec() -> None:
+    assert with_legacy_key_migrated(None, "alias", "rename") is None
+    assert with_legacy_key_migrated({}, "alias", "rename") == {}

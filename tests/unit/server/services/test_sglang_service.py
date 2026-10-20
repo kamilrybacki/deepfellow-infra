@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from server.docker import ContainerStatus
 from server.models.models import InstallModelIn, ListModelsFilters, UninstallModelIn
@@ -27,8 +28,17 @@ from server.services.sglang_service import (
     SglangService,
     _const,  # pyright: ignore[reportPrivateUsage]
 )
-from server.utils.core import DownloadedPacket, PreDownloadPacket, Stream, StreamChunk, StreamChunkProgress, SuccessDownloadPacket
+from server.utils.core import (
+    DownloadedPacket,
+    PreDownloadPacket,
+    Stream,
+    StreamChunk,
+    StreamChunkProgress,
+    SuccessDownloadPacket,
+)
+from server.utils.docker_image_version import newer_tag_needing_cuda, newest_docker_tag
 from server.utils.hardware import NvidiaGpuInfo
+from tests.unit.server.real_docker_tags import real_tags
 
 
 @pytest.fixture
@@ -38,6 +48,7 @@ def deps() -> dict[str, Any]:
     hw.gpus = []
     hw.nvidia_gpus = []
     hw.intel_gpus = []
+    hw.gpu_load_lock = asyncio.Lock()
     return {
         "config": MagicMock(),
         "endpoint_registry": MagicMock(),
@@ -45,6 +56,7 @@ def deps() -> dict[str, Any]:
         "model_downloader": MagicMock(),
         "docker_service": MagicMock(),
         "hardware": hw,
+        "services_manager": MagicMock(),
     }
 
 
@@ -77,6 +89,7 @@ def _make_model_installed_info(
 ) -> ModelInstalledInfo:
     docker = MagicMock()
     docker.name = f"df-sglang-{model_id}"
+    docker.container_name = f"df-sglang-{model_id}"
     return ModelInstalledInfo(
         id=model_id,
         registered_name=model_id,
@@ -154,17 +167,17 @@ def test_get_model_spec_baseline_fields(svc: SglangService) -> None:
     spec = svc.get_model_spec("default", "llm")
 
     field_names = [f.name for f in spec.fields]
-    for expected in ("alias", "max_model_length", "quantization", "extra_args", "extra_envs"):
+    for expected in ("rename", "max_model_length", "quantization", "extra_args", "extra_envs"):
         assert expected in field_names
 
 
-def test_get_model_spec_adds_gpu_memory_utilization(svc: SglangService) -> None:
+def test_get_model_spec_adds_gpu_priority(svc: SglangService) -> None:
     svc.instances_info["default"].config.options = InstallServiceIn(spec={"hardware": True})
 
     spec = svc.get_model_spec("default", "llm")
 
-    field_names = [f.name for f in spec.fields]
-    assert "gpu_memory_utilization" in field_names
+    field = next(f for f in spec.fields if f.name == "gpu_priority")
+    assert field.type == "gpu-priority"
 
 
 def test_get_model_spec_reranker_default_extra_args(svc: SglangService) -> None:
@@ -775,6 +788,25 @@ def test_register_model_endpoint_llm_calls_chat_completion_proxy(svc: SglangServ
     assert gpu_deps["endpoint_registry"].register_embeddings_as_proxy.call_count == 0
 
 
+def test_register_model_endpoint_forwards_modality_support(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    model = SglangModel(hf_id="org/vlm", size="1GB", model_type="llm", supports_vision=True, supports_audio=None)
+    model_info = _make_model_installed_info("org/vlm", model_type="llm")
+
+    svc._register_model_endpoint(  # pyright: ignore[reportPrivateUsage]
+        model_info=model_info,
+        model=model,
+        registered_name="org/vlm",
+        model_id="org/vlm",
+        context_window=4096,
+        max_context_window=4096,
+        capacity=None,
+    )
+
+    call_kwargs = gpu_deps["endpoint_registry"].register_chat_completion_as_proxy.call_args.kwargs
+    assert call_kwargs["props"].supports_vision is True
+    assert call_kwargs["props"].supports_audio is None
+
+
 def test_register_model_endpoint_reranker_calls_rerank_proxy(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
     model = SglangModel(hf_id="google/reranker", size="1GB", model_type="reranker")
     model_info = _make_model_installed_info("google/reranker", model_type="reranker")
@@ -943,6 +975,66 @@ async def test_install_model_calls_docker_install(svc: SglangService, gpu_deps: 
     assert "python3" in docker_options.command
     assert "sglang.launch_server" in docker_options.command
     assert "health_generate" in docker_options.healthcheck["test"]
+
+
+@pytest.mark.asyncio
+async def test_install_model_passes_json_extra_arg_verbatim(svc: SglangService, gpu_deps: dict[str, Any], tmp_path: Path) -> None:
+    """A JSON extra_args value must reach the container as a single argv element with its quotes intact."""
+    _setup_install_mocks(svc, gpu_deps)
+    model_id = next(iter(svc.models["default"]))
+    json_value = '{"method":"mtp","num_speculative_tokens":3}'
+    spec = {"extra_args": {"--json-model-override-args": json_value}}
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.sglang_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.sglang_service.get_base_url", return_value="http://localhost:30000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec=spec))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = gpu_deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert isinstance(docker_options.command, list)
+    idx = docker_options.command.index("--json-model-override-args")
+    assert docker_options.command[idx + 1] == json_value
+
+
+@pytest.mark.asyncio
+async def test_install_model_uses_container_name_override_when_given(svc: SglangService, gpu_deps: dict[str, Any], tmp_path: Path) -> None:
+    _setup_install_mocks(svc, gpu_deps)
+    model_id = next(iter(svc.models["default"]))
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.sglang_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.sglang_service.get_base_url", return_value="http://localhost:30000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}), "pinned-name")  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = gpu_deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "pinned-name"
+    gpu_deps["docker_service"].get_docker_container_name.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_install_model_falls_back_to_generated_container_name(svc: SglangService, gpu_deps: dict[str, Any], tmp_path: Path) -> None:
+    _setup_install_mocks(svc, gpu_deps)
+    model_id = next(iter(svc.models["default"]))
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.sglang_service.get_model_dir_context_window", new_callable=AsyncMock, return_value=4096),
+        patch("server.services.sglang_service.get_base_url", return_value="http://localhost:30000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = gpu_deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == gpu_deps["docker_service"].get_docker_container_name.return_value
 
 
 @pytest.mark.asyncio
@@ -1133,7 +1225,7 @@ async def test_install_model_retries_without_is_embedding_flag_on_mismatch(
 ) -> None:
     installed = _make_installed_info(hardware=True)
     svc.instances_info["default"].installed = installed
-    observed_commands: list[str] = []
+    observed_commands: list[list[str]] = []
 
     async def fake_install_and_run_docker(docker_options: Any) -> tuple[int, bool, bool]:
         observed_commands.append(docker_options.command)
@@ -1162,6 +1254,48 @@ async def test_install_model_retries_without_is_embedding_flag_on_mismatch(
     assert len(observed_commands) == 2
     assert "--is-embedding" in observed_commands[0]
     assert "--is-embedding" not in observed_commands[1]
+
+
+@pytest.mark.asyncio
+async def test_install_model_retry_without_is_embedding_flag_keeps_json_extra_arg_verbatim(
+    svc: SglangService, gpu_deps: dict[str, Any], tmp_path: Path
+) -> None:
+    """The retry command must stay an argv list: only `--is-embedding` dropped, a JSON extra_args value intact."""
+    installed = _make_installed_info(hardware=True)
+    svc.instances_info["default"].installed = installed
+    observed_commands: list[list[str]] = []
+
+    async def fake_install_and_run_docker(docker_options: Any) -> tuple[int, bool, bool]:
+        observed_commands.append(docker_options.command)
+        if len(observed_commands) == 1:
+            raise RuntimeError("Please relaunch without --is-embedding for this model")
+        return 30000, True, False
+
+    gpu_deps["docker_service"].install_and_run_docker = AsyncMock(side_effect=fake_install_and_run_docker)
+    gpu_deps["docker_service"].get_docker_subnet.return_value = None
+    gpu_deps["docker_service"].get_docker_container_name.return_value = "container"
+    gpu_deps["docker_service"].get_container_host.return_value = "localhost"
+    gpu_deps["docker_service"].get_container_port.return_value = 30000
+    gpu_deps["docker_service"].stop_docker = AsyncMock()
+    embedding_id = "embedding-model"
+    svc.models["default"][embedding_id] = SglangModel(hf_id=embedding_id, size="1GB", model_type="embedding")
+    json_value = '{"architectures":["Qwen3ForSequenceClassification"]}'
+    spec = {"extra_args": {"--json-model-override-args": json_value}}
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch("server.services.sglang_service.get_base_url", return_value="http://localhost:30000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        promise = await svc._install_model("default", embedding_id, InstallModelIn(spec=spec))  # pyright: ignore[reportPrivateUsage]
+        result = await promise.wait()
+
+    assert result.status == "OK"
+    first_command, retry_command = observed_commands
+    assert isinstance(retry_command, list)
+    assert "--is-embedding" in first_command
+    assert retry_command == [arg for arg in first_command if arg != "--is-embedding"]
+    assert retry_command[retry_command.index("--json-model-override-args") + 1] == json_value
 
 
 @pytest.mark.asyncio
@@ -1337,6 +1471,164 @@ async def test_get_default_gpu_memory_utilization_uses_free_fraction_with_margin
     assert result == 0.45
 
 
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_applies_priority_to_available_vram(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    gpu_deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.45
+    assert svc.gpu_memory_utilization == 0.45
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_applies_priority_to_currently_free_vram(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.4
+    gpu_deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=4.0, gpus=None))
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.27
+    assert svc.gpu_memory_utilization == pytest.approx(0.67)
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_priority_path_still_enforces_total_limit(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.95
+    gpu_deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_priority=0.5)
+
+    with pytest.raises(HTTPException) as exc:
+        await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc.value.status_code == 422
+    assert svc.gpu_memory_utilization == 0.95
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_rejects_priority_that_rounds_below_minimum(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    """A tiny priority (or almost no free VRAM) must not start the engine with 0 utilization."""
+    svc.gpu_memory_utilization = 0.0
+    gpu_deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=9.5, gpus=None))
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_priority=0.01)
+
+    with pytest.raises(HTTPException) as exc:
+        await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc.value.status_code == 422
+    assert svc.gpu_memory_utilization == 0.0
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_priority_wins_over_model_default(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    gpu_deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = SglangModel(hf_id="google/test", size="1GB", gpu_memory_utilization=0.8)
+    opts = SglangModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.45
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_explicit_absolute_value_wins_over_priority(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_memory_utilization=0.3, gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.3
+    gpu_deps["hardware"].get_realtime_stats.assert_not_called()
+
+
+@pytest.mark.parametrize("priority", [0.0, -0.1, 1.5])
+def test_model_options_reject_out_of_range_gpu_priority(priority: float) -> None:
+    with pytest.raises(ValidationError):
+        SglangModelOptions(gpu_priority=priority)
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_priority_never_exceeds_available_vram(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    gpu_deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_priority=1.0)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.9
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_reuses_persisted_value_over_priority(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    """A persisted value must win over recomputing from priority, for the same reload-stability reason as the default."""
+    svc.gpu_memory_utilization = 0.0
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id="google/test", options=InstallModelIn(spec={"gpu_priority": 1.0}), gpu_memory_utilization=0.33)]
+    )
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_priority=1.0)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.33
+    gpu_deps["hardware"].get_realtime_stats.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_recomputes_when_priority_changed(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    """A persisted value computed for a different priority must not silently override the new one."""
+    svc.gpu_memory_utilization = 0.0
+    gpu_deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id="google/test", options=InstallModelIn(spec={"gpu_priority": 1.0}), gpu_memory_utilization=0.9)]
+    )
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.45
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_reuses_persisted_value_for_string_priority(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    """The persisted spec is the raw request body, so a priority sent as a string must still match its parsed value."""
+    svc.gpu_memory_utilization = 0.0
+    svc.instances_info["default"].config = InstanceConfig(
+        models=[ModelConfig(model_id="google/test", options=InstallModelIn(spec={"gpu_priority": "0.5"}), gpu_memory_utilization=0.33)]
+    )
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_priority=0.5)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.33
+    gpu_deps["hardware"].get_realtime_stats.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_treats_legacy_zero_as_unset(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    """The old free-text field allowed 0, which used to mean "unset" - it must not launch the engine with no memory."""
+    svc.gpu_memory_utilization = 0.0
+    gpu_deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=0.0, gpus=None))
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions(gpu_memory_utilization=0)
+
+    result = await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == 0.9
+
+
 def test_release_gpu_utilization_floors_at_zero(svc: SglangService) -> None:
     svc.gpu_memory_utilization = 0.1
     svc._release_gpu_utilization(0.5)  # pyright: ignore[reportPrivateUsage]
@@ -1377,6 +1669,10 @@ def test_get_image_with_version_overrides_tag(svc: SglangService) -> None:
     base = _const.image.name.split(":")[0]
     assert image.name == f"{base}:v0.9.0-cu130"
     assert image.size == _const.image.size
+
+
+def test_get_default_docker_image_name(svc: SglangService) -> None:
+    assert svc.get_default_docker_image_name() == _const.image.name
 
 
 def test_get_docker_image_repo(svc: SglangService) -> None:
@@ -1597,11 +1893,49 @@ def test_model_installed_info_get_info() -> None:
     assert info.registration_id == "reg-42"
 
 
+def test_model_installed_info_get_info_keeps_legacy_gpu_memory_utilization_spec_key() -> None:
+    model = _make_model_installed_info()
+    model.options.spec = {"gpu_memory_utilization": 0.5}
+
+    info = model.get_info()
+
+    assert info.spec == {"gpu_memory_utilization": 0.5}
+
+
+def test_carry_over_edited_install_options_keeps_legacy_absolute_utilization(svc: SglangService) -> None:
+    """The edit form only renders gpu_priority, so a legacy absolute value must survive an unrelated edit."""
+    old = InstallModelIn(spec={"gpu_memory_utilization": 0.3, "prefix": "old"})
+    new = InstallModelIn(spec={"prefix": "new"})
+
+    result = svc._carry_over_edited_install_options(old, new)  # pyright: ignore[reportPrivateUsage]
+
+    assert result.spec == {"prefix": "new", "gpu_memory_utilization": 0.3}
+    assert new.spec == {"prefix": "new"}
+
+
+def test_carry_over_edited_install_options_lets_new_priority_replace_legacy_value(svc: SglangService) -> None:
+    old = InstallModelIn(spec={"gpu_memory_utilization": 0.3})
+    new = InstallModelIn(spec={"gpu_priority": 0.5})
+
+    assert svc._carry_over_edited_install_options(old, new) is new  # pyright: ignore[reportPrivateUsage]
+
+
 def test_generate_instance_config_none_info(svc: SglangService) -> None:
     config = svc._generate_instance_config("default", None, None)  # pyright: ignore[reportPrivateUsage]
 
     assert config.options is None
     assert config.models == []
+
+
+def test_generate_instance_config_persists_resolved_container_name(svc: SglangService) -> None:
+    """Resolved container name round-trips into the persisted ModelConfig, so a suffix change can't rename it."""
+    info = _make_installed_info()
+    info.models["m1"] = _make_model_installed_info("m1")
+    info.models["m1"].docker.container_name = "pinned-container-name"
+
+    config = svc._generate_instance_config("default", info, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert (config.models or [])[0].container_name == "pinned-container-name"
 
 
 def test_generate_instance_config_with_info(svc: SglangService) -> None:
@@ -1612,6 +1946,38 @@ def test_generate_instance_config_with_info(svc: SglangService) -> None:
 
     assert config.options == info.options
     assert len(config.models or []) == 1
+
+
+def test_reload_instance_models_syncs_installed_registration_modality_support(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    """A catalog refresh must re-sync an already-installed model's registered modality support.
+
+    Otherwise a fix that corrects `classify_modality_support`'s output (or a regenerated static
+    catalog) never reaches a model that was already installed before the refresh - it would keep
+    whatever was captured at install time forever.
+    """
+    installed = _make_installed_info()
+    model_id = next(iter(svc.models["default"]))
+    installed.models[model_id] = _make_model_installed_info(model_id, registration_id="reg-1")
+    svc.instances_info["default"].installed = installed
+
+    refreshed_model = svc.models["default"][model_id].model_copy(update={"supports_vision": True, "supports_audio": True})
+
+    with patch.dict(_const.models, {model_id: refreshed_model}):
+        svc._reload_instance_models("default")  # pyright: ignore[reportPrivateUsage]
+
+    gpu_deps["endpoint_registry"].update_modality_support.assert_called_once_with("reg-1", supports_vision=True, supports_audio=True)
+
+
+def test_reload_instance_models_skips_sync_when_not_registered(svc: SglangService, gpu_deps: dict[str, Any]) -> None:
+    """No registration id (e.g. a model mid-install) means nothing to update yet."""
+    installed = _make_installed_info()
+    model_id = next(iter(svc.models["default"]))
+    installed.models[model_id] = _make_model_installed_info(model_id, registration_id="")
+    svc.instances_info["default"].installed = installed
+
+    svc._reload_instance_models("default")  # pyright: ignore[reportPrivateUsage]
+
+    gpu_deps["endpoint_registry"].update_modality_support.assert_not_called()
 
 
 def test_load_download_info(svc: SglangService) -> None:
@@ -1669,13 +2035,13 @@ def test_get_model_spec_adds_hardware_key_when_missing(svc: SglangService, gpu_d
     assert result is not None
 
 
-def test_get_model_spec_omits_gpu_memory_utilization_for_non_gpu_hardware(svc: SglangService) -> None:
+def test_get_model_spec_omits_gpu_priority_for_non_gpu_hardware(svc: SglangService) -> None:
     svc.instances_info["default"].config.options = InstallServiceIn(spec={"hardware": False})
 
     spec = svc.get_model_spec("default", "llm")
 
     field_names = [f.name for f in spec.fields]
-    assert "gpu_memory_utilization" not in field_names
+    assert "gpu_priority" not in field_names
 
 
 @pytest.mark.asyncio
@@ -2513,3 +2879,85 @@ async def test_sync_models_logs_warning_when_background_refresh_fails(svc: Sglan
         await asyncio.sleep(0)  # let the fire-and-forget task run
 
     mock_logger.warning.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_second_install_is_sized_only_after_the_first_container_is_healthy(
+    svc: SglangService, gpu_deps: dict[str, Any], tmp_path: Path
+) -> None:
+    loaded = False
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def stats(*_args: Any, **_kwargs: Any) -> GpuStats:
+        return GpuStats(total_vram_gb=10.0, used_vram_gb=4.0 if loaded else 0.0, gpus=None)
+
+    async def run_docker(options: Any) -> tuple[int, bool, bool]:
+        nonlocal loaded
+        if not first_started.is_set():
+            first_started.set()
+            await release_first.wait()  # the first container is still loading its weights
+            loaded = True
+        return 30000, True, False
+
+    gpu_deps["hardware"].get_realtime_stats = stats
+    gpu_deps["docker_service"].install_and_run_docker = run_docker
+    gpu_deps["docker_service"].get_docker_subnet.return_value = None
+    gpu_deps["docker_service"].get_docker_container_name.return_value = "container"
+    svc.instances_info["default"].installed = _make_installed_info(hardware=True)
+    first_id, second_id = list(svc.models["default"])[:2]
+
+    with (
+        patch.object(svc, "_download_model_or_set_progress", new_callable=AsyncMock, return_value=tmp_path / "model"),  # pyright: ignore[reportPrivateUsage]
+        patch.object(svc, "_get_quantization", new=AsyncMock(return_value=None)),
+        patch("server.services.sglang_service.get_base_url", return_value="http://localhost:30000"),
+        patch.object(svc, "get_specified_hardware_parts", return_value=[]),
+    ):
+        first = await svc._install_model("default", first_id, InstallModelIn(spec={"gpu_memory_utilization": 0.4}))  # pyright: ignore[reportPrivateUsage]
+        second = await svc._install_model("default", second_id, InstallModelIn(spec={}))  # pyright: ignore[reportPrivateUsage]
+        first_task = asyncio.create_task(first.wait())
+        second_task = asyncio.create_task(second.wait())
+        await first_started.wait()
+        for _ in range(20):
+            await asyncio.sleep(0)  # the second one downloads meanwhile, but must wait for the first before sizing
+        assert svc.gpu_memory_utilization == 0.4  # nothing reserved for the second yet: no double counting while loading
+        release_first.set()
+        await asyncio.gather(first_task, second_task)
+
+    models = svc.instances_info["default"].installed.models  # pyright: ignore[reportOptionalMemberAccess]
+    assert models[second_id].gpu_memory_utilization == 0.54  # 0.9 * the 0.6 left once the first model is loaded
+    assert svc.gpu_memory_utilization == pytest.approx(0.94)
+
+
+@pytest.mark.asyncio
+async def test_get_gpu_memory_utilization_raises_422_when_default_is_below_minimum(svc: SglangService, deps: dict[str, Any]) -> None:
+    svc.gpu_memory_utilization = 0.0
+    deps["hardware"].get_realtime_stats = AsyncMock(return_value=GpuStats(total_vram_gb=10.0, used_vram_gb=10.0, gpus=None))
+    model = SglangModel(hf_id="google/test", size="1GB")
+    opts = SglangModelOptions()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await svc._get_gpu_memory_utilization("default", "google/test", opts, model)  # pyright: ignore[reportPrivateUsage]
+
+    assert exc_info.value.status_code == 422
+    assert "Not enough free GPU memory" in exc_info.value.detail
+    assert svc.gpu_memory_utilization == 0.0
+
+
+@pytest.mark.parametrize(
+    ("max_cuda", "expected"),
+    [
+        (None, "v0.5.19-cu129"),  # without a known driver the CUDA major stays, and no newer CUDA 12 build exists
+        ((12, 9), "v0.5.19-cu129"),
+        ((13, 4), "v0.5.21-cu130"),
+    ],
+)
+def test_newest_tag_in_the_real_docker_hub_list(svc: SglangService, max_cuda: tuple[int, int] | None, expected: str) -> None:
+    tags = svc.filter_docker_tags(real_tags("sglang"), "GPU")
+    assert newest_docker_tag(tags, "v0.5.19-cu129", max_cuda) == expected
+
+
+def test_newer_real_tag_needing_a_newer_cuda(svc: SglangService) -> None:
+    tags = svc.filter_docker_tags(real_tags("sglang"), "GPU")
+    assert newer_tag_needing_cuda(tags, "v0.5.19-cu129", (12, 9)) == ("v0.5.21-cu130", (13, 0))
+    assert newer_tag_needing_cuda(tags, "v0.5.19-cu129", (13, 4)) is None

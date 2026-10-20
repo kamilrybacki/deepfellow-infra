@@ -16,7 +16,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from server.docker import DockerOptions
-from server.models.api import McpToolInfo
+from server.models.api import McpToolInfo, ModelProps
 from server.models.models import (
     AddCustomModelIn,
     InstallModelIn,
@@ -110,6 +110,7 @@ def deps() -> dict[str, Any]:
         "model_downloader": MagicMock(),
         "docker_service": docker_svc,
         "hardware": MagicMock(gpus=[], nvidia_gpus=[]),
+        "services_manager": MagicMock(),
     }
 
 
@@ -136,6 +137,13 @@ def test_is_not_cloud_service(svc: McpService) -> None:
 
 def test_get_size_empty_string(svc: McpService) -> None:
     assert svc.get_size() == ""
+
+
+def test_load_default_models_web_search_uses_sse_transport(svc: McpService) -> None:
+    model = svc.models["default"]["web-search"]
+
+    assert model.proxy_transport == "sse"
+    assert model.model_props.transport == "sse"
 
 
 def test_get_spec_has_no_fields(svc: McpService) -> None:
@@ -465,6 +473,26 @@ def test_generate_instance_config_with_info(svc: McpService) -> None:
     result = svc._generate_instance_config("default", installed, None)  # pyright: ignore[reportPrivateUsage]
 
     assert result.options is options
+
+
+def test_generate_instance_config_persists_resolved_container_name(svc: McpService) -> None:
+    docker_model = MagicMock()
+    docker_model.id = "open-websearch"
+    docker_model.options = InstallModelIn(spec={})
+    docker_model.docker_options.container_name = "df-open-websearch_abc123"
+    proxy_model = MagicMock()
+    proxy_model.id = "remote-proxy"
+    proxy_model.options = InstallModelIn(spec={})
+    proxy_model.docker_options = None
+    installed = InstalledInfo(models={"open-websearch": docker_model, "remote-proxy": proxy_model}, options=InstallServiceIn(spec={}))
+
+    result = svc._generate_instance_config("default", installed, None)  # pyright: ignore[reportPrivateUsage]
+
+    assert result.models is not None
+    assert {m.model_id: m.container_name for m in result.models} == {
+        "open-websearch": "df-open-websearch_abc123",
+        "remote-proxy": None,
+    }
 
 
 def test_load_download_info_creates_downloaded_info(svc: McpService) -> None:
@@ -960,6 +988,157 @@ async def test_install_model_happy_path(svc: McpService, deps: dict[str, Any], t
 
 
 @pytest.mark.asyncio
+async def test_install_model_uses_container_name_override_when_given(svc: McpService, deps: dict[str, Any], tmp_path: Path) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    model_id = "open-websearch"
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True, False))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.2"
+    deps["docker_service"].get_container_port.return_value = 3000
+    deps["endpoint_registry"].register_mcp_endpoint_as_proxy.return_value = "reg-id"
+    original_container_name = svc.models["default"][model_id].options.container_name  # pyright: ignore[reportOptionalMemberAccess]
+
+    with (
+        patch.object(svc, "_verify_docker_image", new=AsyncMock()),
+        patch.object(svc, "_download_image_or_set_progress", new=AsyncMock()),
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),
+        patch("server.services.mcp_service.get_base_url", return_value="http://172.20.0.2:3000"),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn(), "pinned-name")  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "pinned-name"
+    installed_docker_options = svc.get_instance_installed_info("default").models[model_id].docker_options
+    assert installed_docker_options is not None
+    assert installed_docker_options.container_name == "pinned-name"
+    assert svc.models["default"][model_id].options.container_name == original_container_name  # pyright: ignore[reportOptionalMemberAccess]
+
+
+@pytest.mark.asyncio
+async def test_install_model_falls_back_to_generated_container_name(svc: McpService, deps: dict[str, Any], tmp_path: Path) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    model_id = "open-websearch"
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True, False))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.2"
+    deps["docker_service"].get_container_port.return_value = 3000
+    deps["endpoint_registry"].register_mcp_endpoint_as_proxy.return_value = "reg-id"
+
+    with (
+        patch.object(svc, "_verify_docker_image", new=AsyncMock()),
+        patch.object(svc, "_download_image_or_set_progress", new=AsyncMock()),
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),
+        patch("server.services.mcp_service.get_base_url", return_value="http://172.20.0.2:3000"),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn())  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "df-open-websearch"
+
+
+@pytest.mark.asyncio
+async def test_install_model_applies_suffix_changed_after_model_list_was_built(
+    svc: McpService, deps: dict[str, Any], tmp_path: Path
+) -> None:
+    """Catalog options are built at load time; a later live suffix change must still reach new installs."""
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    model_id = "open-websearch"
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True, False))
+    deps["docker_service"].get_container_host.return_value = "172.20.0.2"
+    deps["docker_service"].get_container_port.return_value = 3000
+    deps["endpoint_registry"].register_mcp_endpoint_as_proxy.return_value = "reg-id"
+    deps["docker_service"].get_docker_container_name.side_effect = lambda name: f"{name}_new"  # pyright: ignore[reportUnknownLambdaType]
+
+    with (
+        patch.object(svc, "_verify_docker_image", new=AsyncMock()),
+        patch.object(svc, "_download_image_or_set_progress", new=AsyncMock()),
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),
+        patch("server.services.mcp_service.get_base_url", return_value="http://172.20.0.2:3000"),
+    ):
+        promise = await svc._install_model("default", model_id, InstallModelIn())  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.container_name == "open-websearch_new"
+    assert svc.models["default"][model_id].options.container_name == "df-open-websearch"  # pyright: ignore[reportOptionalMemberAccess]
+
+
+@pytest.mark.asyncio
+async def test_install_model_allows_resolved_container_host_for_duckduckgo(svc: McpService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """DDG's DNS-rebinding protection rejects any other Host header with a 421, so it must list the real hostname."""
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True, False))
+    deps["docker_service"].get_container_host.return_value = "duckduckgo_myinfra_a1b2c3"
+    deps["docker_service"].get_container_port.return_value = 8000
+    deps["endpoint_registry"].register_mcp_endpoint_as_proxy.return_value = "reg-id"
+
+    with (
+        patch.object(svc, "_verify_docker_image", new=AsyncMock()),
+        patch.object(svc, "_download_image_or_set_progress", new=AsyncMock()),
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),
+        patch("server.services.mcp_service.get_base_url", return_value="http://duckduckgo_myinfra_a1b2c3:8000"),
+    ):
+        promise = await svc._install_model("default", "duckduckgo", InstallModelIn())  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.env_vars["DDG_ALLOWED_HOSTS"] == "duckduckgo_myinfra_a1b2c3:*"
+    assert svc.models["default"]["duckduckgo"].options.env_vars["DDG_ALLOWED_HOSTS"] == "{container_host}:*"  # pyright: ignore[reportOptionalMemberAccess]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("override", "expected_host"), [("pinned-name", "pinned-name"), (None, "duckduckgo_new")])
+async def test_install_model_derives_container_host_from_final_container_name(
+    svc: McpService, deps: dict[str, Any], tmp_path: Path, override: str | None, expected_host: str
+) -> None:
+    """The host (and DDG's allow-list) must follow the pinned or re-derived name, not the catalog's load-time one."""
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True, False))
+    deps["docker_service"].get_container_host.side_effect = lambda _subnet, options: options.container_name  # pyright: ignore[reportUnknownLambdaType, reportUnknownMemberType]
+    deps["docker_service"].get_container_port.return_value = 8000
+    deps["docker_service"].get_docker_container_name.side_effect = lambda name: f"{name}_new"  # pyright: ignore[reportUnknownLambdaType]
+    deps["endpoint_registry"].register_mcp_endpoint_as_proxy.return_value = "reg-id"
+
+    with (
+        patch.object(svc, "_verify_docker_image", new=AsyncMock()),
+        patch.object(svc, "_download_image_or_set_progress", new=AsyncMock()),
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),
+        patch("server.services.mcp_service.get_base_url", return_value="http://host:8000") as mock_base_url,
+    ):
+        promise = await svc._install_model("default", "duckduckgo", InstallModelIn(), override)  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    docker_options = deps["docker_service"].install_and_run_docker.call_args.args[0]
+    assert docker_options.env_vars["DDG_ALLOWED_HOSTS"] == f"{expected_host}:*"
+    assert svc.instances_info["default"].installed.models["duckduckgo"].container_host == expected_host  # pyright: ignore[reportOptionalMemberAccess]
+    assert mock_base_url.call_args.args[0] == expected_host
+
+
+@pytest.mark.asyncio
+async def test_install_model_passes_user_envs_over_catalog_envs(svc: McpService, deps: dict[str, Any], tmp_path: Path) -> None:
+    """User-supplied envs (e.g. API keys) must reach the container, and win over the catalog's own defaults."""
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=InstallServiceIn(spec={}))
+    deps["docker_service"].install_and_run_docker = AsyncMock(return_value=(12345, True, False))
+    deps["docker_service"].get_container_host.return_value = "duckduckgo"
+    deps["docker_service"].get_container_port.return_value = 8000
+    deps["endpoint_registry"].register_mcp_endpoint_as_proxy.return_value = "reg-id"
+    spec = {"envs": {"FOO": "bar", "DDG_ALLOWED_HOSTS": "custom:*"}}
+
+    with (
+        patch.object(svc, "_verify_docker_image", new=AsyncMock()),
+        patch.object(svc, "_download_image_or_set_progress", new=AsyncMock()),
+        patch.object(svc, "_get_working_dir", return_value=tmp_path),
+        patch("server.services.mcp_service.get_base_url", return_value="http://duckduckgo:8000"),
+    ):
+        promise = await svc._install_model("default", "duckduckgo", InstallModelIn(spec=spec))  # pyright: ignore[reportPrivateUsage]
+        await promise.wait()
+
+    env_vars = deps["docker_service"].install_and_run_docker.call_args.args[0].env_vars
+    assert env_vars["FOO"] == "bar"
+    assert env_vars["DDG_ALLOWED_HOSTS"] == "custom:*"
+
+
+@pytest.mark.asyncio
 async def test_install_model_cleans_up_installing_set_when_cancelled_during_setup(svc: McpService) -> None:
     """A cancellation during the pre-promise docker-image verification must still discard the
     `_installing` entry - not just ordinary exceptions - or the model gets stuck looking installed.
@@ -1174,7 +1353,9 @@ async def test_install_model_proxy_healthy_probe_skips_background_retry(mock_fet
     assert result.status == "OK"
     assert result.details == "Installed"
     assert result.requires_oauth is False
-    assert len(svc._background_tasks) == 0  # pyright: ignore[reportPrivateUsage]
+    # Only the periodic health monitor runs; no one-shot retry task.
+    assert set(svc._background_tasks) == set(svc._health_monitor_tasks.values())  # pyright: ignore[reportPrivateUsage]
+    svc._stop_health_monitor("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
 
 
 @mock.patch("server.services.mcp_service._fetch_tools_from_mcp_endpoint")
@@ -1195,7 +1376,9 @@ async def test_install_model_proxy_401_auto_detects_oauth_before_returning(mock_
     assert result.status == "OK"
     assert "authorization required" in result.details.lower()
     assert result.requires_oauth is True
-    assert len(svc._background_tasks) == 0  # pyright: ignore[reportPrivateUsage]
+    # Only the periodic health monitor runs; no one-shot retry task.
+    assert set(svc._background_tasks) == set(svc._health_monitor_tasks.values())  # pyright: ignore[reportPrivateUsage]
+    svc._stop_health_monitor("default", "my-remote-mcp")  # pyright: ignore[reportPrivateUsage]
     updated = svc.models["default"]["my-remote-mcp"]
     assert updated.oauth is not None
     assert updated.oauth.enabled is True
@@ -1862,17 +2045,21 @@ async def test_fetch_tools_background_returns_early_when_healthy(svc: McpService
 
 @mock.patch("server.services.mcp_service.asyncio.sleep", new=AsyncMock())
 @pytest.mark.asyncio
-async def test_fetch_tools_background_swallows_exceptions(svc: McpService) -> None:
+async def test_fetch_tools_background_logs_exceptions(svc: McpService) -> None:
     unhealthy_result = McpHealthCheckResult(healthy=False, error="err")
 
-    with patch.object(
-        svc,
-        "healthcheck_model",
-        new=AsyncMock(side_effect=[RuntimeError("boom"), unhealthy_result, unhealthy_result, unhealthy_result, unhealthy_result]),
-    ) as mock_hc:
+    with (
+        patch.object(
+            svc,
+            "healthcheck_model",
+            new=AsyncMock(side_effect=[RuntimeError("boom"), unhealthy_result, unhealthy_result, unhealthy_result, unhealthy_result]),
+        ) as mock_hc,
+        patch("server.services.mcp_service.logger") as mock_logger,
+    ):
         await svc._fetch_tools_background("default", "open-websearch")  # pyright: ignore[reportPrivateUsage]
 
     assert mock_hc.await_count == 5
+    mock_logger.exception.assert_called_once()
 
 
 @mock.patch("server.services.mcp_service.asyncio.sleep", new=AsyncMock())
@@ -1912,6 +2099,36 @@ def test_apply_healthcheck_result_updates_model_props_and_registry(svc: McpServi
     assert reg_model.healthy is True
     assert reg_model.props.tools == tools
     assert reg_model.props.transport == "streamable_http"
+
+
+def test_apply_healthcheck_result_notifies_parent_when_registration_changes(svc: McpService) -> None:
+    props = ModelProps(private=False, type="mcp", endpoints=[])
+    model = MagicMock(spec=SrvMcpModel)
+    model.model_props = props
+    reg_model = MagicMock()
+    reg_model.props = props
+    reg_model.healthy = False
+    svc.endpoint_registry.mcp_endpoints.models.get.return_value = {"v1": reg_model}  # pyright: ignore[reportAttributeAccessIssue]
+    result = McpHealthCheckResult(healthy=True, transport="sse", tools=[McpToolInfo(name="t", description="d")])
+
+    svc._apply_healthcheck_result(model, "my-prefix", result)  # pyright: ignore[reportPrivateUsage]
+
+    svc.endpoint_registry.parent_infra.send_models_list.assert_called_once()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_apply_healthcheck_result_does_not_notify_parent_when_nothing_changed(svc: McpService) -> None:
+    props = ModelProps(private=False, type="mcp", endpoints=[], transport="sse")
+    model = MagicMock(spec=SrvMcpModel)
+    model.model_props = props
+    reg_model = MagicMock()
+    reg_model.props = props
+    reg_model.healthy = True
+    svc.endpoint_registry.mcp_endpoints.models.get.return_value = {"v1": reg_model}  # pyright: ignore[reportAttributeAccessIssue]
+    result = McpHealthCheckResult(healthy=True, transport="sse", tools=[])
+
+    svc._apply_healthcheck_result(model, "my-prefix", result)  # pyright: ignore[reportPrivateUsage]
+
+    svc.endpoint_registry.parent_infra.send_models_list.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def test_apply_healthcheck_result_no_transport_skips_transport_update(svc: McpService) -> None:
@@ -2420,7 +2637,7 @@ async def test_healthcheck_model_docker_transport_mismatch_unregister_failure_is
     svc.endpoint_registry.register_mcp_sse_endpoint_as_proxy.return_value = "new-sse-reg-id"  # pyright: ignore[reportAttributeAccessIssue]
     svc.endpoint_registry.unregister_mcp_endpoint.side_effect = RuntimeError("registry notification failed")  # pyright: ignore[reportAttributeAccessIssue]
 
-    with caplog.at_level(logging.ERROR, logger="uvicorn.error"):
+    with caplog.at_level(logging.ERROR, logger="uvicorn"):
         result = await svc.healthcheck_model("default", "open-websearch")
 
     assert result.healthy is True
@@ -2447,7 +2664,7 @@ async def test_healthcheck_model_docker_transport_mismatch_register_failure_is_l
     mock_sse.return_value = McpHealthCheckResult(healthy=True, transport="sse", tools=[])
     svc.endpoint_registry.register_mcp_sse_endpoint_as_proxy.side_effect = RuntimeError("registry rejected registration")  # pyright: ignore[reportAttributeAccessIssue]
 
-    with caplog.at_level(logging.ERROR, logger="uvicorn.error"), pytest.raises(RuntimeError, match="registry rejected registration"):
+    with caplog.at_level(logging.ERROR, logger="uvicorn"), pytest.raises(RuntimeError, match="registry rejected registration"):
         await svc.healthcheck_model("default", "open-websearch")
 
     svc.endpoint_registry.unregister_mcp_endpoint.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
@@ -3025,7 +3242,7 @@ async def test_get_duplicate_spec_catalog_model_uses_installed_envs_and_headers(
 
     spec = await svc.get_duplicate_spec("default", "brave-search")
 
-    assert spec["envs"] == {"BRAVE_API_KEY": "secret-key"}
+    assert spec["envs"] == {"BRAVE_MCP_TRANSPORT": "http", "BRAVE_API_KEY": "secret-key"}
     assert spec["headers"] == {"X-Custom": "value"}
 
 
@@ -4415,3 +4632,147 @@ async def test_install_model_proxy_with_refresh_token_starts_background_refresh(
         await asyncio.sleep(0)
 
     mock_start.assert_called_once_with("default", "my-remote-mcp")
+
+
+def _install_model_stub(svc: McpService, prefix: str = "my-prefix") -> None:
+    svc.instances_info["default"].installed = InstalledInfo(
+        models={"open-websearch": MagicMock(prefix=prefix)},
+        options=MagicMock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_health_monitor_marks_unhealthy_after_consecutive_failures(svc: McpService) -> None:
+    _install_model_stub(svc)
+    reg_model = MagicMock(healthy=True)
+    svc.endpoint_registry.mcp_endpoints.models.get.return_value = {"v1": reg_model}  # pyright: ignore[reportAttributeAccessIssue]
+    down = McpHealthCheckResult(healthy=False, error="Connection refused")
+
+    with (
+        mock.patch("server.services.mcp_service.asyncio.sleep", new=AsyncMock()),
+        patch.object(svc, "healthcheck_model", new=AsyncMock(side_effect=[down, down, down, asyncio.CancelledError()])),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await svc._health_monitor_background("default", "open-websearch")  # pyright: ignore[reportPrivateUsage]
+
+    assert reg_model.healthy is False
+    svc.endpoint_registry.parent_infra.send_models_list.assert_called_once()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@pytest.mark.asyncio
+async def test_health_monitor_tolerates_transient_failures(svc: McpService) -> None:
+    _install_model_stub(svc)
+    reg_model = MagicMock(healthy=True)
+    svc.endpoint_registry.mcp_endpoints.models.get.return_value = {"v1": reg_model}  # pyright: ignore[reportAttributeAccessIssue]
+    down = McpHealthCheckResult(healthy=False, error="timeout")
+    up = McpHealthCheckResult(healthy=True)
+
+    with (
+        mock.patch("server.services.mcp_service.asyncio.sleep", new=AsyncMock()),
+        patch.object(svc, "healthcheck_model", new=AsyncMock(side_effect=[down, down, up, down, down, asyncio.CancelledError()])),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await svc._health_monitor_background("default", "open-websearch")  # pyright: ignore[reportPrivateUsage]
+
+    assert reg_model.healthy is True
+    svc.endpoint_registry.parent_infra.send_models_list.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@pytest.mark.asyncio
+async def test_health_monitor_ignores_probe_crashes_and_oauth(svc: McpService) -> None:
+    _install_model_stub(svc)
+    reg_model = MagicMock(healthy=True)
+    svc.endpoint_registry.mcp_endpoints.models.get.return_value = {"v1": reg_model}  # pyright: ignore[reportAttributeAccessIssue]
+    oauth = McpHealthCheckResult(healthy=False, requires_oauth=True)
+    outcomes = [RuntimeError("boom")] * 4 + [oauth] * 4 + [asyncio.CancelledError()]
+
+    with (
+        mock.patch("server.services.mcp_service.asyncio.sleep", new=AsyncMock()),
+        patch.object(svc, "healthcheck_model", new=AsyncMock(side_effect=outcomes)),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await svc._health_monitor_background("default", "open-websearch")  # pyright: ignore[reportPrivateUsage]
+
+    assert reg_model.healthy is True
+    svc.endpoint_registry.parent_infra.send_models_list.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@pytest.mark.asyncio
+async def test_health_monitor_recovers_via_healthcheck_after_unhealthy(svc: McpService) -> None:
+    model = MagicMock(spec=SrvMcpModel)
+    model.model_props = ModelProps(private=False, type="mcp", endpoints=[])
+    reg_model = MagicMock(healthy=False)
+    reg_model.props = model.model_props
+    svc.endpoint_registry.mcp_endpoints.models.get.return_value = {"v1": reg_model}  # pyright: ignore[reportAttributeAccessIssue]
+
+    svc._apply_healthcheck_result(model, "my-prefix", McpHealthCheckResult(healthy=True))  # pyright: ignore[reportPrivateUsage]
+
+    assert reg_model.healthy is True
+    svc.endpoint_registry.parent_infra.send_models_list.assert_called_once()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@pytest.mark.asyncio
+async def test_health_monitor_stops_when_model_uninstalled(svc: McpService) -> None:
+    svc.instances_info["default"].installed = InstalledInfo(models={}, options=MagicMock())
+
+    with (
+        mock.patch("server.services.mcp_service.asyncio.sleep", new=AsyncMock()),
+        patch.object(svc, "healthcheck_model", new=AsyncMock()) as mock_hc,
+    ):
+        await svc._health_monitor_background("default", "open-websearch")  # pyright: ignore[reportPrivateUsage]
+
+    mock_hc.assert_not_awaited()
+
+
+def test_mark_unhealthy_skips_already_unhealthy_registrations(svc: McpService) -> None:
+    already_down = MagicMock(healthy=False)
+    up = MagicMock(healthy=True)
+    svc.endpoint_registry.mcp_endpoints.models.get.return_value = {"v1": already_down, "v2": up}  # pyright: ignore[reportAttributeAccessIssue]
+
+    svc._mark_unhealthy("my-prefix")  # pyright: ignore[reportPrivateUsage]
+
+    assert already_down.healthy is False
+    assert up.healthy is False
+    svc.endpoint_registry.parent_infra.send_models_list.assert_called_once()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_mark_unhealthy_does_not_notify_when_already_unhealthy(svc: McpService) -> None:
+    svc.endpoint_registry.mcp_endpoints.models.get.return_value = {"v1": MagicMock(healthy=False)}  # pyright: ignore[reportAttributeAccessIssue]
+
+    svc._mark_unhealthy("my-prefix")  # pyright: ignore[reportPrivateUsage]
+
+    svc.endpoint_registry.parent_infra.send_models_list.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@pytest.mark.asyncio
+async def test_health_monitor_survives_mark_unhealthy_failure(svc: McpService) -> None:
+    _install_model_stub(svc)
+    down = McpHealthCheckResult(healthy=False, error="refused")
+
+    with (
+        mock.patch("server.services.mcp_service.asyncio.sleep", new=AsyncMock()),
+        patch.object(svc, "healthcheck_model", new=AsyncMock(side_effect=[down] * 4 + [asyncio.CancelledError()])),
+        patch.object(svc, "_mark_unhealthy", side_effect=RuntimeError("registry broke")) as mock_mark,
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await svc._health_monitor_background("default", "open-websearch")  # pyright: ignore[reportPrivateUsage]
+
+    assert mock_mark.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_start_health_monitor_is_idempotent_and_stoppable(svc: McpService) -> None:
+    async def sleep_forever(*_: object) -> None:
+        await asyncio.sleep(3600)
+
+    with patch.object(svc, "_health_monitor_background", new=sleep_forever):
+        svc._start_health_monitor("default", "m")  # pyright: ignore[reportPrivateUsage]
+        first = svc._health_monitor_tasks[("default", "m")]  # pyright: ignore[reportPrivateUsage]
+        svc._start_health_monitor("default", "m")  # pyright: ignore[reportPrivateUsage]
+        assert svc._health_monitor_tasks[("default", "m")] is first  # pyright: ignore[reportPrivateUsage]
+
+        await svc.stop_instance("default")
+        await asyncio.sleep(0)
+
+    assert first.cancelled()
+    assert ("default", "m") not in svc._health_monitor_tasks  # pyright: ignore[reportPrivateUsage]

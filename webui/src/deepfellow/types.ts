@@ -27,6 +27,13 @@ export interface InstallProgress {
   value: number; // 0.0 to 1.0
 }
 
+/** A newer image tag that needs a newer CUDA than the host's NVIDIA driver supports. */
+export interface NewerNeedsCuda {
+  tag: string;
+  required_cuda: string;
+  host_cuda: string;
+}
+
 export interface SpecField {
   name: string;
   description: string;
@@ -39,7 +46,8 @@ export interface SpecField {
     | "list"
     | "map"
     | "textarea"
-    | "docker-tags";
+    | "docker-tags"
+    | "gpu-priority";
   required: boolean;
   default?: string | number | boolean;
   placeholder?: string;
@@ -114,6 +122,9 @@ export interface ServiceModel {
   // True when this entry was previously seen (and possibly installed) but is no longer present
   // in the most recent live provider listing.
   stale?: boolean;
+  // null/undefined means the capability is unknown/not yet resolved for this backend; true/false means resolved.
+  supports_vision?: boolean | null;
+  supports_audio?: boolean | null;
 }
 
 export interface GpuCardStats {
@@ -137,6 +148,22 @@ export interface SystemStats {
 
 export interface ServiceModelsResponse {
   list: ServiceModel[];
+}
+
+export interface FinetuneAdapter {
+  id: string;
+  object: string;
+  created: number; // Unix timestamp (seconds)
+  owned_by: string;
+  base_model: string;
+  formats: string[];
+  lora?: Record<string, unknown> | null;
+  gguf?: Record<string, unknown> | null;
+}
+
+export interface FinetuneAdapterListResponse {
+  object: string;
+  data: FinetuneAdapter[];
 }
 
 export interface TestResult {

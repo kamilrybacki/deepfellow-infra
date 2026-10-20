@@ -4,18 +4,16 @@
 """Remote service."""
 
 import asyncio
-import logging
 from abc import abstractmethod
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from typing import Any, Generic, Literal, TypeVar
-from urllib.parse import urljoin
 
 from fastapi import HTTPException
 from pydantic import BaseModel
 
 from server.endpointregistry import ProxyOptions, RegistrationId, RegistrationOptions
-from server.models.api import ModelProps
+from server.models.api import EMBEDDINGS_ENDPOINTS, IMG_ENDPOINTS, STT_ENDPOINTS, TTS_ENDPOINTS, ModelProps
 from server.models.models import (
     CustomModelField,
     CustomModelId,
@@ -46,11 +44,11 @@ from server.utils.core import (
     Stream,
     StreamChunk,
     StreamChunkProgress,
+    Utils,
     positive_context_window_or_none,
     try_parse_pydantic,
 )
-
-logger = logging.getLogger("uvicorn.error")
+from server.utils.logger import logger
 
 RemoteModelType = Literal["llm", "embedding", "stt", "tts", "txt2img"]
 
@@ -113,9 +111,22 @@ class RemoteCustomModel(BaseModel):
     max_context_length: int | None = None
 
 
-def get_model_props(model: RemoteModel | RemoteCustomModel) -> ModelProps:
-    """Get model props."""
-    endpoints = []
+# Endpoints advertised by non-LLM models. The completions/responses/messages flags only apply to LLMs.
+_NON_LLM_ENDPOINTS: dict[RemoteModelType, list[str]] = {
+    "embedding": EMBEDDINGS_ENDPOINTS,
+    "stt": STT_ENDPOINTS,
+    "tts": TTS_ENDPOINTS,
+    "txt2img": IMG_ENDPOINTS,
+}
+
+
+def get_model_endpoints(model: RemoteModel | RemoteCustomModel) -> list[str]:
+    """Get the endpoints the model accepts, based on its type."""
+    if model.type is None:
+        return []
+    if model.type != "llm":
+        return list(_NON_LLM_ENDPOINTS[model.type])
+    endpoints: list[str] = []
     if model.legacy_completions:
         endpoints.append("/v1/completions")
     if model.completions:
@@ -124,10 +135,15 @@ def get_model_props(model: RemoteModel | RemoteCustomModel) -> ModelProps:
         endpoints.append("/v1/responses")
     if model.messages:
         endpoints.append("/v1/messages")
+    return endpoints
+
+
+def get_model_props(model: RemoteModel | RemoteCustomModel) -> ModelProps:
+    """Get model props."""
     return ModelProps(
         private=False,
         type=model.type or "unknown",
-        endpoints=endpoints,
+        endpoints=get_model_endpoints(model),
         context_window=positive_context_window_or_none(model.context_length),
         max_context_window=positive_context_window_or_none(model.max_context_length),
     )
@@ -181,6 +197,7 @@ T_Options = TypeVar("T_Options", bound=BaseServiceOptions, default=DefaultRemote
 
 
 class RemoteModelOptions(BaseModel):
+    rename: str | None = None
     alias: str | None = None
 
 
@@ -367,7 +384,14 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
         """Provide the specification for the install service modal fields compatible with OpenAI."""
         return ServiceSpecification(
             fields=[
-                ServiceField(type="text", name="api_url", description="API URL", required=False, default=self.get_default_url()),
+                ServiceField(
+                    type="text",
+                    name="api_url",
+                    description="API URL",
+                    placeholder="https://api.example.com (with or without a trailing /v1)",
+                    required=False,
+                    default=self.get_default_url(),
+                ),
                 ServiceField(type="password", name="api_key", description="API Key", required=False),
             ]
         )
@@ -376,7 +400,10 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
         """Return the model specification."""
         return ModelSpecification(
             fields=[
-                ModelField(type="text", name="alias", description="Model alias", required=False),
+                ModelField(type="text", name="rename", description="Rename the model, hiding its original name", required=False),
+                ModelField(
+                    type="text", name="alias", description="Additional name for the model, the original name keeps working", required=False
+                ),
             ]
         )
 
@@ -444,7 +471,10 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
         return DownloadedInfo(**data)
 
     async def _install_instance(
-        self, instance: str, options: InstallServiceIn
+        self,
+        instance: str,
+        options: InstallServiceIn,
+        container_name_override: str | None = None,  # noqa: ARG002
     ) -> PromiseWithProgress[InstalledInfo[T_Options], StreamChunk]:
         """Install a remote service instance with validated frontend options."""
         if not self.models.get(instance):
@@ -591,7 +621,11 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
         )
 
     async def _install_model(  # noqa: C901
-        self, instance: str, model_id: str, options: InstallModelIn
+        self,
+        instance: str,
+        model_id: str,
+        options: InstallModelIn,
+        container_name_override: str | None = None,  # noqa: ARG002
     ) -> PromiseWithProgress[InstallModelOut, StreamChunk]:
         parsed_model_options = try_parse_pydantic(RemoteModelOptions, options.spec) if options.spec else RemoteModelOptions()
         info = self.get_instance_installed_info(instance)
@@ -621,7 +655,8 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
         async def func(stream: Stream[StreamChunk]) -> InstallModelOut:
             try:
                 stream.emit(StreamChunkProgress(type="progress", stage="install", value=0, data={}))
-                registered_name = parsed_model_options.alias if parsed_model_options.alias else model_id
+                registered_name = parsed_model_options.rename if parsed_model_options.rename else model_id
+                registered_alias = parsed_model_options.alias
                 info.models[model_id] = model_info = ModelInstalledInfo(
                     id=model_id,
                     type=model.type or "unknown",
@@ -632,7 +667,7 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
                     registration_id="",
                 )
 
-                url_base = urljoin(info.parsed_options.api_url, self.api_version)
+                url_base = Utils.join_versioned_url(info.parsed_options.api_url, self.api_version)
                 props = get_model_props(model)
                 try:
                     if model.type == "llm":
@@ -640,38 +675,38 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
                             model=registered_name,
                             props=props,
                             messages=ProxyOptions(
-                                url=urljoin(url_base, "messages"),
+                                url=Utils.join_url(url_base, "messages"),
                                 rewrite_model_to=model.real_model_name or model_id,
                                 headers=headers,
                             )
                             if model.messages
                             else None,
                             responses=ProxyOptions(
-                                url=urljoin(url_base, "responses"),
+                                url=Utils.join_url(url_base, "responses"),
                                 rewrite_model_to=model.real_model_name or model_id,
                                 headers=headers,
                             )
                             if model.responses
                             else None,
                             chat_completions=ProxyOptions(
-                                url=urljoin(url_base, "chat/completions"),
+                                url=Utils.join_url(url_base, "chat/completions"),
                                 rewrite_model_to=model.real_model_name or model_id,
                                 headers=headers,
                             )
                             if model.completions
                             else None,
                             completions=ProxyOptions(
-                                url=urljoin(url_base, "completions"),
+                                url=Utils.join_url(url_base, "completions"),
                                 rewrite_model_to=model.real_model_name or model_id,
                                 headers=headers,
                             )
                             if model.legacy_completions
                             else None,
                             ollama_chat=None,
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                            registration_options=RegistrationOptions(origin="local", alias=registered_alias, owned_by=self.get_type()),
                         )
                     if model.type == "tts":
-                        url = urljoin(url_base, "audio/speech")
+                        url = Utils.join_url(url_base, "audio/speech")
                         model_info.registration_id = self.endpoint_registry.register_audio_speech_as_proxy(
                             model=registered_name,
                             props=props,
@@ -680,10 +715,10 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
                                 rewrite_model_to=model.real_model_name or model_id,
                                 headers=headers,
                             ),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                            registration_options=RegistrationOptions(origin="local", alias=registered_alias, owned_by=self.get_type()),
                         )
                     if model.type == "stt":
-                        url = urljoin(url_base, "audio/transcriptions")
+                        url = Utils.join_url(url_base, "audio/transcriptions")
                         model_info.registration_id = self.endpoint_registry.register_audio_transcriptions_as_proxy(
                             model=registered_name,
                             props=props,
@@ -692,10 +727,10 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
                                 rewrite_model_to=model.real_model_name or model_id,
                                 headers=headers,
                             ),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                            registration_options=RegistrationOptions(origin="local", alias=registered_alias, owned_by=self.get_type()),
                         )
                     if model.type == "txt2img":
-                        url = urljoin(url_base, "images/generations")
+                        url = Utils.join_url(url_base, "images/generations")
                         model_info.registration_id = self.endpoint_registry.register_image_generations_as_proxy(
                             model=registered_name,
                             props=props,
@@ -704,10 +739,10 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
                                 rewrite_model_to=model.real_model_name or model_id,
                                 headers=headers,
                             ),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                            registration_options=RegistrationOptions(origin="local", alias=registered_alias, owned_by=self.get_type()),
                         )
                     if model.type == "embedding":
-                        url = urljoin(url_base, "embeddings")
+                        url = Utils.join_url(url_base, "embeddings")
                         model_info.registration_id = self.endpoint_registry.register_embeddings_as_proxy(
                             model=registered_name,
                             props=props,
@@ -716,7 +751,7 @@ class RemoteService(Base2Service[InstalledInfo[T_Options], DownloadedInfo]):
                                 rewrite_model_to=model.real_model_name or model_id,
                                 headers=headers,
                             ),
-                            registration_options=RegistrationOptions(origin="local", owned_by=self.get_type()),
+                            registration_options=RegistrationOptions(origin="local", alias=registered_alias, owned_by=self.get_type()),
                         )
                     stream.emit(StreamChunkProgress(type="progress", stage="install", value=1, data={}))
                     self.models_downloaded[model_id] = DownloadedInfo()

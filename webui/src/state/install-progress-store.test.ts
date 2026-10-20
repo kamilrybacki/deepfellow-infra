@@ -10,9 +10,11 @@ limitations under the License.
 */
 import { describe, expect, it } from "vitest";
 import {
+  type InstallProgress,
   clearModelInstallProgress,
   clearServiceInstallProgress,
   getSnapshot,
+  normalizeProgress,
   setModelInstallProgress,
   setServiceInstallProgress,
 } from "./install-progress-store";
@@ -240,4 +242,54 @@ describe("boundary values 0 and 1 are accepted (Bug 3 — hasRealProgressRef mus
     setServiceInstallProgress(id, { stage: "install", value: 0.5 });
     expect(getSnapshot().services[id]?.value).toBe(1);
   });
+});
+
+describe("normalizeProgress", () => {
+  it("returns undefined when progress is undefined", () => {
+    expect(normalizeProgress(undefined)).toBeUndefined();
+  });
+
+  it("returns the same object when the value is already within 0..1", () => {
+    const atZero: InstallProgress = { stage: "download", value: 0 };
+    expect(normalizeProgress(atZero)).toBe(atZero);
+
+    const midway: InstallProgress = { stage: "install", value: 0.5 };
+    expect(normalizeProgress(midway)).toBe(midway);
+
+    const atOne: InstallProgress = { stage: "download", value: 1 };
+    expect(normalizeProgress(atOne)).toBe(atOne);
+  });
+
+  it("clamps a value below 0 to 0 and returns a new object", () => {
+    const progress: InstallProgress = { stage: "download", value: -0.5 };
+    const result = normalizeProgress(progress);
+    expect(result).not.toBe(progress);
+    expect(result).toEqual({ stage: "download", value: 0 });
+  });
+
+  it("clamps a value above 1 to 1 and returns a new object", () => {
+    const progress: InstallProgress = { stage: "install", value: 1.5 };
+    const result = normalizeProgress(progress);
+    expect(result).not.toBe(progress);
+    expect(result).toEqual({ stage: "install", value: 1 });
+  });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    "returns undefined for non-finite value %s",
+    (value) => {
+      expect(normalizeProgress({ stage: "download", value })).toBeUndefined();
+    },
+  );
+
+  it.each(["0.5", null])(
+    "returns undefined for non-number value %j",
+    (value) => {
+      // Cast to exercise runtime handling of malformed input.
+      const progress = {
+        stage: "install",
+        value,
+      } as unknown as InstallProgress;
+      expect(normalizeProgress(progress)).toBeUndefined();
+    },
+  );
 });
